@@ -36,6 +36,8 @@ VERSION
 
 Run from the repository root:
 
+Repository contract tests require Pester 5 or later.
+
 ```powershell
 pwsh -File ./tests/Invoke-Tests.ps1
 pwsh -File ./.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1

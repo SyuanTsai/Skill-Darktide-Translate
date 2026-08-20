@@ -4,10 +4,11 @@ param()
 $ErrorActionPreference = 'Stop'
 $available = @(
     Get-Module -Name Pester -ListAvailable |
+        Where-Object { $_.Version.Major -ge 5 } |
         Sort-Object Version -Descending
 )
 if ($available.Count -eq 0) {
-    throw 'Pester is required to run repository tests.'
+    throw 'Pester 5 or later is required to run repository tests.'
 }
 
 $selected = $available[0]
@@ -21,12 +22,7 @@ if ($testFiles.Count -eq 0) {
     throw 'No Pester test files were found.'
 }
 
-if ($selected.Version.Major -ge 5) {
-    $result = Invoke-Pester -Path $testFiles -PassThru
-}
-else {
-    $result = Invoke-Pester -Script $testFiles -PassThru
-}
+$result = Invoke-Pester -Path $testFiles -PassThru
 
 if ($result.FailedCount -gt 0) {
     throw "$($result.FailedCount) Pester test(s) failed."

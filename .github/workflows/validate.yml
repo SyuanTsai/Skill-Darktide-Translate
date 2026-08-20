@@ -19,10 +19,16 @@ jobs:
       - name: Resolve Pester
         shell: pwsh
         run: |
-          $module = Get-Module -Name Pester -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+          $module = Get-Module -Name Pester -ListAvailable |
+            Where-Object { $_.Version.Major -ge 5 } |
+            Sort-Object Version -Descending |
+            Select-Object -First 1
           if ($null -eq $module) {
-            Install-Module -Name Pester -Scope CurrentUser -Force -SkipPublisherCheck
-            $module = Get-Module -Name Pester -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+            Install-Module -Name Pester -MinimumVersion 5.0.0 -Scope CurrentUser -Force -SkipPublisherCheck
+            $module = Get-Module -Name Pester -ListAvailable |
+              Where-Object { $_.Version.Major -ge 5 } |
+              Sort-Object Version -Descending |
+              Select-Object -First 1
           }
           Write-Host "Pester $($module.Version)"
 
