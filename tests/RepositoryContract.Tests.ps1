@@ -1,6 +1,8 @@
-$repoRoot = Split-Path -Parent $PSScriptRoot
-
 Describe 'Darktide Translate repository contract' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+    }
+
     # Scenario: A consumer discovers this repository through its stable catalog.
     # Purpose: Protect the source ID, repository URL, Skill path, and opt-in profile contract.
     It 'UnitT10_ExposesTheStableSourceSkillAndProfileContract' {
@@ -37,9 +39,10 @@ Describe 'Darktide Translate repository contract' {
             '.agents/skills/auto-update-darktide-mod/SKILL.md',
             '.agents/skills/auto-update-darktide-mod/agents/openai.yaml',
             '.agents/skills/auto-update-darktide-mod/references/package-binding.md',
-            '.agents/skills/auto-update-darktide-mod/references/workflow-schema-14.md',
-            '.agents/skills/auto-update-darktide-mod/references/review-baseline.md',
+            '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz',
+            '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz',
             '.agents/skills/auto-update-darktide-mod/references/source-provenance.json',
+            '.agents/skills/auto-update-darktide-mod/scripts/Expand-Schema14Reference.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1',
             '.github/workflows/validate.yml',
             '.github/workflows/skill-validator.yml',

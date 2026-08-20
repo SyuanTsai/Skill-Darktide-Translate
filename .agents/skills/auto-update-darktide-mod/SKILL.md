@@ -1,6 +1,6 @@
 ---
 name: auto-update-darktide-mod
-description: Safely update Warhammer 40,000 DARKTIDE MODs from user-supplied archives while preserving active zh-tw localization, producing Schema 14 layered Git evidence, validating metadata, and opening or reviewing one PR per MOD. Use for end-to-end AI Auto Update claims, resumptions, feedback handling, or merge finalization. Do not use for generic translation, MOD authoring, or broad non-localization code review.
+description: Update Warhammer 40,000 DARKTIDE MODs from supplied archives while preserving active zh-tw localization and producing Schema 14 Git evidence. Use for claims, resumptions, review feedback, or merge finalization; not generic translation or MOD authoring.
 ---
 
 # Auto Update a DARKTIDE MOD
@@ -10,11 +10,25 @@ Use the packaged Schema 14 workflow as the normative operating procedure. The Sk
 ## Load the authoritative instructions
 
 1. Read [references/package-binding.md](references/package-binding.md) to resolve this installed Skill source and map the original prompt paths into the package.
-2. Run `scripts/Test-ReferenceIntegrity.ps1` before starting a new claim. Stop if either normative reference fails its size or SHA-256 check.
-3. Read [references/workflow-schema-14.md](references/workflow-schema-14.md) completely before claiming or resuming a MOD, then follow the applicable sections without weakening their ordering, safety, state, evidence, or concurrency requirements.
-4. Before local Review, external feedback classification, or Review completion, also read [references/review-baseline.md](references/review-baseline.md) completely from the same pinned Skill source commit.
+2. Run `scripts/Test-ReferenceIntegrity.ps1` before starting a new claim. Stop if either compressed package or expanded normative document fails its size or SHA-256 check.
+3. Use `scripts/Expand-Schema14Reference.ps1` to expand `assets/workflow-schema-14.md.gz` into a fresh temporary directory. Read the expanded Workflow completely before claiming or resuming a MOD, then follow the applicable sections without weakening their ordering, safety, state, evidence, or concurrency requirements.
+4. Before local Review, external feedback classification, or Review completion, use the same script to expand `assets/review-baseline.md.gz` from the same pinned Skill source commit and read it completely.
 
 Existing runs remain pinned to the workflow tuple recorded in their own state. Never migrate an existing state to this package or a newer package revision implicitly.
+
+## Example
+
+From this Skill directory, materialize only the Workflow needed for a claim into a new temporary directory:
+
+```powershell
+$schema14Temp = Join-Path ([IO.Path]::GetTempPath()) "darktide-schema14-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $schema14Temp | Out-Null
+./scripts/Test-ReferenceIntegrity.ps1
+$expanded = ./scripts/Expand-Schema14Reference.ps1 -Document Workflow -OutputDirectory $schema14Temp -PassThru
+Get-Content -LiteralPath $expanded.path -Raw
+```
+
+Keep the temporary materialization outside the Skill source and target MOD repository. Do not reuse an existing output file.
 
 ## Select the operation
 

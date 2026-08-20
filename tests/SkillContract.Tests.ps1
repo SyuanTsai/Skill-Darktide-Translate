@@ -1,7 +1,9 @@
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$skillRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod'
-
 Describe 'Auto Update Darktide MOD Skill contract' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        $skillRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod'
+    }
+
     # Scenario: A new run loads the packaged Skill entrypoint.
     # Purpose: Ensure discovery is precise and every normative reference is explicitly routed.
     It 'UnitT10_RoutesSchema14ExecutionAndReviewReferences' {
@@ -11,8 +13,9 @@ Describe 'Auto Update Darktide MOD Skill contract' {
 
         $skill | Should Match '(?m)^name: auto-update-darktide-mod$'
         $skill | Should Match 'references/package-binding\.md'
-        $skill | Should Match 'references/workflow-schema-14\.md'
-        $skill | Should Match 'references/review-baseline\.md'
+        $skill | Should Match 'assets/workflow-schema-14\.md\.gz'
+        $skill | Should Match 'assets/review-baseline\.md\.gz'
+        $skill | Should Match 'scripts/Expand-Schema14Reference\.ps1'
         $skill | Should Match 'scripts/Test-ReferenceIntegrity\.ps1'
     }
 
@@ -26,6 +29,31 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $result.result | Should Be 'passed'
         $result.workflow.sha256 | Should Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
         $result.reviewBaseline.sha256 | Should Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
+        $result.workflow.path | Should Be 'assets/workflow-schema-14.md.gz'
+        $result.reviewBaseline.path | Should Be 'assets/review-baseline.md.gz'
+        $result.workflow.packageSha256 | Should Match '^[0-9a-f]{64}$'
+        $result.reviewBaseline.packageSha256 | Should Match '^[0-9a-f]{64}$'
+    }
+
+    # Scenario: A run loads each normative Schema 14 document only when its stage needs it.
+    # Purpose: Prove both compressed packages reconstruct byte-exact originals before an agent reads them.
+    It 'UnitT25_ExpandsVerifiedSchema14DocumentsOnDemand' {
+        $expanderPath = Join-Path $skillRoot 'scripts/Expand-Schema14Reference.ps1'
+        Test-Path -LiteralPath $expanderPath | Should Be $true
+
+        $workflow = & $expanderPath -Document Workflow -OutputDirectory $TestDrive -PassThru
+        $workflow.result | Should Be 'passed'
+        $workflow.document | Should Be 'Workflow'
+        $workflow.sha256 | Should Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
+        Test-Path -LiteralPath $workflow.path -PathType Leaf | Should Be $true
+        (Get-Item -LiteralPath $workflow.path).Length | Should Be 74587
+
+        $baseline = & $expanderPath -Document ReviewBaseline -OutputDirectory $TestDrive -PassThru
+        $baseline.result | Should Be 'passed'
+        $baseline.document | Should Be 'ReviewBaseline'
+        $baseline.sha256 | Should Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
+        Test-Path -LiteralPath $baseline.path -PathType Leaf | Should Be $true
+        (Get-Item -LiteralPath $baseline.path).Length | Should Be 20507
     }
 
     # Scenario: The Skill runs outside the original MOD repository prompt location.
@@ -37,8 +65,9 @@ Describe 'Auto Update Darktide MOD Skill contract' {
 
         $binding | Should Match 'darktide-translate'
         $binding | Should Match 'workflow_commit_oid'
-        $binding | Should Match 'workflow-schema-14\.md'
-        $binding | Should Match 'review-baseline\.md'
+        $binding | Should Match 'workflow-schema-14\.md\.gz'
+        $binding | Should Match 'review-baseline\.md\.gz'
+        $binding | Should Match 'Expand-Schema14Reference\.ps1'
         $binding | Should Match 'target MOD repository'
     }
 

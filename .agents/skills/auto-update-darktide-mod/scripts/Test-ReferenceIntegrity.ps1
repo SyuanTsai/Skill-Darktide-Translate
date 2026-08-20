@@ -11,7 +11,7 @@ if (-not (Test-Path -LiteralPath $provenancePath -PathType Leaf)) {
 }
 
 $provenance = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json
-if ($provenance.schemaVersion -ne 1) {
+if ($provenance.schemaVersion -ne 2) {
     throw 'Unsupported source provenance schemaVersion.'
 }
 if ($provenance.sourceCommit -notmatch '^[0-9a-f]{40}$') {
@@ -39,20 +39,57 @@ function Test-Document {
     }
 
     $file = Get-Item -LiteralPath $candidate
-    $actualSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant()
-    if ($file.Length -ne [int64] $Document.sizeBytes) {
-        throw "$Name reference size mismatch."
+    $packageSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant()
+    if ($file.Length -ne [int64] $Document.packagedSizeBytes) {
+        throw "$Name package size mismatch."
     }
-    if ($actualSha -ne $Document.sha256) {
-        throw "$Name reference SHA-256 mismatch."
+    if ($packageSha -ne $Document.packagedSha256) {
+        throw "$Name package SHA-256 mismatch."
+    }
+
+    $packageStream = [IO.File]::OpenRead($candidate)
+    try {
+        $gzipStream = [IO.Compression.GZipStream]::new(
+            $packageStream,
+            [IO.Compression.CompressionMode]::Decompress
+        )
+        try {
+            $expandedStream = [IO.MemoryStream]::new()
+            try {
+                $gzipStream.CopyTo($expandedStream)
+                $expandedBytes = $expandedStream.ToArray()
+            }
+            finally {
+                $expandedStream.Dispose()
+            }
+        }
+        finally {
+            $gzipStream.Dispose()
+        }
+    }
+    finally {
+        $packageStream.Dispose()
+    }
+
+    $contentSha = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($expandedBytes)
+    ).ToLowerInvariant()
+    if ($expandedBytes.Length -ne [int64] $Document.contentSizeBytes) {
+        throw "$Name expanded content size mismatch."
+    }
+    if ($contentSha -ne $Document.contentSha256) {
+        throw "$Name expanded content SHA-256 mismatch."
     }
 
     [ordered]@{
         path = $Document.packagedPath
+        contentName = $Document.contentName
         originalPath = $Document.originalPath
         gitBlobOid = $Document.gitBlobOid
-        sizeBytes = [int64] $file.Length
-        sha256 = $actualSha
+        packageSizeBytes = [int64] $file.Length
+        packageSha256 = $packageSha
+        sizeBytes = [int64] $expandedBytes.Length
+        sha256 = $contentSha
     }
 }
 
