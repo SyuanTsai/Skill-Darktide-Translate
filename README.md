@@ -21,7 +21,9 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
 .agents/skills/auto-update-darktide-mod/
   SKILL.md
   agents/openai.yaml
+  assets/
   references/
+  scripts/Expand-Schema14Reference.ps1
   scripts/Test-ReferenceIntegrity.ps1
 catalog/skills-catalog.json
 docs/RELEASE.md

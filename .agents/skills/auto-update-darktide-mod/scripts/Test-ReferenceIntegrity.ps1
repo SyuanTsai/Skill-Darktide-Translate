@@ -11,7 +11,7 @@ if (-not (Test-Path -LiteralPath $provenancePath -PathType Leaf)) {
 }
 
 $provenance = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json
-if ($provenance.schemaVersion -ne 2) {
+if ($provenance.schemaVersion -ne 3) {
     throw 'Unsupported source provenance schemaVersion.'
 }
 if ($provenance.sourceCommit -notmatch '^[0-9a-f]{40}$') {
@@ -45,6 +45,19 @@ function Test-Document {
     }
     if ($packageSha -ne $Document.packagedSha256) {
         throw "$Name package SHA-256 mismatch."
+    }
+    if ($Document.packagedGitObjectFormat -ne 'sha1') {
+        throw "$Name package Git object format is unsupported."
+    }
+
+    $packageBytes = [IO.File]::ReadAllBytes($candidate)
+    $gitBlobHeader = [Text.Encoding]::ASCII.GetBytes("blob $($packageBytes.Length)`0")
+    $gitBlobBytes = [byte[]] ($gitBlobHeader + $packageBytes)
+    $packageGitBlobOid = [Convert]::ToHexString(
+        [Security.Cryptography.SHA1]::HashData($gitBlobBytes)
+    ).ToLowerInvariant()
+    if ($packageGitBlobOid -ne $Document.packagedGitBlobOid) {
+        throw "$Name package Git blob OID mismatch."
     }
 
     $packageStream = [IO.File]::OpenRead($candidate)
@@ -85,7 +98,8 @@ function Test-Document {
         path = $Document.packagedPath
         contentName = $Document.contentName
         originalPath = $Document.originalPath
-        gitBlobOid = $Document.gitBlobOid
+        gitBlobOid = $packageGitBlobOid
+        sourceGitBlobOid = $Document.sourceGitBlobOid
         packageSizeBytes = [int64] $file.Length
         packageSha256 = $packageSha
         sizeBytes = [int64] $expandedBytes.Length

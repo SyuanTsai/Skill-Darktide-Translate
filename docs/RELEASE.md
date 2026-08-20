@@ -7,7 +7,7 @@ This repository is versioned independently from the target DARKTIDE MOD reposito
 ## Release checklist
 
 1. Run `pwsh -File ./tests/Invoke-Tests.ps1`.
-2. Run `.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1`.
+2. Run `pwsh -File ./.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1`.
 3. Run `pwsh -File ./scripts/Get-SourcePin.ps1 -Ref HEAD` and retain the resolved commit and content SHA-256.
 4. Confirm the catalog exposes only `auto-update-darktide-mod` through the opt-in `darktide-mod-maintenance` profile.
 5. Confirm the GitHub `Validate` and `Skill Quality Gate` workflows pass on the exact PR head.

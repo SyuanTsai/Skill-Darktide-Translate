@@ -32,7 +32,8 @@ For new packaged runs:
 - `workflow_commit_oid` records the resolved `darktide-translate` source commit.
 - `workflow_path` records `.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz`.
 - `workflow_sha256` records the expanded Workflow content SHA-256; `workflow_package_sha256` records the compressed container SHA-256.
-- `reference_sources[]` records the Workflow, Review Baseline, this package binding, and `SKILL.md`, including package-relative path, resolved source commit, original Git blob OID when available, compressed and expanded sizes, and both SHA-256 values.
+- `reference_sources[]` records the Workflow, Review Baseline, this package binding, and `SKILL.md`, including package-relative path, resolved source commit, compressed and expanded sizes, and both SHA-256 values. Its `gitBlobOid` is the packaged file's Git blob at `workflow_commit_oid`, so the commit, path, and blob form one reproducible tuple.
+- For converted documents, `packagedGitBlobOid` names that packaged gzip blob while `sourceGitBlobOid` retains the original uncompressed authoring blob. Never substitute `sourceGitBlobOid` into runtime `reference_sources[].gitBlobOid`.
 - The consumer source pin's repository URL and content SHA-256 are retained with the run evidence so a future verifier can reconstruct the package.
 
 The source provenance in `source-provenance.json` proves which original Schema 14 documents were converted. It is authoring provenance, not a replacement for the current run's immutable Skill source pin.

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "sourceRepository": "https://github.com/SyuanTsai/Warhammer-40-000-DARKTIDE-Mods.git",
   "sourceRef": "Codex/AI-Auto-Update-Workflow-Hash",
   "sourceCommit": "f2912faf7a52304198aa0ffc096eb12a436bbb45",
@@ -10,7 +10,9 @@
       "packagedSizeBytes": 26467,
       "packagedSha256": "43bdbb41c041be4bdbac5e0a2a0b11f50a12c2c5a06a575653d0807da499438b",
       "contentName": "workflow-schema-14.md",
-      "gitBlobOid": "40752444d26a4ce39c4f32201076b1c84ad1db31",
+      "packagedGitObjectFormat": "sha1",
+      "packagedGitBlobOid": "48d1ace4f2c6095a7df2ab45af6ce03c57aa2ab1",
+      "sourceGitBlobOid": "40752444d26a4ce39c4f32201076b1c84ad1db31",
       "contentSizeBytes": 74587,
       "contentSha256": "931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549"
     },
@@ -20,7 +22,9 @@
       "packagedSizeBytes": 8610,
       "packagedSha256": "b6ef60d5ea59ceaeb66130b69781b70457dc687fe70875bf91c656a50e919999",
       "contentName": "review-baseline.md",
-      "gitBlobOid": "e1b94428c041238e3aff8cf02408b3de1387ee15",
+      "packagedGitObjectFormat": "sha1",
+      "packagedGitBlobOid": "ac411332ec53e9524d687a87f0694214e858ad43",
+      "sourceGitBlobOid": "e1b94428c041238e3aff8cf02408b3de1387ee15",
       "contentSizeBytes": 20507,
       "contentSha256": "d8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26"
     }

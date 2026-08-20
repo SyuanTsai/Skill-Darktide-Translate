@@ -39,7 +39,10 @@ finally {
     $sha.Dispose()
 }
 
-$version = (Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION') -Raw).Trim()
+$version = (@(Invoke-GitText -Arguments @('show', "${resolvedCommit}:VERSION")) -join "`n").Trim()
+if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
+    throw "VERSION at ref '$Ref' is not SemVer-compatible."
+}
 [ordered]@{
     sourceId = 'darktide-translate'
     repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'

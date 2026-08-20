@@ -10,7 +10,7 @@ Use the packaged Schema 14 workflow as the normative operating procedure. The Sk
 ## Load the authoritative instructions
 
 1. Read [references/package-binding.md](references/package-binding.md) to resolve this installed Skill source and map the original prompt paths into the package.
-2. Run `scripts/Test-ReferenceIntegrity.ps1` before starting a new claim. Stop if either compressed package or expanded normative document fails its size or SHA-256 check.
+2. Run `scripts/Test-ReferenceIntegrity.ps1` before loading packaged instructions for a claim, resume, review, or finalization. Stop if a compressed package, packaged Git blob OID, or expanded normative document fails verification.
 3. Use `scripts/Expand-Schema14Reference.ps1` to expand `assets/workflow-schema-14.md.gz` into a fresh temporary directory. Read the expanded Workflow completely before claiming or resuming a MOD, then follow the applicable sections without weakening their ordering, safety, state, evidence, or concurrency requirements.
 4. Before local Review, external feedback classification, or Review completion, use the same script to expand `assets/review-baseline.md.gz` from the same pinned Skill source commit and read it completely.
 
