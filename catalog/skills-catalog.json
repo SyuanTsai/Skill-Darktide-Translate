@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "catalogId": "darktide-translate",
+  "sources": [
+    {
+      "id": "darktide-translate",
+      "repository": "https://github.com/SyuanTsai/Skill-Darktide-Translate.git"
+    }
+  ],
+  "profiles": [
+    {
+      "id": "darktide-mod-maintenance",
+      "description": "Opt-in DARKTIDE MOD archive update, zh-tw maintenance, evidence, and PR workflow.",
+      "default": false,
+      "includes": [
+        "auto-update-darktide-mod"
+      ],
+      "excludes": []
+    }
+  ],
+  "skills": [
+    {
+      "id": "auto-update-darktide-mod",
+      "group": "darktide-mod-maintenance",
+      "source": {
+        "sourceId": "darktide-translate",
+        "path": ".agents/skills/auto-update-darktide-mod"
+      },
+      "profiles": [
+        "darktide-mod-maintenance"
+      ],
+      "compatibility": {
+        "platforms": [
+          "windows"
+        ],
+        "shells": [
+          "pwsh>=7"
+        ],
+        "requiredCapabilities": [
+          {
+            "kind": "command",
+            "id": "git",
+            "state": "available"
+          }
+        ],
+        "anyOfCapabilities": [
+          {
+            "kind": "connector",
+            "id": "github",
+            "state": "configured"
+          },
+          {
+            "kind": "command",
+            "id": "gh",
+            "state": "authenticated"
+          }
+        ]
+      },
+      "dependencies": [],
+      "lifecycle": {
+        "status": "active",
+        "aliases": []
+      }
+    }
+  ]
+}
