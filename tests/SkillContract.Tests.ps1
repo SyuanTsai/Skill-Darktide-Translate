@@ -29,14 +29,31 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $result.result | Should -Be 'passed'
         $result.workflow.sha256 | Should -Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
         $result.reviewBaseline.sha256 | Should -Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
-        $result.workflow.path | Should -Be 'assets/workflow-schema-14.md.gz'
-        $result.reviewBaseline.path | Should -Be 'assets/review-baseline.md.gz'
+        $result.workflow.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz'
+        $result.reviewBaseline.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz'
+        $result.workflow.packagedPath | Should -Be 'assets/workflow-schema-14.md.gz'
+        $result.reviewBaseline.packagedPath | Should -Be 'assets/review-baseline.md.gz'
         $result.workflow.packageSha256 | Should -Match '^[0-9a-f]{64}$'
         $result.reviewBaseline.packageSha256 | Should -Match '^[0-9a-f]{64}$'
         $result.workflow.gitBlobOid | Should -Be '48d1ace4f2c6095a7df2ab45af6ce03c57aa2ab1'
         $result.reviewBaseline.gitBlobOid | Should -Be 'ac411332ec53e9524d687a87f0694214e858ad43'
         $result.workflow.sourceGitBlobOid | Should -Be '40752444d26a4ce39c4f32201076b1c84ad1db31'
         $result.reviewBaseline.sourceGitBlobOid | Should -Be 'e1b94428c041238e3aff8cf02408b3de1387ee15'
+    }
+
+    # Scenario: Authoring provenance names a source blob that does not match the expanded bytes.
+    # Purpose: Prevent the integrity command from passing while merely echoing a false source Git OID.
+    It 'UnitT22_RejectsMismatchedSourceGitBlobProvenance' {
+        $fixtureRoot = Join-Path $TestDrive 'tampered-source-provenance'
+        Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
+        $fixtureProvenancePath = Join-Path $fixtureRoot 'references/source-provenance.json'
+        $fixtureProvenance = Get-Content -LiteralPath $fixtureProvenancePath -Raw | ConvertFrom-Json
+        $fixtureProvenance.documents.workflow.sourceGitBlobOid = '0000000000000000000000000000000000000000'
+        $fixtureProvenance | ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath $fixtureProvenancePath -NoNewline
+
+        $fixtureValidator = Join-Path $fixtureRoot 'scripts/Test-ReferenceIntegrity.ps1'
+        { & $fixtureValidator -PassThru } | Should -Throw '*source Git blob OID mismatch*'
     }
 
     # Scenario: A run loads each normative Schema 14 document only when its stage needs it.
@@ -73,6 +90,17 @@ Describe 'Auto Update Darktide MOD Skill contract' {
             Should -Throw
     }
 
+    # Scenario: A caller selects the installed Skill directory as the expansion destination.
+    # Purpose: Enforce the documented boundary that generated documents never modify the Skill source.
+    It 'UnitT28_RefusesToExpandInsideTheSkillSource' {
+        $fixtureRoot = Join-Path $TestDrive 'in-skill-output'
+        Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
+        $fixtureExpander = Join-Path $fixtureRoot 'scripts/Expand-Schema14Reference.ps1'
+
+        { & $fixtureExpander -Document Workflow -OutputDirectory $fixtureRoot -PassThru } |
+            Should -Throw '*outside the Skill source*'
+    }
+
     # Scenario: The Skill runs outside the original MOD repository prompt location.
     # Purpose: Preserve immutable source pinning without requiring AI Prompt files in the target repository.
     It 'UnitT30_MapsOriginalWorkflowLocationsToTheInstalledSkillSource' {
@@ -88,6 +116,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $binding | Should -Match 'target MOD repository'
         $binding | Should -Match 'packagedGitBlobOid'
         $binding | Should -Match 'sourceGitBlobOid'
+        $binding | Should -Match 'repository-relative path'
     }
 
     # Scenario: The Skill appears in Codex UI and may be selected automatically for matching maintenance work.

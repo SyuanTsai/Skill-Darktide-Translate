@@ -99,5 +99,9 @@ Describe 'Darktide Translate repository contract' {
         $validate | Should -Match 'tests/Invoke-Tests\.ps1'
         $validate | Should -Match 'Test-ReferenceIntegrity\.ps1'
         $validate | Should -Match 'scripts/Get-SourcePin\.ps1 -Ref HEAD'
+
+        $exactHeadRef = 'ref: ${{ github.event_name == ''pull_request'' && github.event.pull_request.head.sha || github.sha }}'
+        $validate | Should -Match ([regex]::Escape($exactHeadRef))
+        ([regex]::Matches($quality, [regex]::Escape($exactHeadRef))).Count | Should -Be 2
     }
 }

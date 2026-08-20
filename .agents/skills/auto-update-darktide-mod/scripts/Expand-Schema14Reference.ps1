@@ -19,6 +19,23 @@ if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
     throw 'OutputDirectory must be an existing directory.'
 }
 
+$resolvedSkillRoot = [IO.Path]::GetFullPath($skillRoot).TrimEnd(
+    [IO.Path]::DirectorySeparatorChar,
+    [IO.Path]::AltDirectorySeparatorChar
+)
+$outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
+$resolvedOutputRoot = $outputRoot.TrimEnd(
+    [IO.Path]::DirectorySeparatorChar,
+    [IO.Path]::AltDirectorySeparatorChar
+)
+$skillPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
+if (
+    $resolvedOutputRoot.Equals($resolvedSkillRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    $resolvedOutputRoot.StartsWith($skillPrefix, [StringComparison]::OrdinalIgnoreCase)
+) {
+    throw 'OutputDirectory must be outside the Skill source.'
+}
+
 $integrity = & $integrityPath -PassThru
 $provenance = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json
 $documentKey = if ($Document -eq 'Workflow') { 'workflow' } else { 'reviewBaseline' }
@@ -30,7 +47,6 @@ if ([IO.Path]::GetFileName($metadata.contentName) -ne $metadata.contentName) {
 }
 
 $packagePath = [IO.Path]::GetFullPath((Join-Path $skillRoot $metadata.packagedPath))
-$outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $outputPath = Join-Path $outputRoot $metadata.contentName
 if (Test-Path -LiteralPath $outputPath) {
     throw "Refusing to replace existing output: $outputPath"

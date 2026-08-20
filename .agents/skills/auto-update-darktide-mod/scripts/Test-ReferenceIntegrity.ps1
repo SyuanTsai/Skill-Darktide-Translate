@@ -11,12 +11,49 @@ if (-not (Test-Path -LiteralPath $provenancePath -PathType Leaf)) {
 }
 
 $provenance = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json
-if ($provenance.schemaVersion -ne 3) {
+if ($provenance.schemaVersion -ne 4) {
     throw 'Unsupported source provenance schemaVersion.'
 }
 if ($provenance.sourceCommit -notmatch '^[0-9a-f]{40}$') {
     throw 'Source provenance commit must be a full Git SHA.'
 }
+
+function ConvertTo-NormalizedRepositoryPath {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [string] $Name
+    )
+
+    if ([IO.Path]::IsPathRooted($Path)) {
+        throw "$Name must be repository-relative."
+    }
+    $segments = @($Path -split '[\\/]')
+    if ($segments.Count -eq 0 -or @($segments | Where-Object { $_ -in @('', '.', '..') }).Count -gt 0) {
+        throw "$Name must be a normalized repository-relative path."
+    }
+    $segments -join '/'
+}
+
+function Get-GitBlobOid {
+    param(
+        [Parameter(Mandatory = $true)] [byte[]] $Content,
+        [Parameter(Mandatory = $true)] [string] $ObjectFormat,
+        [Parameter(Mandatory = $true)] [string] $Name
+    )
+
+    $header = [Text.Encoding]::ASCII.GetBytes("blob $($Content.Length)`0")
+    $objectBytes = [byte[]] ($header + $Content)
+    $hash = switch ($ObjectFormat) {
+        'sha1' { [Security.Cryptography.SHA1]::HashData($objectBytes); break }
+        'sha256' { [Security.Cryptography.SHA256]::HashData($objectBytes); break }
+        default { throw "$Name Git object format is unsupported." }
+    }
+    [Convert]::ToHexString($hash).ToLowerInvariant()
+}
+
+$skillRepositoryPath = ConvertTo-NormalizedRepositoryPath `
+    -Path $provenance.skillRepositoryPath `
+    -Name 'Skill repository path'
 
 $resolvedSkillRoot = [IO.Path]::GetFullPath($skillRoot).TrimEnd(
     [IO.Path]::DirectorySeparatorChar,
@@ -46,16 +83,11 @@ function Test-Document {
     if ($packageSha -ne $Document.packagedSha256) {
         throw "$Name package SHA-256 mismatch."
     }
-    if ($Document.packagedGitObjectFormat -ne 'sha1') {
-        throw "$Name package Git object format is unsupported."
-    }
-
     $packageBytes = [IO.File]::ReadAllBytes($candidate)
-    $gitBlobHeader = [Text.Encoding]::ASCII.GetBytes("blob $($packageBytes.Length)`0")
-    $gitBlobBytes = [byte[]] ($gitBlobHeader + $packageBytes)
-    $packageGitBlobOid = [Convert]::ToHexString(
-        [Security.Cryptography.SHA1]::HashData($gitBlobBytes)
-    ).ToLowerInvariant()
+    $packageGitBlobOid = Get-GitBlobOid `
+        -Content $packageBytes `
+        -ObjectFormat $Document.packagedGitObjectFormat `
+        -Name "$Name package"
     if ($packageGitBlobOid -ne $Document.packagedGitBlobOid) {
         throw "$Name package Git blob OID mismatch."
     }
@@ -94,12 +126,27 @@ function Test-Document {
         throw "$Name expanded content SHA-256 mismatch."
     }
 
+    $sourceGitBlobOid = Get-GitBlobOid `
+        -Content $expandedBytes `
+        -ObjectFormat $Document.sourceGitObjectFormat `
+        -Name "$Name source"
+    if ($sourceGitBlobOid -ne $Document.sourceGitBlobOid) {
+        throw "$Name source Git blob OID mismatch."
+    }
+
+    $packagedPath = ConvertTo-NormalizedRepositoryPath `
+        -Path $Document.packagedPath `
+        -Name "$Name packaged path"
+
     [ordered]@{
-        path = $Document.packagedPath
+        path = "$skillRepositoryPath/$packagedPath"
+        packagedPath = $packagedPath
         contentName = $Document.contentName
         originalPath = $Document.originalPath
         gitBlobOid = $packageGitBlobOid
-        sourceGitBlobOid = $Document.sourceGitBlobOid
+        gitObjectFormat = $Document.packagedGitObjectFormat
+        sourceGitBlobOid = $sourceGitBlobOid
+        sourceGitObjectFormat = $Document.sourceGitObjectFormat
         packageSizeBytes = [int64] $file.Length
         packageSha256 = $packageSha
         sizeBytes = [int64] $expandedBytes.Length
