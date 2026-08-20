@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "sourceRepository": "https://github.com/SyuanTsai/Warhammer-40-000-DARKTIDE-Mods.git",
+  "sourceRef": "Codex/AI-Auto-Update-Workflow-Hash",
+  "sourceCommit": "f2912faf7a52304198aa0ffc096eb12a436bbb45",
+  "documents": {
+    "workflow": {
+      "originalPath": "AI Prompt/AI-Auto-Update-MOD-Workflow.md",
+      "packagedPath": "references/workflow-schema-14.md",
+      "gitBlobOid": "40752444d26a4ce39c4f32201076b1c84ad1db31",
+      "sizeBytes": 74587,
+      "sha256": "931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549"
+    },
+    "reviewBaseline": {
+      "originalPath": "AI Prompt/AI-Auto-Update-MOD-Review-Baseline.md",
+      "packagedPath": "references/review-baseline.md",
+      "gitBlobOid": "e1b94428c041238e3aff8cf02408b3de1387ee15",
+      "sizeBytes": 20507,
+      "sha256": "d8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26"
+    }
+  }
+}

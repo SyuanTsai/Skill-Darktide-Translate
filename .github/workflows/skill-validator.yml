@@ -1,0 +1,94 @@
+name: Skill Quality Gate
+
+on:
+  push:
+    paths:
+      - '.agents/skills/**'
+      - '.github/workflows/skill-validator.yml'
+  pull_request:
+    paths:
+      - '.agents/skills/**'
+      - '.github/workflows/skill-validator.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  skill-validator:
+    name: skill-validator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: Install latest skill-validator
+        run: go install github.com/agent-ecosystem/skill-validator/cmd/skill-validator@latest
+
+      - name: Show resolved skill-validator version
+        run: |
+          VALIDATOR="$(go env GOPATH)/bin/skill-validator"
+          "$VALIDATOR" --version
+
+      - name: Validate Agent Skills
+        run: |
+          VALIDATOR="$(go env GOPATH)/bin/skill-validator"
+          "$VALIDATOR" check --strict --allow-dirs=agents --emit-annotations .agents/skills/
+
+      - name: Write skill-validator report
+        if: always()
+        run: |
+          VALIDATOR="$(go env GOPATH)/bin/skill-validator"
+          "$VALIDATOR" check --strict --allow-dirs=agents -o markdown .agents/skills/ >> "$GITHUB_STEP_SUMMARY" || true
+
+  skill-tools:
+    name: skill-tools
+    runs-on: ubuntu-latest
+    env:
+      CI: 'true'
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+          check-latest: true
+
+      - name: Install latest skill-tools
+        run: npm install --global --no-audit --no-fund skill-tools@latest
+
+      - name: Show resolved skill-tools package and CLI versions
+        run: |
+          npm list --global --depth=0 skill-tools
+          skill-tools --version
+
+      - name: Run skill-tools quality gate
+        shell: bash
+        run: |
+          set -o pipefail
+          skill-tools check .agents/skills/ \
+            --format text \
+            --fail-on warning \
+            --min-score 91 | tee skill-tools-report.txt
+
+      - name: Write skill-tools report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## skill-tools'
+            echo
+            echo '```text'
+            if [[ -f skill-tools-report.txt ]]; then
+              cat skill-tools-report.txt
+            else
+              echo 'skill-tools did not produce a report.'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
