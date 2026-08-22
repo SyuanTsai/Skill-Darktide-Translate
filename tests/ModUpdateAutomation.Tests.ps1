@@ -116,6 +116,9 @@ Describe 'Deterministic Darktide MOD update automation' {
         $validator | Should -Match 'candidateGate'
         $validator | Should -Match 'rejected'
         $validator | Should -Match 'manifest'
+        $validator | Should -Match "ls-tree', '-r', '-l', '--full-tree'"
+        $validator | Should -Match 'Get-GitBlobBytes'
+        $validator | Should -Not -Match 'Test-ManifestAgainstDirectory'
         $validator | Should -Match 'sha256'
         $validator | Should -Match 'exit 1'
     }

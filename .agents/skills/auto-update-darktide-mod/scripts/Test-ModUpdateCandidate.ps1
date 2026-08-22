@@ -128,31 +128,6 @@ function Get-ChangedPaths {
     )
 }
 
-function Test-ManifestAgainstDirectory {
-    param([Collections.IDictionary] $Manifest, [string] $Root)
-    $actual = @(
-        Get-ChildItem -LiteralPath $Root -File -Recurse |
-            ForEach-Object {
-                [ordered]@{
-                    path = [IO.Path]::GetRelativePath($Root, $_.FullName).Replace('\', '/')
-                    size = $_.Length
-                    sha256 = Get-FileSha256 -Path $_.FullName
-                }
-            } |
-            Sort-Object { $_.path }
-    )
-    $expected = @($Manifest.files | Sort-Object { $_.path })
-    if ($actual.Count -ne $expected.Count) { return $false }
-    for ($index = 0; $index -lt $actual.Count; $index++) {
-        if ($actual[$index].path -cne $expected[$index].path -or
-            $actual[$index].size -ne $expected[$index].size -or
-            $actual[$index].sha256 -ne $expected[$index].sha256) {
-            return $false
-        }
-    }
-    $true
-}
-
 function Test-ApprovedSpanCandidate {
     param([byte[]] $Indexed, [byte[]] $Merged, [object[]] $ApprovedSpans)
     $ordered = @($ApprovedSpans | Sort-Object { [int64]$_.startByte })
