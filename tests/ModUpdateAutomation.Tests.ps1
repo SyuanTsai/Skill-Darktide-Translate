@@ -127,8 +127,13 @@ Describe 'Deterministic Darktide MOD update automation' {
     # Purpose: Permit exactly one bounded snapshot with no watcher, sleep, or positive polling wait.
     It 'UnitT160_UsesOneZeroWaitExternalReviewSnapshot' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
 
         $runner | Should -Match 'pollingWaitSeconds\s*=\s*0'
+        $runner | Should -Match '\$external\.Contains\(''pollingWaitSeconds''\)'
+        $runner | Should -Match '\[int64\]\$external\.pollingWaitSeconds\s*-ne\s*0'
+        $runner | Should -Not -Match '\$pollingWaitSeconds\s*=\s*0'
+        $validator | Should -Match '\$state\.externalReview\.Contains\(''pollingWaitSeconds''\)'
         $runner | Should -Match 'requested-pending'
         $runner | Should -Match 'unavailable'
         $runner | Should -Not -Match 'Start-Sleep|--watch|while\s*\('

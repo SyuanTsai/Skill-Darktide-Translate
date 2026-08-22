@@ -206,7 +206,7 @@ if ($ReviewCompletion) {
     Add-ReviewCheck -Name 'reviewed-oid' -Action {
         if ($state.reviewedOid -ne $state.evidenceChain.fOid) { throw 'reviewedOid does not equal F.' }
         if ($state.externalReview.status -notin @('completed', 'requested-pending', 'not-applicable', 'unavailable')) { throw 'External Review has no allowed zero-wait observation.' }
-        if ([int64]$state.externalReview.pollingWaitSeconds -ne 0) { throw 'External Review polling wait is not zero.' }
+        if (-not $state.externalReview.Contains('pollingWaitSeconds') -or [int64]$state.externalReview.pollingWaitSeconds -ne 0) { throw 'External Review polling wait is missing or not zero.' }
         $state.reviewedOid
     }
     $reviewResultName = if ($reviewErrors.Count -eq 0) { 'passed' } else { 'rejected' }

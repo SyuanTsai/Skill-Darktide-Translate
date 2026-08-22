@@ -1332,7 +1332,6 @@ function Invoke-ReviewSnapshot {
     Save-State -State $State
 
     $snapshotAt = Get-UtcTimestamp
-    $pollingWaitSeconds = 0
     if ($State.localizationMode -eq 'none') {
         $external = [ordered]@{ status = 'not-applicable'; reason = 'localization mode none'; headOid = $State.headOid; snapshotAt = $snapshotAt; pollingWaitSeconds = 0 }
         $snapshot = [ordered]@{ headRefOid = $State.headOid; reviews = @(); reviewRequests = @(); comments = @() }
@@ -1366,7 +1365,7 @@ function Invoke-ReviewSnapshot {
             }
         }
     }
-    if ($pollingWaitSeconds -ne 0) { throw 'External Review polling wait must remain zero.' }
+    if (-not $external.Contains('pollingWaitSeconds') -or [int64]$external.pollingWaitSeconds -ne 0) { throw 'External Review polling wait must remain zero.' }
     $artifactPath = Join-Path $State.artifactsRoot 'review-snapshot.json'
     Write-AtomicJson -Path $artifactPath -Value ([ordered]@{ snapshot = $snapshot; externalReview = $external })
     $State.externalReview = $external
