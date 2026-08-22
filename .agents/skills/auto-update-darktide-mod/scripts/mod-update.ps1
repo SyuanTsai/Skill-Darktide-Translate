@@ -127,6 +127,28 @@ function Invoke-Git {
     }
 }
 
+function Assert-AppendOnlyPushArguments {
+    param(
+        [Parameter(Mandatory)][string[]] $Arguments,
+        [Parameter(Mandatory)][string] $Remote,
+        [Parameter(Mandatory)][string] $Branch
+    )
+    $expected = @('push', '--set-upstream', $Remote, $Branch)
+    if ($Arguments.Count -ne $expected.Count) {
+        throw 'Append-only publication requires one explicit branch push.'
+    }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($Arguments[$index] -cne $expected[$index]) {
+            throw 'Append-only publication rejected unexpected Git push arguments.'
+        }
+    }
+    foreach ($argument in $Arguments[2..3]) {
+        if ($argument.StartsWith('-', [StringComparison]::Ordinal) -or $argument.StartsWith('+', [StringComparison]::Ordinal)) {
+            throw 'Append-only publication rejected an option-like remote or branch.'
+        }
+    }
+}
+
 function Invoke-Gh {
     param(
         [Parameter(Mandatory)][string[]] $Arguments,
@@ -836,9 +858,9 @@ function Invoke-Extract {
             }
             $parent = Split-Path -Parent $destination
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
-            $input = $entry.Open()
+            $entryStream = $entry.Open()
             $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-            try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+            try { $entryStream.CopyTo($output) } finally { $output.Dispose(); $entryStream.Dispose() }
         }
     }
     finally {
@@ -1246,9 +1268,9 @@ function Invoke-Publish {
     if ($State.candidateGate.status -ne 'passed') { throw 'Publishing requires a passed candidateGate.' }
     $head = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('rev-parse', 'HEAD')).output.Trim()
     if ($head -ne $State.evidenceChain.fOid) { throw 'Local HEAD no longer equals F.' }
-    $forbiddenPushOptions = @('--force', '--force-with-lease')
-    if ($forbiddenPushOptions.Count -ne 2) { throw 'Append-only push guard is unavailable.' }
-    $null = Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('push', '--set-upstream', $Remote, $State.branch)
+    $pushArguments = @('push', '--set-upstream', $Remote, $State.branch)
+    Assert-AppendOnlyPushArguments -Arguments $pushArguments -Remote $Remote -Branch $State.branch
+    $null = Invoke-Git -WorkingDirectory $State.worktreePath -Arguments $pushArguments
     $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $Remote, "refs/heads/$($State.branch)")).output.Split("`t")[0]
     if ($remoteHead -ne $head) { throw 'Remote branch does not equal F after append-only push.' }
 

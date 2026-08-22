@@ -45,6 +45,8 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'StartsWith'
         $runner | Should -Match 'ExternalAttributes'
         $runner | Should -Match 'CreateNew'
+        $runner | Should -Match '\$entryStream\s*=\s*\$entry\.Open\(\)'
+        $runner | Should -Not -Match '\$input\s*='
         $runner | Should -Not -Match '(?i)Invoke-Expression|\biex\b'
         $runner | Should -Not -Match '(?i)(Get-Content|ReadAllText|ReadAllBytes)[^\r\n]*Trim(?:End)?\(|-replace\s+[''\"]\\s'
     }
@@ -75,10 +77,33 @@ Describe 'Deterministic Darktide MOD update automation' {
             $validator | Should -Match $checkpoint
         }
         $runner | Should -Match 'core\.autocrlf=true'
-        $runner | Should -Match '--force-with-lease|--force'
+        $runner | Should -Match 'function Assert-AppendOnlyPushArguments'
+        $runner | Should -Match '\$pushArguments\s*=\s*@\('
+        $runner | Should -Match 'Assert-AppendOnlyPushArguments -Arguments \$pushArguments'
+        $runner | Should -Match 'Invoke-Git[^\r\n]+-Arguments \$pushArguments'
+        $runner | Should -Not -Match '\$forbiddenPushOptions\.Count'
         $runner | Should -Match 'append-only'
         $validator | Should -Match 'parent tree'
         $validator | Should -Match 'diff --check'
+
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $guardAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-AppendOnlyPushArguments'
+        }, $true)
+        $guardAst | Should -Not -BeNullOrEmpty
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($guardAst.Extent.Text))
+        try {
+            { & $guardModule { Assert-AppendOnlyPushArguments -Arguments @('push', '--set-upstream', 'origin', 'codex/test') -Remote 'origin' -Branch 'codex/test' } } | Should -Not -Throw
+            { & $guardModule { Assert-AppendOnlyPushArguments -Arguments @('push', '--force', 'origin', 'codex/test') -Remote 'origin' -Branch 'codex/test' } } | Should -Throw
+            { & $guardModule { Assert-AppendOnlyPushArguments -Arguments @('push', '--set-upstream', '--force', 'codex/test') -Remote '--force' -Branch 'codex/test' } } | Should -Throw
+        }
+        finally {
+            Remove-Module $guardModule -Force
+        }
     }
 
     # Scenario: Validation fails after a candidate is generated.
