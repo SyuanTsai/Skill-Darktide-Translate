@@ -4,8 +4,8 @@ Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive up
 
 - Stable source ID: `darktide-translate`
 - Catalog: `catalog/skills-catalog.json`
-- Current repository version: `0.1.0`
-- Jira delivery item: `SYP-92` under `SYP-86`
+- Current repository version: `0.2.0`
+- Jira delivery items: `SYP-92` packaging and `SYP-88` deterministic automation under `SYP-86`
 
 ## Skill
 
@@ -23,6 +23,8 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
   agents/openai.yaml
   assets/
   references/
+  scripts/mod-update.ps1
+  scripts/Test-ModUpdateCandidate.ps1
   scripts/Expand-Schema14Reference.ps1
   scripts/Test-ReferenceIntegrity.ps1
 catalog/skills-catalog.json
@@ -52,6 +54,8 @@ GitHub Actions also runs strict `skill-validator` and `skill-tools` Quality Gate
 
 Release and immutable pin rules are in `docs/RELEASE.md`. Consumers roll back by restoring an earlier tag, resolved commit, and deterministic content hash as described in `docs/ROLLBACK.md`. Existing MOD runs never auto-migrate to a newer Workflow revision.
 
+The real Reconnect trial, immutable Git evidence, Gate hashes, Review result, and measured 9-minute-18-second wall-clock run are recorded in [`docs/SYP-88-E2E.md`](docs/SYP-88-E2E.md).
+
 ## Scope
 
-This repository owns the packaged Skill, its Schema 14 Workflow and Review references, metadata, validation, and release contract. Consumer catalog integration, legacy prompt removal, installation migration, and cross-repository cutover remain in SYP-86 integration scope.
+This repository independently owns the packaged Skill, its Schema 14 Workflow and Review references, deterministic stage runner, Candidate Gate, metadata, validation, and release contract. It is not added to the AI-Instructions Catalog, Lock, bootstrap, or fan-out; consumers install and pin it independently.
