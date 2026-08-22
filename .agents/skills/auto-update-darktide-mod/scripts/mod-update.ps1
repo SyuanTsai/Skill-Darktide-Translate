@@ -487,6 +487,14 @@ function Exit-RunWriterLock {
     [IO.File]::Delete([string]$Lease.path)
 }
 
+function Ensure-RunWriterLock {
+    param([Collections.IDictionary] $State)
+    $script:activeStatePath = [string]$State.statePath
+    if (-not $script:writerLease) {
+        $script:writerLease = Enter-RunWriterLock -State $State
+    }
+}
+
 function Complete-IncompleteClaim {
     param([Collections.IDictionary] $State)
     Assert-LockOwner -State $State
@@ -519,6 +527,12 @@ function Complete-IncompleteClaim {
 
     $coordinatorArchive = [string]$State.claimCoordinatorArchivePath
     $claimedArchive = [string]$State.archive.path
+    if (-not (Test-Path -LiteralPath $coordinatorArchive -PathType Leaf) -and
+        -not (Test-Path -LiteralPath $claimedArchive -PathType Leaf) -and
+        $State.archive.Contains('originalPath') -and
+        (Test-Path -LiteralPath ([string]$State.archive.originalPath) -PathType Leaf)) {
+        [IO.File]::Move([string]$State.archive.originalPath, $coordinatorArchive)
+    }
     if (Test-Path -LiteralPath $coordinatorArchive -PathType Leaf) {
         if (Test-Path -LiteralPath $claimedArchive) { throw 'Incomplete claim has both coordinator and run-owned archive copies.' }
         [IO.File]::Move($coordinatorArchive, $claimedArchive)
@@ -587,6 +601,7 @@ function Invoke-Claim {
     if (Test-Path -LiteralPath $actualStatePath -PathType Leaf) {
         $existing = Read-State -Path $actualStatePath
         if ($existing.runId -ne $actualRunId) { throw 'Existing state belongs to another run.' }
+        Ensure-RunWriterLock -State $existing
         $completed = Get-CompletedStageResult -State $existing -Name 'claim'
         if ($completed) { return $completed }
         return Complete-IncompleteClaim -State $existing
@@ -626,7 +641,6 @@ function Invoke-Claim {
     }
     Write-AtomicJson -Path (Join-Path $modLockPath 'owner.json') -Value $plannedOwner
     New-Item -ItemType Directory -Path $claimSourceRoot -Force | Out-Null
-    [IO.File]::Move($sourceFull, $coordinatorArchive)
     $claimRecord = [ordered]@{
         runId = $actualRunId
         status = 'identified'
@@ -702,6 +716,7 @@ function Invoke-Claim {
         )
         archive = [ordered]@{
             filename = [IO.Path]::GetFileName($claimedArchive)
+            originalPath = $sourceFull
             path = [IO.Path]::GetFullPath($claimedArchive)
             size = $sampleTwo.Length
             sha256 = $archiveSha
@@ -748,7 +763,9 @@ function Invoke-Claim {
         updatedAt = Get-UtcTimestamp
         claimAttemptedAt = $null
     }
+    Ensure-RunWriterLock -State $state
     Write-AtomicJson -Path $state.statePath -Value $state
+    [IO.File]::Move($sourceFull, $coordinatorArchive)
     Complete-IncompleteClaim -State $state
 }
 
@@ -1415,11 +1432,12 @@ function Invoke-StageCommand {
 }
 
 $writerLease = $null
+$activeStatePath = $null
 try {
     $result = if ($Command -eq 'claim') {
         if ($StatePath -and (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
             $state = Read-State -Path $StatePath
-            $writerLease = Enter-RunWriterLock -State $state
+            Ensure-RunWriterLock -State $state
         }
         Invoke-Claim
     }
@@ -1431,7 +1449,7 @@ try {
             $claimResult = Invoke-Claim
             Read-State -Path $claimResult.statePath
         }
-        $writerLease = Enter-RunWriterLock -State $state
+        Ensure-RunWriterLock -State $state
         $state = Read-State -Path $state.statePath
         $last = $null
         foreach ($stageName in @('verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot')) {
@@ -1450,7 +1468,7 @@ try {
     }
     else {
         $state = Resolve-InitialState
-        $writerLease = Enter-RunWriterLock -State $state
+        Ensure-RunWriterLock -State $state
         $state = Read-State -Path $state.statePath
         Invoke-StageCommand -StageName $Command -State $state
     }
@@ -1461,13 +1479,13 @@ catch {
     $errorResult = [ordered]@{
         result = 'failed'
         stage = $Command
-        statePath = $StatePath
+        statePath = if ($activeStatePath) { $activeStatePath } else { $StatePath }
         error = $_.Exception.Message
         at = Get-UtcTimestamp
     }
-    if ($writerLease -and $StatePath -and (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
+    if ($writerLease -and $activeStatePath -and (Test-Path -LiteralPath $activeStatePath -PathType Leaf)) {
         try {
-            $failedState = Read-State -Path $StatePath
+            $failedState = Read-State -Path $activeStatePath
             $failedState.lastError = $errorResult
             $failedState.status = if ($_.Exception.Message -match 'identity|security|archive|path|user') { 'waiting-user' } else { 'failed' }
             Save-State -State $failedState

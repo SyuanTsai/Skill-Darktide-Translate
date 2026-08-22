@@ -120,6 +120,9 @@ Describe 'Deterministic Darktide MOD update automation' {
         $validator | Should -Match 'manifest'
         $validator | Should -Match "ls-tree', '-r', '-l', '--full-tree'"
         $validator | Should -Match 'Get-GitBlobBytes'
+        $validator | Should -Match 'function Assert-ClaimedArchiveIntegrity'
+        $validator | Should -Match "Add-ReviewCheck -Name 'claimed-archive'"
+        $validator | Should -Match "Add-ValidationCheck -Name 'claimed-archive'"
         $validator | Should -Not -Match 'Test-ManifestAgainstDirectory'
         $validator | Should -Match 'sha256'
         $validator | Should -Match 'exit 1'
@@ -153,6 +156,10 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'published'
         $runner | Should -Match 'LocalReviewPath'
         $runner | Should -Match 'review-completion-validation\.json'
+        $runner | Should -Match 'function Ensure-RunWriterLock'
+        $runner | Should -Match '(?s)Ensure-RunWriterLock -State \$state\s+Write-AtomicJson -Path \$state\.statePath'
+        $runner | Should -Match 'if \(-not \$script:writerLease\)'
+        $runner | Should -Match '\$script:writerLease = Enter-RunWriterLock -State \$State'
     }
 
     # Scenario: A maintainer installs the Skill, recovers a failed run, rolls back, or adds a MOD exception.
@@ -236,9 +243,13 @@ Describe 'Deterministic Darktide MOD update automation' {
         $incompleteClaim.status = 'claiming'
         $incompleteClaim.completedStages = @($incompleteClaim.completedStages | Where-Object { $_ -ne 'claim' })
         $incompleteClaim.stageTimings.Remove('claim')
+        $incompleteClaim.archive.originalPath | Should -Not -BeNullOrEmpty
+        [IO.File]::Move([string]$incompleteClaim.archive.path, [string]$incompleteClaim.archive.originalPath)
         [IO.File]::WriteAllText($statePath, ($incompleteClaim | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
         $claimRecovery = & $runnerPath claim -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru
         $claimRecovery.result | Should -Be 'passed'
+        Test-Path -LiteralPath $incompleteClaim.archive.originalPath | Should -Be $false
+        Test-Path -LiteralPath $incompleteClaim.archive.path -PathType Leaf | Should -Be $true
         (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).lastRecovery.reason | Should -Be 'incomplete claim reattached to original run tuple'
 
         $writerState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
@@ -323,6 +334,16 @@ Describe 'Deterministic Darktide MOD update automation' {
         [IO.File]::WriteAllText($planPath, ($plan | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         (& $runnerPath localization -RepositoryRoot $fixtureRepo -StatePath $statePath -LocalizationPlanPath $planPath -PassThru).result | Should -Be 'passed'
         (& $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
+        $preGateState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        try {
+            $appendStream = [IO.File]::Open([string]$preGateState.archive.path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $appendStream.WriteByte(0) } finally { $appendStream.Dispose() }
+            { & $validatorPath -StatePath $statePath -PassThru } | Should -Throw '*claimed-archive*'
+            (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).candidateGate.status | Should -Be 'rejected'
+        }
+        finally {
+            [IO.File]::Copy($archiveBackupPath, [string]$preGateState.archive.path, $true)
+        }
         $validation = & $runnerPath validate -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru
         $validation.result | Should -Be 'passed'
 

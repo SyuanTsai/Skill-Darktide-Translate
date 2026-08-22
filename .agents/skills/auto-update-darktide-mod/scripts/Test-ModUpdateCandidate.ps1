@@ -29,6 +29,31 @@ function Get-FileSha256 {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Assert-ClaimedArchiveIntegrity {
+    param([Collections.IDictionary] $Archive)
+    if (-not $Archive -or -not $Archive.Contains('path') -or -not $Archive.Contains('size') -or -not $Archive.Contains('sha256')) {
+        throw 'claimed-archive evidence is incomplete.'
+    }
+    $archivePath = [string]$Archive.path
+    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+        throw 'claimed-archive file is missing.'
+    }
+    $stream = [IO.File]::Open($archivePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -ne [int64]$Archive.size) {
+            throw 'claimed-archive size changed after claim.'
+        }
+        $actualSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+        if ($actualSha256 -ne [string]$Archive.sha256) {
+            throw 'claimed-archive SHA-256 changed after claim.'
+        }
+        $actualSha256
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 function Write-AtomicJson {
     param([string] $Path, $Value)
     $parent = Split-Path -Parent $Path
@@ -179,6 +204,9 @@ if ($ReviewCompletion) {
         try { $reviewChecks[$Name] = [ordered]@{ result = 'passed'; evidence = (& $Action) } }
         catch { $reviewChecks[$Name] = [ordered]@{ result = 'rejected'; evidence = $_.Exception.Message }; $reviewErrors.Add("${Name}: $($_.Exception.Message)") }
     }
+    Add-ReviewCheck -Name 'claimed-archive' -Action {
+        Assert-ClaimedArchiveIntegrity -Archive $state.archive
+    }
     Add-ReviewCheck -Name 'candidate-gate' -Action {
         if ($state.candidateGate.status -ne 'passed') { throw 'Candidate Gate is not passed.' }
         if ((Get-FileSha256 -Path $state.candidateGate.validationReportPath) -ne $state.candidateGate.validationReportSha256) { throw 'Candidate Gate report SHA-256 changed.' }
@@ -237,6 +265,10 @@ function Add-ValidationCheck {
 
 $chain = $state.evidenceChain
 $worktree = [string]$state.worktreePath
+
+Add-ValidationCheck -Name 'claimed-archive' -Action {
+    Assert-ClaimedArchiveIntegrity -Archive $state.archive
+}
 
 Add-ValidationCheck -Name 'candidate-head' -Action {
     foreach ($field in @('c0Oid', 'c1Oid', 'fOid')) {
