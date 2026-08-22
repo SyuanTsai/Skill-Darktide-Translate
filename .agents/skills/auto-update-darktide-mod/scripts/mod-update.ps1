@@ -537,6 +537,10 @@ function Complete-IncompleteClaim {
         if (Test-Path -LiteralPath $claimedArchive) { throw 'Incomplete claim has both coordinator and run-owned archive copies.' }
         [IO.File]::Move($coordinatorArchive, $claimedArchive)
     }
+    $claimedArchiveItem = Get-Item -LiteralPath $claimedArchive -ErrorAction SilentlyContinue
+    if ($claimedArchiveItem -and ($claimedArchiveItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Claimed archive must be a regular file, not a reparse point.'
+    }
     if (-not (Test-Path -LiteralPath $claimedArchive -PathType Leaf) -or (Get-FileSha256 -Path $claimedArchive) -ne $State.archive.sha256) {
         throw 'Incomplete claim archive is missing or no longer matches its source SHA-256.'
     }
@@ -587,6 +591,9 @@ function Invoke-Claim {
     if (-not (Test-Path -LiteralPath $sourceFull -PathType Leaf)) { throw 'Archive is missing.' }
 
     $sampleOne = Get-Item -LiteralPath $sourceFull
+    if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'Source archive must be a regular file, not a reparse point.'
+    }
     [Threading.Thread]::Sleep(10000)
     $sampleTwo = Get-Item -LiteralPath $sourceFull
     if ($sampleOne.Length -ne $sampleTwo.Length -or $sampleOne.LastWriteTimeUtc -ne $sampleTwo.LastWriteTimeUtc) {

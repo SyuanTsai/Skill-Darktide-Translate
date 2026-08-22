@@ -47,6 +47,8 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'CreateNew'
         $runner | Should -Match 'ExpectedSha256'
         $runner | Should -Match 'HashData\(\$stream\)'
+        $runner | Should -Match 'Source archive must be a regular file, not a reparse point'
+        $runner | Should -Match 'Claimed archive must be a regular file, not a reparse point'
         $runner | Should -Match '\$entryStream\s*=\s*\$entry\.Open\(\)'
         $runner | Should -Not -Match '\$input\s*='
         $runner | Should -Not -Match '(?i)Invoke-Expression|\biex\b'
