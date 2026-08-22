@@ -83,6 +83,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'core\.autocrlf=true'
         $runner | Should -Match 'function Assert-AppendOnlyPushArguments'
         $runner | Should -Match '\$pushArguments\s*=\s*@\('
+        $runner | Should -Match '\$pushArguments\s*=\s*@\(''push'',\s*''--set-upstream'',\s*\$State\.remote,\s*\$State\.branch\)'
         $runner | Should -Match 'Assert-AppendOnlyPushArguments -Arguments \$pushArguments'
         $runner | Should -Match 'Invoke-Git[^\r\n]+-Arguments \$pushArguments'
         $runner | Should -Not -Match '\$forbiddenPushOptions\.Count'
@@ -128,6 +129,15 @@ Describe 'Deterministic Darktide MOD update automation' {
         $validator | Should -Not -Match 'Test-ManifestAgainstDirectory'
         $validator | Should -Match 'sha256'
         $validator | Should -Match 'exit 1'
+
+        $runner | Should -Match '\$start\.WorkingDirectory\s*=\s*\[IO\.Path\]::GetFullPath\(\$WorkingDirectory\)'
+        $validator | Should -Match '\$start\.WorkingDirectory\s*=\s*\[IO\.Path\]::GetFullPath\(\$WorkingDirectory\)'
+        $runnerGhCalls = [regex]::Matches($runner, '(?m)Invoke-Gh\s+-')
+        $runnerScopedGhCalls = [regex]::Matches($runner, '(?m)Invoke-Gh\s+-WorkingDirectory\s+\$State\.worktreePath\s+-Arguments')
+        $runnerGhCalls.Count | Should -Be $runnerScopedGhCalls.Count
+        $validatorGhCalls = [regex]::Matches($validator, '(?m)Invoke-GhCheck\s+-')
+        $validatorScopedGhCalls = [regex]::Matches($validator, '(?m)Invoke-GhCheck\s+-WorkingDirectory\s+\$state\.worktreePath\s+-Arguments')
+        $validatorGhCalls.Count | Should -Be $validatorScopedGhCalls.Count
     }
 
     # Scenario: Copilot review is pending, unavailable, or already exists for the immutable PR head.
@@ -162,6 +172,16 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match '(?s)Ensure-RunWriterLock -State \$state\s+Write-AtomicJson -Path \$state\.statePath'
         $runner | Should -Match 'if \(-not \$script:writerLease\)'
         $runner | Should -Match '\$script:writerLease = Enter-RunWriterLock -State \$State'
+        $runner | Should -Match '\$pendingWriterRecovery\s*=\s*\$null'
+        $runner | Should -Match '(?s)\$script:writerLease = Enter-RunWriterLock -State \$State.*?\$State\.lastRecovery = \$script:writerLease\.recovery.*?Save-State -State \$State'
+        $runner | Should -Match 'function Assert-PublishedPrAtF'
+        ([regex]::Matches($runner, 'Assert-PublishedPrAtF -State \$State')).Count | Should -Be 2
+        $runner | Should -Match "(?s)\$stageName -eq 'review-snapshot'.*?completedStages.*?-notcontains 'review-snapshot'"
+        $runner | Should -Match '(?s)if \(\$completed\).*?Assert-PublishedPrAtF -State \$State.*?\$State\.status = ''awaiting-user-merge''.*?Save-State -State \$State'
+        $baseResolutionIndex = $runner.IndexOf('$baseOid = (Invoke-Git -WorkingDirectory $repository')
+        $identityLockIndex = $runner.IndexOf("try { New-Item -ItemType Directory -Path `$modLockPath")
+        $baseResolutionIndex | Should -BeGreaterOrEqual 0
+        $identityLockIndex | Should -BeGreaterThan $baseResolutionIndex
     }
 
     # Scenario: A maintainer installs the Skill, recovers a failed run, rolls back, or adds a MOD exception.
@@ -403,6 +423,14 @@ Describe 'Deterministic Darktide MOD update automation' {
         { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
             Should -Throw '*missing its recorded artifact*'
         [IO.File]::WriteAllBytes($state.evidenceReceipt.path, $receiptBytes)
+
+        $incompleteBuildState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $incompleteBuildState.published = $false
+        $incompleteBuildState.completedStages = @($incompleteBuildState.completedStages | Where-Object { $_ -ne 'build-commits' })
+        [IO.File]::WriteAllText($statePath, ($incompleteBuildState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*Incomplete build-commits recovery requires HEAD to equal C0*'
+        (& git -C $state.worktreePath rev-parse HEAD).Trim() | Should -Be $headBeforeRerun
 
         $recoveryState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
         $recoveryState.status = 'candidate-committed'

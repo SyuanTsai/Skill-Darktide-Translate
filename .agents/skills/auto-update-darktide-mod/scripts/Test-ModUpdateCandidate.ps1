@@ -88,12 +88,13 @@ function Invoke-GitCheck {
 }
 
 function Invoke-GhCheck {
-    param([string[]] $Arguments, [switch] $AllowFailure)
+    param([string] $WorkingDirectory, [string[]] $Arguments, [switch] $AllowFailure)
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'gh'
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    $start.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
     foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
@@ -226,7 +227,7 @@ if ($ReviewCompletion) {
     Add-ReviewCheck -Name 'local-remote-pr-head' -Action {
         $local = (Invoke-GitCheck -WorkingDirectory $state.worktreePath -Arguments @('rev-parse', 'HEAD')).output.Trim()
         $remote = (Invoke-GitCheck -WorkingDirectory $state.worktreePath -Arguments @('ls-remote', '--heads', $state.remote, "refs/heads/$($state.branch)")).output.Split("`t")[0]
-        $pr = (Invoke-GhCheck -Arguments @('pr', 'view', [string]$state.prNumber, '--json', 'number,url,state,isDraft,baseRefName,headRefName,headRefOid')).output | ConvertFrom-Json -AsHashtable
+        $pr = (Invoke-GhCheck -WorkingDirectory $state.worktreePath -Arguments @('pr', 'view', [string]$state.prNumber, '--json', 'number,url,state,isDraft,baseRefName,headRefName,headRefOid')).output | ConvertFrom-Json -AsHashtable
         if ($local -ne $state.evidenceChain.fOid -or $remote -ne $local -or $pr.headRefOid -ne $local) { throw 'local, remote, PR head, and F are not identical.' }
         if ($pr.state -ne 'OPEN' -or $pr.isDraft -or $pr.baseRefName -ne $state.pullRequestBase -or $pr.headRefName -ne $state.branch) { throw 'PR state, draft flag, base, or head is invalid.' }
         $local

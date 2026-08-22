@@ -151,6 +151,7 @@ function Assert-AppendOnlyPushArguments {
 
 function Invoke-Gh {
     param(
+        [Parameter(Mandatory)][string] $WorkingDirectory,
         [Parameter(Mandatory)][string[]] $Arguments,
         [switch] $AllowFailure
     )
@@ -159,6 +160,7 @@ function Invoke-Gh {
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    $start.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
     foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
@@ -441,6 +443,7 @@ function Enter-RunWriterLock {
         acquiredAt = Get-UtcTimestamp
     }
     $ownerBytes = [Text.UTF8Encoding]::new($false).GetBytes(($owner | ConvertTo-Json -Depth 10))
+    $pendingWriterRecovery = $null
 
     for ($attempt = 0; $attempt -lt 4; $attempt++) {
         try {
@@ -450,7 +453,7 @@ function Enter-RunWriterLock {
                 $stream.Flush($true)
             }
             finally { $stream.Dispose() }
-            return [ordered]@{ path = $lockPath; token = $token }
+            return [ordered]@{ path = $lockPath; token = $token; recovery = $pendingWriterRecovery }
         }
         catch [IO.IOException] {
             if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { continue }
@@ -465,12 +468,11 @@ function Enter-RunWriterLock {
             $retainedPath = Join-Path $recoveryRoot ("stale-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))-$([guid]::NewGuid().ToString('N')).json")
             try { [IO.File]::Move($lockPath, $retainedPath) }
             catch [IO.IOException] { continue }
-            $State.lastRecovery = [ordered]@{
+            $pendingWriterRecovery = [ordered]@{
                 at = Get-UtcTimestamp
                 reason = 'stale run writer lock retained'
                 retainedPath = $retainedPath
             }
-            Save-State -State $State
         }
     }
     throw 'Unable to acquire the single-writer lock for this run state.'
@@ -492,6 +494,10 @@ function Ensure-RunWriterLock {
     $script:activeStatePath = [string]$State.statePath
     if (-not $script:writerLease) {
         $script:writerLease = Enter-RunWriterLock -State $State
+        if ($script:writerLease.recovery) {
+            $State.lastRecovery = $script:writerLease.recovery
+            Save-State -State $State
+        }
     }
 }
 
@@ -619,6 +625,16 @@ function Invoke-Claim {
     $integrity = & $integrityScript -PassThru
     if ($integrity.result -ne 'passed') { throw 'The packaged Schema 14 Workflow and Review Baseline failed integrity validation.' }
 
+    $baseOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', "$BaseRef^{commit}")).output.Trim()
+    $baseTreeOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', "$baseOid^{tree}")).output.Trim()
+    $branch = "Update/$slug/$([DateTimeOffset]::Now.ToString('yyyyMMdd'))-$short"
+    $worktreeParent = if ([string]::IsNullOrWhiteSpace($WorktreeParent)) {
+        Join-Path (Split-Path -Parent $repository) ((Split-Path -Leaf $repository) + '-worktrees')
+    }
+    else { [IO.Path]::GetFullPath($WorktreeParent) }
+    New-Item -ItemType Directory -Path $worktreeParent -Force | Out-Null
+    $worktree = Join-Path $worktreeParent "$slug-$short"
+
     $claimRoot = Join-Path (Join-Path $queueRoot '.claims') $actualRunId
     $claimSourceRoot = Join-Path $claimRoot 'source'
     $claimPath = Join-Path $claimRoot 'claim.json'
@@ -676,15 +692,6 @@ function Invoke-Claim {
     New-Item -ItemType Directory -Path (Join-Path $runRoot 'artifacts') -Force | Out-Null
     $claimedArchive = Join-Path (Join-Path $runRoot 'source') ([IO.Path]::GetFileName($sourceFull))
 
-    $baseOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', "$BaseRef^{commit}")).output.Trim()
-    $baseTreeOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', "$baseOid^{tree}")).output.Trim()
-    $branch = "Update/$slug/$([DateTimeOffset]::Now.ToString('yyyyMMdd'))-$short"
-    $worktreeParent = if ([string]::IsNullOrWhiteSpace($WorktreeParent)) {
-        Join-Path (Split-Path -Parent $repository) ((Split-Path -Leaf $repository) + '-worktrees')
-    }
-    else { [IO.Path]::GetFullPath($WorktreeParent) }
-    New-Item -ItemType Directory -Path $worktreeParent -Force | Out-Null
-    $worktree = Join-Path $worktreeParent "$slug-$short"
     $state = [ordered]@{
         schemaVersion = 14
         runId = $actualRunId
@@ -1096,6 +1103,10 @@ function Invoke-BuildCommits {
     Assert-LockOwner -State $State
     if ($State.published) { throw 'A published evidence branch is append-only; completed checkpoints are never reset or rebuilt in place.' }
     $worktree = [string]$State.worktreePath
+    $startingHead = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD')).output.Trim()
+    if ($startingHead -ne $State.evidenceChain.c0Oid) {
+        throw 'Incomplete build-commits recovery requires HEAD to equal C0; preserve the partial history and request explicit user recovery.'
+    }
     $targets = @($State.evidenceTargetPaths)
     $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('-c', 'core.autocrlf=true', 'add', '-A', '--', $State.modRelativePath)
     foreach ($target in $targets) {
@@ -1278,6 +1289,20 @@ function Get-PrBody {
 "@
 }
 
+function Assert-PublishedPrAtF {
+    param([Collections.IDictionary] $State)
+    $localHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('rev-parse', 'HEAD')).output.Trim()
+    $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $State.remote, "refs/heads/$($State.branch)")).output.Split("`t")[0]
+    $pr = (Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'view', [string]$State.prNumber, '--json', 'state,isDraft,baseRefName,headRefName,headRefOid')).output | ConvertFrom-Json -AsHashtable
+    if ($localHead -ne $State.evidenceChain.fOid -or $remoteHead -ne $localHead -or $pr.headRefOid -ne $localHead) {
+        throw 'Local, remote, PR head, and immutable F are not identical.'
+    }
+    if ($pr.state -ne 'OPEN' -or $pr.isDraft -or $pr.baseRefName -ne $State.pullRequestBase -or $pr.headRefName -ne $State.branch) {
+        throw 'Published PR state, draft flag, base, or head branch changed.'
+    }
+    [ordered]@{ localHead = $localHead; remoteHead = $remoteHead; prHead = $pr.headRefOid }
+}
+
 function Invoke-Publish {
     param([Collections.IDictionary] $State)
     $currentBody = Get-PrBody -State $State
@@ -1292,9 +1317,7 @@ function Invoke-Publish {
     }
     $completed = Get-CompletedStageResult -State $State -Name 'publish'
     if ($completed) {
-        $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $State.remote, "refs/heads/$($State.branch)")).output.Split("`t")[0]
-        $pr = (Invoke-Gh -Arguments @('pr', 'view', [string]$State.prNumber, '--json', 'state,isDraft,baseRefName,headRefName,headRefOid')).output | ConvertFrom-Json -AsHashtable
-        if ($remoteHead -ne $State.evidenceChain.fOid -or $pr.headRefOid -ne $remoteHead -or $pr.state -ne 'OPEN' -or $pr.isDraft) { throw 'Completed publication no longer has one open non-draft PR at immutable F.' }
+        $null = Assert-PublishedPrAtF -State $State
         return $completed
     }
     $stage = Start-Stage -Name 'publish'
@@ -1302,14 +1325,14 @@ function Invoke-Publish {
     if ($State.candidateGate.status -ne 'passed') { throw 'Publishing requires a passed candidateGate.' }
     $head = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('rev-parse', 'HEAD')).output.Trim()
     if ($head -ne $State.evidenceChain.fOid) { throw 'Local HEAD no longer equals F.' }
-    $pushArguments = @('push', '--set-upstream', $Remote, $State.branch)
-    Assert-AppendOnlyPushArguments -Arguments $pushArguments -Remote $Remote -Branch $State.branch
+    $pushArguments = @('push', '--set-upstream', $State.remote, $State.branch)
+    Assert-AppendOnlyPushArguments -Arguments $pushArguments -Remote $State.remote -Branch $State.branch
     $null = Invoke-Git -WorkingDirectory $State.worktreePath -Arguments $pushArguments
-    $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $Remote, "refs/heads/$($State.branch)")).output.Split("`t")[0]
+    $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $State.remote, "refs/heads/$($State.branch)")).output.Split("`t")[0]
     if ($remoteHead -ne $head) { throw 'Remote branch does not equal F after append-only push.' }
 
     # Reuse an existing PR for this exact branch instead of creating duplicate PRs.
-    $existingJson = (Invoke-Gh -Arguments @('pr', 'list', '--state', 'all', '--head', $State.branch, '--base', $State.pullRequestBase, '--json', 'number,url,state,isDraft,headRefOid')).output
+    $existingJson = (Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'list', '--state', 'all', '--head', $State.branch, '--base', $State.pullRequestBase, '--json', 'number,url,state,isDraft,headRefOid')).output
     $existing = @()
     if (-not [string]::IsNullOrWhiteSpace($existingJson)) {
         $parsedExisting = $existingJson | ConvertFrom-Json -AsHashtable
@@ -1320,14 +1343,14 @@ function Invoke-Publish {
     if ($existing.Count -eq 1) {
         if ($existing[0].state -ne 'OPEN') { throw 'The existing PR is closed; waiting for user recovery.' }
         $prNumber = [int]$existing[0].number
-        $null = Invoke-Gh -Arguments @('pr', 'edit', [string]$prNumber, '--body', $body)
+        $null = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'edit', [string]$prNumber, '--body', $body)
         $prUrl = [string]$existing[0].url
     }
     else {
-        $prUrl = (Invoke-Gh -Arguments @('pr', 'create', '--base', $State.pullRequestBase, '--head', $State.branch, '--title', "Update $($State.mod)", '--body', $body)).output.Trim()
+        $prUrl = (Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'create', '--base', $State.pullRequestBase, '--head', $State.branch, '--title', "Update $($State.mod)", '--body', $body)).output.Trim()
         $prNumber = [int]($prUrl.TrimEnd('/').Split('/')[-1])
     }
-    $pr = (Invoke-Gh -Arguments @('pr', 'view', [string]$prNumber, '--json', 'number,url,state,isDraft,baseRefName,headRefName,headRefOid')).output | ConvertFrom-Json -AsHashtable
+    $pr = (Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'view', [string]$prNumber, '--json', 'number,url,state,isDraft,baseRefName,headRefName,headRefOid')).output | ConvertFrom-Json -AsHashtable
     if ($pr.state -ne 'OPEN' -or $pr.isDraft -or $pr.baseRefName -ne $State.pullRequestBase -or $pr.headRefName -ne $State.branch -or $pr.headRefOid -ne $head) {
         throw 'Created or reused PR does not match the required open non-draft base/head/F tuple.'
     }
@@ -1345,7 +1368,15 @@ function Invoke-Publish {
 function Invoke-ReviewSnapshot {
     param([Collections.IDictionary] $State)
     $completed = Get-CompletedStageResult -State $State -Name 'review-snapshot'
-    if ($completed) { return $completed }
+    if ($completed) {
+        $null = Assert-PublishedPrAtF -State $State
+        if ($State.status -ne 'awaiting-user-merge') {
+            $State.status = 'awaiting-user-merge'
+            Save-State -State $State
+            $completed.status = $State.status
+        }
+        return $completed
+    }
     $stage = Start-Stage -Name 'review-snapshot'
     if (-not $State.prNumber) { throw 'review-snapshot requires an existing PR.' }
     if ([string]::IsNullOrWhiteSpace($LocalReviewPath) -or -not (Test-Path -LiteralPath $LocalReviewPath -PathType Leaf)) {
@@ -1375,7 +1406,7 @@ function Invoke-ReviewSnapshot {
         $snapshot = [ordered]@{}
     }
     else {
-        $view = Invoke-Gh -Arguments @('pr', 'view', [string]$State.prNumber, '--json', 'headRefOid,reviews,reviewRequests,comments') -AllowFailure
+        $view = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'view', [string]$State.prNumber, '--json', 'headRefOid,reviews,reviewRequests,comments') -AllowFailure
         if ($view.exitCode -ne 0) {
             $external = [ordered]@{ status = 'unavailable'; reason = "$($view.warning) $($view.output)".Trim(); headOid = $State.headOid; verifiedAt = $snapshotAt; snapshotAt = $snapshotAt; pollingWaitSeconds = 0 }
             $snapshot = [ordered]@{}
@@ -1391,8 +1422,8 @@ function Invoke-ReviewSnapshot {
             else {
                 $requestEvidence = $null
                 if ($requested.Count -eq 0 -and $State.externalReview.status -eq 'not-requested') {
-                    $repositoryName = ((Invoke-Gh -Arguments @('repo', 'view', '--json', 'nameWithOwner')).output | ConvertFrom-Json -AsHashtable).nameWithOwner
-                    $request = Invoke-Gh -Arguments @('api', '--method', 'POST', "repos/$repositoryName/pulls/$($State.prNumber)/requested_reviewers", '-f', 'reviewers[]=copilot-pull-request-reviewer[bot]') -AllowFailure
+                    $repositoryName = ((Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('repo', 'view', '--json', 'nameWithOwner')).output | ConvertFrom-Json -AsHashtable).nameWithOwner
+                    $request = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('api', '--method', 'POST', "repos/$repositoryName/pulls/$($State.prNumber)/requested_reviewers", '-f', 'reviewers[]=copilot-pull-request-reviewer[bot]') -AllowFailure
                     $requestEvidence = [ordered]@{ exitCode = $request.exitCode; requestedAt = Get-UtcTimestamp; warning = $request.warning }
                 }
                 [ordered]@{ status = 'requested-pending'; reason = 'No completed Copilot review existed in the one bounded snapshot; no polling was scheduled.'; requestEvidence = $requestEvidence; headOid = $State.headOid; snapshotAt = $snapshotAt; pollingWaitSeconds = 0 }
@@ -1406,7 +1437,7 @@ function Invoke-ReviewSnapshot {
     $State.reviewedOid = $State.headOid
     Save-State -State $State
     $updatedBody = Get-PrBody -State $State
-    $null = Invoke-Gh -Arguments @('pr', 'edit', [string]$State.prNumber, '--body', $updatedBody)
+    $null = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'edit', [string]$State.prNumber, '--body', $updatedBody)
     $validator = Join-Path $PSScriptRoot 'Test-ModUpdateCandidate.ps1'
     $completion = & $validator -StatePath $State.statePath -ReviewCompletion -PassThru
     if ($completion.result -ne 'passed') { throw 'Independent Review completion validation rejected the current F.' }
@@ -1460,7 +1491,7 @@ try {
         $state = Read-State -Path $state.statePath
         $last = $null
         foreach ($stageName in @('verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot')) {
-            if ($stageName -eq 'review-snapshot' -and [string]::IsNullOrWhiteSpace($LocalReviewPath)) {
+            if ($stageName -eq 'review-snapshot' -and [string]::IsNullOrWhiteSpace($LocalReviewPath) -and @($state.completedStages) -notcontains 'review-snapshot') {
                 $last = [ordered]@{
                     result = 'waiting-input'; runId = $state.runId; stage = 'local-review'; status = $state.status; statePath = $state.statePath
                     data = [ordered]@{ required = 'Expand and read the packaged Review Baseline, review the current F, then resume run with -LocalReviewPath.'; headOid = $state.evidenceChain.fOid; candidateGateSha256 = $state.candidateGate.validationReportSha256 }

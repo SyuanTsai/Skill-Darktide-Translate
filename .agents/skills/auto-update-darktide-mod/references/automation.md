@@ -98,11 +98,12 @@ Every finding must have a completed `keep`, `resolved`, or `out-of-scope` dispos
 Keep `state.json`, the claimed archive, MOD identity lock, worktree, branch, and artifacts together. A retry must use the exact returned `statePath`; never create a replacement generation to bypass a failed run.
 
 - A completed stage returns its existing receipt only after re-hashing its primary artifact, rechecking the lock-owner tuple, and—after evidence exists—confirming HEAD still equals F.
-- Claim first moves the stable source into `.claims/<run-id>/source`, records the fixed Workflow/Baseline source tuple, and writes `state.json` with the immutable run/worktree/archive tuple before creating the worktree. Retrying that state reattaches a partially created worktree or branch and moves the same claimed archive into the run; it never starts a replacement generation. `claim.json` and `owner.json` retain the planned state path so the narrower pre-state crash window remains attributable to the same run.
+- Claim resolves the immutable base and worktree plan before taking the MOD identity lock, records the fixed Workflow/Baseline source tuple, and writes writer-protected `state.json` before moving the stable source into `.claims/<run-id>/source` or creating the worktree. Retrying that state can recover the ZIP from its original queue path, reattach a partially created worktree or branch, and move the same claimed archive into the run; it never starts a replacement generation. `claim.json` and `owner.json` retain the planned state path so the narrower pre-state crash window remains attributable to the same run.
 - Every state-mutating resume uses an atomic run-local writer lock bound to machine, PID, process start time, state path, and an unguessable token. A live owner blocks the second writer; a stale lock is retained as evidence before the original run resumes.
 - An interrupted extraction preserves the previous directory under a recovery name before atomically installing the new extraction.
+- An incomplete `build-commits` may resume only while HEAD still equals C0. A partial C1/C2/C3 history is retained and stops for explicit user-directed recovery instead of appending duplicate evidence commits.
 - Recorded C0/C1/C2/C3/F OIDs and trees are revalidated by the independent Gate before publication.
-- An existing open PR is updated; a second PR is not created. A closed PR stops for user recovery.
+- GitHub CLI operations run from the recorded worktree and publication uses the remote stored in state. An existing open PR is updated; a second PR is not created. A closed, retargeted, or head-mismatched PR stops for user recovery.
 - After publication, history is append-only. Never reset, rebase, squash, force-push, or replace rejected evidence.
 - External review takes one zero-wait snapshot. `requested-pending` is non-blocking and schedules no watcher.
 
