@@ -13,6 +13,7 @@ Use the packaged Schema 14 workflow as the normative operating procedure. The Sk
 2. Run `scripts/Test-ReferenceIntegrity.ps1` before loading packaged instructions for a claim, resume, review, or finalization. Stop if a compressed package, packaged Git blob OID, or expanded normative document fails verification.
 3. Use `scripts/Expand-Schema14Reference.ps1` to expand `assets/workflow-schema-14.md.gz` into a fresh temporary directory. Read the expanded Workflow completely before claiming or resuming a MOD, then follow the applicable sections without weakening their ordering, safety, state, evidence, or concurrency requirements.
 4. Before local Review, external feedback classification, or Review completion, use the same script to expand `assets/review-baseline.md.gz` from the same pinned Skill source commit and read it completely.
+5. Before executing or recovering deterministic stages, read [references/automation.md](references/automation.md). Use `scripts/mod-update.ps1` for fixed stage orchestration and `scripts/Test-ModUpdateCandidate.ps1` as the independent Final Candidate Gate; do not replace either with a generated per-run helper.
 
 Existing runs remain pinned to the workflow tuple recorded in their own state. Never migrate an existing state to this package or a newer package revision implicitly.
 
@@ -36,6 +37,10 @@ Keep the temporary materialization outside the Skill source and target MOD repos
 - **Resume:** reattach only the matching run ID and reservation tuple. Revalidate completed checkpoints and artifacts before reusing them.
 - **Review or feedback:** bind every conclusion to the current F, Gate tuple, immutable evidence receipt, and packaged Review Baseline. Apply only `in-scope / adopt` findings.
 - **Merge finalization:** wake only from a user request, GitHub event, same-run recovery, or merge/finalization action; verify the merged head and archive evidence before owner-checked reservation release.
+
+The fixed entrypoint accepts `claim`, `verify-source`, `extract`, `install`, `localization`, `build-commits`, `validate`, `publish`, `review-snapshot`, or `run`. It emits structured JSON and persists stage receipts in the run's `state.json`. Translation eligibility and wording remain Agent decisions expressed as an approved byte-span plan; scripts never infer translations or perform general whitespace cleanup.
+
+When `run` returns `waiting-input` after publication, perform the required local Review against the fully read packaged Review Baseline, write a Review artifact bound to the returned F and Candidate Gate SHA, and resume the same state with `-LocalReviewPath`. Never let the runner synthesize a semantic Review result.
 
 ## Preserve the non-negotiable boundaries
 

@@ -42,8 +42,11 @@ Describe 'Darktide Translate repository contract' {
             '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz',
             '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz',
             '.agents/skills/auto-update-darktide-mod/references/source-provenance.json',
+            '.agents/skills/auto-update-darktide-mod/references/automation.md',
             '.agents/skills/auto-update-darktide-mod/scripts/Expand-Schema14Reference.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1',
+            '.agents/skills/auto-update-darktide-mod/scripts/mod-update.ps1',
+            '.agents/skills/auto-update-darktide-mod/scripts/Test-ModUpdateCandidate.ps1',
             '.github/workflows/validate.yml',
             '.github/workflows/skill-validator.yml',
             'catalog/skills-catalog.json',
@@ -65,6 +68,17 @@ Describe 'Darktide Translate repository contract' {
                 Sort-Object
         )
         ($actualSkillDirectories -join "`n") | Should -Be 'auto-update-darktide-mod'
+    }
+
+    # Scenario: The independent source remains intentionally outside AI-Instructions fan-out.
+    # Purpose: Prevent the Darktide Skill from being reintroduced into an unrelated consumer Catalog or bootstrap contract.
+    It 'UnitT25_RemainsAnIndependentRepositorySource' {
+        $readme = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
+        $catalog = Get-Content -LiteralPath (Join-Path $repoRoot 'catalog/skills-catalog.json') -Raw | ConvertFrom-Json
+
+        $readme | Should -Match 'not added to the AI-Instructions Catalog, Lock, bootstrap, or fan-out'
+        @($catalog.sources).Count | Should -Be 1
+        $catalog.sources[0].id | Should -Be 'darktide-translate'
     }
 
     # Scenario: A release process resolves the repository version before pin generation.
