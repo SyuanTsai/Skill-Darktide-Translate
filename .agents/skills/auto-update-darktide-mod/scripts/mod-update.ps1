@@ -753,10 +753,18 @@ function Invoke-Claim {
 }
 
 function Get-ZipEntries {
-    param([Parameter(Mandatory)][string] $Path)
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $ExpectedSha256
+    )
     Add-Type -AssemblyName System.IO.Compression
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
+        $actualSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+        $stream.Position = 0
+        if ($actualSha256 -ne $ExpectedSha256) {
+            throw 'Claimed archive SHA-256 changed before ZIP processing.'
+        }
         $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Read, $false)
         $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         $entries = @()
@@ -771,6 +779,9 @@ function Get-ZipEntries {
             if ($segments.Count -eq 0) { continue }
             foreach ($segment in $segments) {
                 if ($segment.EndsWith(' ') -or $segment.EndsWith('.')) { throw "Windows path collision rejected: $entryPath" }
+                if ($segment -match '(?i)^(con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$') {
+                    throw "Archive path uses a reserved Windows device name: $entryPath"
+                }
             }
             $collisionKey = $entryPath.Normalize([Text.NormalizationForm]::FormC)
             if (-not $seen.Add($collisionKey)) { throw "Duplicate or Unicode/case-colliding archive path rejected: $entryPath" }
@@ -810,8 +821,7 @@ function Invoke-VerifySource {
     $stage = Start-Stage -Name 'verify-source'
     Assert-LockOwner -State $State
     $archivePath = [string]$State.archive.path
-    if ((Get-FileSha256 -Path $archivePath) -ne $State.archive.sha256) { throw 'Claimed archive SHA-256 changed.' }
-    $zip = Get-ZipEntries -Path $archivePath
+    $zip = Get-ZipEntries -Path $archivePath -ExpectedSha256 $State.archive.sha256
     try {
         $fileEntries = @($zip.entries | Where-Object { -not $_.directory })
         if ($fileEntries.Count -eq 0) { throw 'Archive contains no files.' }
@@ -846,7 +856,7 @@ function Invoke-Extract {
     $stagingRoot = Join-Path $State.runRoot 'staging'
     $temporaryRoot = Join-Path $stagingRoot ('.extract-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
-    $zip = Get-ZipEntries -Path $State.archive.path
+    $zip = Get-ZipEntries -Path $State.archive.path -ExpectedSha256 $State.archive.sha256
     try {
         foreach ($entry in $zip.archive.Entries) {
             $relative = $entry.FullName.Replace('\', '/')

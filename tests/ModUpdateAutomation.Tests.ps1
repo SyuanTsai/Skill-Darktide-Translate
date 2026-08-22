@@ -45,6 +45,8 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'StartsWith'
         $runner | Should -Match 'ExternalAttributes'
         $runner | Should -Match 'CreateNew'
+        $runner | Should -Match 'ExpectedSha256'
+        $runner | Should -Match 'HashData\(\$stream\)'
         $runner | Should -Match '\$entryStream\s*=\s*\$entry\.Open\(\)'
         $runner | Should -Not -Match '\$input\s*='
         $runner | Should -Not -Match '(?i)Invoke-Expression|\biex\b'
@@ -259,6 +261,17 @@ Describe 'Deterministic Darktide MOD update automation' {
         $writerRecoveryState.lastRecovery.reason | Should -Be 'stale run writer lock retained'
         Test-Path -LiteralPath $writerRecoveryState.lastRecovery.retainedPath -PathType Leaf | Should -Be $true
         $preExtractState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $archiveBackupPath = Join-Path $preExtractState.runRoot 'archive-before-tamper.zip'
+        [IO.File]::Copy([string]$preExtractState.archive.path, $archiveBackupPath)
+        try {
+            $appendStream = [IO.File]::Open([string]$preExtractState.archive.path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $appendStream.WriteByte(0) } finally { $appendStream.Dispose() }
+            { & $runnerPath extract -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+                Should -Throw '*Claimed archive SHA-256 changed before ZIP processing*'
+        }
+        finally {
+            [IO.File]::Copy($archiveBackupPath, [string]$preExtractState.archive.path, $true)
+        }
         $partialExtraction = Join-Path $preExtractState.runRoot 'staging/extracted'
         New-Item -ItemType Directory -Path $partialExtraction -Force | Out-Null
         [IO.File]::WriteAllText((Join-Path $partialExtraction 'partial.txt'), 'crash residue', [Text.UTF8Encoding]::new($false))
@@ -434,10 +447,10 @@ Describe 'Deterministic Darktide MOD update automation' {
         Test-Path -LiteralPath (Join-Path $runRoot 'staging/extracted') | Should -Be $false
     }
 
-    # Scenario: A ZIP has the wrong canonical root or declares a Unix symlink entry.
-    # Purpose: Execute both identity and link-type security blocks before any filesystem extraction.
-    It 'InterT220_RejectsInvalidRootAndSymlinkArchives' {
-        foreach ($case in @('invalid-root', 'symlink')) {
+    # Scenario: A ZIP has the wrong canonical root, declares a Unix symlink entry, or uses a Windows device name.
+    # Purpose: Execute identity, link-type, and device-path security blocks before any filesystem extraction.
+    It 'InterT220_RejectsInvalidRootSymlinkAndDeviceNameArchives' {
+        foreach ($case in @('invalid-root', 'symlink', 'reserved-device')) {
             $runRoot = Join-Path $TestDrive $case
             $artifactsRoot = Join-Path $runRoot 'artifacts'
             $lockPath = Join-Path $runRoot 'lock'
@@ -447,7 +460,11 @@ Describe 'Deterministic Darktide MOD update automation' {
             $archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew)
             $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
             try {
-                $entryName = if ($case -eq 'invalid-root') { 'OtherMod/file.lua' } else { 'ExampleMod/link.lua' }
+                $entryName = switch ($case) {
+                    'invalid-root' { 'OtherMod/file.lua' }
+                    'symlink' { 'ExampleMod/link.lua' }
+                    'reserved-device' { 'ExampleMod/NUL' }
+                }
                 $entry = $archive.CreateEntry($entryName)
                 if ($case -eq 'symlink') { $entry.ExternalAttributes = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]2684354560), 0) }
                 $entryStream = $entry.Open()
@@ -466,7 +483,11 @@ Describe 'Deterministic Darktide MOD update automation' {
             }
             [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
             [IO.File]::WriteAllText((Join-Path $lockPath 'owner.json'), ([ordered]@{ runId = $runId; modLockKey = $lockKey; statePath = $statePath } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-            $expected = if ($case -eq 'invalid-root') { '*Invalid archive root*' } else { '*symlink rejected*' }
+            $expected = switch ($case) {
+                'invalid-root' { '*Invalid archive root*' }
+                'symlink' { '*symlink rejected*' }
+                'reserved-device' { '*reserved Windows device name*' }
+            }
             { & $runnerPath verify-source -RepositoryRoot $TestDrive -StatePath $statePath -PassThru } | Should -Throw $expected
             Test-Path -LiteralPath (Join-Path $runRoot 'staging/extracted') | Should -Be $false
         }
