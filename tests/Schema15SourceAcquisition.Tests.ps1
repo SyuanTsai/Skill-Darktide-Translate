@@ -63,6 +63,33 @@ Describe 'Schema 15 source acquisition contract' {
         Test-Path -LiteralPath (Join-Path $repository 'AI Auto Update/In Progress/.locks/mod') | Should -Be $false
     }
 
+    # Scenario: Untrusted orchestration supplies a path-like MOD identity or an off-domain source page.
+    # Purpose: Keep canonical MOD paths inside one directory and bind source identity to the official Nexus game page.
+    It 'UnitT26_RejectsPathLikeModNamesAndOffDomainSourcePages' {
+        $repository = Join-Path $TestDrive 'identity-boundary-repository'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $requestPath = Join-Path $TestDrive 'off-domain-request.json'
+        [ordered]@{
+            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
+            version = '2.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://example.invalid/warhammer40kdarktide/mods/123'
+        } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
+        $runner = Join-Path $scriptRoot 'mod-update.ps1'
+
+        { & $runner acquire-source -RepositoryRoot $repository -ModDirectory '../Escape' `
+                -SourceRequestPath $requestPath -Provider browser -PassThru } |
+            Should -Throw '*single directory name*'
+        { & $runner acquire-source -RepositoryRoot $repository -ModDirectory 'ExampleMod' `
+                -SourceRequestPath $requestPath -Provider browser -PassThru } |
+            Should -Throw '*official Nexus MOD page*'
+        $request = Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
+        $request.pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+        $request.fileName = '../Escape.zip'
+        $request | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
+        { & $runner acquire-source -RepositoryRoot $repository -ModDirectory 'ExampleMod' `
+                -SourceRequestPath $requestPath -Provider browser -PassThru } |
+            Should -Throw '*single file name*'
+    }
+
     # Scenario: An existing signed-in browser session has completed a stable ZIP download for the exact requested Main file.
     # Purpose: Prove receipt generation, URL sanitization, SHA-256 binding, independent verification, and atomic delivery.
     It 'InterT30_VerifiesAndAtomicallyDeliversAStableZip' {
@@ -179,6 +206,32 @@ Describe 'Schema 15 source acquisition contract' {
         $result.status | Should -Be 'waiting-system'
         $result.waitingReason.code | Should -Be 'download_incomplete'
         Test-Path -LiteralPath $downloadPath -PathType Leaf | Should -Be $true
+    }
+
+    # Scenario: The apparent incoming directory is a junction to a different physical location.
+    # Purpose: Reject reparse-root path indirection before stable-file verification or delivery.
+    It 'InterT55_RejectsAReparseIncomingDirectory' {
+        $runRoot = Join-Path $TestDrive 'reparse-incoming'
+        $outside = Join-Path $TestDrive 'reparse-target'
+        New-Item -ItemType Directory -Path $runRoot, $outside -Force | Out-Null
+        $incoming = Join-Path $runRoot '.incoming-test-run'
+        New-Item -ItemType Junction -Path $incoming -Target $outside | Out-Null
+        $downloadPath = Join-Path $incoming 'ExampleMod.zip'
+        $stream = [IO.File]::Open($downloadPath, [IO.FileMode]::CreateNew)
+        $zip = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try { $null = $zip.CreateEntry('ExampleMod/file.txt') } finally { $zip.Dispose(); $stream.Dispose() }
+        $requestPath = Join-Path $runRoot 'source-request.json'
+        [ordered]@{
+            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
+            version = '2.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+        } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
+
+        { & (Join-Path $scriptRoot 'Receive-NexusMainFile.ps1') `
+                -SourceRequestPath $requestPath -IncomingDirectory $incoming `
+                -DeliveryDirectory (Join-Path $runRoot 'source') -Provider browser `
+                -DownloadedFilePath $downloadPath -ReceiptPath (Join-Path $runRoot 'source-receipt.json') `
+                -ObservationIntervalMilliseconds 0 -PassThru } |
+            Should -Throw '*reparse*'
     }
 
     # Scenario: The fixed runner is extended for Schema 15 without removing the manual Schema 14 claim path.
@@ -326,14 +379,21 @@ Describe 'Schema 15 source acquisition contract' {
             -DownloadedFilePath $downloadPath `
             -ObservationIntervalMilliseconds 0 `
             -PassThru
+        $interruptedReceipt = Get-Content -LiteralPath $acquired.receiptPath -Raw | ConvertFrom-Json
+        $interruptedReceipt.status = 'verified'
+        $interruptedReceipt.deliveredAt = $null
+        $interruptedReceipt.deliveredPath = $null
+        $interruptedReceipt | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $acquired.receiptPath -NoNewline
+        [IO.File]::Delete($acquired.acquisitionPath)
         $recoveredAcquisition = & $runner acquire-source `
             -RepositoryRoot $repository -ModDirectory 'ExampleMod' -RunId $runId `
             -SourceRequestPath $requestPath -Provider browser -DownloadedFilePath $downloadPath `
             -ObservationIntervalMilliseconds 0 -PassThru
         $recoveredAcquisition.status | Should -Be 'delivered'
         $recoveredAcquisition.idempotent | Should -Be $true
-        $recoveredAcquisition.receiptSha256 | Should -Be $acquired.receiptSha256
-        $recoveredAcquisition.acquisitionSha256 | Should -Be $acquired.acquisitionSha256
+        (Get-Content -LiteralPath $recoveredAcquisition.receiptPath -Raw | ConvertFrom-Json).status | Should -Be 'delivered'
+        Test-Path -LiteralPath $recoveredAcquisition.acquisitionPath -PathType Leaf | Should -Be $true
+        $acquired = $recoveredAcquisition
         $boundRequestBytes = [IO.File]::ReadAllBytes($acquired.sourceRequestPath)
         $tamperedRequest = Get-Content -LiteralPath $acquired.sourceRequestPath -Raw | ConvertFrom-Json
         $tamperedRequest.mainFileId = 999

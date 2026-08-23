@@ -63,6 +63,20 @@ $sourceUri = [Uri]$receipt.sourceUrl
 if (-not $sourceUri.IsAbsoluteUri -or $sourceUri.Scheme -cne 'https' -or $sourceUri.Query -or $sourceUri.Fragment -or -not [string]::IsNullOrWhiteSpace($sourceUri.UserInfo)) {
     throw 'Source receipt URL is not sanitized.'
 }
+$requestUri = [Uri](ConvertTo-InvariantString $request.pageUrl)
+$expectedGameDomain = 'warhammer40kdarktide'
+$expectedPagePath = "/$expectedGameDomain/mods/$(ConvertTo-InvariantString $request.modId)"
+if ((ConvertTo-InvariantString $request.gameDomain) -cne $expectedGameDomain -or
+    $requestUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+    $requestUri.AbsolutePath.TrimEnd('/') -cne $expectedPagePath) {
+    throw 'Source request does not identify the official Nexus MOD page for warhammer40kdarktide.'
+}
+$requestedFileName = ConvertTo-InvariantString $request.fileName
+if ([IO.Path]::GetFileName($requestedFileName) -cne $requestedFileName -or
+    $requestedFileName.TrimEnd([char[]]' .') -cne $requestedFileName -or
+    $requestedFileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+    throw 'Source request fileName is not one safe single file name.'
+}
 if ([string]$receipt.sourceUrl -cne (Get-SanitizedUrl -Url (ConvertTo-InvariantString $request.pageUrl))) {
     throw 'Source receipt URL does not match the sanitized source request pageUrl.'
 }

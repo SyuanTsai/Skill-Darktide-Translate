@@ -515,6 +515,12 @@ function Get-ModRunPlan {
         [Parameter(Mandatory)][string] $CanonicalModDirectory,
         [Parameter(Mandatory)][string] $ActualRunId
     )
+    if ([string]::IsNullOrWhiteSpace($CanonicalModDirectory) -or $CanonicalModDirectory -cne $CanonicalModDirectory.Trim() -or
+        [IO.Path]::IsPathRooted($CanonicalModDirectory) -or [IO.Path]::GetFileName($CanonicalModDirectory) -cne $CanonicalModDirectory -or
+        $CanonicalModDirectory -in @('.', '..') -or $CanonicalModDirectory.TrimEnd([char[]]' .') -cne $CanonicalModDirectory -or
+        $CanonicalModDirectory.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw 'Canonical MOD identity must be one safe single directory name.'
+    }
     $queueRoot = Join-Path $Repository 'AI Auto Update'
     $slug = ConvertTo-SafeSlug -Value $CanonicalModDirectory
     $short = $ActualRunId.Replace('-', '').Substring(0, 8)
@@ -615,6 +621,19 @@ function Test-SourceRequestPreflight {
     }
     $pageUri = [Uri]([string]$request.pageUrl)
     if (-not $pageUri.IsAbsoluteUri -or $pageUri.Scheme -cne 'https') { throw 'Source request pageUrl must be an absolute HTTPS URL.' }
+    $expectedGameDomain = 'warhammer40kdarktide'
+    $expectedPagePath = "/$expectedGameDomain/mods/$([Convert]::ToString($request.modId, [Globalization.CultureInfo]::InvariantCulture))"
+    if ([string]$request.gameDomain -cne $expectedGameDomain -or
+        $pageUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+        $pageUri.AbsolutePath.TrimEnd('/') -cne $expectedPagePath) {
+        throw 'Source request must identify the official Nexus MOD page for warhammer40kdarktide.'
+    }
+    $requestedFileName = [string]$request.fileName
+    if ([IO.Path]::GetFileName($requestedFileName) -cne $requestedFileName -or
+        $requestedFileName.TrimEnd([char[]]' .') -cne $requestedFileName -or
+        $requestedFileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw 'Source request fileName must be one safe single file name.'
+    }
     if ($request.Contains('officialSha256') -and -not [string]::IsNullOrWhiteSpace([string]$request.officialSha256) -and
         [string]$request.officialSha256 -notmatch '^[0-9a-fA-F]{64}$') {
         throw 'officialSha256 must contain 64 hexadecimal characters.'
@@ -628,6 +647,56 @@ function Test-SourceRequestPreflight {
         }
     }
     [ordered]@{ result = 'passed'; status = 'eligible'; sourceRequestPath = $full }
+}
+
+function Complete-InterruptedSourceDelivery {
+    param(
+        [Parameter(Mandatory)][string] $ReceiptPath,
+        [Parameter(Mandatory)][string] $SourceRequestPath,
+        [Parameter(Mandatory)][string] $IncomingDirectory,
+        [Parameter(Mandatory)][string] $DeliveryDirectory
+    )
+    $receipt = Get-Content -LiteralPath $ReceiptPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([string]$receipt.status -cne 'verified') { return $false }
+    $request = Get-Content -LiteralPath $SourceRequestPath -Raw | ConvertFrom-Json -AsHashtable
+    foreach ($directory in @($IncomingDirectory, $DeliveryDirectory)) {
+        if (Test-Path -LiteralPath $directory -PathType Container) {
+            $directoryItem = Get-Item -LiteralPath $directory
+            if ($directoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Interrupted source delivery directory must not be a reparse point.' }
+        }
+    }
+    foreach ($field in @('gameDomain', 'modId', 'mainFileId', 'version', 'fileName')) {
+        if ([Convert]::ToString($receipt.sourceRequest[$field], [Globalization.CultureInfo]::InvariantCulture) -cne
+            [Convert]::ToString($request[$field], [Globalization.CultureInfo]::InvariantCulture)) {
+            throw "Interrupted source delivery $field no longer matches its request."
+        }
+    }
+    if ([string]$receipt.archiveFormat -cne 'zip' -or [string]$receipt.filename -cne [string]$request.fileName -or
+        [string]$receipt.sha256 -notmatch '^[0-9a-f]{64}$' -or [int64]$receipt.size -le 0) {
+        throw 'Interrupted source delivery receipt is not a verified ZIP tuple.'
+    }
+    $incomingCandidate = [IO.Path]::GetFullPath((Join-Path $IncomingDirectory ([string]$receipt.filename)))
+    $deliveredCandidate = [IO.Path]::GetFullPath((Join-Path $DeliveryDirectory ([string]$receipt.filename)))
+    $incomingExists = Test-Path -LiteralPath $incomingCandidate -PathType Leaf
+    $deliveredExists = Test-Path -LiteralPath $deliveredCandidate -PathType Leaf
+    if ($incomingExists -and $deliveredExists) { throw 'Interrupted source delivery has both incoming and delivered copies.' }
+    if (-not $incomingExists -and -not $deliveredExists) { throw 'Interrupted source delivery has no recoverable file.' }
+    $candidate = if ($deliveredExists) { $deliveredCandidate } else { $incomingCandidate }
+    $item = Get-Item -LiteralPath $candidate
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint -or [int64]$item.Length -ne [int64]$receipt.size -or
+        (Get-FileSha256 -Path $candidate) -cne [string]$receipt.sha256) {
+        throw 'Interrupted source delivery file no longer matches its receipt.'
+    }
+    if ($incomingExists) {
+        if (-not (Test-Path -LiteralPath $DeliveryDirectory -PathType Container)) { New-Item -ItemType Directory -Path $DeliveryDirectory -Force | Out-Null }
+        [IO.File]::Move($incomingCandidate, $deliveredCandidate)
+    }
+    $receipt.status = 'delivered'
+    $receipt.deliveredAt = Get-UtcTimestamp
+    $receipt.deliveredPath = $deliveredCandidate
+    $receipt.deliveryRecovery = [ordered]@{ recoveredAt = Get-UtcTimestamp; reason = 'verified receipt delivery interruption' }
+    Write-AtomicJson -Path $ReceiptPath -Value $receipt
+    $true
 }
 
 function Invoke-AcquireSource {
@@ -671,6 +740,29 @@ function Invoke-AcquireSource {
     }
     $acquisitionPath = Join-Path $reviewArtifacts 'source-acquisition.json'
     if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
+        $preservedReceipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$preservedReceipt.status -ceq 'verified') {
+            $null = Complete-InterruptedSourceDelivery -ReceiptPath $receiptPath -SourceRequestPath $boundRequestPath -IncomingDirectory $incoming -DeliveryDirectory $delivery
+            $preservedReceipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
+        }
+        if ([string]$preservedReceipt.status -cne 'delivered') {
+            if (-not (Test-Path -LiteralPath $acquisitionPath -PathType Leaf)) { throw 'Preserved non-delivered receipt is missing its acquisition record.' }
+            $record = Get-Content -LiteralPath $acquisitionPath -Raw | ConvertFrom-Json -AsHashtable
+            $receiptSha = Get-FileSha256 -Path $receiptPath
+            $requestSha = Get-FileSha256 -Path $boundRequestPath
+            if ([string]$record.runId -cne $actualRunId -or [string]$record.mod -cne $ModDirectory -or
+                [string]$record.sourceRequestSha256 -cne $requestSha -or [string]$record.receiptSha256 -cne $receiptSha) {
+                throw 'Preserved non-delivered acquisition record changed.'
+            }
+            return [ordered]@{
+                result = $record.result.result; status = $record.result.status; idempotent = $true; runId = $actualRunId; stage = 'acquire-source'
+                plannedStatePath = $plannedStatePath; runRoot = $plan.runRoot; modLockPath = $plan.modLockPath
+                deliveredPath = $null; receiptPath = [IO.Path]::GetFullPath($receiptPath); receiptSha256 = $receiptSha
+                sourceRequestPath = [IO.Path]::GetFullPath($boundRequestPath); sourceRequestSha256 = $requestSha
+                acquisitionPath = $acquisitionPath; acquisitionSha256 = Get-FileSha256 -Path $acquisitionPath
+                waitingReason = $record.result.waitingReason; timings = if ($preservedReceipt.Contains('timings')) { $preservedReceipt.timings } else { $null }
+            }
+        }
         $receiptVerifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
         $verification = & $receiptVerifier -ReceiptPath $receiptPath -SourceRequestPath $boundRequestPath -PassThru
         if ($verification.result -cne 'passed') { throw 'Preserved source receipt failed same-run acquisition recovery.' }

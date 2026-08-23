@@ -70,6 +70,15 @@ function Assert-ContainedFilePath {
     $candidateFull
 }
 
+function Assert-RegularDirectoryRoot {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Label)
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) { New-Item -ItemType Directory -Path $full -Force | Out-Null }
+    $item = Get-Item -LiteralPath $full
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$Label must not be a reparse point." }
+    $full
+}
+
 function ConvertTo-InvariantString {
     param($Value)
     if ($null -eq $Value) { return $null }
@@ -88,6 +97,19 @@ function Read-SourceRequest {
     }
     $pageUri = [Uri](ConvertTo-InvariantString $request.pageUrl)
     if (-not $pageUri.IsAbsoluteUri -or $pageUri.Scheme -cne 'https') { throw 'Source request pageUrl must be an absolute HTTPS URL.' }
+    $expectedGameDomain = 'warhammer40kdarktide'
+    $expectedPagePath = "/$expectedGameDomain/mods/$(ConvertTo-InvariantString $request.modId)"
+    if ((ConvertTo-InvariantString $request.gameDomain) -cne $expectedGameDomain -or
+        $pageUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+        $pageUri.AbsolutePath.TrimEnd('/') -cne $expectedPagePath) {
+        throw 'Source request must identify the official Nexus MOD page for warhammer40kdarktide.'
+    }
+    $requestedFileName = ConvertTo-InvariantString $request.fileName
+    if ([IO.Path]::GetFileName($requestedFileName) -cne $requestedFileName -or
+        $requestedFileName.TrimEnd([char[]]' .') -cne $requestedFileName -or
+        $requestedFileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw 'Source request fileName must be one safe single file name.'
+    }
     [ordered]@{
         schemaVersion = 1
         gameDomain = ConvertTo-InvariantString $request.gameDomain
@@ -185,9 +207,8 @@ $incomingFull = [IO.Path]::GetFullPath($IncomingDirectory)
 if (-not (Split-Path -Leaf $incomingFull).StartsWith('.incoming-', [StringComparison]::Ordinal)) {
     throw 'Incoming directory must use the run-isolated .incoming-<run-id> name.'
 }
-if (-not (Test-Path -LiteralPath $incomingFull -PathType Container)) {
-    New-Item -ItemType Directory -Path $incomingFull -Force | Out-Null
-}
+$incomingFull = Assert-RegularDirectoryRoot -Path $incomingFull -Label 'Incoming directory'
+$receiptParent = Assert-RegularDirectoryRoot -Path (Split-Path -Parent ([IO.Path]::GetFullPath($ReceiptPath))) -Label 'Receipt directory'
 
 $providerStart = [Diagnostics.Stopwatch]::StartNew()
 $candidate = if ($Provider -eq 'api') {
@@ -286,9 +307,7 @@ if ([IO.Path]::GetFileName($candidateFull) -cne [string]$request.fileName) {
 
 $deliveryStart = [Diagnostics.Stopwatch]::StartNew()
 $deliveryFull = [IO.Path]::GetFullPath($DeliveryDirectory)
-if (-not (Test-Path -LiteralPath $deliveryFull -PathType Container)) {
-    New-Item -ItemType Directory -Path $deliveryFull -Force | Out-Null
-}
+$deliveryFull = Assert-RegularDirectoryRoot -Path $deliveryFull -Label 'Delivery directory'
 $deliveredPath = Assert-ContainedFilePath -Candidate (Join-Path $deliveryFull $request.fileName) -Root $deliveryFull
 if (Test-Path -LiteralPath $deliveredPath) { throw 'Verified source delivery destination already exists.' }
 Write-AtomicJson -Path $ReceiptPath -Value $receipt
