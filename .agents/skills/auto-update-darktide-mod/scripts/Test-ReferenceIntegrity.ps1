@@ -154,6 +154,39 @@ function Test-Document {
     }
 }
 
+function Test-Schema15Extension {
+    $extensionProvenancePath = Join-Path $skillRoot 'references/schema-15-provenance.json'
+    if (-not (Test-Path -LiteralPath $extensionProvenancePath -PathType Leaf)) { throw 'Missing references/schema-15-provenance.json.' }
+    $extensionProvenance = Get-Content -LiteralPath $extensionProvenancePath -Raw | ConvertFrom-Json
+    if ($extensionProvenance.schemaVersion -ne 1 -or $extensionProvenance.issue -cne 'SYP-91') { throw 'Unsupported Schema 15 provenance contract.' }
+    if ($extensionProvenance.derivedFrom.workflowSchemaVersion -ne 14 -or
+        $extensionProvenance.derivedFrom.workflowSha256 -cne $provenance.documents.workflow.contentSha256 -or
+        $extensionProvenance.derivedFrom.reviewBaselineSha256 -cne $provenance.documents.reviewBaseline.contentSha256) {
+        throw 'Schema 15 provenance does not derive from the packaged Schema 14 Workflow and Review Baseline.'
+    }
+    $relativePath = ConvertTo-NormalizedRepositoryPath -Path $extensionProvenance.path -Name 'Schema 15 reference path'
+    $candidate = [IO.Path]::GetFullPath((Join-Path $skillRoot $relativePath))
+    $expectedPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
+    if (-not $candidate.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Schema 15 reference escaped the Skill root.' }
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { throw 'Schema 15 reference is missing.' }
+    $bytes = [IO.File]::ReadAllBytes($candidate)
+    $sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    if ($bytes.LongLength -ne [int64]$extensionProvenance.sizeBytes) { throw 'Schema 15 reference size mismatch.' }
+    if ($sha256 -cne [string]$extensionProvenance.sha256) { throw 'Schema 15 reference SHA-256 mismatch.' }
+    [ordered]@{
+        path = "$skillRepositoryPath/$relativePath"
+        packagedPath = $relativePath
+        issue = $extensionProvenance.issue
+        derivedFromWorkflowSchemaVersion = 14
+        derivedFromWorkflowSha256 = $extensionProvenance.derivedFrom.workflowSha256
+        derivedFromReviewBaselineSha256 = $extensionProvenance.derivedFrom.reviewBaselineSha256
+        gitBlobOid = Get-GitBlobOid -Content $bytes -ObjectFormat 'sha1' -Name 'Schema 15 reference'
+        gitObjectFormat = 'sha1'
+        sizeBytes = $bytes.LongLength
+        sha256 = $sha256
+    }
+}
+
 $result = [ordered]@{
     result = 'passed'
     sourceRepository = $provenance.sourceRepository
@@ -161,6 +194,7 @@ $result = [ordered]@{
     sourceCommit = $provenance.sourceCommit
     workflow = Test-Document -Name 'Workflow' -Document $provenance.documents.workflow
     reviewBaseline = Test-Document -Name 'Review Baseline' -Document $provenance.documents.reviewBaseline
+    schema15 = Test-Schema15Extension
 }
 
 if ($PassThru) {

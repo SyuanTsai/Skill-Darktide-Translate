@@ -17,7 +17,7 @@ Do not copy only `mod-update.ps1`; the runner, independent validator, packaged W
 
 ## Usage
 
-The archive must be a stable, ordinary ZIP directly under the target repository's `AI Auto Update` directory. The canonical MOD directory must already be known and must match the ZIP's single root directory.
+For a Schema 14 manual claim, the archive must be a stable, ordinary ZIP directly under the target repository's `AI Auto Update` directory. The canonical MOD directory must already be known and must match the ZIP's single root directory.
 
 Start a run:
 
@@ -27,6 +27,28 @@ Start a run:
   -ArchivePath 'D:\Games\Warhammer-40-000-DARKTIDE-Mods\AI Auto Update\ExampleMod.zip' `
   -ModDirectory 'ExampleMod'
 ```
+
+### Schema 15 automatic source
+
+Read `references/schema-15.md` completely before a new automatic-source run. Supply the normalized SYP-14 source request and a fixed run ID. The request contains identity metadata, never credentials or a signed download URL.
+
+For an existing signed-in browser session, download only into the fixed run's exact `.incoming-<run-id>` directory. A single `run` invocation acquires, independently verifies, receipt-binds, claims, and continues the ordered stages:
+
+```powershell
+./scripts/mod-update.ps1 run `
+  -RepositoryRoot 'D:\Games\Warhammer-40-000-DARKTIDE-Mods' `
+  -ModDirectory 'ExampleMod' `
+  -RunId '11111111-2222-4333-8444-555555555555' `
+  -SourceRequestPath 'D:\...\source-request.json' `
+  -Provider browser `
+  -DownloadedFilePath 'D:\...\.incoming-11111111-2222-4333-8444-555555555555\ExampleMod.zip'
+```
+
+`acquire-source` and receipt-bound `claim` remain separately callable for coordinators and diagnosis. New automatic runs preflight immutable base localization before branch creation; a loader-only entry returns `AUTOMATION_EXCLUDED: localization_entry_is_loader` while retaining acquisition evidence and the per-MOD reservation.
+
+Acquisition atomically archives the supplied request as run-local `review-artifacts/source-request.json`; receipt-bound claim accepts only that exact path and verifies its hash against `source-acquisition.json` and the MOD reservation owner. The API provider reads an ephemeral HTTPS Nexus download URL from `NEXUS_DOWNLOAD_URI` and an optional API key from `NEXUS_API_KEY`. These environment values are never written to state or receipts. Missing URLs, partial files, instability, and rate limits are `waiting-system`; login, OTP, CAPTCHA, terms, permissions, and unsupported archives are `waiting-user`. Identity or hash mismatches are blocked.
+
+Use `scripts/Invoke-ModUpdateQueue.ps1` for acquisition concurrency. Its throttle is restricted to one through four distinct MOD identities; duplicate identities are rejected before workers start.
 
 The JSON result returns the generated `statePath`. Resume individual stages with that exact file:
 
@@ -46,6 +68,8 @@ The JSON result returns the generated `statePath`. Resume individual stages with
 Every result contains the run ID, stage, state, active and waiting milliseconds, and the primary artifact SHA-256. Completed stages are idempotent: rerunning them reuses the matching same-run receipt instead of creating duplicate commits or PRs.
 
 ### Localization plan
+
+This subsection is Schema 14 only.
 
 The Agent first determines active `zh-tw` targets, wording, placeholders, markup, and lookup structure under Schema 14. It then supplies deterministic byte-span approvals over the Git-normalized indexed base:
 
@@ -74,6 +98,14 @@ The Agent first determines active `zh-tw` targets, wording, placeholders, markup
 ```
 
 Spans must not overlap. `oldSha256` binds each decision to the immutable indexed bytes. The generator applies only those replacements; the independent validator separately proves that every byte outside the approved spans is unchanged. Direct fields and dynamic lookups use the same byte contract because semantic selection stays outside the script. Put an upstream-deleted active target in `removedPaths`; the runner requires it to be absent after raw installation and checkpoints that deletion in C2. A newly added target is a normal `files` entry and may have an empty `approvedSpans` array when upstream bytes are intentionally unchanged.
+
+### Schema 15 localization workset
+
+After raw installation, `localization` creates the fixed run-local `review-artifacts/localization-workset.json` with `New-LocalizationWorkset.ps1`. OLD comes from `baseOid`; NEW is a byte-identical physical staging copy. The scanner never executes Lua.
+
+If the workset contains pending `AI_REQUIRED` units, the runner returns `waiting-input`. Review only those unit IDs, set `reviewStatus` to `approved`, and provide `suggestedZhTwExpression`. Do not edit classification, action, paths, source spans, or non-AI units. `immutableContractSha256` binds every other field and is independently recomputed. Resume the same `localization` stage.
+
+`Apply-LocalizationWorkset.ps1` selects INSERT, REPLACE, or REMOVE, preserves BOM/newlines, and records byte edits. C2 checkpoints raw upstream localization and C3 applies the merged workset artifact. The independent Gate proves bytes outside workset edits are unchanged. A passing Gate records the workset hash and counts, then deletes the JSON before publication; it is never added to Git.
 
 ### Local Review artifact
 
@@ -120,7 +152,7 @@ Rolling back the Skill itself means restoring a previous immutable `darktide-tra
 ## Known limitations
 
 - Only ZIP archives are accepted by the deterministic extractor.
-- Nexus identity and translation wording remain Agent-verified inputs; the script does not log in, bypass CAPTCHA, scrape credentials, or invent translations.
+- Nexus identity remains receipt-verified. Translation wording is Agent-supplied only for Schema 15 `AI_REQUIRED` units or Schema 14 approved spans; scripts do not log in, bypass CAPTCHA, scrape credentials, or invent translations.
 - The runner assumes one canonical MOD directory and one repository-local `main` base. Conflicting or multi-root archives stop.
 - Publication needs authenticated `git` and `gh`; unavailable external review is recorded and does not trigger login prompts.
 - The automation does not merge PRs, poll reviews, release reservations, or finalize merged runs automatically.

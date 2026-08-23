@@ -54,6 +54,70 @@ function Assert-ClaimedArchiveIntegrity {
     }
 }
 
+function Assert-SourceReceiptIntegrity {
+    param([Collections.IDictionary] $State)
+    if ([int]$State.schemaVersion -lt 15) { return 'not-applicable: Schema 14 manual source' }
+    if (-not $State.sourceReceipt -or -not $State.sourceAcquisition) { throw 'Schema 15 source receipt evidence is missing.' }
+    foreach ($field in @('path', 'sha256', 'sourceRequestPath', 'sourceRequestSha256')) {
+        if (-not $State.sourceReceipt.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$State.sourceReceipt[$field])) {
+            throw "Schema 15 sourceReceipt.$field is missing."
+        }
+    }
+    if ((Get-FileSha256 -Path ([string]$State.sourceReceipt.path)) -cne [string]$State.sourceReceipt.sha256) { throw 'Schema 15 source receipt SHA-256 changed.' }
+    if ((Get-FileSha256 -Path ([string]$State.sourceReceipt.sourceRequestPath)) -cne [string]$State.sourceReceipt.sourceRequestSha256) { throw 'Schema 15 source request SHA-256 changed.' }
+    if ([string]::IsNullOrWhiteSpace([string]$State.sourceAcquisition.recordPath) -or
+        [string]::IsNullOrWhiteSpace([string]$State.sourceAcquisition.recordSha256) -or
+        (Get-FileSha256 -Path ([string]$State.sourceAcquisition.recordPath)) -cne [string]$State.sourceAcquisition.recordSha256) {
+        throw 'Schema 15 source acquisition record is missing or changed.'
+    }
+    $acquisition = Get-Content -LiteralPath $State.sourceAcquisition.recordPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([string]$acquisition.runId -cne [string]$State.runId -or [string]$acquisition.mod -cne [string]$State.repoModDirectory -or
+        [string]$acquisition.sourceRequestPath -cne [string]$State.sourceReceipt.sourceRequestPath -or
+        [string]$acquisition.sourceRequestSha256 -cne [string]$State.sourceReceipt.sourceRequestSha256 -or
+        [string]$acquisition.receiptPath -cne [string]$State.sourceReceipt.path -or
+        [string]$acquisition.receiptSha256 -cne [string]$State.sourceReceipt.sha256 -or
+        [string]$acquisition.result.status -cne 'delivered') {
+        throw 'Schema 15 source acquisition record tuple changed.'
+    }
+    $verifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
+    $verification = & $verifier -ReceiptPath ([string]$State.sourceReceipt.path) -SourceRequestPath ([string]$State.sourceReceipt.sourceRequestPath) -PassThru
+    if ($verification.result -cne 'passed') { throw 'Independent source receipt verifier rejected Schema 15 evidence.' }
+    $receipt = Get-Content -LiteralPath $State.sourceReceipt.path -Raw | ConvertFrom-Json -AsHashtable
+    if ([string]$receipt.sha256 -cne [string]$State.archive.sha256) { throw 'Preserved delivered source and claimed archive SHA-256 differ.' }
+    if ([string]$State.sourceAcquisition.receiptSha256 -cne [string]$State.sourceReceipt.sha256) { throw 'sourceAcquisition receipt binding changed.' }
+    if (-not $State.stageTimings.Contains('acquire-source') -or [string]$State.stageTimings['acquire-source'].artifactSha256 -cne [string]$State.sourceReceipt.sha256) {
+        throw 'acquire-source stage timing is not bound to the source receipt.'
+    }
+    [string]$State.sourceReceipt.sha256
+}
+
+function Assert-ReferenceIntegrity {
+    param([Collections.IDictionary] $State)
+    $integrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') -PassThru
+    if ($integrity.result -cne 'passed' -or [string]$integrity.sourceCommit -cne [string]$State.workflowCommitOid) {
+        throw 'Recorded reference source commit no longer matches the verified Skill package.'
+    }
+    foreach ($binding in @(
+        [ordered]@{ name = 'Workflow'; expectedPath = $State.workflowPath; expectedBlob = $State.workflowBlobOid; expectedSha = $State.workflowSha256; actual = $integrity.workflow },
+        [ordered]@{ name = 'Review Baseline'; expectedPath = $State.reviewBaselinePath; expectedBlob = $State.reviewBaselineBlobOid; expectedSha = $State.reviewBaselineSha256; actual = $integrity.reviewBaseline }
+    )) {
+        if ([string]$binding.expectedPath -cne [string]$binding.actual.originalPath -or
+            [string]$binding.expectedBlob -cne [string]$binding.actual.gitBlobOid -or
+            [string]$binding.expectedSha -cne [string]$binding.actual.sha256) {
+            throw "$($binding.name) reference binding changed."
+        }
+    }
+    if ([int]$State.schemaVersion -ge 15) {
+        if ([string]$State.schema15Path -cne [string]$integrity.schema15.path -or
+            [string]$State.schema15BlobOid -cne [string]$integrity.schema15.gitBlobOid -or
+            [string]$State.schema15Sha256 -cne [string]$integrity.schema15.sha256) {
+            throw 'Schema 15 extension reference binding changed.'
+        }
+        return [string]$State.schema15Sha256
+    }
+    [string]$State.workflowSha256
+}
+
 function Write-AtomicJson {
     param([string] $Path, $Value)
     $parent = Split-Path -Parent $Path
@@ -195,6 +259,45 @@ function Test-ApprovedSpanCandidate {
     $true
 }
 
+function Test-LocalizationWorksetCandidate {
+    param([byte[]] $NewBytes, [byte[]] $MergedBytes, [object[]] $Edits)
+    $spans = @($Edits | ForEach-Object {
+        [ordered]@{
+            startByte = [int64]$_.startByte
+            length = [int64]$_.lengthByte
+            oldSha256 = [string]$_.oldSha256
+            replacementBase64 = [string]$_.replacementBase64
+        }
+    })
+    try { $null = Test-ApprovedSpanCandidate -Indexed $NewBytes -Merged $MergedBytes -ApprovedSpans $spans }
+    catch { throw "Candidate changed bytes outside approved localization workset edits. $($_.Exception.Message)" }
+    $true
+}
+
+function Get-ImmutableWorksetContractSha256 {
+    param($Workset)
+    $unitContracts = @($Workset.units | ForEach-Object {
+        [ordered]@{
+            unitId = $_.unitId; sourceId = $_.sourceId; containerPath = $_.containerPath
+            key = $_.key; occurrence = $_.occurrence; old = $_.old; new = $_.new
+            changeType = $_.changeType; action = $_.action; blockedReason = $_.blockedReason
+        }
+    })
+    $contract = [ordered]@{
+        schemaVersion = $Workset.schemaVersion
+        workflowSchemaVersion = $Workset.workflowSchemaVersion
+        generatorVersion = $Workset.generatorVersion
+        baseOid = $Workset.baseOid
+        sourceId = $Workset.sourceId
+        modRelativePath = $Workset.modRelativePath
+        old = $Workset.old
+        new = $Workset.new
+        counts = $Workset.counts
+        units = $unitContracts
+    }
+    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress)))
+}
+
 $state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json -AsHashtable
 
 if ($ReviewCompletion) {
@@ -207,6 +310,12 @@ if ($ReviewCompletion) {
     }
     Add-ReviewCheck -Name 'claimed-archive' -Action {
         Assert-ClaimedArchiveIntegrity -Archive $state.archive
+    }
+    Add-ReviewCheck -Name 'source-receipt' -Action {
+        Assert-SourceReceiptIntegrity -State $state
+    }
+    Add-ReviewCheck -Name 'reference-integrity' -Action {
+        Assert-ReferenceIntegrity -State $state
     }
     Add-ReviewCheck -Name 'candidate-gate' -Action {
         if ($state.candidateGate.status -ne 'passed') { throw 'Candidate Gate is not passed.' }
@@ -269,6 +378,14 @@ $worktree = [string]$state.worktreePath
 
 Add-ValidationCheck -Name 'claimed-archive' -Action {
     Assert-ClaimedArchiveIntegrity -Archive $state.archive
+}
+
+Add-ValidationCheck -Name 'source-receipt' -Action {
+    Assert-SourceReceiptIntegrity -State $state
+}
+
+Add-ValidationCheck -Name 'reference-integrity' -Action {
+    Assert-ReferenceIntegrity -State $state
 }
 
 Add-ValidationCheck -Name 'candidate-head' -Action {
@@ -460,7 +577,49 @@ Add-ValidationCheck -Name 'install-normalization' -Action {
     'install, Git normalization, and candidate tree agree'
 }
 
+Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
+    if ([int]$state.schemaVersion -lt 15) { return 'not-applicable: Schema 14 approved spans' }
+    if (-not $state.localizationWorkset -or [string]$state.localizationWorkset.status -cne 'applied') { throw 'Schema 15 applied localization workset evidence is missing.' }
+    $worksetPath = [string]$state.localizationWorkset.path
+    if (-not (Test-Path -LiteralPath $worksetPath -PathType Leaf)) { throw 'Localization workset is missing before Candidate Gate.' }
+    if ((Get-FileSha256 -Path $worksetPath) -cne [string]$state.localizationWorkset.sha256) { throw 'Localization workset SHA-256 changed.' }
+    $worksetFull = [IO.Path]::GetFullPath($worksetPath)
+    $worktreeFull = [IO.Path]::GetFullPath([string]$state.worktreePath).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if ($worksetFull.StartsWith($worktreeFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'Localization workset must never be inside the Git worktree.' }
+    $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([int]$workset.workflowSchemaVersion -ne 15 -or [string]$workset.status -cne 'applied') { throw 'Localization workset is not an applied Schema 15 artifact.' }
+    if ([string]::IsNullOrWhiteSpace([string]$workset.immutableContractSha256) -or
+        (Get-ImmutableWorksetContractSha256 -Workset $workset) -cne [string]$workset.immutableContractSha256) {
+        throw 'Localization workset immutable contract changed.'
+    }
+    if ([string]$state.localizationWorkset.immutableContractSha256 -cne [string]$workset.immutableContractSha256) {
+        throw 'Localization workset immutable contract differs from state evidence.'
+    }
+    if (@($workset.units | Where-Object { $_.action -ceq 'BLOCKED' }).Count -ne 0) { throw 'Localization workset contains BLOCKED units.' }
+    if (@($workset.units | Where-Object { $_.action -ceq 'AI_REQUIRED' -and $_.reviewStatus -cne 'approved' }).Count -ne 0) { throw 'Localization workset contains unapproved AI_REQUIRED units.' }
+    if (@($workset.units | Where-Object { $_.action -cne 'AI_REQUIRED' -and $null -ne $_.suggestedZhTwExpression }).Count -ne 0) { throw 'AI expression exists outside AI_REQUIRED units.' }
+    foreach ($record in @($state.localizationFiles)) {
+        if ([string]$record.decisionsSha256 -cne [string]$state.localizationWorkset.sha256) { throw 'Localization file is not bound to the current workset SHA-256.' }
+        $newPath = Join-Path ([string]$record.artifactDirectory) 'new.lua'
+        $mergedPath = Join-Path ([string]$record.artifactDirectory) 'merged.lua'
+        $mergedIndexedPath = Join-Path ([string]$record.artifactDirectory) 'merged-indexed.lua'
+        $newBytes = [IO.File]::ReadAllBytes($newPath)
+        $mergedBytes = [IO.File]::ReadAllBytes($mergedPath)
+        $mergedIndexedBytes = [IO.File]::ReadAllBytes($mergedIndexedPath)
+        if ((Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.apply.inputSha256 -or (Get-Sha256Bytes -Bytes $newBytes) -cne [string]$record.rawSha256) { throw 'Workset NEW bytes differ from raw localization evidence.' }
+        if ((Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$workset.apply.outputSha256 -or (Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$record.mergedRawSha256) { throw 'Workset merged bytes differ from apply evidence.' }
+        if ((Get-Sha256Bytes -Bytes $mergedIndexedBytes) -cne [string]$record.mergedSha256) { throw 'Workset merged indexed bytes changed.' }
+        $null = Test-LocalizationWorksetCandidate -NewBytes $newBytes -MergedBytes $mergedBytes -Edits @($workset.apply.edits)
+        $targetPath = Join-Path $worktree ([string]$record.relativePath)
+        if ((Get-FileSha256 -Path $targetPath) -cne [string]$record.mergedRawSha256) { throw 'Worktree localization target differs from workset merged raw bytes.' }
+        $candidateBlob = Get-GitBlobBytes -WorkingDirectory $worktree -Object "$($chain.fOid):$([string]$record.relativePath)"
+        if ((Get-Sha256Bytes -Bytes $candidateBlob) -cne [string]$record.mergedSha256) { throw 'F localization blob differs from workset merged indexed bytes.' }
+    }
+    "Workset units=$(@($workset.units).Count), edits=$(@($workset.apply.edits).Count), SHA-256=$($state.localizationWorkset.sha256)"
+}
+
 Add-ValidationCheck -Name 'localization-byte-boundary' -Action {
+    if ([int]$state.schemaVersion -ge 15) { return 'not-applicable: Schema 15 localization workset' }
     if ($state.localizationMode -eq 'none') { return 'not-applicable: localization mode none' }
     $rawInstall = Get-Content -LiteralPath $state.rawInstallManifest.path -Raw | ConvertFrom-Json -AsHashtable
     $normalization = Get-Content -LiteralPath $state.gitIndexNormalization.path -Raw | ConvertFrom-Json -AsHashtable
@@ -500,6 +659,8 @@ Add-ValidationCheck -Name 'localization-byte-boundary' -Action {
 
 $validationPath = Join-Path $state.artifactsRoot 'validation-report.json'
 $resultName = if ($errors.Count -eq 0) { 'passed' } else { 'rejected' }
+$sourceReceiptEvidence = if ($state.Contains('sourceReceipt')) { $state.sourceReceipt } else { $null }
+$localizationWorksetEvidence = if ($state.Contains('localizationWorkset')) { $state.localizationWorkset } else { $null }
 $report = [ordered]@{
     schemaVersion = 1
     result = $resultName
@@ -509,12 +670,14 @@ $report = [ordered]@{
     workflow = [ordered]@{ commitOid = $state.workflowCommitOid; path = $state.workflowPath; blobOid = $state.workflowBlobOid; sha256 = $state.workflowSha256 }
     reviewBaseline = [ordered]@{ path = $state.reviewBaselinePath; blobOid = $state.reviewBaselineBlobOid; sha256 = $state.reviewBaselineSha256 }
     archive = $state.archive
+    sourceReceipt = $sourceReceiptEvidence
     evidenceGeneration = $state.evidenceGeneration
     evidenceTargetPaths = $state.evidenceTargetPaths
     evidenceTargetPathsSha256 = $state.evidenceTargetPathsSha256
     evidenceDiffs = $state.evidenceDiffs
     diffReadability = $state.diffReadability
     localizationMode = $state.localizationMode
+    localizationWorkset = $localizationWorksetEvidence
     manifests = [ordered]@{
         extraction = $state.extractionManifest
         rawInstall = $state.rawInstallManifest
@@ -555,6 +718,8 @@ $state.candidateGate = [ordered]@{
     metadataPreviewSha256 = $state.metadataPreview.sha256
     evidenceGenerationReceiptSha256 = $state.evidenceReceipt.sha256
     diffReadabilitySha256 = $state.diffReadability.sha256
+    localizationWorksetSha256 = if ([int]$state.schemaVersion -ge 15) { $state.localizationWorkset.sha256 } else { $null }
+    sourceReceiptSha256 = if ([int]$state.schemaVersion -ge 15) { $state.sourceReceipt.sha256 } else { $null }
     validatorSha256 = Get-FileSha256 -Path $PSCommandPath
     validationReportPath = $validationPath
     validationReportSha256 = $validationSha

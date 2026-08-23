@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'run')]
+    [ValidateSet('acquire-source', 'claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'run')]
     [string] $Command,
 
     [Parameter(Mandatory)]
@@ -13,6 +13,13 @@ param(
     [string] $ArchivePath,
     [string] $ModDirectory,
     [string] $RunId,
+    [string] $SourceRequestPath,
+    [string] $SourceReceiptPath,
+    [ValidateSet('api', 'browser')]
+    [string] $Provider = 'browser',
+    [string] $DownloadedFilePath,
+    [ValidateRange(0, 60000)]
+    [int] $ObservationIntervalMilliseconds = 1000,
     [string] $LocalizationPlanPath,
     [string] $LocalReviewPath,
     [string[]] $MetadataPath = @(),
@@ -20,7 +27,7 @@ param(
     [string] $WorktreeParent,
     [string] $Remote = 'origin',
     [string] $PullRequestBase = 'main',
-    [ValidateSet('awaiting-user-merge')]
+    [ValidateSet('source-verified', 'awaiting-user-merge')]
     [string] $Until = 'awaiting-user-merge',
     [switch] $PassThru
 )
@@ -253,6 +260,7 @@ function Test-CrlfNormalizationOnly {
 function Get-StageArtifactPath {
     param([Collections.IDictionary] $State, [string] $Name)
     switch ($Name) {
+        'acquire-source' { if ($State.sourceReceipt) { [string]$State.sourceReceipt.path } }
         'claim' { Join-Path ([string]$State.runRoot) 'claim.json' }
         'verify-source' { Join-Path ([string]$State.artifactsRoot) 'archive-listing.json' }
         'extract' { if ($State.extractionManifest) { [string]$State.extractionManifest.path } }
@@ -501,6 +509,271 @@ function Ensure-RunWriterLock {
     }
 }
 
+function Get-ModRunPlan {
+    param(
+        [Parameter(Mandatory)][string] $Repository,
+        [Parameter(Mandatory)][string] $CanonicalModDirectory,
+        [Parameter(Mandatory)][string] $ActualRunId
+    )
+    $queueRoot = Join-Path $Repository 'AI Auto Update'
+    $slug = ConvertTo-SafeSlug -Value $CanonicalModDirectory
+    $short = $ActualRunId.Replace('-', '').Substring(0, 8)
+    $runRoot = Join-Path (Join-Path $queueRoot 'In Progress') "$slug-$short"
+    $modRelativePath = "Warhammer 40,000 DARKTIDE/mods/$CanonicalModDirectory"
+    $lockKey = Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))
+    [ordered]@{
+        queueRoot = [IO.Path]::GetFullPath($queueRoot)
+        slug = $slug
+        short = $short
+        runRoot = [IO.Path]::GetFullPath($runRoot)
+        modRelativePath = $modRelativePath
+        lockKey = $lockKey
+        modLockPath = [IO.Path]::GetFullPath((Join-Path (Join-Path $queueRoot 'In Progress/.locks/mod') "$lockKey.lock"))
+    }
+}
+
+function Enter-ModReservation {
+    param(
+        [Collections.IDictionary] $Plan,
+        [string] $ActualRunId,
+        [string] $PlannedStatePath
+    )
+    $lockRoot = Split-Path -Parent ([string]$Plan.modLockPath)
+    New-Item -ItemType Directory -Path $lockRoot -Force | Out-Null
+    $created = $false
+    try {
+        New-Item -ItemType Directory -Path ([string]$Plan.modLockPath) -ErrorAction Stop | Out-Null
+        $created = $true
+    }
+    catch {
+        $ownerPath = Join-Path ([string]$Plan.modLockPath) 'owner.json'
+        if (-not (Test-Path -LiteralPath $ownerPath -PathType Leaf)) { throw 'Another generation owns an incomplete canonical MOD reservation.' }
+        $existing = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$existing.runId -cne $ActualRunId) { throw 'Another generation already owns this canonical MOD identity.' }
+    }
+    $ownerPath = Join-Path ([string]$Plan.modLockPath) 'owner.json'
+    $owner = if (-not $created -and (Test-Path -LiteralPath $ownerPath -PathType Leaf)) {
+        Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+    }
+    else {
+        [ordered]@{
+            schemaVersion = 1
+            runId = $ActualRunId
+            canonicalModRelativePath = $Plan.modRelativePath
+            acquiredAt = Get-UtcTimestamp
+        }
+    }
+    $owner.modLockKey = $Plan.lockKey
+    $owner.plannedStatePath = [IO.Path]::GetFullPath($PlannedStatePath)
+    $owner.statePath = [IO.Path]::GetFullPath($PlannedStatePath)
+    $owner.workerId = $PID
+    $owner.leaseMode = 'active'
+    $owner.heartbeat = Get-UtcTimestamp
+    Write-AtomicJson -Path $ownerPath -Value $owner
+    $owner
+}
+
+function Assert-Schema15BaseLocalizationEligibility {
+    param(
+        [Parameter(Mandatory)][string] $Repository,
+        [Parameter(Mandatory)][string] $BaseOid,
+        [Parameter(Mandatory)][string] $ModRelativePath
+    )
+    $listing = (Invoke-Git -WorkingDirectory $Repository -Arguments @(
+        'ls-tree', '-r', '--name-only', $BaseOid, '--', $ModRelativePath
+    )).output
+    $localizationPaths = @(
+        $listing -split "`r?`n" |
+            Where-Object { $_ -match '(?i)(?:^|/)[^/]*localization\.lua$' } |
+            Sort-Object -Unique
+    )
+    if ($localizationPaths.Count -eq 0) { return }
+
+    Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force -ErrorAction Stop
+    foreach ($path in $localizationPaths) {
+        $blobOid = (Invoke-Git -WorkingDirectory $Repository -Arguments @('rev-parse', "$BaseOid`:$path")).output.Trim()
+        $bytes = Get-GitBlobBytes -WorkingDirectory $Repository -Object $blobOid
+        $document = Get-LuaLocalizationDocument -Bytes $bytes -SourceId $path
+        $textOffset = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $textOffset, $bytes.Length - $textOffset)
+        if (@($document.units).Count -eq 0 -and $text -match '(?i)mod\s*:\s*io_dofile\s*\(') {
+            throw "AUTOMATION_EXCLUDED: localization_entry_is_loader ($path)"
+        }
+    }
+}
+
+function Test-SourceRequestPreflight {
+    param([Parameter(Mandatory)][string] $Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'Source request does not exist.' }
+    $request = Get-Content -LiteralPath $full -Raw | ConvertFrom-Json -AsHashtable
+    if ([int]$request.schemaVersion -ne 1) { throw 'Source request schemaVersion must be 1.' }
+    foreach ($field in @('gameDomain', 'modId', 'mainFileId', 'version', 'fileName', 'pageUrl')) {
+        if (-not $request.Contains($field) -or [string]::IsNullOrWhiteSpace([Convert]::ToString($request[$field], [Globalization.CultureInfo]::InvariantCulture))) {
+            throw "Source request requires a unique $field value."
+        }
+    }
+    $pageUri = [Uri]([string]$request.pageUrl)
+    if (-not $pageUri.IsAbsoluteUri -or $pageUri.Scheme -cne 'https') { throw 'Source request pageUrl must be an absolute HTTPS URL.' }
+    if ($request.Contains('officialSha256') -and -not [string]::IsNullOrWhiteSpace([string]$request.officialSha256) -and
+        [string]$request.officialSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'officialSha256 must contain 64 hexadecimal characters.'
+    }
+    $extension = [IO.Path]::GetExtension([string]$request.fileName).ToLowerInvariant()
+    if ($extension -cne '.zip') {
+        return [ordered]@{
+            result = 'waiting'; status = 'waiting-user'
+            waitingReason = [ordered]@{ code = 'unsupported_archive_format'; message = 'Only ZIP Main files are supported in Schema 15.' }
+            archiveFormat = $extension.TrimStart('.'); sourceRequestPath = $full
+        }
+    }
+    [ordered]@{ result = 'passed'; status = 'eligible'; sourceRequestPath = $full }
+}
+
+function Invoke-AcquireSource {
+    if ([string]::IsNullOrWhiteSpace($ModDirectory) -or [string]::IsNullOrWhiteSpace($SourceRequestPath)) {
+        throw 'acquire-source requires -ModDirectory and -SourceRequestPath.'
+    }
+    $repository = [IO.Path]::GetFullPath($RepositoryRoot)
+    $actualRunId = if ($RunId) { [guid]::Parse($RunId).ToString() } else { [guid]::NewGuid().ToString() }
+    $plan = Get-ModRunPlan -Repository $repository -CanonicalModDirectory $ModDirectory -ActualRunId $actualRunId
+    $plannedStatePath = Join-Path ([string]$plan.runRoot) 'state.json'
+    $preflight = Test-SourceRequestPreflight -Path $SourceRequestPath
+    if ($preflight.status -ne 'eligible') {
+        return [ordered]@{
+            result = $preflight.result; status = $preflight.status; runId = $actualRunId; stage = 'acquire-source'
+            plannedStatePath = $plannedStatePath; runRoot = $plan.runRoot; modLockPath = $null
+            deliveredPath = $null; receiptPath = $null; receiptSha256 = $null
+            sourceRequestPath = $preflight.sourceRequestPath; sourceRequestSha256 = Get-FileSha256 -Path $preflight.sourceRequestPath
+            acquisitionPath = $null; acquisitionSha256 = $null; waitingReason = $preflight.waitingReason; timings = $null
+        }
+    }
+    $null = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $plannedStatePath
+    $reviewArtifacts = Join-Path ([string]$plan.runRoot) 'review-artifacts'
+    $incoming = Join-Path ([string]$plan.runRoot) ".incoming-$actualRunId"
+    $delivery = Join-Path ([string]$plan.runRoot) 'verified-source'
+    $receiptPath = Join-Path $reviewArtifacts 'source-receipt.json'
+    New-Item -ItemType Directory -Path $reviewArtifacts -Force | Out-Null
+    $suppliedRequestPath = [IO.Path]::GetFullPath($SourceRequestPath)
+    if (-not (Test-Path -LiteralPath $suppliedRequestPath -PathType Leaf)) { throw 'Source request does not exist.' }
+    $boundRequestPath = Join-Path $reviewArtifacts 'source-request.json'
+    $suppliedRequestBytes = [IO.File]::ReadAllBytes($suppliedRequestPath)
+    if (Test-Path -LiteralPath $boundRequestPath -PathType Leaf) {
+        if ((Get-FileSha256 -Path $boundRequestPath) -cne (Get-Sha256Bytes -Bytes $suppliedRequestBytes)) {
+            throw 'Same-run source request evidence already exists with different bytes.'
+        }
+    }
+    elseif ($suppliedRequestPath -cne [IO.Path]::GetFullPath($boundRequestPath)) {
+        $temporaryRequestPath = Join-Path $reviewArtifacts ('.source-request-' + [guid]::NewGuid().ToString('N') + '.json')
+        [IO.File]::WriteAllBytes($temporaryRequestPath, $suppliedRequestBytes)
+        $null = Get-Content -LiteralPath $temporaryRequestPath -Raw | ConvertFrom-Json -AsHashtable
+        [IO.File]::Move($temporaryRequestPath, $boundRequestPath)
+    }
+    $acquisitionPath = Join-Path $reviewArtifacts 'source-acquisition.json'
+    if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
+        $receiptVerifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
+        $verification = & $receiptVerifier -ReceiptPath $receiptPath -SourceRequestPath $boundRequestPath -PassThru
+        if ($verification.result -cne 'passed') { throw 'Preserved source receipt failed same-run acquisition recovery.' }
+        $preservedReceipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
+        $receiptSha = Get-FileSha256 -Path $receiptPath
+        $requestSha = Get-FileSha256 -Path $boundRequestPath
+        if (Test-Path -LiteralPath $acquisitionPath -PathType Leaf) {
+            $record = Get-Content -LiteralPath $acquisitionPath -Raw | ConvertFrom-Json -AsHashtable
+            if ([string]$record.runId -cne $actualRunId -or [string]$record.mod -cne $ModDirectory -or
+                [string]$record.sourceRequestPath -cne [IO.Path]::GetFullPath($boundRequestPath) -or
+                [string]$record.sourceRequestSha256 -cne $requestSha -or
+                [string]$record.receiptPath -cne [IO.Path]::GetFullPath($receiptPath) -or
+                [string]$record.receiptSha256 -cne $receiptSha -or [string]$record.result.status -cne 'delivered') {
+                throw 'Preserved acquisition record does not match the same-run recovery tuple.'
+            }
+        }
+        else {
+            $recoveredResult = [ordered]@{
+                result = 'passed'; status = 'delivered'; deliveredPath = [IO.Path]::GetFullPath([string]$preservedReceipt.deliveredPath)
+                receiptPath = [IO.Path]::GetFullPath($receiptPath); receiptSha256 = $receiptSha; timings = $preservedReceipt.timings
+            }
+            $record = [ordered]@{
+                schemaVersion = 1; workflowSchemaVersion = 15; runId = $actualRunId; mod = $ModDirectory
+                sourceRequestPath = [IO.Path]::GetFullPath($boundRequestPath); sourceRequestSha256 = $requestSha
+                result = $recoveredResult; receiptPath = [IO.Path]::GetFullPath($receiptPath); receiptSha256 = $receiptSha
+                recordedAt = Get-UtcTimestamp; recovered = $true
+            }
+            Write-AtomicJson -Path $acquisitionPath -Value $record
+        }
+        $ownerPath = Join-Path ([string]$plan.modLockPath) 'owner.json'
+        $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        $owner.sourceReceiptSha256 = $receiptSha
+        $owner.sourceSha256 = [string]$preservedReceipt.sha256
+        $owner.heartbeat = Get-UtcTimestamp
+        Write-AtomicJson -Path $ownerPath -Value $owner
+        return [ordered]@{
+            result = 'passed'; status = 'delivered'; idempotent = $true; runId = $actualRunId; stage = 'acquire-source'
+            plannedStatePath = $plannedStatePath; runRoot = $plan.runRoot; modLockPath = $plan.modLockPath
+            deliveredPath = [IO.Path]::GetFullPath([string]$preservedReceipt.deliveredPath)
+            receiptPath = [IO.Path]::GetFullPath($receiptPath); receiptSha256 = $receiptSha
+            sourceRequestPath = [IO.Path]::GetFullPath($boundRequestPath); sourceRequestSha256 = $requestSha
+            acquisitionPath = $acquisitionPath; acquisitionSha256 = Get-FileSha256 -Path $acquisitionPath
+            waitingReason = $null; timings = $preservedReceipt.timings
+        }
+    }
+    $receiver = Join-Path $PSScriptRoot 'Receive-NexusMainFile.ps1'
+    $arguments = @{
+        SourceRequestPath = [IO.Path]::GetFullPath($boundRequestPath)
+        IncomingDirectory = $incoming
+        DeliveryDirectory = $delivery
+        Provider = $Provider
+        ReceiptPath = $receiptPath
+        ObservationIntervalMilliseconds = $ObservationIntervalMilliseconds
+        PassThru = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DownloadedFilePath)) { $arguments.DownloadedFilePath = [IO.Path]::GetFullPath($DownloadedFilePath) }
+    $acquired = & $receiver @arguments
+    $record = [ordered]@{
+        schemaVersion = 1
+        workflowSchemaVersion = 15
+        runId = $actualRunId
+        mod = $ModDirectory
+        sourceRequestPath = [IO.Path]::GetFullPath($boundRequestPath)
+        sourceRequestSha256 = Get-FileSha256 -Path ([IO.Path]::GetFullPath($boundRequestPath))
+        result = $acquired
+        receiptPath = if (Test-Path -LiteralPath $receiptPath -PathType Leaf) { [IO.Path]::GetFullPath($receiptPath) } else { $null }
+        receiptSha256 = if (Test-Path -LiteralPath $receiptPath -PathType Leaf) { Get-FileSha256 -Path $receiptPath } else { $null }
+        recordedAt = Get-UtcTimestamp
+    }
+    Write-AtomicJson -Path $acquisitionPath -Value $record
+    $ownerPath = Join-Path ([string]$plan.modLockPath) 'owner.json'
+    $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+    if ($acquired.status -eq 'delivered') {
+        $owner.sourceReceiptSha256 = $record.receiptSha256
+        $owner.sourceSha256 = (Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable).sha256
+    }
+    else {
+        $owner.leaseMode = 'reserved'
+        $owner.workerId = $null
+        $owner.waitingReason = $acquired.waitingReason
+    }
+    $owner.heartbeat = Get-UtcTimestamp
+    Write-AtomicJson -Path $ownerPath -Value $owner
+    [ordered]@{
+        result = $acquired.result
+        status = $acquired.status
+        runId = $actualRunId
+        stage = 'acquire-source'
+        plannedStatePath = $plannedStatePath
+        runRoot = $plan.runRoot
+        modLockPath = $plan.modLockPath
+        deliveredPath = if ($acquired.status -eq 'delivered') { $acquired.deliveredPath } else { $null }
+        receiptPath = $record.receiptPath
+        receiptSha256 = $record.receiptSha256
+        sourceRequestPath = $record.sourceRequestPath
+        sourceRequestSha256 = $record.sourceRequestSha256
+        acquisitionPath = $acquisitionPath
+        acquisitionSha256 = Get-FileSha256 -Path $acquisitionPath
+        waitingReason = if ($acquired.status -ne 'delivered') { $acquired.waitingReason } else { $null }
+        timings = if ($acquired.Contains('timings')) { $acquired.timings } else { $null }
+    }
+}
+
 function Complete-IncompleteClaim {
     param([Collections.IDictionary] $State)
     Assert-LockOwner -State $State
@@ -537,7 +810,12 @@ function Complete-IncompleteClaim {
         -not (Test-Path -LiteralPath $claimedArchive -PathType Leaf) -and
         $State.archive.Contains('originalPath') -and
         (Test-Path -LiteralPath ([string]$State.archive.originalPath) -PathType Leaf)) {
-        [IO.File]::Move([string]$State.archive.originalPath, $coordinatorArchive)
+        if ($State.archive.Contains('preserveOriginal') -and $State.archive.preserveOriginal) {
+            [IO.File]::Copy([string]$State.archive.originalPath, $coordinatorArchive)
+        }
+        else {
+            [IO.File]::Move([string]$State.archive.originalPath, $coordinatorArchive)
+        }
     }
     if (Test-Path -LiteralPath $coordinatorArchive -PathType Leaf) {
         if (Test-Path -LiteralPath $claimedArchive) { throw 'Incomplete claim has both coordinator and run-owned archive copies.' }
@@ -589,27 +867,88 @@ function Invoke-Claim {
         throw 'claim requires -ArchivePath and -ModDirectory.'
     }
     $repository = [IO.Path]::GetFullPath($RepositoryRoot)
-    $queueRoot = Join-Path $repository 'AI Auto Update'
-    $sourceFull = Assert-ContainedPath -Candidate $ArchivePath -Root $queueRoot -Label 'Archive path'
-    if ((Split-Path -Parent $sourceFull) -ne [IO.Path]::GetFullPath($queueRoot)) {
-        throw 'Archive must be a direct child of AI Auto Update.'
-    }
-    if (-not (Test-Path -LiteralPath $sourceFull -PathType Leaf)) { throw 'Archive is missing.' }
-
-    $sampleOne = Get-Item -LiteralPath $sourceFull
-    if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-        throw 'Source archive must be a regular file, not a reparse point.'
-    }
-    [Threading.Thread]::Sleep(10000)
-    $sampleTwo = Get-Item -LiteralPath $sourceFull
-    if ($sampleOne.Length -ne $sampleTwo.Length -or $sampleOne.LastWriteTimeUtc -ne $sampleTwo.LastWriteTimeUtc) {
-        throw 'Archive did not remain stable across the required ten-second observation.'
-    }
-
     $actualRunId = if ($RunId) { [guid]::Parse($RunId).ToString() } else { [guid]::NewGuid().ToString() }
-    $slug = ConvertTo-SafeSlug -Value $ModDirectory
-    $short = $actualRunId.Replace('-', '').Substring(0, 8)
-    $runRoot = Join-Path (Join-Path $queueRoot 'In Progress') "$slug-$short"
+    $plan = Get-ModRunPlan -Repository $repository -CanonicalModDirectory $ModDirectory -ActualRunId $actualRunId
+    $queueRoot = [string]$plan.queueRoot
+    $slug = [string]$plan.slug
+    $short = [string]$plan.short
+    $runRoot = [string]$plan.runRoot
+    $sourceReceipt = $null
+    $sourceAcquisitionRecord = $null
+    if (-not [string]::IsNullOrWhiteSpace($SourceReceiptPath)) {
+        if ([string]::IsNullOrWhiteSpace($SourceRequestPath)) { throw 'Receipt-bound claim requires -SourceRequestPath.' }
+        $receiptFull = Assert-ContainedPath -Candidate $SourceReceiptPath -Root $runRoot -Label 'Source receipt path'
+        $requestFull = Assert-ContainedPath -Candidate $SourceRequestPath -Root $runRoot -Label 'Source request path'
+        if ($requestFull -cne [IO.Path]::GetFullPath((Join-Path $runRoot 'review-artifacts/source-request.json'))) {
+            throw 'Receipt-bound claim requires the run-archived source request.'
+        }
+        $acquisitionFull = [IO.Path]::GetFullPath((Join-Path $runRoot 'review-artifacts/source-acquisition.json'))
+        if (-not (Test-Path -LiteralPath $acquisitionFull -PathType Leaf)) { throw 'Schema 15 acquisition record is missing.' }
+        $acquisitionSha = Get-FileSha256 -Path $acquisitionFull
+        $acquisition = Get-Content -LiteralPath $acquisitionFull -Raw | ConvertFrom-Json -AsHashtable
+        $requestSha = Get-FileSha256 -Path $requestFull
+        $receiptSha = Get-FileSha256 -Path $receiptFull
+        if ([string]$acquisition.runId -cne $actualRunId -or [string]$acquisition.mod -cne $ModDirectory -or
+            [string]$acquisition.sourceRequestPath -cne $requestFull -or [string]$acquisition.sourceRequestSha256 -cne $requestSha -or
+            [string]$acquisition.receiptPath -cne $receiptFull -or [string]$acquisition.receiptSha256 -cne $receiptSha -or
+            [string]$acquisition.result.status -cne 'delivered') {
+            throw 'Schema 15 acquisition record no longer matches the run request and receipt tuple.'
+        }
+        $ownerPath = Join-Path ([string]$plan.modLockPath) 'owner.json'
+        if (-not (Test-Path -LiteralPath $ownerPath -PathType Leaf)) { throw 'Schema 15 acquisition reservation owner is missing.' }
+        $acquisitionOwner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        $receiptPreview = Get-Content -LiteralPath $receiptFull -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$acquisitionOwner.runId -cne $actualRunId -or
+            [string]$acquisitionOwner.sourceReceiptSha256 -cne $receiptSha -or
+            [string]$acquisitionOwner.sourceSha256 -cne [string]$receiptPreview.sha256) {
+            throw 'Schema 15 acquisition record differs from the MOD reservation owner.'
+        }
+        $receiptVerifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
+        $receiptVerification = & $receiptVerifier -ReceiptPath $receiptFull -SourceRequestPath $requestFull -PassThru
+        if ($receiptVerification.result -ne 'passed') { throw 'Independent source receipt verification failed.' }
+        $receipt = Get-Content -LiteralPath $receiptFull -Raw | ConvertFrom-Json -AsHashtable
+        $sourceFull = Assert-ContainedPath -Candidate ([string]$receipt.deliveredPath) -Root (Join-Path $runRoot 'verified-source') -Label 'Verified source path'
+        if ([IO.Path]::GetFullPath($ArchivePath) -ne $sourceFull) { throw 'ArchivePath does not match the verified source receipt.' }
+        $sampleOne = Get-Item -LiteralPath $sourceFull
+        $sampleTwo = $sampleOne
+        $sourceReceipt = [ordered]@{
+            path = $receiptFull
+            sha256 = Get-FileSha256 -Path $receiptFull
+            sourceRequestPath = $requestFull
+            sourceRequestSha256 = Get-FileSha256 -Path $requestFull
+            verification = $receiptVerification
+            provider = $receipt.provider
+            sourceRequest = $receipt.sourceRequest
+            timings = $receipt.timings
+            startedAt = $receipt.stableObservations[0].observedAt
+            completedAt = $receipt.deliveredAt
+        }
+        $sourceAcquisitionRecord = [ordered]@{
+            recordPath = $acquisitionFull
+            recordSha256 = $acquisitionSha
+            sourceRequestPath = $requestFull
+            sourceRequestSha256 = $requestSha
+            receiptPath = $receiptFull
+            receiptSha256 = $receiptSha
+        }
+    }
+    else {
+        $sourceFull = Assert-ContainedPath -Candidate $ArchivePath -Root $queueRoot -Label 'Archive path'
+        if ((Split-Path -Parent $sourceFull) -ne [IO.Path]::GetFullPath($queueRoot)) {
+            throw 'Archive must be a direct child of AI Auto Update.'
+        }
+        if (-not (Test-Path -LiteralPath $sourceFull -PathType Leaf)) { throw 'Archive is missing.' }
+        $sampleOne = Get-Item -LiteralPath $sourceFull
+        if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Source archive must be a regular file, not a reparse point.'
+        }
+        [Threading.Thread]::Sleep(10000)
+        $sampleTwo = Get-Item -LiteralPath $sourceFull
+        if ($sampleOne.Length -ne $sampleTwo.Length -or $sampleOne.LastWriteTimeUtc -ne $sampleTwo.LastWriteTimeUtc) {
+            throw 'Archive did not remain stable across the required ten-second observation.'
+        }
+    }
+    if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Source archive must be a regular file, not a reparse point.' }
     $actualStatePath = if ($StatePath) { Assert-ContainedPath -Candidate $StatePath -Root $runRoot -Label 'State path' } else { Join-Path $runRoot 'state.json' }
     if (Test-Path -LiteralPath $actualStatePath -PathType Leaf) {
         $existing = Read-State -Path $actualStatePath
@@ -623,10 +962,13 @@ function Invoke-Claim {
     $archiveSha = Get-FileSha256 -Path $sourceFull
     $integrityScript = Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1'
     $integrity = & $integrityScript -PassThru
-    if ($integrity.result -ne 'passed') { throw 'The packaged Schema 14 Workflow and Review Baseline failed integrity validation.' }
+    if ($integrity.result -ne 'passed') { throw 'The packaged Schema 14 base and Schema 15 extension references failed integrity validation.' }
 
     $baseOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', "$BaseRef^{commit}")).output.Trim()
     $baseTreeOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', "$baseOid^{tree}")).output.Trim()
+    if ($sourceReceipt) {
+        Assert-Schema15BaseLocalizationEligibility -Repository $repository -BaseOid $baseOid -ModRelativePath ([string]$plan.modRelativePath)
+    }
     $branch = "Update/$slug/$([DateTimeOffset]::Now.ToString('yyyyMMdd'))-$short"
     $worktreeParent = if ([string]::IsNullOrWhiteSpace($WorktreeParent)) {
         Join-Path (Split-Path -Parent $repository) ((Split-Path -Leaf $repository) + '-worktrees')
@@ -639,29 +981,14 @@ function Invoke-Claim {
     $claimSourceRoot = Join-Path $claimRoot 'source'
     $claimPath = Join-Path $claimRoot 'claim.json'
     $coordinatorArchive = Join-Path $claimSourceRoot ([IO.Path]::GetFileName($sourceFull))
-    $modRelativePath = "Warhammer 40,000 DARKTIDE/mods/$ModDirectory"
-    $lockKey = Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))
-    $lockRoot = Join-Path $queueRoot 'In Progress/.locks/mod'
-    New-Item -ItemType Directory -Path $lockRoot -Force | Out-Null
-    $modLockPath = Join-Path $lockRoot "$lockKey.lock"
-    try { New-Item -ItemType Directory -Path $modLockPath -ErrorAction Stop | Out-Null }
-    catch { throw 'Another generation already owns this canonical MOD identity.' }
-
-    $plannedOwner = [ordered]@{
-        runId = $actualRunId
-        workflowCommitOid = $integrity.sourceCommit
-        modLockKey = $lockKey
-        canonicalModRelativePath = $modRelativePath
-        sourceSha256 = $archiveSha
-        claimPath = [IO.Path]::GetFullPath($claimPath)
-        plannedStatePath = [IO.Path]::GetFullPath($actualStatePath)
-        statePath = [IO.Path]::GetFullPath($actualStatePath)
-        workerId = $PID
-        leaseMode = 'active'
-        acquiredAt = Get-UtcTimestamp
-        heartbeat = Get-UtcTimestamp
-        worktree = $null
-    }
+    $modRelativePath = [string]$plan.modRelativePath
+    $lockKey = [string]$plan.lockKey
+    $modLockPath = [string]$plan.modLockPath
+    $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
+    $plannedOwner.workflowCommitOid = $integrity.sourceCommit
+    $plannedOwner.sourceSha256 = $archiveSha
+    $plannedOwner.claimPath = [IO.Path]::GetFullPath($claimPath)
+    $plannedOwner.worktree = $null
     Write-AtomicJson -Path (Join-Path $modLockPath 'owner.json') -Value $plannedOwner
     New-Item -ItemType Directory -Path $claimSourceRoot -Force | Out-Null
     $claimRecord = [ordered]@{
@@ -669,6 +996,7 @@ function Invoke-Claim {
         status = 'identified'
         workflowCommitOid = $integrity.sourceCommit
         workflowSha256 = $integrity.workflow.sha256
+        schema15Sha256 = if ($sourceReceipt) { $integrity.schema15.sha256 } else { $null }
         reviewBaselineSha256 = $integrity.reviewBaseline.sha256
         createdAt = Get-UtcTimestamp
         waitingReason = $null
@@ -676,13 +1004,15 @@ function Invoke-Claim {
         modLockKey = $lockKey
         canonicalModRelativePath = $modRelativePath
         plannedStatePath = [IO.Path]::GetFullPath($actualStatePath)
+        sourceReceipt = $sourceReceipt
         archive = [ordered]@{
             filename = [IO.Path]::GetFileName($coordinatorArchive)
             originalPath = $sourceFull
             path = [IO.Path]::GetFullPath($coordinatorArchive)
             size = $sampleTwo.Length
             sha256 = $archiveSha
-            format = 'zip'
+            format = if ($sourceReceipt) { 'zip' } else { 'zip' }
+            preserveOriginal = [bool]$sourceReceipt
         }
     }
     Write-AtomicJson -Path $claimPath -Value $claimRecord
@@ -693,7 +1023,8 @@ function Invoke-Claim {
     $claimedArchive = Join-Path (Join-Path $runRoot 'source') ([IO.Path]::GetFileName($sourceFull))
 
     $state = [ordered]@{
-        schemaVersion = 14
+        schemaVersion = if ($sourceReceipt) { 15 } else { 14 }
+        workflowSchemaVersion = if ($sourceReceipt) { 15 } else { 14 }
         runId = $actualRunId
         status = 'claiming'
         statePath = [IO.Path]::GetFullPath($actualStatePath)
@@ -716,6 +1047,21 @@ function Invoke-Claim {
         baseOid = $baseOid
         checkedMainOid = $baseOid
         metadataPaths = @($MetadataPath)
+        sourceReceipt = $sourceReceipt
+        sourceAcquisition = if ($sourceReceipt) {
+            [ordered]@{
+                recordPath = $sourceAcquisitionRecord.recordPath
+                recordSha256 = $sourceAcquisitionRecord.recordSha256
+                provider = $sourceReceipt.provider
+                sourceRequest = $sourceReceipt.sourceRequest
+                receiptPath = $sourceReceipt.path
+                receiptSha256 = $sourceReceipt.sha256
+                sourceRequestPath = $sourceReceipt.sourceRequestPath
+                sourceRequestSha256 = $sourceReceipt.sourceRequestSha256
+                timings = $sourceReceipt.timings
+            }
+        }
+        else { $null }
         workflowRef = $integrity.sourceRef
         workflowCommitOid = $integrity.sourceCommit
         workflowPath = $integrity.workflow.originalPath
@@ -724,9 +1070,14 @@ function Invoke-Claim {
         reviewBaselinePath = $integrity.reviewBaseline.originalPath
         reviewBaselineBlobOid = $integrity.reviewBaseline.gitBlobOid
         reviewBaselineSha256 = $integrity.reviewBaseline.sha256
+        schema15Path = if ($sourceReceipt) { $integrity.schema15.path } else { $null }
+        schema15BlobOid = if ($sourceReceipt) { $integrity.schema15.gitBlobOid } else { $null }
+        schema15Sha256 = if ($sourceReceipt) { $integrity.schema15.sha256 } else { $null }
         referenceSources = @(
             [ordered]@{ role = 'workflow'; path = $integrity.workflow.originalPath; blobOid = $integrity.workflow.gitBlobOid; sha256 = $integrity.workflow.sha256 },
             [ordered]@{ role = 'review-baseline'; path = $integrity.reviewBaseline.originalPath; blobOid = $integrity.reviewBaseline.gitBlobOid; sha256 = $integrity.reviewBaseline.sha256 }
+        ) + @(
+            if ($sourceReceipt) { [ordered]@{ role = 'schema-15-extension'; path = $integrity.schema15.path; blobOid = $integrity.schema15.gitBlobOid; sha256 = $integrity.schema15.sha256 } }
         )
         archive = [ordered]@{
             filename = [IO.Path]::GetFileName($claimedArchive)
@@ -735,9 +1086,26 @@ function Invoke-Claim {
             size = $sampleTwo.Length
             sha256 = $archiveSha
             format = 'zip'
+            preserveOriginal = [bool]$sourceReceipt
         }
-        completedStages = @()
-        stageTimings = [ordered]@{}
+        completedStages = if ($sourceReceipt) { @('acquire-source') } else { @() }
+        stageTimings = if ($sourceReceipt) {
+            [ordered]@{
+                'acquire-source' = [ordered]@{
+                    attempt = 1
+                    startedAt = $sourceReceipt.startedAt
+                    completedAt = $sourceReceipt.completedAt
+                    activeMilliseconds = [int64]$sourceReceipt.timings.downloadMilliseconds + [int64]$sourceReceipt.timings.verifyMilliseconds + [int64]$sourceReceipt.timings.deliverMilliseconds
+                    waitingMilliseconds = if ($sourceReceipt.timings.Contains('waitingMilliseconds')) { [int64]$sourceReceipt.timings.waitingMilliseconds } else { 0 }
+                    result = 'passed'
+                    artifactSha256 = $sourceReceipt.sha256
+                    downloadMilliseconds = [int64]$sourceReceipt.timings.downloadMilliseconds
+                    verifyMilliseconds = [int64]$sourceReceipt.timings.verifyMilliseconds
+                    deliverMilliseconds = [int64]$sourceReceipt.timings.deliverMilliseconds
+                }
+            }
+        }
+        else { [ordered]@{} }
         lastRecovery = $null
         evidenceChain = [ordered]@{
             c0Oid = $baseOid
@@ -779,7 +1147,8 @@ function Invoke-Claim {
     }
     Ensure-RunWriterLock -State $state
     Write-AtomicJson -Path $state.statePath -Value $state
-    [IO.File]::Move($sourceFull, $coordinatorArchive)
+    if ($sourceReceipt) { [IO.File]::Copy($sourceFull, $coordinatorArchive) }
+    else { [IO.File]::Move($sourceFull, $coordinatorArchive) }
     Complete-IncompleteClaim -State $state
 }
 
@@ -1005,8 +1374,137 @@ function Invoke-ApprovedSpans {
     $result
 }
 
+function Invoke-LocalizationWorkset {
+    param([Collections.IDictionary] $State)
+    $completed = Get-CompletedStageResult -State $State -Name 'localization'
+    if ($completed) { return $completed }
+    $stage = Start-Stage -Name 'localization'
+    Assert-LockOwner -State $State
+    $reviewArtifacts = Join-Path ([string]$State.runRoot) 'review-artifacts'
+    $stagingParent = Join-Path ([string]$State.runRoot) 'staging/localization-workset-input'
+    $stagingModRoot = Join-Path $stagingParent ([string]$State.repoModDirectory)
+    $worksetPath = Join-Path $reviewArtifacts 'localization-workset.json'
+    if (-not (Test-Path -LiteralPath $worksetPath -PathType Leaf)) {
+        if (Test-Path -LiteralPath $stagingModRoot) { throw 'Unexpected pre-existing localization workset staging without a workset.' }
+        Copy-DirectoryBytes -Source ([string]$State.installRoot) -Destination $stagingModRoot
+    }
+    elseif (-not (Test-Path -LiteralPath $stagingModRoot -PathType Container)) {
+        throw 'Localization workset staging is missing during resume.'
+    }
+    $generator = Join-Path $PSScriptRoot 'New-LocalizationWorkset.ps1'
+    $generation = & $generator `
+        -RepositoryRoot ([string]$State.repositoryRoot) `
+        -BaseOid ([string]$State.baseOid) `
+        -ModRelativePath ([string]$State.modRelativePath) `
+        -StagingModPath $stagingModRoot `
+        -OutputPath $worksetPath `
+        -SourceId ([string]$State.modSlug) `
+        -PassThru
+    if ($generation.status -eq 'automation-excluded') {
+        $State.status = 'automation-excluded'
+        $State.waitingReason = [ordered]@{ code = 'localization_entry_is_loader'; message = 'The unique localization entry is a loader and cannot be automated.' }
+        Save-State -State $State
+        return [ordered]@{ result = 'waiting-input'; runId = $State.runId; stage = 'localization-workset'; status = $State.status; statePath = $State.statePath; data = $State.waitingReason }
+    }
+    if ($generation.status -eq 'blocked') { throw "Localization workset generation is blocked: $($generation.reason)" }
+    $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
+    $pending = @($workset.units | Where-Object { $_.action -ceq 'AI_REQUIRED' -and $_.reviewStatus -cne 'approved' })
+    if ($pending.Count -gt 0) {
+        $State.status = 'waiting-input'
+        $State.localizationWorkset = [ordered]@{
+            path = [IO.Path]::GetFullPath($worksetPath)
+            sha256 = Get-FileSha256 -Path $worksetPath
+            immutableContractSha256 = $workset.immutableContractSha256
+            status = 'awaiting-ai-review'
+            pendingUnitIds = @($pending.unitId)
+            counts = $workset.counts
+        }
+        Save-State -State $State
+        return [ordered]@{
+            result = 'waiting-input'
+            runId = $State.runId
+            stage = 'localization-workset'
+            status = $State.status
+            statePath = $State.statePath
+            data = [ordered]@{ worksetPath = $worksetPath; pendingUnitIds = @($pending.unitId); required = 'Review only AI_REQUIRED units, set reviewStatus=approved and suggestedZhTwExpression, then resume localization.' }
+        }
+    }
+    $applier = Join-Path $PSScriptRoot 'Apply-LocalizationWorkset.ps1'
+    $applied = & $applier -WorksetPath $worksetPath -PassThru
+    if ($applied.result -cne 'passed') { throw 'Localization workset apply did not pass.' }
+    $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
+    $stagedLocalization = [IO.Path]::GetFullPath([string]$workset.new.path)
+    $relativeToMod = [IO.Path]::GetRelativePath($stagingModRoot, $stagedLocalization).Replace('\', '/')
+    if ($relativeToMod.StartsWith('../', [StringComparison]::Ordinal) -or [IO.Path]::IsPathRooted($relativeToMod)) { throw 'Applied localization path escapes workset staging.' }
+    $relative = ([string]$State.modRelativePath).TrimEnd('/') + '/' + $relativeToMod
+    $worktreeFile = Assert-ContainedPath -Candidate (Join-Path ([string]$State.worktreePath) $relative) -Root ([string]$State.worktreePath) -Label 'Localization worktree target'
+    if ((Get-FileSha256 -Path $worktreeFile) -cne [string]$workset.new.sha256) { throw 'Raw worktree localization differs from the workset NEW input.' }
+    $rawBytes = [IO.File]::ReadAllBytes($worktreeFile)
+    $rawBlobOid = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.autocrlf=true', 'hash-object', '-w', "--path=$relative", '--', $worktreeFile)).output.Trim()
+    $indexedBytes = Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $rawBlobOid
+    $mergedRawBytes = [IO.File]::ReadAllBytes($stagedLocalization)
+    $mergedBlobOid = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.autocrlf=true', 'hash-object', '-w', "--path=$relative", '--', $stagedLocalization)).output.Trim()
+    $mergedIndexedBytes = Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $mergedBlobOid
+    $localizationRoot = Join-Path ([string]$State.artifactsRoot) 'localization'
+    $safeId = (Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($relative))).Substring(0, 16)
+    $artifactDirectory = Join-Path $localizationRoot $safeId
+    $oldObject = "$($State.baseOid):$([string]$workset.old.path)"
+    Write-ByteFile -Path (Join-Path $artifactDirectory 'old.lua') -Bytes (Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $oldObject)
+    Write-ByteFile -Path (Join-Path $artifactDirectory 'new.lua') -Bytes $rawBytes
+    Write-ByteFile -Path (Join-Path $artifactDirectory 'indexed.lua') -Bytes $indexedBytes
+    Write-ByteFile -Path (Join-Path $artifactDirectory 'merged.lua') -Bytes $mergedRawBytes
+    Write-ByteFile -Path (Join-Path $artifactDirectory 'merged-indexed.lua') -Bytes $mergedIndexedBytes
+    $worksetSha = Get-FileSha256 -Path $worksetPath
+    $records = @([ordered]@{
+        relativePath = $relative
+        safeId = $safeId
+        rawSha256 = Get-Sha256Bytes -Bytes $rawBytes
+        indexedSha256 = Get-Sha256Bytes -Bytes $indexedBytes
+        mergedRawSha256 = Get-Sha256Bytes -Bytes $mergedRawBytes
+        mergedSha256 = Get-Sha256Bytes -Bytes $mergedIndexedBytes
+        artifactDirectory = $artifactDirectory
+        decisionsSha256 = $worksetSha
+        worksetPath = [IO.Path]::GetFullPath($worksetPath)
+        worksetUnitCount = @($workset.units).Count
+        worksetEditCount = @($workset.apply.edits).Count
+    })
+    $manifestPath = Join-Path ([string]$State.artifactsRoot) 'localization-manifest.json'
+    Write-AtomicJson -Path $manifestPath -Value ([ordered]@{
+        schemaVersion = 2
+        workflowSchemaVersion = 15
+        mode = 'zh-tw-workset'
+        worksetPath = [IO.Path]::GetFullPath($worksetPath)
+        worksetSha256 = $worksetSha
+        immutableContractSha256 = $workset.immutableContractSha256
+        counts = $workset.counts
+        files = $records
+        removedPaths = @()
+    })
+    $State.localizationMode = 'zh-tw'
+    $State.localizationFiles = $records
+    $State.localizationRemovedPaths = @()
+    $State.evidenceTargetPaths = @($relative)
+    $targetPathJson = ConvertTo-Json -InputObject @($State.evidenceTargetPaths) -Compress
+    $State.evidenceTargetPathsSha256 = Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($targetPathJson))
+    $State.localizationManifestPath = $manifestPath
+    $State.localizationWorkset = [ordered]@{
+        path = [IO.Path]::GetFullPath($worksetPath)
+        sha256 = $worksetSha
+        immutableContractSha256 = $workset.immutableContractSha256
+        status = 'applied'
+        inputSha256 = $workset.apply.inputSha256
+        outputSha256 = $workset.apply.outputSha256
+        counts = $workset.counts
+        unitCount = @($workset.units).Count
+        editCount = @($workset.apply.edits).Count
+    }
+    $State.status = 'localized'
+    Complete-Stage -State $State -Context $stage -ArtifactSha256 (Get-FileSha256 -Path $manifestPath) -Data ([ordered]@{ mode = 'zh-tw-workset'; fileCount = 1; workset = $State.localizationWorkset })
+}
+
 function Invoke-Localization {
     param([Collections.IDictionary] $State)
+    if ([int]$State.schemaVersion -ge 15) { return Invoke-LocalizationWorkset -State $State }
     $completed = Get-CompletedStageResult -State $State -Name 'localization'
     if ($completed) { return $completed }
     $stage = Start-Stage -Name 'localization'
@@ -1240,18 +1738,39 @@ function Invoke-Validate {
     $result = & $validator -StatePath $State.statePath -PassThru
     $State = Read-State -Path $State.statePath
     if ($result.result -ne 'passed') { throw 'Independent Final Candidate Gate rejected the candidate.' }
-    Complete-Stage -State $State -Context $stage -ArtifactSha256 $result.validationReportSha256 -Data ([ordered]@{ validationReportPath = $result.validationReportPath })
+    $completion = Complete-Stage -State $State -Context $stage -ArtifactSha256 $result.validationReportSha256 -Data ([ordered]@{ validationReportPath = $result.validationReportPath })
+    if ([int]$State.schemaVersion -ge 15 -and $State.localizationWorkset -and (Test-Path -LiteralPath ([string]$State.localizationWorkset.path) -PathType Leaf)) {
+        $State.localizationWorkset.deletedBeforePublish = $true
+        $State.localizationWorkset.deletedSha256 = Get-FileSha256 -Path ([string]$State.localizationWorkset.path)
+        [IO.File]::Delete([string]$State.localizationWorkset.path)
+        Save-State -State $State
+    }
+    $completion
 }
 
 function Get-PrBody {
     param([Collections.IDictionary] $State)
     $localizationIds = @($State.localizationFiles | ForEach-Object { $_.safeId }) -join ', '
     if ([string]::IsNullOrWhiteSpace($localizationIds)) { $localizationIds = 'not-applicable' }
-    $localizationEvidence = @($State.localizationFiles | ForEach-Object { "$($_.safeId): raw=$($_.rawSha256), indexed=$($_.indexedSha256), merged=$($_.mergedSha256), approved-spans=$(@($_.approvedSpans).Count)" }) -join '; '
+    if ([int]$State.schemaVersion -ge 15) {
+        $localizationEvidence = @($State.localizationFiles | ForEach-Object { "$($_.safeId): raw=$($_.rawSha256), indexed=$($_.indexedSha256), merged-raw=$($_.mergedRawSha256), merged-indexed=$($_.mergedSha256), workset-edits=$($_.worksetEditCount)" }) -join '; '
+        $approvedSpanCount = [int]$State.localizationWorkset.editCount
+        $unchangedTargetCount = [int]$State.localizationWorkset.counts.unchanged
+        $localizationScope = 'only program-selected zh-tw workset edits; BLOCKED=0'
+        $rows = foreach ($changeType in @('unchanged', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
+            "| $changeType | $($State.localizationWorkset.counts[$changeType]) |"
+        }
+        $localizationTable = "`n| Localization change type | Count |`n| --- | ---: |`n" + ($rows -join "`n")
+    }
+    else {
+        $localizationEvidence = @($State.localizationFiles | ForEach-Object { "$($_.safeId): raw=$($_.rawSha256), indexed=$($_.indexedSha256), merged=$($_.mergedSha256), approved-spans=$(@($_.approvedSpans).Count)" }) -join '; '
+        $approvedSpanCount = @($State.localizationFiles | ForEach-Object { @($_.approvedSpans).Count } | Measure-Object -Sum).Sum
+        if ($null -eq $approvedSpanCount) { $approvedSpanCount = 0 }
+        $unchangedTargetCount = @($State.localizationFiles | Where-Object { @($_.approvedSpans).Count -eq 0 }).Count
+        $localizationScope = 'only approved zh-tw spans; BLOCKED=0'
+        $localizationTable = ''
+    }
     if ([string]::IsNullOrWhiteSpace($localizationEvidence)) { $localizationEvidence = 'not-applicable' }
-    $approvedSpanCount = @($State.localizationFiles | ForEach-Object { @($_.approvedSpans).Count } | Measure-Object -Sum).Sum
-    if ($null -eq $approvedSpanCount) { $approvedSpanCount = 0 }
-    $unchangedTargetCount = @($State.localizationFiles | Where-Object { @($_.approvedSpans).Count -eq 0 }).Count
     $removedTargetCount = if ($State.Contains('localizationRemovedPaths')) { @($State.localizationRemovedPaths).Count } else { 0 }
     @"
 ## Darktide MOD update evidence
@@ -1282,10 +1801,12 @@ function Get-PrBody {
 - Localization mode/ids: $($State.localizationMode) / $localizationIds
 - Localization raw/indexed/merged evidence: $localizationEvidence
 - Localization target/approved-span/unchanged/removed/BLOCKED counts: $(@($State.evidenceTargetPaths).Count) / $approvedSpanCount / $unchangedTargetCount / $removedTargetCount / 0
-- Localization scope: only approved zh-tw spans; BLOCKED=0
+- Localization scope: $localizationScope
 - Archive filename/SHA-256: $($State.archive.filename) / $($State.archive.sha256)
+- Source receipt SHA-256: $(if ($State.Contains('sourceReceipt') -and $State.sourceReceipt) { $State.sourceReceipt.sha256 } else { 'not-applicable' })
 - Security overrides: $(@($State.securityOverrides) -join ', ')
 - External review: $($State.externalReview.status)
+$localizationTable
 "@
 }
 
@@ -1472,7 +1993,10 @@ function Invoke-StageCommand {
 $writerLease = $null
 $activeStatePath = $null
 try {
-    $result = if ($Command -eq 'claim') {
+    $result = if ($Command -eq 'acquire-source') {
+        Invoke-AcquireSource
+    }
+    elseif ($Command -eq 'claim') {
         if ($StatePath -and (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
             $state = Read-State -Path $StatePath
             Ensure-RunWriterLock -State $state
@@ -1480,29 +2004,47 @@ try {
         Invoke-Claim
     }
     elseif ($Command -eq 'run') {
-        $state = if ($StatePath -and (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
-            Read-State -Path $StatePath
+        $acquisitionResult = $null
+        if ((-not $StatePath -or -not (Test-Path -LiteralPath $StatePath -PathType Leaf)) -and
+            [string]::IsNullOrWhiteSpace($ArchivePath) -and
+            -not [string]::IsNullOrWhiteSpace($SourceRequestPath)) {
+            $acquisitionResult = Invoke-AcquireSource
+            if ($acquisitionResult.status -eq 'delivered') {
+                $ArchivePath = [string]$acquisitionResult.deliveredPath
+                $SourceReceiptPath = [string]$acquisitionResult.receiptPath
+                $SourceRequestPath = [string]$acquisitionResult.sourceRequestPath
+                $RunId = [string]$acquisitionResult.runId
+            }
+        }
+        if ($acquisitionResult -and $acquisitionResult.status -ne 'delivered') {
+            $acquisitionResult
         }
         else {
-            $claimResult = Invoke-Claim
-            Read-State -Path $claimResult.statePath
-        }
-        Ensure-RunWriterLock -State $state
-        $state = Read-State -Path $state.statePath
-        $last = $null
-        foreach ($stageName in @('verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot')) {
-            if ($stageName -eq 'review-snapshot' -and [string]::IsNullOrWhiteSpace($LocalReviewPath) -and @($state.completedStages) -notcontains 'review-snapshot') {
-                $last = [ordered]@{
-                    result = 'waiting-input'; runId = $state.runId; stage = 'local-review'; status = $state.status; statePath = $state.statePath
-                    data = [ordered]@{ required = 'Expand and read the packaged Review Baseline, review the current F, then resume run with -LocalReviewPath.'; headOid = $state.evidenceChain.fOid; candidateGateSha256 = $state.candidateGate.validationReportSha256 }
-                }
-                break
+            $state = if ($StatePath -and (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
+                Read-State -Path $StatePath
             }
-            $last = Invoke-StageCommand -StageName $stageName -State $state
+            else {
+                $claimResult = Invoke-Claim
+                Read-State -Path $claimResult.statePath
+            }
+            Ensure-RunWriterLock -State $state
             $state = Read-State -Path $state.statePath
-            if ($state.status -eq $Until) { break }
+            $last = $null
+            foreach ($stageName in @('verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot')) {
+                if ($stageName -eq 'review-snapshot' -and [string]::IsNullOrWhiteSpace($LocalReviewPath) -and @($state.completedStages) -notcontains 'review-snapshot') {
+                    $last = [ordered]@{
+                        result = 'waiting-input'; runId = $state.runId; stage = 'local-review'; status = $state.status; statePath = $state.statePath
+                        data = [ordered]@{ required = 'Expand and read the packaged Review Baseline, review the current F, then resume run with -LocalReviewPath.'; headOid = $state.evidenceChain.fOid; candidateGateSha256 = $state.candidateGate.validationReportSha256 }
+                    }
+                    break
+                }
+                $last = Invoke-StageCommand -StageName $stageName -State $state
+                $state = Read-State -Path $state.statePath
+                if ($last.result -eq 'waiting-input' -or $state.status -in @('waiting-input', 'waiting-user', 'waiting-system', 'automation-excluded')) { break }
+                if (($Until -eq 'source-verified' -and $stageName -eq 'verify-source') -or $state.status -eq $Until) { break }
+            }
+            $last
         }
-        $last
     }
     else {
         $state = Resolve-InitialState

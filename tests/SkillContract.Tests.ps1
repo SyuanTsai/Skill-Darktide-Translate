@@ -6,7 +6,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
 
     # Scenario: A new run loads the packaged Skill entrypoint.
     # Purpose: Ensure discovery is precise and every normative reference is explicitly routed.
-    It 'UnitT10_RoutesSchema14ExecutionAndReviewReferences' {
+    It 'UnitT10_RoutesSchema14BaseAndSchema15ExtensionReferences' {
         $skillPath = Join-Path $skillRoot 'SKILL.md'
         Test-Path -LiteralPath $skillPath | Should -Be $true
         $skill = Get-Content -LiteralPath $skillPath -Raw
@@ -15,6 +15,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $skill | Should -Match 'references/package-binding\.md'
         $skill | Should -Match 'assets/workflow-schema-14\.md\.gz'
         $skill | Should -Match 'assets/review-baseline\.md\.gz'
+        $skill | Should -Match 'references/schema-15\.md'
         $skill | Should -Match 'scripts/Expand-Schema14Reference\.ps1'
         $skill | Should -Match 'scripts/Test-ReferenceIntegrity\.ps1'
     }
@@ -29,6 +30,8 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $result.result | Should -Be 'passed'
         $result.workflow.sha256 | Should -Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
         $result.reviewBaseline.sha256 | Should -Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
+        $result.schema15.sha256 | Should -Be 'ee06b79cdb46003807f88a551e7b59bdc2040310a4e6bc0206a108a0de70d262'
+        $result.schema15.path | Should -Be '.agents/skills/auto-update-darktide-mod/references/schema-15.md'
         $result.workflow.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz'
         $result.reviewBaseline.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz'
         $result.workflow.packagedPath | Should -Be 'assets/workflow-schema-14.md.gz'
@@ -54,6 +57,17 @@ Describe 'Auto Update Darktide MOD Skill contract' {
 
         $fixtureValidator = Join-Path $fixtureRoot 'scripts/Test-ReferenceIntegrity.ps1'
         { & $fixtureValidator -PassThru } | Should -Throw '*source Git blob OID mismatch*'
+    }
+
+    # Scenario: The installed Schema 15 extension bytes drift from their local provenance record.
+    # Purpose: Prevent new automatic-source runs from starting under an unverified extension contract.
+    It 'UnitT23_RejectsTamperedSchema15ExtensionBytes' {
+        $fixtureRoot = Join-Path $TestDrive 'tampered-schema-15'
+        Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
+        Add-Content -LiteralPath (Join-Path $fixtureRoot 'references/schema-15.md') -Value "`ntampered"
+
+        { & (Join-Path $fixtureRoot 'scripts/Test-ReferenceIntegrity.ps1') -PassThru } |
+            Should -Throw '*Schema 15 reference size mismatch*'
     }
 
     # Scenario: A run loads each normative Schema 14 document only when its stage needs it.

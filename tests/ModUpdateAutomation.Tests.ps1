@@ -12,6 +12,9 @@ Describe 'Deterministic Darktide MOD update automation' {
         Test-Path -LiteralPath $runnerPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath $validatorPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath (Join-Path $skillRoot 'references/automation.md') -PathType Leaf | Should -Be $true
+        foreach ($script in @('Receive-NexusMainFile.ps1', 'Test-SourceReceipt.ps1', 'Invoke-ModUpdateQueue.ps1', 'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1')) {
+            Test-Path -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') $script) -PathType Leaf | Should -Be $true
+        }
 
         $skill = Get-Content -LiteralPath (Join-Path $skillRoot 'SKILL.md') -Raw
         $skill | Should -Match 'scripts/mod-update\.ps1'
@@ -23,7 +26,7 @@ Describe 'Deterministic Darktide MOD update automation' {
     # Purpose: Preserve the fixed command surface, structured JSON, timing, state, and idempotency contracts.
     It 'UnitT110_DeclaresTheFixedResumableStageContract' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
-        foreach ($stage in @('claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'run')) {
+        foreach ($stage in @('acquire-source', 'claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'run')) {
             $runner | Should -Match ([regex]::Escape("'$stage'"))
         }
 
@@ -179,7 +182,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match "(?s)\$stageName -eq 'review-snapshot'.*?completedStages.*?-notcontains 'review-snapshot'"
         $runner | Should -Match '(?s)if \(\$completed\).*?Assert-PublishedPrAtF -State \$State.*?\$State\.status = ''awaiting-user-merge''.*?Save-State -State \$State'
         $baseResolutionIndex = $runner.IndexOf('$baseOid = (Invoke-Git -WorkingDirectory $repository')
-        $identityLockIndex = $runner.IndexOf("try { New-Item -ItemType Directory -Path `$modLockPath")
+        $identityLockIndex = $runner.IndexOf('Enter-ModReservation -Plan $plan', $baseResolutionIndex)
         $baseResolutionIndex | Should -BeGreaterOrEqual 0
         $identityLockIndex | Should -BeGreaterThan $baseResolutionIndex
     }
