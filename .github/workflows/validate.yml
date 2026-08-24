@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: ./tests/Invoke-Tests.ps1
 
-      - name: Validate packaged Schema 14 references
+      - name: Validate packaged Schema 14 and Schema 15 references
         shell: pwsh
         run: ./.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1
 

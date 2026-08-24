@@ -1,0 +1,132 @@
+# Schema 15 automatic source and localization workset extension
+
+This reference is normative for new Schema 15 runs. It extends the packaged Schema 14 Workflow; every Schema 14 safety, Git evidence, Candidate Gate, Review, publication, and recovery requirement remains in force unless this document explicitly replaces that behavior.
+
+Existing Schema 14 states remain pinned to their recorded Skill source tuple. Never migrate or reinterpret them as Schema 15.
+
+## Source identity
+
+A Schema 15 source request is unique only when all of these values are present:
+
+- Nexus game domain
+- Nexus MOD ID
+- Nexus Main file ID
+- Main file version
+- expected filename
+- canonical Nexus page URL
+
+Do not use an older file, alternate file, mirror, or filename-only match when the tuple cannot be proven. An official SHA-256 may strengthen the tuple but does not replace the Main file ID and version.
+
+## Acquisition ordering
+
+The fixed ordering is:
+
+1. validate the source request and known archive extension;
+2. reserve the canonical MOD identity for one run ID;
+3. create the run-local `.incoming-<run-id>` directory;
+4. acquire through the API provider or an existing signed-in browser session;
+5. ignore partial files and observe size and mtime twice;
+6. identify the archive from magic bytes;
+7. compute SHA-256 and compare the immutable source tuple and official hash when present;
+8. write an immutable receipt;
+9. atomically deliver the verified source;
+10. independently verify the receipt before claim or worktree creation.
+
+The incoming, verified, claimed, and run-owned source paths are distinct. Never overwrite an existing queue, claim, incoming, verified, or run source. Preserve the verified source referenced by the receipt after claim.
+
+## Providers and credentials
+
+Prefer an allowed Nexus API flow. Keep endpoint-specific behavior behind the provider boundary because official file APIs and entitlements may change independently of the runner.
+
+API keys and ephemeral signed download URLs come only from environment variables or an approved secret provider. Never accept credentials as persisted request fields, print them, put them in state, or include URL query, fragment, or user information in a receipt.
+
+The browser provider consumes only a file produced by an existing signed-in session. It never enters a password, API key, OTP, or payment data and never bypasses CAPTCHA, terms, permissions, rate limits, or download protection.
+
+Use `waiting-user` only for login, OTP, CAPTCHA, terms, permissions, or a known unsupported archive requiring user action. Use `waiting-system` for partial downloads, instability, unavailable ephemeral URLs, rate limiting, or retryable network state. A source identity or hash mismatch is blocked, not `waiting-user`.
+
+## Archive boundary
+
+The first release accepts ZIP only.
+
+- A known RAR or 7z filename stops before download with `unsupported_archive_format`.
+- `.part` and `.crdownload` files never enter verification.
+- ZIP, RAR, and 7z are identified by signature bytes, not extension alone.
+- RAR, 7z, or unknown bytes detected after download remain in incoming with their receipt and never reach claim, extraction, or installation.
+
+The receipt records request identity, provider, sanitized source URL, filename, size, SHA-256, archive format, official-hash result, two stability observations, timestamps, delivered path, and separate download, wait, verify, and delivery timings.
+
+## Concurrency and recovery
+
+At most four distinct canonical MOD identities may acquire concurrently. The same canonical MOD has one reservation and writer. Waiting workers release their execution slot but retain their exact run reservation.
+
+Every resume uses the same run ID, source request hash, receipt hash, MOD lock owner, Skill source pin, base OID, and paths. A changed tuple stops. A crash after receipt creation or source delivery reattaches only when the preserved bytes and receipt still pass independent verification.
+
+## Localization eligibility
+
+Discover exactly one `*_localization.lua` below the canonical MOD boundary at the fixed base OID and exactly one physical NEW file below run-local staging. Check containment and every path component for symlinks or reparse points.
+
+A localization entry containing only `mod:io_dofile` loader routing is `AUTOMATION_EXCLUDED: localization_entry_is_loader`. Determine this before starting a production update branch whenever eligibility metadata is available. Do not combine its referenced files into a synthetic localization source.
+
+Inventory counts are acceptance observations, not constants. Recompute them from the pinned base OID.
+
+## Static Lua scanner
+
+Never execute Lua. The scanner is lexical and structural only. It must tolerate comments, quoted and long strings, escaped characters, bracketed language keys, same-line fields, a final field without a comma, nested tables, multiline expressions, concatenation, function calls, table expressions, and dynamic keys.
+
+Each localization unit has the stable identity:
+
+`source_id :: container_path :: key :: occurrence`
+
+Duplicate keys remain separate occurrences. Expressions retain their raw bytes and source spans. Canonical token sequences are used only for conservative comparison; a comparison that cannot be proven safe becomes `BLOCKED` or `AI_REQUIRED`, never an automatic rewrite.
+
+## Single localization workset
+
+`New-LocalizationWorkset.ps1` reads OLD bytes from `base_oid` with Git object access and NEW bytes from physical staging. It writes exactly:
+
+`AI Auto Update/In Progress/<slug>-<run-short>/review-artifacts/localization-workset.json`
+
+The write is atomic. Repeating generation for the same base/source hashes reuses the existing workset so approved decisions are not overwritten. A different tuple is rejected.
+
+The deterministic classifications and actions are:
+
+| Change type | Action |
+| --- | --- |
+| `unchanged` | `NONE` |
+| `missing_zh_tw` | `AI_REQUIRED` |
+| `zh_tw_only_changed` | `RESTORE_OLD_ZH_TW` |
+| `source_changed_translation_unchanged` | `AI_REQUIRED` |
+| `source_and_translation_changed` | `AI_REQUIRED` |
+| `new_key` | `AI_REQUIRED` |
+| `deleted_key` | `ACCEPT_REMOVAL` |
+| `blocked` | `BLOCKED` |
+
+When English/source structure is unchanged, upstream zh-tw drift is reverted to OLD. If OLD has no zh-tw and NEW adds it, remove the NEW field. These decisions are deterministic and are not sent to AI.
+
+An active unit whose OLD and NEW entries both lack zh-tw is `missing_zh_tw`; it remains an explicit translation target and cannot silently pass as unchanged.
+
+AI receives only `AI_REQUIRED` units and may set only `reviewStatus` and `suggestedZhTwExpression` for the same unit ID. Non-AI units must retain `reviewStatus=not-required` and a null suggestion. AI never chooses byte spans, actions, insertion points, or fields outside zh-tw. The generator records `immutableContractSha256` over every workset input, classification, and action except those two AI fields; generation resume, apply, and the independent Candidate Gate recompute it and reject any other workset mutation.
+
+## Workset apply
+
+`Apply-LocalizationWorkset.ps1` validates the entire NEW SHA-256 before applying anything. It derives INSERT, REPLACE, or REMOVE edits, validates every approved expression as one Lua field value, applies non-overlapping edits from highest byte offset to lowest, and preserves UTF-8 BOM and newline style.
+
+After apply, reparse the result. Every unit identity and non-zh-tw source expression must equal NEW. Bind all review fields into `reviewContractSha256`, then record each edit's original SHA-256, replacement bytes, replacement SHA-256, unit ID, and operation. The independent Candidate Gate does not trust that mutable receipt: it recomputes the review contract and exact edit plan from the immutable workset units and raw NEW bytes, compares every receipt field, reconstructs merged bytes, and proves that bytes outside the recomputed edits did not change.
+
+## Git evidence and Candidate Gate
+
+The existing C0/C1/C2/C3/F boundaries remain normative:
+
+- C1 contains upstream non-localization bytes.
+- C2 checkpoints raw upstream localization bytes.
+- C3 contains only program-selected zh-tw workset edits.
+- F adds only allowlisted metadata after C3 when required.
+
+The independent Candidate Gate revalidates the source request, preserved receipt source, claimed archive, workset SHA-256, classification permissions, edit spans, raw and merged artifacts, Git-normalized blobs, C0/C1/C2/C3/F trees, manifests, and target paths.
+
+The PR body contains a deterministic classification-count table and receipt/workset hashes. Delete `localization-workset.json` after a passed Candidate Gate and before publication. Preserve its SHA-256, counts, edit count, validation result, and deletion evidence in state and the Gate report. The workset must never be added to Git.
+
+## Publication and rollback
+
+Schema 15 does not authorize push, PR mutation, merge, destructive cleanup, credential entry, or security overrides. Existing authorization boundaries remain unchanged.
+
+Before publication, rollback retains the receipt, verified source, workset evidence hash, run reservation, rejected artifacts, worktree, and branch until the exact run is explicitly abandoned. After publication, rollback remains append-only. Restoring Skill 0.2.x resumes only Schema 14 states; it cannot resume a Schema 15 state.

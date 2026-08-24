@@ -4,6 +4,8 @@ Describe 'Deterministic Darktide MOD update automation' {
         $skillRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod'
         $runnerPath = Join-Path $skillRoot 'scripts/mod-update.ps1'
         $validatorPath = Join-Path $skillRoot 'scripts/Test-ModUpdateCandidate.ps1'
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:skillSourcePinPath = New-TestSkillSourcePin -SkillRoot $skillRoot -OutputPath (Join-Path $TestDrive 'skill-source-pin.json')
     }
 
     # Scenario: An agent selects the Skill for an archive-backed MOD update or recovery.
@@ -12,6 +14,9 @@ Describe 'Deterministic Darktide MOD update automation' {
         Test-Path -LiteralPath $runnerPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath $validatorPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath (Join-Path $skillRoot 'references/automation.md') -PathType Leaf | Should -Be $true
+        foreach ($script in @('Receive-NexusMainFile.ps1', 'Test-SourceReceipt.ps1', 'Invoke-ModUpdateQueue.ps1', 'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1')) {
+            Test-Path -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') $script) -PathType Leaf | Should -Be $true
+        }
 
         $skill = Get-Content -LiteralPath (Join-Path $skillRoot 'SKILL.md') -Raw
         $skill | Should -Match 'scripts/mod-update\.ps1'
@@ -19,11 +24,23 @@ Describe 'Deterministic Darktide MOD update automation' {
         $skill | Should -Match 'references/automation\.md'
     }
 
+    # Scenario: The fixed automation package is loaded into a PowerShell session that relies on built-in automatic variables.
+    # Purpose: Prevent local assignments from shadowing PowerShell's pipeline-input and regex-match automatic variables.
+    It 'UnitT105_AvoidsAssignmentsToInputAndMatchesAutomaticVariables' {
+        $scriptFiles = Get-ChildItem -LiteralPath (Join-Path $skillRoot 'scripts') -File |
+            Where-Object { $_.Extension -in @('.ps1', '.psm1') }
+
+        foreach ($scriptFile in $scriptFiles) {
+            $scriptContent = Get-Content -LiteralPath $scriptFile.FullName -Raw
+            $scriptContent | Should -Not -Match '(?im)^\s*\$(?:input|matches)\s*=' -Because $scriptFile.Name
+        }
+    }
+
     # Scenario: A caller invokes a single stage or resumes the same run.
     # Purpose: Preserve the fixed command surface, structured JSON, timing, state, and idempotency contracts.
     It 'UnitT110_DeclaresTheFixedResumableStageContract' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
-        foreach ($stage in @('claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'run')) {
+        foreach ($stage in @('acquire-source', 'claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'run')) {
             $runner | Should -Match ([regex]::Escape("'$stage'"))
         }
 
@@ -111,6 +128,45 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
     }
 
+    # Scenario: The installed MOD tree is swapped for a junction after localization but before C1/C2/C3 or Candidate validation.
+    # Purpose: Recheck the complete physical MOD tree at both boundaries so Git staging, merged localization writes, and Gate reads cannot escape the worktree.
+    It 'UnitT145_RechecksThePhysicalInstallTreeBeforeCommitsAndCandidateReads' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+
+        $runner | Should -Match 'function Assert-NoReparseTree'
+        $runner | Should -Match '(?s)function Invoke-BuildCommits.*?Assert-NoReparseTree -Path \(\[string\]\$State\.installRoot\) -Root \$worktree -Label ''Installed MOD tree before evidence commits''.*?Write-ByteFile -Path \$destination'
+        $runner | Should -Match '(?s)\$destination = Assert-ContainedPath.*?Assert-NoReparsePath -Path \$destination -Root \$worktree -Label ''Merged localization target''.*?Write-ByteFile -Path \$destination'
+        $validator | Should -Match 'function Assert-NoReparseTree'
+        $validator | Should -Match "Add-ValidationCheck -Name 'physical-install-tree'"
+        $validator | Should -Match 'Assert-NoReparsePath -Path \$targetPath -Root \$worktree -Label ''Worktree localization target'''
+    }
+
+    # Scenario: The installed MOD root or its immutable workset staging is swapped for a junction before localization generation.
+    # Purpose: Reject physical tree indirection before copying or enumerating localization input so outside-worktree bytes cannot become authorized upstream evidence.
+    It 'UnitT146_RechecksPhysicalTreesBeforeLocalizationWorksetGeneration' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+
+        $runner | Should -Match '(?s)function Invoke-LocalizationWorkset.*?Assert-NoReparseTree -Path \(\[string\]\$State\.installRoot\) -Root \(\[string\]\$State\.worktreePath\) -Label ''Installed MOD tree before localization workset staging''.*?Copy-DirectoryBytes -Source \(\[string\]\$State\.installRoot\) -Destination \$stagingModRoot'
+        $runner | Should -Match '(?s)Copy-DirectoryBytes -Source \(\[string\]\$State\.installRoot\) -Destination \$stagingModRoot.*?Assert-NoReparseTree -Path \$stagingModRoot -Root \(\[string\]\$State\.runRoot\) -Label ''Localization workset staging tree''.*?& \$generator'
+    }
+
+    # Scenario: The installed MOD root is swapped for a junction while localization waits for AI review and the same stage later resumes.
+    # Purpose: Reject physical path indirection before reading the raw worktree localization input on resume.
+    It 'UnitT147_RechecksTheRawLocalizationPathBeforeResumeReads' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+
+        $runner | Should -Match '(?s)\$worktreeFile = Assert-ContainedPath.*?\$worktreeFile = Assert-NoReparsePath -Path \$worktreeFile -Root \(\[string\]\$State\.worktreePath\) -Label ''Raw worktree localization input''.*?Get-FileSha256 -Path \$worktreeFile.*?ReadAllBytes\(\$worktreeFile\)'
+    }
+
+    # Scenario: The completed extraction tree is swapped for a junction before install resumes.
+    # Purpose: Reject physical tree indirection before directory enumeration so archive files cannot be omitted or sourced outside run-owned staging.
+    It 'UnitT148_RechecksThePhysicalExtractionTreeBeforeInstall' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+
+        $runner | Should -Match '(?s)function Invoke-Install.*?Assert-NoReparseTree -Path \$source -Root \(\[string\]\$State\.runRoot\) -Label ''Verified extracted MOD tree before install''.*?Copy-DirectoryBytes -Source \$source -Destination \$target'
+    }
+
     # Scenario: Validation fails after a candidate is generated.
     # Purpose: Keep validation independent from generation and reject mismatched manifests, byte spans, Git evidence, or artifact hashes.
     It 'UnitT150_KeepsTheCandidateGateIndependentAndFailClosed' {
@@ -126,6 +182,10 @@ Describe 'Deterministic Darktide MOD update automation' {
         $validator | Should -Match 'function Assert-ClaimedArchiveIntegrity'
         $validator | Should -Match "Add-ReviewCheck -Name 'claimed-archive'"
         $validator | Should -Match "Add-ValidationCheck -Name 'claimed-archive'"
+        $validator | Should -Match 'Assert-NoReparsePath -Path \$archivePath -Root \(\[string\]\$State\.repositoryRoot\) -Label ''Claimed source archive'''
+        $validator | Should -Match 'Join-Path \(Join-Path \(\[string\]\$State\.runRoot\) ''source''\) \(\[string\]\$Archive\.filename\)'
+        $validator | Should -Match 'Assert-ClaimedArchiveIntegrity -State \$state'
+        $validator | Should -Match "Deleted localization workset parent"
         $validator | Should -Not -Match 'Test-ManifestAgainstDirectory'
         $validator | Should -Match 'sha256'
         $validator | Should -Match 'exit 1'
@@ -179,7 +239,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match "(?s)\$stageName -eq 'review-snapshot'.*?completedStages.*?-notcontains 'review-snapshot'"
         $runner | Should -Match '(?s)if \(\$completed\).*?Assert-PublishedPrAtF -State \$State.*?\$State\.status = ''awaiting-user-merge''.*?Save-State -State \$State'
         $baseResolutionIndex = $runner.IndexOf('$baseOid = (Invoke-Git -WorkingDirectory $repository')
-        $identityLockIndex = $runner.IndexOf("try { New-Item -ItemType Directory -Path `$modLockPath")
+        $identityLockIndex = $runner.IndexOf('Enter-ModReservation -Plan $plan', $baseResolutionIndex)
         $baseResolutionIndex | Should -BeGreaterOrEqual 0
         $identityLockIndex | Should -BeGreaterThan $baseResolutionIndex
     }
@@ -249,14 +309,14 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
         finally { $archive.Dispose(); $archiveStream.Dispose() }
 
-        $claim = & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $archivePath -ModDirectory 'ExampleMod' -BaseRef HEAD -PassThru
+        $claim = & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $archivePath -ModDirectory 'ExampleMod' -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD -PassThru
         $claim.result | Should -Be 'passed'
         $statePath = $claim.statePath
 
         $claimedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         $secondArchivePath = Join-Path $queueRoot 'ExampleMod-second.zip'
         [IO.File]::Copy($claimedState.archive.path, $secondArchivePath)
-        { & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $secondArchivePath -ModDirectory 'ExampleMod' -BaseRef HEAD -PassThru } |
+        { & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $secondArchivePath -ModDirectory 'ExampleMod' -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD -PassThru } |
             Should -Throw '*already owns this canonical MOD identity*'
         Test-Path -LiteralPath $secondArchivePath -PathType Leaf | Should -Be $true
         [IO.File]::Delete($secondArchivePath)
@@ -309,6 +369,29 @@ Describe 'Deterministic Darktide MOD update automation' {
         New-Item -ItemType Directory -Path $partialExtraction -Force | Out-Null
         [IO.File]::WriteAllText((Join-Path $partialExtraction 'partial.txt'), 'crash residue', [Text.UTF8Encoding]::new($false))
         (& $runnerPath extract -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
+
+        $preInstallState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $worktreeModRoot = Join-Path ([string]$preInstallState.worktreePath) 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $outsideInstallTarget = Join-Path $TestDrive 'install-junction-target'
+        Move-Item -LiteralPath $worktreeModRoot -Destination $outsideInstallTarget
+        New-Item -ItemType Junction -Path $worktreeModRoot -Target $outsideInstallTarget | Out-Null
+        try {
+            { & $runnerPath install -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+                Should -Throw '*reparse*'
+            Test-Path -LiteralPath (Join-Path $outsideInstallTarget 'upstream.txt') -PathType Leaf | Should -Be $true
+        }
+        finally {
+            if (Test-Path -LiteralPath $worktreeModRoot) {
+                $installedItem = Get-Item -LiteralPath $worktreeModRoot -Force
+                if ($installedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    Remove-Item -LiteralPath $worktreeModRoot -Force
+                }
+                else {
+                    Remove-Item -LiteralPath $worktreeModRoot -Recurse -Force
+                }
+            }
+            Move-Item -LiteralPath $outsideInstallTarget -Destination $worktreeModRoot
+        }
         (& $runnerPath install -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
 
         $indexedText = $rawText.Replace("`r`n", "`n")
@@ -455,9 +538,13 @@ Describe 'Deterministic Darktide MOD update automation' {
     # Scenario: A claimed ZIP uses a traversal path even though its state and identity lock otherwise match.
     # Purpose: Execute the hostile archive boundary and prove verification fails before extraction.
     It 'InterT210_RejectsArchivePathTraversalBeforeExtraction' {
-        $runRoot = Join-Path $TestDrive 'hostile-run'
+        $runId = [guid]::NewGuid().ToString()
+        $short = $runId.Replace('-', '').Substring(0, 8)
+        $runRoot = Join-Path $TestDrive "AI Auto Update/In Progress/examplemod-$short"
         $artifactsRoot = Join-Path $runRoot 'artifacts'
-        $lockPath = Join-Path $runRoot 'lock'
+        $modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $lockKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))).ToLowerInvariant()
+        $lockPath = Join-Path $TestDrive "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
         New-Item -ItemType Directory -Path $artifactsRoot -Force | Out-Null
         New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
         $archivePath = Join-Path $runRoot 'hostile.zip'
@@ -470,17 +557,18 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
         finally { $archive.Dispose(); $archiveStream.Dispose() }
         $statePath = Join-Path $runRoot 'state.json'
-        $runId = [guid]::NewGuid().ToString()
-        $lockKey = 'a' * 64
         $state = [ordered]@{
             runId = $runId
             statePath = $statePath
+            repositoryRoot = $TestDrive
             status = 'worktree-ready'
             runRoot = $runRoot
             artifactsRoot = $artifactsRoot
             modLockPath = $lockPath
             modLockKey = $lockKey
+            mod = 'ExampleMod'
             repoModDirectory = 'ExampleMod'
+            modRelativePath = $modRelativePath
             archive = [ordered]@{
                 path = $archivePath
                 sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -489,7 +577,10 @@ Describe 'Deterministic Darktide MOD update automation' {
             stageTimings = [ordered]@{}
         }
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
-        $owner = [ordered]@{ runId = $runId; modLockKey = $lockKey; statePath = $statePath }
+        $owner = [ordered]@{
+            runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
+            plannedStatePath = $statePath; statePath = $statePath
+        }
         [IO.File]::WriteAllText((Join-Path $lockPath 'owner.json'), ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 
         { & $runnerPath verify-source -RepositoryRoot $TestDrive -StatePath $statePath -PassThru } |
@@ -502,9 +593,13 @@ Describe 'Deterministic Darktide MOD update automation' {
     # Purpose: Execute identity, link-type, and device-path security blocks before any filesystem extraction.
     It 'InterT220_RejectsInvalidRootSymlinkAndDeviceNameArchives' {
         foreach ($case in @('invalid-root', 'symlink', 'reserved-device')) {
-            $runRoot = Join-Path $TestDrive $case
+            $runId = [guid]::NewGuid().ToString()
+            $short = $runId.Replace('-', '').Substring(0, 8)
+            $runRoot = Join-Path $TestDrive "AI Auto Update/In Progress/examplemod-$short"
             $artifactsRoot = Join-Path $runRoot 'artifacts'
-            $lockPath = Join-Path $runRoot 'lock'
+            $modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+            $lockKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))).ToLowerInvariant()
+            $lockPath = Join-Path $TestDrive "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
             New-Item -ItemType Directory -Path $artifactsRoot -Force | Out-Null
             New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
             $archivePath = Join-Path $runRoot "$case.zip"
@@ -524,16 +619,19 @@ Describe 'Deterministic Darktide MOD update automation' {
             finally { $archive.Dispose(); $archiveStream.Dispose() }
 
             $statePath = Join-Path $runRoot 'state.json'
-            $runId = [guid]::NewGuid().ToString()
-            $lockKey = 'b' * 64
             $state = [ordered]@{
-                runId = $runId; statePath = $statePath; status = 'worktree-ready'; runRoot = $runRoot
-                artifactsRoot = $artifactsRoot; modLockPath = $lockPath; modLockKey = $lockKey; repoModDirectory = 'ExampleMod'
+                runId = $runId; statePath = $statePath; repositoryRoot = $TestDrive; status = 'worktree-ready'; runRoot = $runRoot
+                artifactsRoot = $artifactsRoot; mod = 'ExampleMod'; modLockPath = $lockPath; modLockKey = $lockKey
+                repoModDirectory = 'ExampleMod'; modRelativePath = $modRelativePath
                 archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
                 completedStages = @(); stageTimings = [ordered]@{}
             }
             [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
-            [IO.File]::WriteAllText((Join-Path $lockPath 'owner.json'), ([ordered]@{ runId = $runId; modLockKey = $lockKey; statePath = $statePath } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+            $owner = [ordered]@{
+                runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
+                plannedStatePath = $statePath; statePath = $statePath
+            }
+            [IO.File]::WriteAllText((Join-Path $lockPath 'owner.json'), ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
             $expected = switch ($case) {
                 'invalid-root' { '*Invalid archive root*' }
                 'symlink' { '*symlink rejected*' }
@@ -542,5 +640,97 @@ Describe 'Deterministic Darktide MOD update automation' {
             { & $runnerPath verify-source -RepositoryRoot $TestDrive -StatePath $statePath -PassThru } | Should -Throw $expected
             Test-Path -LiteralPath (Join-Path $runRoot 'staging/extracted') | Should -Be $false
         }
+    }
+
+    # Scenario: A valid-looking state keeps the canonical reservation path string, but that directory is replaced by a junction.
+    # Purpose: Reject the physical reservation boundary before reading or writing owner.json outside the repository.
+    It 'InterT225_RejectsAReparseModReservationBeforeReadingItsOwner' {
+        $repository = Join-Path $TestDrive 'reservation-reparse-repository'
+        $runId = '57575757-6666-4777-8888-999999999999'
+        $modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $lockKeyBytes = [Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant())
+        $lockKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($lockKeyBytes)).ToLowerInvariant()
+        $runRoot = Join-Path $repository 'AI Auto Update/In Progress/examplemod-57575757'
+        $artifactsRoot = Join-Path $runRoot 'artifacts'
+        $lockParent = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod'
+        $lockPath = Join-Path $lockParent "$lockKey.lock"
+        $outside = Join-Path $TestDrive 'reservation-reparse-outside'
+        New-Item -ItemType Directory -Path $artifactsRoot, $lockParent, $outside -Force | Out-Null
+
+        $archivePath = Join-Path $runRoot 'hostile.zip'
+        $archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew)
+        $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $entry = $archive.CreateEntry('ExampleMod/../../escape.lua')
+            $entryStream = $entry.Open()
+            try { $entryStream.WriteByte(65) } finally { $entryStream.Dispose() }
+        }
+        finally { $archive.Dispose(); $archiveStream.Dispose() }
+
+        $statePath = Join-Path $runRoot 'state.json'
+        $state = [ordered]@{
+            schemaVersion = 15; workflowSchemaVersion = 15; runId = $runId; statePath = $statePath
+            repositoryRoot = $repository; status = 'worktree-ready'; runRoot = $runRoot; artifactsRoot = $artifactsRoot
+            mod = 'ExampleMod'; repoModDirectory = 'ExampleMod'; modRelativePath = $modRelativePath
+            modLockPath = $lockPath; modLockKey = $lockKey
+            archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
+            completedStages = @(); stageTimings = [ordered]@{}
+        }
+        [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+        $owner = [ordered]@{
+            runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
+            plannedStatePath = $statePath; statePath = $statePath
+        }
+        $ownerPath = Join-Path $outside 'owner.json'
+        [IO.File]::WriteAllText($ownerPath, ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        $ownerBefore = [IO.File]::ReadAllBytes($ownerPath)
+        New-Item -ItemType Junction -Path $lockPath -Target $outside | Out-Null
+
+        { & $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru } |
+            Should -Throw '*reparse*'
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($ownerPath)) | Should -Be ([Convert]::ToHexString($ownerBefore))
+        Test-Path -LiteralPath (Join-Path $runRoot 'staging/extracted') | Should -Be $false
+    }
+
+    # Scenario: State retains the canonical lock key and owner while changing the MOD path protected by that reservation.
+    # Purpose: Bind every resume to the exact canonical MOD path, fixed run root, and planned state path instead of trusting the lock key alone.
+    It 'InterT226_RejectsAStateThatChangesTheCanonicalReservationTuple' {
+        $repository = Join-Path $TestDrive 'reservation-tuple-repository'
+        $runId = '58585858-6666-4777-8888-999999999999'
+        $modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $lockKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))).ToLowerInvariant()
+        $runRoot = Join-Path $repository 'AI Auto Update/In Progress/examplemod-58585858'
+        $artifactsRoot = Join-Path $runRoot 'artifacts'
+        $lockPath = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
+        New-Item -ItemType Directory -Path $artifactsRoot, $lockPath -Force | Out-Null
+        $archivePath = Join-Path $runRoot 'hostile.zip'
+        $archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew)
+        $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $entry = $archive.CreateEntry('ExampleMod/../../escape.lua')
+            $entryStream = $entry.Open()
+            try { $entryStream.WriteByte(65) } finally { $entryStream.Dispose() }
+        }
+        finally { $archive.Dispose(); $archiveStream.Dispose() }
+
+        $statePath = Join-Path $runRoot 'state.json'
+        $state = [ordered]@{
+            schemaVersion = 15; workflowSchemaVersion = 15; runId = $runId; statePath = $statePath
+            repositoryRoot = $repository; status = 'worktree-ready'; runRoot = $runRoot; artifactsRoot = $artifactsRoot
+            mod = 'ExampleMod'; repoModDirectory = 'ExampleMod'
+            modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/OtherMod'
+            modLockPath = $lockPath; modLockKey = $lockKey
+            archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
+            completedStages = @(); stageTimings = [ordered]@{}
+        }
+        [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+        [ordered]@{
+            runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
+            plannedStatePath = $statePath; statePath = $statePath
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $lockPath 'owner.json') -NoNewline
+
+        { & $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru } |
+            Should -Throw '*canonical reservation tuple*'
+        Test-Path -LiteralPath (Join-Path $runRoot 'staging/extracted') | Should -Be $false
     }
 }

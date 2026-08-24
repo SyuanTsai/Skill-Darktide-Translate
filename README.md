@@ -4,14 +4,14 @@ Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive up
 
 - Stable source ID: `darktide-translate`
 - Catalog: `catalog/skills-catalog.json`
-- Current repository version: `0.2.0`
-- Jira delivery items: `SYP-92` packaging and `SYP-88` deterministic automation under `SYP-86`
+- Current repository version: `0.3.0`
+- Jira delivery items: `SYP-91` automatic Nexus Main-file acquisition and localization worksets, `SYP-92` packaging, and `SYP-88` deterministic automation under `SYP-86`
 
 ## Skill
 
 | Skill | Profile | Purpose | Capability gate |
 | --- | --- | --- | --- |
-| `auto-update-darktide-mod` | `darktide-mod-maintenance` | Execute or resume the Schema 14 archive, localization, Git evidence, Candidate Gate, PR, Review, and finalization workflow. | Windows, PowerShell 7, Git, and either a configured GitHub connector or authenticated `gh` |
+| `auto-update-darktide-mod` | `darktide-mod-maintenance` | Execute or resume manual Schema 14 runs or receipt-bound Schema 15 Nexus Main-file, localization-workset, Git evidence, Candidate Gate, PR, Review, and finalization runs. | Windows, PowerShell 7, Git, and either a configured GitHub connector or authenticated `gh` |
 
 The profile is opt-in because the workflow can mutate isolated branches, publish PRs, and retain per-MOD reservations. Normal user authorization remains required for external writes and security overrides.
 
@@ -22,8 +22,17 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
   SKILL.md
   agents/openai.yaml
   assets/
-  references/
+  references/schema-15.md
+  references/schema-15-provenance.json
   scripts/mod-update.ps1
+  scripts/Receive-NexusMainFile.ps1
+  scripts/Test-SourceReceipt.ps1
+  scripts/Invoke-ModUpdateQueue.ps1
+  scripts/LuaLocalizationScanner.psm1
+  scripts/New-LocalizationWorkset.ps1
+  scripts/Apply-LocalizationWorkset.ps1
+  scripts/Test-LocalizationWorksetReceipt.ps1
+  scripts/Finalize-LocalizationWorksetEvidence.ps1
   scripts/Test-ModUpdateCandidate.ps1
   scripts/Expand-Schema14Reference.ps1
   scripts/Test-ReferenceIntegrity.ps1
@@ -52,10 +61,10 @@ GitHub Actions also runs strict `skill-validator` and `skill-tools` Quality Gate
 
 ## Versioning and rollback
 
-Release and immutable pin rules are in `docs/RELEASE.md`. Consumers roll back by restoring an earlier tag, resolved commit, and deterministic content hash as described in `docs/ROLLBACK.md`. Existing MOD runs never auto-migrate to a newer Workflow revision.
+Release and immutable pin rules are in `docs/RELEASE.md`. Consumers start and roll back runs with the complete JSON emitted by `scripts/Get-SourcePin.ps1`, including the tag/ref, resolved commit, deterministic content hash, and installed Skill file manifest, as described in `docs/ROLLBACK.md`. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
 
 The real Reconnect trial, immutable Git evidence, Gate hashes, Review result, and measured 9-minute-18-second wall-clock run are recorded in [`docs/SYP-88-E2E.md`](docs/SYP-88-E2E.md).
 
 ## Scope
 
-This repository independently owns the packaged Skill, its Schema 14 Workflow and Review references, deterministic stage runner, Candidate Gate, metadata, validation, and release contract. It is not added to the AI-Instructions Catalog, Lock, bootstrap, or fan-out; consumers install and pin it independently.
+This repository independently owns the packaged Skill, its Schema 14 Workflow and Review base, Schema 15 normative extension, source receipt boundary, deterministic localization worksets, stage runner, Candidate Gate, metadata, validation, and release contract. It is not added to the AI-Instructions Catalog, Lock, bootstrap, or fan-out; consumers install and pin it independently.

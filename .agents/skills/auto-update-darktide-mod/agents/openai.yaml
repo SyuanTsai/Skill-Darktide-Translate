@@ -1,4 +1,4 @@
 interface:
   display_name: "Auto Update Darktide MOD"
-  short_description: "Update DARKTIDE MODs with Schema 14 evidence gates"
+  short_description: "Update DARKTIDE MODs with Schema 14/15 evidence gates"
   default_prompt: "Use $auto-update-darktide-mod to process or resume a DARKTIDE MOD update safely."

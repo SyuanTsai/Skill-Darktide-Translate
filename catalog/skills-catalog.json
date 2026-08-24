@@ -10,7 +10,7 @@
   "profiles": [
     {
       "id": "darktide-mod-maintenance",
-      "description": "Opt-in DARKTIDE MOD archive update, zh-tw maintenance, evidence, and PR workflow.",
+      "description": "Opt-in DARKTIDE MOD Nexus acquisition, archive update, zh-tw workset, evidence, and PR workflow.",
       "default": false,
       "includes": [
         "auto-update-darktide-mod"
