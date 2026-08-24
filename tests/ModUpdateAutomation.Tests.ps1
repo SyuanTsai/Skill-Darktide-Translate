@@ -24,6 +24,18 @@ Describe 'Deterministic Darktide MOD update automation' {
         $skill | Should -Match 'references/automation\.md'
     }
 
+    # Scenario: The fixed automation package is loaded into a PowerShell session that relies on built-in automatic variables.
+    # Purpose: Prevent local assignments from shadowing PowerShell's pipeline-input and regex-match automatic variables.
+    It 'UnitT105_AvoidsAssignmentsToInputAndMatchesAutomaticVariables' {
+        $scriptFiles = Get-ChildItem -LiteralPath (Join-Path $skillRoot 'scripts') -File |
+            Where-Object { $_.Extension -in @('.ps1', '.psm1') }
+
+        foreach ($scriptFile in $scriptFiles) {
+            $scriptContent = Get-Content -LiteralPath $scriptFile.FullName -Raw
+            $scriptContent | Should -Not -Match '(?im)^\s*\$(?:input|matches)\s*=' -Because $scriptFile.Name
+        }
+    }
+
     # Scenario: A caller invokes a single stage or resumes the same run.
     # Purpose: Preserve the fixed command surface, structured JSON, timing, state, and idempotency contracts.
     It 'UnitT110_DeclaresTheFixedResumableStageContract' {

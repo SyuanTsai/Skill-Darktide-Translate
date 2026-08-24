@@ -152,9 +152,9 @@ function Write-AtomicBytes {
 
 function Get-SkillSourceFileEntry {
     param([Collections.IDictionary] $SkillSourcePin, [string] $RepositoryPath)
-    $matches = @($SkillSourcePin.files | Where-Object { [string]$_.repositoryPath -ceq $RepositoryPath })
-    if ($matches.Count -ne 1) { throw "Skill source pin does not contain exactly one required file: $RepositoryPath" }
-    $matches[0]
+    $matchingEntries = @($SkillSourcePin.files | Where-Object { [string]$_.repositoryPath -ceq $RepositoryPath })
+    if ($matchingEntries.Count -ne 1) { throw "Skill source pin does not contain exactly one required file: $RepositoryPath" }
+    $matchingEntries[0]
 }
 
 function Get-ModReservationOwnerPath {

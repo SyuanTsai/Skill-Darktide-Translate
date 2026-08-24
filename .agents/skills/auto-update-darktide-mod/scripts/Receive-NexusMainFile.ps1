@@ -273,9 +273,9 @@ function Invoke-ApiDownload {
             return New-WaitingResult -Status 'waiting-user' -Code 'nexus_permission_required' -Message 'Nexus login or download permission requires user action.' -Path $retainedPartialPath
         }
         $response.EnsureSuccessStatusCode()
-        $input = $response.Content.ReadAsStream()
-        $output = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+        $responseStream = $response.Content.ReadAsStream()
+        $outputStream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $responseStream.CopyTo($outputStream) } finally { $outputStream.Dispose(); $responseStream.Dispose() }
         [IO.File]::Move($temporaryPath, $finalPath)
         $finalPath
     }

@@ -207,13 +207,13 @@ function Assert-ReferenceIntegrity {
         else { @('workflow', 'review-baseline', 'package-binding', 'skill') }
     if ($references.Count -ne $expectedRoles.Count) { throw 'Recorded reference_sources count changed.' }
     foreach ($role in $expectedRoles) {
-        $matches = @($references | Where-Object { [string]$_.role -ceq $role })
-        if ($matches.Count -ne 1 -or [string]$matches[0].sourceCommit -cne [string]$State.workflowCommitOid) {
+        $roleReferences = @($references | Where-Object { [string]$_.role -ceq $role })
+        if ($roleReferences.Count -ne 1 -or [string]$roleReferences[0].sourceCommit -cne [string]$State.workflowCommitOid) {
             throw "Recorded reference_sources role is missing, duplicated, or pinned to another commit: $role"
         }
-        $pinEntries = @($integrity.skillSourcePin.files | Where-Object { [string]$_.repositoryPath -ceq [string]$matches[0].path })
-        if ($pinEntries.Count -ne 1 -or [string]$matches[0].blobOid -cne [string]$pinEntries[0].blobOid -or
-            [int64]$matches[0].size -ne [int64]$pinEntries[0].size -or [string]$matches[0].sha256 -cne [string]$pinEntries[0].sha256) {
+        $pinEntries = @($integrity.skillSourcePin.files | Where-Object { [string]$_.repositoryPath -ceq [string]$roleReferences[0].path })
+        if ($pinEntries.Count -ne 1 -or [string]$roleReferences[0].blobOid -cne [string]$pinEntries[0].blobOid -or
+            [int64]$roleReferences[0].size -ne [int64]$pinEntries[0].size -or [string]$roleReferences[0].sha256 -cne [string]$pinEntries[0].sha256) {
             throw "Recorded reference_sources evidence differs from the source pin: $role"
         }
     }
