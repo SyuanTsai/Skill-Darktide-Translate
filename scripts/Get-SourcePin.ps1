@@ -16,6 +16,32 @@ function Invoke-GitText {
     @($output | ForEach-Object { [string] $_ })
 }
 
+function Invoke-GitBytes {
+    param([Parameter(Mandatory = $true)] [string[]] $Arguments)
+
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = 'git'
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in @('-C', $repoRoot) + $Arguments) { $start.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    if (-not $process.Start()) { throw 'Unable to start Git for source-pin blob hashing.' }
+    $memory = [IO.MemoryStream]::new()
+    try {
+        $process.StandardOutput.BaseStream.CopyTo($memory)
+        $errorText = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw "git $($Arguments -join ' ') failed: $errorText" }
+        $memory.ToArray()
+    }
+    finally {
+        $memory.Dispose()
+        $process.Dispose()
+    }
+}
+
 $resolvedCommit = @(Invoke-GitText -Arguments @('rev-parse', "$Ref^{commit}"))[0].Trim()
 if ($resolvedCommit -notmatch '^[0-9a-f]{40}$') {
     throw "Ref '$Ref' did not resolve to a full commit SHA."
@@ -43,11 +69,31 @@ $version = (@(Invoke-GitText -Arguments @('show', "${resolvedCommit}:VERSION")) 
 if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
     throw "VERSION at ref '$Ref' is not SemVer-compatible."
 }
+$skillPath = '.agents/skills/auto-update-darktide-mod'
+$skillFiles = @(
+    foreach ($line in @(Invoke-GitText -Arguments @('ls-tree', '-r', '--full-tree', '-l', $resolvedCommit, '--', $skillPath))) {
+        if ($line -notmatch '^([0-7]{6}) blob ([0-9a-f]{40,64})\s+(\d+)\t(.+)$') {
+            throw "Unable to parse Skill tree entry: $line"
+        }
+        $blobBytes = Invoke-GitBytes -Arguments @('cat-file', 'blob', $Matches[2])
+        if ($blobBytes.LongLength -ne [int64]$Matches[3]) { throw "Skill blob size differs from Git tree entry: $($Matches[4])" }
+        [ordered]@{
+            repositoryPath = $Matches[4]
+            mode = $Matches[1]
+            blobOid = $Matches[2]
+            size = $blobBytes.LongLength
+            sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($blobBytes)).ToLowerInvariant()
+        }
+    }
+)
 [ordered]@{
+    schemaVersion = 1
     sourceId = 'darktide-translate'
     repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
     requestedRef = $Ref
     resolvedCommit = $resolvedCommit
     resolvedVersion = $version
     contentSha256 = $contentSha256
+    skillPath = $skillPath
+    skillFiles = $skillFiles
 } | ConvertTo-Json -Depth 4

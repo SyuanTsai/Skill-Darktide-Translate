@@ -29,14 +29,57 @@ function Get-FileSha256 {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Assert-NoReparsePath {
+    param([string] $Path, [string] $Root, [string] $Label)
+    $rawRoot = [IO.Path]::GetFullPath($Root)
+    $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
+    $pathFull = [IO.Path]::GetFullPath($Path)
+    $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
+    if (-not $pathFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $pathFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label escapes its physical verification root."
+    }
+    $current = $pathFull
+    for ($depth = 0; $depth -lt 2048; $depth++) {
+        if (-not (Test-Path -LiteralPath $current)) { throw "$Label path component is missing." }
+        if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "$Label path contains a symlink or reparse point."
+        }
+        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
+        $parent = Split-Path -Parent $current
+        if ([string]::IsNullOrWhiteSpace($parent)) { throw "Unable to prove $Label physical containment." }
+        $current = $parent
+    }
+    throw "Unable to prove $Label physical containment within 2048 path components."
+}
+
+function Assert-NoReparseTree {
+    param([string] $Path, [string] $Root, [string] $Label)
+    $treeFull = Assert-NoReparsePath -Path $Path -Root $Root -Label $Label
+    if (-not (Test-Path -LiteralPath $treeFull -PathType Container)) { throw "$Label is not a directory." }
+    foreach ($item in @(Get-ChildItem -LiteralPath $treeFull -Recurse -Force)) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "$Label contains a symlink or reparse point."
+        }
+    }
+    $treeFull
+}
+
 function Assert-ClaimedArchiveIntegrity {
-    param([Collections.IDictionary] $Archive)
+    param([Collections.IDictionary] $State)
+    $Archive = $State.archive
     if (-not $Archive -or -not $Archive.Contains('path') -or -not $Archive.Contains('size') -or -not $Archive.Contains('sha256')) {
         throw 'claimed-archive evidence is incomplete.'
     }
     $archivePath = [string]$Archive.path
-    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
-        throw 'claimed-archive file is missing.'
+    $archivePath = Assert-NoReparsePath -Path $archivePath -Root ([string]$State.repositoryRoot) -Label 'Claimed source archive'
+    if ([IO.Path]::GetFileName([string]$Archive.filename) -cne [string]$Archive.filename -or
+        [string]$Archive.filename -match '^\s*$') {
+        throw 'claimed-archive filename is not one safe file name.'
+    }
+    $expectedPath = [IO.Path]::GetFullPath((Join-Path (Join-Path ([string]$State.runRoot) 'source') ([string]$Archive.filename)))
+    if ($archivePath -cne $expectedPath) {
+        throw 'claimed-archive path differs from its fixed run-owned source path.'
     }
     $stream = [IO.File]::Open($archivePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
@@ -63,6 +106,23 @@ function Assert-SourceReceiptIntegrity {
             throw "Schema 15 sourceReceipt.$field is missing."
         }
     }
+    if (-not $State.sourceAcquisition.Contains('skillSourcePinPath') -or -not $State.sourceAcquisition.Contains('skillSourcePinSha256') -or
+        [string]$State.sourceAcquisition.skillSourcePinPath -cne [string]$State.workflowSourcePinPath -or
+        [string]$State.sourceAcquisition.skillSourcePinSha256 -cne [string]$State.workflowSourcePinSha256) {
+        throw 'Schema 15 source acquisition Skill source pin differs from the verified workflow source pin.'
+    }
+    $sourceRunRoot = [IO.Path]::GetFullPath([string]$State.runRoot)
+    $receiptFull = Assert-NoReparsePath -Path ([string]$State.sourceReceipt.path) -Root ([string]$State.repositoryRoot) -Label 'Schema 15 source receipt'
+    $requestFull = Assert-NoReparsePath -Path ([string]$State.sourceReceipt.sourceRequestPath) -Root ([string]$State.repositoryRoot) -Label 'Schema 15 source request'
+    $recordFull = Assert-NoReparsePath -Path ([string]$State.sourceAcquisition.recordPath) -Root ([string]$State.repositoryRoot) -Label 'Schema 15 source acquisition record'
+    if ($receiptFull -cne [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-receipt.json')) -or
+        $requestFull -cne [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-request.json')) -or
+        $recordFull -cne [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-acquisition.json'))) {
+        throw 'Schema 15 source evidence is outside its fixed run-local paths.'
+    }
+    $verifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
+    $verification = & $verifier -ReceiptPath $receiptFull -SourceRequestPath $requestFull -RunRoot $sourceRunRoot -PassThru
+    if ($verification.result -cne 'passed') { throw 'Independent source receipt verifier rejected Schema 15 evidence.' }
     if ((Get-FileSha256 -Path ([string]$State.sourceReceipt.path)) -cne [string]$State.sourceReceipt.sha256) { throw 'Schema 15 source receipt SHA-256 changed.' }
     if ((Get-FileSha256 -Path ([string]$State.sourceReceipt.sourceRequestPath)) -cne [string]$State.sourceReceipt.sourceRequestSha256) { throw 'Schema 15 source request SHA-256 changed.' }
     if ([string]::IsNullOrWhiteSpace([string]$State.sourceAcquisition.recordPath) -or
@@ -76,13 +136,22 @@ function Assert-SourceReceiptIntegrity {
         [string]$acquisition.sourceRequestSha256 -cne [string]$State.sourceReceipt.sourceRequestSha256 -or
         [string]$acquisition.receiptPath -cne [string]$State.sourceReceipt.path -or
         [string]$acquisition.receiptSha256 -cne [string]$State.sourceReceipt.sha256 -or
+        [string]$acquisition.skillSourcePinPath -cne [string]$State.sourceAcquisition.skillSourcePinPath -or
+        [string]$acquisition.skillSourcePinSha256 -cne [string]$State.sourceAcquisition.skillSourcePinSha256 -or
+        [string]$acquisition.skillSourceCommit -cne [string]$State.workflowCommitOid -or
+        [string]$acquisition.skillSourceContentSha256 -cne [string]$State.workflowSourceContentSha256 -or
         [string]$acquisition.result.status -cne 'delivered') {
         throw 'Schema 15 source acquisition record tuple changed.'
     }
-    $verifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
-    $verification = & $verifier -ReceiptPath ([string]$State.sourceReceipt.path) -SourceRequestPath ([string]$State.sourceReceipt.sourceRequestPath) -PassThru
-    if ($verification.result -cne 'passed') { throw 'Independent source receipt verifier rejected Schema 15 evidence.' }
     $receipt = Get-Content -LiteralPath $State.sourceReceipt.path -Raw | ConvertFrom-Json -AsHashtable
+    $expectedAcquisitionResult = [ordered]@{
+        result = 'passed'; status = 'delivered'; deliveredPath = [IO.Path]::GetFullPath([string]$receipt.deliveredPath)
+        receiptPath = $receiptFull; receiptSha256 = [string]$State.sourceReceipt.sha256; timings = $receipt.timings
+    }
+    if (($acquisition.result | ConvertTo-Json -Depth 20 -Compress) -cne
+        ($expectedAcquisitionResult | ConvertTo-Json -Depth 20 -Compress)) {
+        throw 'Schema 15 source acquisition result changed.'
+    }
     if ([string]$receipt.sha256 -cne [string]$State.archive.sha256) { throw 'Preserved delivered source and claimed archive SHA-256 differ.' }
     if ([string]$State.sourceAcquisition.receiptSha256 -cne [string]$State.sourceReceipt.sha256) { throw 'sourceAcquisition receipt binding changed.' }
     if (-not $State.stageTimings.Contains('acquire-source') -or [string]$State.stageTimings['acquire-source'].artifactSha256 -cne [string]$State.sourceReceipt.sha256) {
@@ -93,18 +162,59 @@ function Assert-SourceReceiptIntegrity {
 
 function Assert-ReferenceIntegrity {
     param([Collections.IDictionary] $State)
-    $integrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') -PassThru
-    if ($integrity.result -cne 'passed' -or [string]$integrity.sourceCommit -cne [string]$State.workflowCommitOid) {
-        throw 'Recorded reference source commit no longer matches the verified Skill package.'
+    if (-not $State.Contains('workflowSourcePinPath') -or [string]::IsNullOrWhiteSpace([string]$State.workflowSourcePinPath)) {
+        if ([int]$State.schemaVersion -ne 14) { throw 'Schema 15 state is missing its immutable Skill source pin.' }
+        $legacyIntegrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') -PassThru
+        if ($legacyIntegrity.result -cne 'passed' -or [string]$legacyIntegrity.authoringSourceCommit -cne [string]$State.workflowCommitOid -or
+            [string]$State.workflowPath -cne [string]$legacyIntegrity.workflow.originalPath -or
+            [string]$State.workflowBlobOid -cne [string]$legacyIntegrity.workflow.gitBlobOid -or
+            [string]$State.workflowSha256 -cne [string]$legacyIntegrity.workflow.sha256 -or
+            [string]$State.reviewBaselinePath -cne [string]$legacyIntegrity.reviewBaseline.originalPath -or
+            [string]$State.reviewBaselineBlobOid -cne [string]$legacyIntegrity.reviewBaseline.gitBlobOid -or
+            [string]$State.reviewBaselineSha256 -cne [string]$legacyIntegrity.reviewBaseline.sha256) {
+            throw 'Legacy Schema 14 authoring reference tuple changed.'
+        }
+        return [string]$State.workflowSha256
+    }
+    foreach ($field in @('workflowSourcePinPath', 'workflowSourcePinSha256', 'workflowSourceRepository', 'workflowSourceContentSha256')) {
+        if (-not $State.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$State[$field])) { throw "Recorded Skill source pin field is missing: $field" }
+    }
+    if ((Get-FileSha256 -Path ([string]$State.workflowSourcePinPath)) -cne [string]$State.workflowSourcePinSha256) {
+        throw 'Recorded Skill source pin bytes changed.'
+    }
+    $integrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') -SkillSourcePinPath ([string]$State.workflowSourcePinPath) -PassThru
+    if ($integrity.result -cne 'passed' -or -not $integrity.skillSourcePin -or
+        [string]$integrity.skillSourcePin.pinSha256 -cne [string]$State.workflowSourcePinSha256 -or
+        [string]$integrity.skillSourcePin.repository -cne [string]$State.workflowSourceRepository -or
+        [string]$integrity.skillSourcePin.requestedRef -cne [string]$State.workflowRef -or
+        [string]$integrity.skillSourcePin.resolvedCommit -cne [string]$State.workflowCommitOid -or
+        [string]$integrity.skillSourcePin.contentSha256 -cne [string]$State.workflowSourceContentSha256) {
+        throw 'Recorded immutable Skill source tuple no longer matches the verified package.'
     }
     foreach ($binding in @(
-        [ordered]@{ name = 'Workflow'; expectedPath = $State.workflowPath; expectedBlob = $State.workflowBlobOid; expectedSha = $State.workflowSha256; actual = $integrity.workflow },
-        [ordered]@{ name = 'Review Baseline'; expectedPath = $State.reviewBaselinePath; expectedBlob = $State.reviewBaselineBlobOid; expectedSha = $State.reviewBaselineSha256; actual = $integrity.reviewBaseline }
+        [ordered]@{ name = 'Workflow'; expectedPath = $State.workflowPath; expectedBlob = $State.workflowBlobOid; expectedSha = $State.workflowSha256; expectedPackageSha = $State.workflowPackageSha256; actual = $integrity.workflow },
+        [ordered]@{ name = 'Review Baseline'; expectedPath = $State.reviewBaselinePath; expectedBlob = $State.reviewBaselineBlobOid; expectedSha = $State.reviewBaselineSha256; expectedPackageSha = $State.reviewBaselinePackageSha256; actual = $integrity.reviewBaseline }
     )) {
-        if ([string]$binding.expectedPath -cne [string]$binding.actual.originalPath -or
+        if ([string]$binding.expectedPath -cne [string]$binding.actual.path -or
             [string]$binding.expectedBlob -cne [string]$binding.actual.gitBlobOid -or
+            [string]$binding.expectedPackageSha -cne [string]$binding.actual.packageSha256 -or
             [string]$binding.expectedSha -cne [string]$binding.actual.sha256) {
             throw "$($binding.name) reference binding changed."
+        }
+    }
+    $references = @($State.referenceSources)
+    $expectedRoles = if ([int]$State.schemaVersion -ge 15) { @('workflow', 'review-baseline', 'package-binding', 'skill', 'schema-15-extension') }
+        else { @('workflow', 'review-baseline', 'package-binding', 'skill') }
+    if ($references.Count -ne $expectedRoles.Count) { throw 'Recorded reference_sources count changed.' }
+    foreach ($role in $expectedRoles) {
+        $matches = @($references | Where-Object { [string]$_.role -ceq $role })
+        if ($matches.Count -ne 1 -or [string]$matches[0].sourceCommit -cne [string]$State.workflowCommitOid) {
+            throw "Recorded reference_sources role is missing, duplicated, or pinned to another commit: $role"
+        }
+        $pinEntries = @($integrity.skillSourcePin.files | Where-Object { [string]$_.repositoryPath -ceq [string]$matches[0].path })
+        if ($pinEntries.Count -ne 1 -or [string]$matches[0].blobOid -cne [string]$pinEntries[0].blobOid -or
+            [int64]$matches[0].size -ne [int64]$pinEntries[0].size -or [string]$matches[0].sha256 -cne [string]$pinEntries[0].sha256) {
+            throw "Recorded reference_sources evidence differs from the source pin: $role"
         }
     }
     if ([int]$State.schemaVersion -ge 15) {
@@ -298,7 +408,14 @@ function Get-ImmutableWorksetContractSha256 {
     Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress)))
 }
 
-$state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json -AsHashtable
+$stateFull = [IO.Path]::GetFullPath($StatePath)
+$stateRunRoot = Split-Path -Parent $stateFull
+$null = Assert-NoReparsePath -Path $stateFull -Root ([IO.Path]::GetPathRoot($stateFull)) -Label 'Candidate state'
+$state = Get-Content -LiteralPath $stateFull -Raw | ConvertFrom-Json -AsHashtable
+if ([IO.Path]::GetFullPath([string]$state.runRoot) -cne $stateRunRoot -or [IO.Path]::GetFullPath([string]$state.statePath) -cne $stateFull) {
+    throw 'Candidate state path differs from its fixed run root tuple.'
+}
+$null = Assert-NoReparsePath -Path $stateFull -Root ([string]$state.repositoryRoot) -Label 'Candidate state'
 
 if ($ReviewCompletion) {
     $reviewChecks = [ordered]@{}
@@ -309,7 +426,7 @@ if ($ReviewCompletion) {
         catch { $reviewChecks[$Name] = [ordered]@{ result = 'rejected'; evidence = $_.Exception.Message }; $reviewErrors.Add("${Name}: $($_.Exception.Message)") }
     }
     Add-ReviewCheck -Name 'claimed-archive' -Action {
-        Assert-ClaimedArchiveIntegrity -Archive $state.archive
+        Assert-ClaimedArchiveIntegrity -State $state
     }
     Add-ReviewCheck -Name 'source-receipt' -Action {
         Assert-SourceReceiptIntegrity -State $state
@@ -322,6 +439,37 @@ if ($ReviewCompletion) {
         if ((Get-FileSha256 -Path $state.candidateGate.validationReportPath) -ne $state.candidateGate.validationReportSha256) { throw 'Candidate Gate report SHA-256 changed.' }
         if (-not $state.diffReadability -or (Get-FileSha256 -Path $state.diffReadability.path) -ne $state.candidateGate.diffReadabilitySha256 -or $state.diffReadability.result -ne 'passed') { throw 'Diff readability evidence is missing, changed, or rejected.' }
         $state.candidateGate.validationReportSha256
+    }
+    Add-ReviewCheck -Name 'localization-workset-deletion' -Action {
+        if ([int]$state.schemaVersion -lt 15) { return 'not-applicable: Schema 14 approved spans' }
+        if (-not $state.localizationWorkset -or -not $state.localizationWorkset.Contains('deletedBeforePublish') -or -not [bool]$state.localizationWorkset.deletedBeforePublish) {
+            throw 'Schema 15 localization workset deletion is not finalized.'
+        }
+        $worksetPath = [IO.Path]::GetFullPath([string]$state.localizationWorkset.path)
+        if ($worksetPath -cne [IO.Path]::GetFullPath((Join-Path ([string]$state.runRoot) 'review-artifacts/localization-workset.json'))) {
+            throw 'Schema 15 localization workset deletion evidence has a non-canonical path.'
+        }
+        $null = Assert-NoReparsePath -Path (Split-Path -Parent $worksetPath) -Root ([string]$state.repositoryRoot) -Label 'Deleted localization workset parent'
+        if (Test-Path -LiteralPath $worksetPath) { throw 'Schema 15 localization workset still exists after Candidate Gate.' }
+        $receiptPath = Assert-NoReparsePath -Path ([string]$state.localizationWorkset.deletionReceiptPath) -Root ([string]$state.repositoryRoot) -Label 'Localization workset deletion receipt'
+        if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { throw 'Localization workset deletion receipt is missing.' }
+        $receiptSha = Get-FileSha256 -Path $receiptPath
+        if ($receiptSha -cne [string]$state.localizationWorkset.deletionReceiptSha256 -or
+            $receiptSha -cne [string]$state.candidateGate.localizationWorksetDeletionReceiptSha256) {
+            throw 'Localization workset deletion receipt is not bound to state and Candidate Gate.'
+        }
+        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$receipt.status -cne 'deleted' -or [string]$receipt.worksetSha256 -cne [string]$state.localizationWorkset.sha256) {
+            throw 'Localization workset deletion receipt does not prove deletion of the reviewed workset.'
+        }
+        $reviewReportPath = Assert-NoReparsePath -Path ([string]$state.candidateGate.validationReportPath) -Root ([string]$state.repositoryRoot) -Label 'Candidate Gate report'
+        $report = Get-Content -LiteralPath $reviewReportPath -Raw | ConvertFrom-Json -AsHashtable
+        if (-not $report.Contains('worksetDeletion') -or [string]$report.worksetDeletion.status -cne 'deleted' -or
+            [string]$report.worksetDeletion.receiptSha256 -cne $receiptSha -or
+            [string]$report.worksetDeletion.worksetSha256 -cne [string]$state.localizationWorkset.sha256) {
+            throw 'Candidate Gate report does not contain matching workset deletion evidence.'
+        }
+        $receiptSha
     }
     Add-ReviewCheck -Name 'local-review' -Action {
         if (-not $state.localReview -or -not (Test-Path -LiteralPath $state.localReview.path -PathType Leaf)) { throw 'Local review artifact is missing.' }
@@ -377,7 +525,17 @@ $chain = $state.evidenceChain
 $worktree = [string]$state.worktreePath
 
 Add-ValidationCheck -Name 'claimed-archive' -Action {
-    Assert-ClaimedArchiveIntegrity -Archive $state.archive
+    Assert-ClaimedArchiveIntegrity -State $state
+}
+
+Add-ValidationCheck -Name 'physical-install-tree' -Action {
+    $verifiedWorktree = Assert-NoReparsePath -Path $worktree -Root ([IO.Path]::GetPathRoot($worktree)) -Label 'Candidate worktree'
+    $expectedInstallRoot = [IO.Path]::GetFullPath((Join-Path $verifiedWorktree ([string]$state.modRelativePath)))
+    if ([IO.Path]::GetFullPath([string]$state.installRoot) -cne $expectedInstallRoot) {
+        throw 'Candidate installRoot differs from the fixed MOD path in its worktree.'
+    }
+    $null = Assert-NoReparseTree -Path ([string]$state.installRoot) -Root $verifiedWorktree -Label 'Candidate installed MOD tree'
+    $expectedInstallRoot
 }
 
 Add-ValidationCheck -Name 'source-receipt' -Action {
@@ -568,7 +726,8 @@ Add-ValidationCheck -Name 'install-normalization' -Action {
     $normalizationByPath = @{}; foreach ($file in $normalization.files) { $normalizationByPath[$file.path] = $file }
     foreach ($file in $install.files) {
         if (-not $candidateByPath.ContainsKey($file.path) -or -not $normalizationByPath.ContainsKey($file.path)) { throw "Install path is missing from Git candidate evidence: $($file.path). Candidate paths: $($candidateByPath.Keys -join ', '). Normalization paths: $($normalizationByPath.Keys -join ', ')." }
-        $raw = [IO.File]::ReadAllBytes((Join-Path $state.installRoot $file.path))
+        $rawPath = Assert-NoReparsePath -Path (Join-Path $state.installRoot $file.path) -Root $worktree -Label 'Installed candidate file'
+        $raw = [IO.File]::ReadAllBytes($rawPath)
         $candidateBytes = Get-GitBlobBytes -WorkingDirectory $worktree -Object ([string]$candidateByPath[$file.path].blobOid)
         $same = (Get-Sha256Bytes -Bytes $raw) -eq (Get-Sha256Bytes -Bytes $candidateBytes)
         if (-not $same -and -not (Test-CrlfNormalizationOnly -RawBytes $raw -IndexedBytes $candidateBytes)) { throw "Candidate changed bytes beyond CRLF-to-LF for $($file.path)" }
@@ -580,14 +739,23 @@ Add-ValidationCheck -Name 'install-normalization' -Action {
 Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
     if ([int]$state.schemaVersion -lt 15) { return 'not-applicable: Schema 14 approved spans' }
     if (-not $state.localizationWorkset -or [string]$state.localizationWorkset.status -cne 'applied') { throw 'Schema 15 applied localization workset evidence is missing.' }
-    $worksetPath = [string]$state.localizationWorkset.path
-    if (-not (Test-Path -LiteralPath $worksetPath -PathType Leaf)) { throw 'Localization workset is missing before Candidate Gate.' }
+    if ([string]$state.localizationMode -cne 'zh-tw' -or @($state.localizationFiles).Count -ne 1) {
+        throw 'Schema 15 Candidate state must contain exactly one localization file.'
+    }
+    if ([string]$state.baseOid -cne [string]$chain.c0Oid) { throw 'Schema 15 state base OID differs from C0.' }
+    $worksetPath = Assert-NoReparsePath -Path ([string]$state.localizationWorkset.path) -Root ([string]$state.repositoryRoot) -Label 'Localization workset'
+    if ($worksetPath -cne [IO.Path]::GetFullPath((Join-Path ([string]$state.runRoot) 'review-artifacts/localization-workset.json'))) {
+        throw 'Localization workset is outside its fixed run-local path.'
+    }
     if ((Get-FileSha256 -Path $worksetPath) -cne [string]$state.localizationWorkset.sha256) { throw 'Localization workset SHA-256 changed.' }
     $worksetFull = [IO.Path]::GetFullPath($worksetPath)
     $worktreeFull = [IO.Path]::GetFullPath([string]$state.worktreePath).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     if ($worksetFull.StartsWith($worktreeFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'Localization workset must never be inside the Git worktree.' }
     $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
     if ([int]$workset.workflowSchemaVersion -ne 15 -or [string]$workset.status -cne 'applied') { throw 'Localization workset is not an applied Schema 15 artifact.' }
+    if (-not $workset.Contains('apply') -or -not $workset.apply -or [string]$workset.apply.status -cne 'applied') {
+        throw 'Localization workset apply receipt is not finalized.'
+    }
     if ([string]::IsNullOrWhiteSpace([string]$workset.immutableContractSha256) -or
         (Get-ImmutableWorksetContractSha256 -Workset $workset) -cne [string]$workset.immutableContractSha256) {
         throw 'Localization workset immutable contract changed.'
@@ -595,22 +763,86 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
     if ([string]$state.localizationWorkset.immutableContractSha256 -cne [string]$workset.immutableContractSha256) {
         throw 'Localization workset immutable contract differs from state evidence.'
     }
+    $localizationManifestPath = Assert-NoReparsePath -Path ([string]$state.localizationManifestPath) -Root ([string]$state.repositoryRoot) -Label 'Localization manifest'
+    if ($localizationManifestPath -cne [IO.Path]::GetFullPath((Join-Path ([string]$state.artifactsRoot) 'localization-manifest.json'))) {
+        throw 'Schema 15 localization manifest is outside its fixed artifact path.'
+    }
+    $localizationManifest = Get-Content -LiteralPath $localizationManifestPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([int]$localizationManifest.schemaVersion -ne 2 -or [int]$localizationManifest.workflowSchemaVersion -ne 15 -or
+        [string]$localizationManifest.mode -cne 'zh-tw-workset' -or @($localizationManifest.files).Count -ne 1 -or
+        @($localizationManifest.removedPaths).Count -ne 0 -or @($state.localizationRemovedPaths).Count -ne 0 -or
+        [string]$localizationManifest.worksetPath -cne $worksetPath -or
+        [string]$localizationManifest.worksetSha256 -cne [string]$state.localizationWorkset.sha256 -or
+        [string]$localizationManifest.immutableContractSha256 -cne [string]$workset.immutableContractSha256) {
+        throw 'Schema 15 localization manifest tuple differs from Candidate state or workset evidence.'
+    }
+    $classificationNames = @('unchanged', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')
+    if (@($localizationManifest.counts.Keys).Count -ne $classificationNames.Count -or @($state.localizationWorkset.counts.Keys).Count -ne $classificationNames.Count) {
+        throw 'Schema 15 localization classification counts are malformed.'
+    }
+    foreach ($name in $classificationNames) {
+        if (-not $localizationManifest.counts.Contains($name) -or -not $state.localizationWorkset.counts.Contains($name) -or
+            [int]$localizationManifest.counts[$name] -ne [int]$workset.counts[$name] -or
+            [int]$state.localizationWorkset.counts[$name] -ne [int]$workset.counts[$name]) {
+            throw "Schema 15 localization classification count binding changed: $name"
+        }
+    }
+    $stateRecord = $state.localizationFiles[0]
+    $manifestRecord = $localizationManifest.files[0]
+    $recordFields = @('relativePath', 'safeId', 'rawSha256', 'indexedSha256', 'mergedRawSha256', 'mergedSha256', 'artifactDirectory', 'decisionsSha256', 'worksetPath', 'worksetUnitCount', 'worksetEditCount')
+    if (@($stateRecord.Keys).Count -ne $recordFields.Count -or @($manifestRecord.Keys).Count -ne $recordFields.Count) {
+        throw 'Schema 15 localization file record fields are malformed.'
+    }
+    foreach ($field in $recordFields) {
+        if (-not $stateRecord.Contains($field) -or -not $manifestRecord.Contains($field) -or
+            [string]$stateRecord[$field] -cne [string]$manifestRecord[$field]) {
+            throw "Schema 15 localization manifest file binding changed: $field"
+        }
+    }
+    $expectedStagingRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path ([string]$state.runRoot) 'staging/localization-workset-input') ([string]$state.repoModDirectory)))
+    $stagedLocalizationPath = [IO.Path]::GetFullPath([string]$workset.new.path)
+    $relativeToMod = [IO.Path]::GetRelativePath($expectedStagingRoot, $stagedLocalizationPath).Replace('\', '/')
+    if ($relativeToMod -eq '..' -or $relativeToMod.StartsWith('../', [StringComparison]::Ordinal) -or [IO.Path]::IsPathRooted($relativeToMod)) {
+        throw 'Schema 15 workset NEW localization path escapes fixed staging.'
+    }
+    $expectedRelativePath = ([string]$state.modRelativePath).TrimEnd('/') + '/' + $relativeToMod
+    $expectedSafeId = (Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($expectedRelativePath))).Substring(0, 16)
+    $expectedArtifactDirectory = [IO.Path]::GetFullPath((Join-Path (Join-Path ([string]$state.artifactsRoot) 'localization') $expectedSafeId))
+    if ([string]$stateRecord.relativePath -cne $expectedRelativePath -or [string]$stateRecord.safeId -cne $expectedSafeId -or
+        [IO.Path]::GetFullPath([string]$stateRecord.artifactDirectory) -cne $expectedArtifactDirectory -or
+        [string]$stateRecord.worksetPath -cne $worksetPath -or
+        [string]$stateRecord.decisionsSha256 -cne [string]$state.localizationWorkset.sha256 -or
+        [int]$stateRecord.worksetUnitCount -ne @($workset.units).Count -or
+        [int]$stateRecord.worksetEditCount -ne @($workset.apply.edits).Count) {
+        throw 'Schema 15 localization file record differs from the unique workset output.'
+    }
+    if ([string]$workset.old.path -cnotin @($state.evidenceTargetPaths)) { throw 'Workset OLD localization path is outside evidenceTargetPaths.' }
     if (@($workset.units | Where-Object { $_.action -ceq 'BLOCKED' }).Count -ne 0) { throw 'Localization workset contains BLOCKED units.' }
     if (@($workset.units | Where-Object { $_.action -ceq 'AI_REQUIRED' -and $_.reviewStatus -cne 'approved' }).Count -ne 0) { throw 'Localization workset contains unapproved AI_REQUIRED units.' }
-    if (@($workset.units | Where-Object { $_.action -cne 'AI_REQUIRED' -and $null -ne $_.suggestedZhTwExpression }).Count -ne 0) { throw 'AI expression exists outside AI_REQUIRED units.' }
+        if (@($workset.units | Where-Object { $_.action -cne 'AI_REQUIRED' -and ($_.reviewStatus -cne 'not-required' -or $null -ne $_.suggestedZhTwExpression) }).Count -ne 0) { throw 'Localization review fields were edited outside AI_REQUIRED units.' }
     foreach ($record in @($state.localizationFiles)) {
+        if ([string]$record.relativePath -cnotin @($state.evidenceTargetPaths)) { throw 'Workset NEW localization path is outside evidenceTargetPaths.' }
         if ([string]$record.decisionsSha256 -cne [string]$state.localizationWorkset.sha256) { throw 'Localization file is not bound to the current workset SHA-256.' }
         $newPath = Join-Path ([string]$record.artifactDirectory) 'new.lua'
         $mergedPath = Join-Path ([string]$record.artifactDirectory) 'merged.lua'
         $mergedIndexedPath = Join-Path ([string]$record.artifactDirectory) 'merged-indexed.lua'
+        $newPath = Assert-NoReparsePath -Path $newPath -Root ([string]$state.repositoryRoot) -Label 'Raw NEW localization evidence'
+        $mergedPath = Assert-NoReparsePath -Path $mergedPath -Root ([string]$state.repositoryRoot) -Label 'Merged localization evidence'
+        $mergedIndexedPath = Assert-NoReparsePath -Path $mergedIndexedPath -Root ([string]$state.repositoryRoot) -Label 'Merged indexed localization evidence'
         $newBytes = [IO.File]::ReadAllBytes($newPath)
         $mergedBytes = [IO.File]::ReadAllBytes($mergedPath)
         $mergedIndexedBytes = [IO.File]::ReadAllBytes($mergedIndexedPath)
         if ((Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.apply.inputSha256 -or (Get-Sha256Bytes -Bytes $newBytes) -cne [string]$record.rawSha256) { throw 'Workset NEW bytes differ from raw localization evidence.' }
         if ((Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$workset.apply.outputSha256 -or (Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$record.mergedRawSha256) { throw 'Workset merged bytes differ from apply evidence.' }
         if ((Get-Sha256Bytes -Bytes $mergedIndexedBytes) -cne [string]$record.mergedSha256) { throw 'Workset merged indexed bytes changed.' }
+        $receiptVerifier = Join-Path $PSScriptRoot 'Test-LocalizationWorksetReceipt.ps1'
+        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath `
+            -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) `
+            -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) -PassThru
+        if ($receiptVerification.result -cne 'passed') { throw 'Independent localization apply receipt verification failed.' }
         $null = Test-LocalizationWorksetCandidate -NewBytes $newBytes -MergedBytes $mergedBytes -Edits @($workset.apply.edits)
         $targetPath = Join-Path $worktree ([string]$record.relativePath)
+        $targetPath = Assert-NoReparsePath -Path $targetPath -Root $worktree -Label 'Worktree localization target'
         if ((Get-FileSha256 -Path $targetPath) -cne [string]$record.mergedRawSha256) { throw 'Worktree localization target differs from workset merged raw bytes.' }
         $candidateBlob = Get-GitBlobBytes -WorkingDirectory $worktree -Object "$($chain.fOid):$([string]$record.relativePath)"
         if ((Get-Sha256Bytes -Bytes $candidateBlob) -cne [string]$record.mergedSha256) { throw 'F localization blob differs from workset merged indexed bytes.' }

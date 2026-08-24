@@ -20,6 +20,8 @@ param(
     [Parameter(Mandatory)]
     [string] $ReceiptPath,
 
+    [string] $RunRoot,
+
     [ValidateRange(0, 60000)]
     [int] $ObservationIntervalMilliseconds = 1000,
 
@@ -70,12 +72,38 @@ function Assert-ContainedFilePath {
     $candidateFull
 }
 
+function Assert-NoReparsePath {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Root, [Parameter(Mandatory)][string] $Label, [switch] $AllowMissingLeaf)
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $pathFull = [IO.Path]::GetFullPath($Path)
+    if (-not $pathFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label escapes the isolated source run root."
+    }
+    $relative = [IO.Path]::GetRelativePath($rootFull, $pathFull)
+    $components = if ($relative -eq '.') { @() } else { @($relative -split '[\\/]') }
+    $current = $rootFull
+    $paths = @($rootFull)
+    foreach ($component in $components) { $current = Join-Path $current $component; $paths += $current }
+    for ($index = 0; $index -lt $paths.Count; $index++) {
+        if (-not (Test-Path -LiteralPath $paths[$index])) {
+            if ($AllowMissingLeaf -and $index -eq ($paths.Count - 1)) { continue }
+            throw "$Label path component is missing."
+        }
+        if ((Get-Item -LiteralPath $paths[$index]).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "$Label path contains a symlink or reparse point."
+        }
+    }
+}
+
 function Assert-RegularDirectoryRoot {
-    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Label)
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Label, [Parameter(Mandatory)][string] $RunRoot)
     $full = [IO.Path]::GetFullPath($Path)
-    if (-not (Test-Path -LiteralPath $full -PathType Container)) { New-Item -ItemType Directory -Path $full -Force | Out-Null }
-    $item = Get-Item -LiteralPath $full
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$Label must not be a reparse point." }
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+        Assert-NoReparsePath -Path (Split-Path -Parent $full) -Root $RunRoot -Label "$Label parent"
+        New-Item -ItemType Directory -Path $full | Out-Null
+    }
+    Assert-NoReparsePath -Path $full -Root $RunRoot -Label $Label
     $full
 }
 
@@ -97,6 +125,10 @@ function Read-SourceRequest {
     }
     $pageUri = [Uri](ConvertTo-InvariantString $request.pageUrl)
     if (-not $pageUri.IsAbsoluteUri -or $pageUri.Scheme -cne 'https') { throw 'Source request pageUrl must be an absolute HTTPS URL.' }
+    if (-not [string]::IsNullOrEmpty($pageUri.UserInfo) -or -not [string]::IsNullOrEmpty($pageUri.Query) -or
+        -not [string]::IsNullOrEmpty($pageUri.Fragment) -or -not $pageUri.IsDefaultPort) {
+        throw 'Source request pageUrl must be a canonical page URL without user-info, query, fragment, or a custom port.'
+    }
     $expectedGameDomain = 'warhammer40kdarktide'
     $expectedPagePath = "/$expectedGameDomain/mods/$(ConvertTo-InvariantString $request.modId)"
     if ((ConvertTo-InvariantString $request.gameDomain) -cne $expectedGameDomain -or
@@ -110,6 +142,9 @@ function Read-SourceRequest {
         $requestedFileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
         throw 'Source request fileName must be one safe single file name.'
     }
+    if ($requestedFileName -match '(?i)^(con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$') {
+        throw 'Source request fileName uses a reserved Windows device name.'
+    }
     [ordered]@{
         schemaVersion = 1
         gameDomain = ConvertTo-InvariantString $request.gameDomain
@@ -118,7 +153,10 @@ function Read-SourceRequest {
         version = ConvertTo-InvariantString $request.version
         fileName = ConvertTo-InvariantString $request.fileName
         pageUrl = ConvertTo-InvariantString $request.pageUrl
-        officialSha256 = if ($request.Contains('officialSha256')) { (ConvertTo-InvariantString $request.officialSha256).ToLowerInvariant() } else { $null }
+        officialSha256 = if ($request.Contains('officialSha256') -and
+            -not [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request.officialSha256))) {
+            (ConvertTo-InvariantString $request.officialSha256).ToLowerInvariant()
+        } else { $null }
     }
 }
 
@@ -132,24 +170,44 @@ function Get-SanitizedUrl {
     $builder.Uri.AbsoluteUri.TrimEnd('?')
 }
 
-function Get-ArchiveFormat {
+function Assert-NexusDownloadUri {
+    param([Uri] $Uri, [string] $Label = 'API download URI')
+    if (-not $Uri -or -not $Uri.IsAbsoluteUri -or $Uri.Scheme -cne 'https' -or
+        ($Uri.Host -cne 'nexusmods.com' -and -not $Uri.Host.EndsWith('.nexusmods.com', [StringComparison]::OrdinalIgnoreCase))) {
+        throw "$Label must use HTTPS on a nexusmods.com host."
+    }
+    $Uri
+}
+
+function Get-ArchiveEvidence {
     param([string] $Path)
     $bytes = [byte[]]::new(8)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    try { $read = $stream.Read($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
-    if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $size = $stream.Length
+        $read = $stream.Read($bytes, 0, $bytes.Length)
+        $stream.Position = 0
+        $sha256 = [Convert]::ToHexString($hasher.ComputeHash($stream)).ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+    $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
         (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
-        return 'zip'
+        'zip'
     }
-    if ($read -ge 7 -and $bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and
+    elseif ($read -ge 7 -and $bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and
         $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07 -and $bytes[6] -in @(0x00, 0x01)) {
-        return 'rar'
+        'rar'
     }
-    if ($read -ge 6 -and $bytes[0] -eq 0x37 -and $bytes[1] -eq 0x7A -and $bytes[2] -eq 0xBC -and
+    elseif ($read -ge 6 -and $bytes[0] -eq 0x37 -and $bytes[1] -eq 0x7A -and $bytes[2] -eq 0xBC -and
         $bytes[3] -eq 0xAF -and $bytes[4] -eq 0x27 -and $bytes[5] -eq 0x1C) {
-        return '7z'
+        '7z'
     }
-    'unknown'
+    else { 'unknown' }
+    [ordered]@{ size = [int64]$size; sha256 = $sha256; archiveFormat = $format }
 }
 
 function New-WaitingResult {
@@ -163,28 +221,56 @@ function New-WaitingResult {
     }
 }
 
+function Move-ApiPartialToRetainedEvidence {
+    param([string] $PartialPath, [string] $IncomingRoot)
+    if (-not (Test-Path -LiteralPath $PartialPath)) { return $null }
+    $item = Get-Item -LiteralPath $PartialPath
+    if (-not $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        $retainedName = '.retained-partial-' + [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') + '-' + [guid]::NewGuid().ToString('N') + '-' + $item.Name
+        $retainedPath = Assert-ContainedFilePath -Candidate (Join-Path $IncomingRoot $retainedName) -Root $IncomingRoot
+        [IO.File]::Move($item.FullName, $retainedPath)
+        return $retainedPath
+    }
+    throw 'API partial download must be a regular file, not a directory or reparse point.'
+}
+
 function Invoke-ApiDownload {
     param([Collections.IDictionary] $Request, [string] $IncomingRoot)
-    $downloadUriValue = [Environment]::GetEnvironmentVariable($ApiDownloadUriEnvironmentVariable)
-    if ([string]::IsNullOrWhiteSpace($downloadUriValue)) {
-        return New-WaitingResult -Status 'waiting-system' -Code 'api_download_uri_unavailable' -Message 'The API provider did not return an ephemeral download URL.'
-    }
-    $downloadUri = [Uri]$downloadUriValue
-    if (-not $downloadUri.IsAbsoluteUri -or $downloadUri.Scheme -cne 'https' -or
-        ($downloadUri.Host -cne 'nexusmods.com' -and -not $downloadUri.Host.EndsWith('.nexusmods.com', [StringComparison]::OrdinalIgnoreCase))) {
-        throw 'API download URI must use HTTPS on a nexusmods.com host.'
-    }
     $temporaryPath = Assert-ContainedFilePath -Candidate (Join-Path $IncomingRoot ($Request.fileName + '.part')) -Root $IncomingRoot
     $finalPath = Assert-ContainedFilePath -Candidate (Join-Path $IncomingRoot $Request.fileName) -Root $IncomingRoot
-    if (Test-Path -LiteralPath $temporaryPath -or Test-Path -LiteralPath $finalPath) { throw 'API download destination already exists.' }
-    $client = [Net.Http.HttpClient]::new()
+    $retainedPartialPath = Move-ApiPartialToRetainedEvidence -PartialPath $temporaryPath -IncomingRoot $IncomingRoot
+    if (Test-Path -LiteralPath $finalPath -PathType Leaf) {
+        return $finalPath
+    }
+    $downloadUriValue = [Environment]::GetEnvironmentVariable($ApiDownloadUriEnvironmentVariable)
+    if ([string]::IsNullOrWhiteSpace($downloadUriValue)) {
+        return New-WaitingResult -Status 'waiting-system' -Code 'api_download_uri_unavailable' -Message 'The API provider did not return an ephemeral download URL.' -Path $retainedPartialPath
+    }
+    $downloadUri = Assert-NexusDownloadUri -Uri ([Uri]$downloadUriValue)
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [Net.Http.HttpClient]::new($handler, $true)
+    $response = $null
     $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.3.0')
     $apiKey = [Environment]::GetEnvironmentVariable($ApiKeyEnvironmentVariable)
     if (-not [string]::IsNullOrWhiteSpace($apiKey)) { $client.DefaultRequestHeaders.Add('apikey', $apiKey) }
     try {
-        $response = $client.GetAsync($downloadUri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        $currentUri = $downloadUri
+        for ($redirectCount = 0; $redirectCount -le 10; $redirectCount++) {
+            if ($response) { $response.Dispose(); $response = $null }
+            $response = $client.GetAsync($currentUri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            if ([int]$response.StatusCode -notin @(301, 302, 303, 307, 308)) { break }
+            if ($redirectCount -eq 10) { throw 'API download exceeded the ten-redirect safety limit.' }
+            $location = $response.Headers.Location
+            if (-not $location) { throw 'API download redirect is missing its Location header.' }
+            $nextUri = if ($location.IsAbsoluteUri) { $location } else { [Uri]::new($currentUri, $location) }
+            $currentUri = Assert-NexusDownloadUri -Uri $nextUri -Label 'API download redirect URI'
+        }
         if ([int]$response.StatusCode -eq 429) {
-            return New-WaitingResult -Status 'waiting-system' -Code 'nexus_rate_limited' -Message 'Nexus rate limit requires a later retry.'
+            return New-WaitingResult -Status 'waiting-system' -Code 'nexus_rate_limited' -Message 'Nexus rate limit requires a later retry.' -Path $retainedPartialPath
+        }
+        if ([int]$response.StatusCode -in @(401, 403)) {
+            return New-WaitingResult -Status 'waiting-user' -Code 'nexus_permission_required' -Message 'Nexus login or download permission requires user action.' -Path $retainedPartialPath
         }
         $response.EnsureSuccessStatusCode()
         $input = $response.Content.ReadAsStream()
@@ -193,10 +279,31 @@ function Invoke-ApiDownload {
         [IO.File]::Move($temporaryPath, $finalPath)
         $finalPath
     }
-    finally { $client.Dispose() }
+    catch [Net.Http.HttpRequestException] {
+        $retainedPartialPath = Move-ApiPartialToRetainedEvidence -PartialPath $temporaryPath -IncomingRoot $IncomingRoot
+        return New-WaitingResult -Status 'waiting-system' -Code 'api_download_interrupted' -Message 'The API download did not complete and its partial bytes were retained for evidence.' -Path $retainedPartialPath
+    }
+    catch [Threading.Tasks.TaskCanceledException] {
+        $retainedPartialPath = Move-ApiPartialToRetainedEvidence -PartialPath $temporaryPath -IncomingRoot $IncomingRoot
+        return New-WaitingResult -Status 'waiting-system' -Code 'api_download_interrupted' -Message 'The API download did not complete and its partial bytes were retained for evidence.' -Path $retainedPartialPath
+    }
+    catch [IO.IOException] {
+        $retainedPartialPath = Move-ApiPartialToRetainedEvidence -PartialPath $temporaryPath -IncomingRoot $IncomingRoot
+        return New-WaitingResult -Status 'waiting-system' -Code 'api_download_interrupted' -Message 'The API download did not complete and its partial bytes were retained for evidence.' -Path $retainedPartialPath
+    }
+    finally { if ($response) { $response.Dispose() }; $client.Dispose() }
 }
 
-$request = Read-SourceRequest -Path ([IO.Path]::GetFullPath($SourceRequestPath))
+$receiptFull = [IO.Path]::GetFullPath($ReceiptPath)
+$receiptParentPath = Split-Path -Parent $receiptFull
+$sourceRunRoot = if (-not [string]::IsNullOrWhiteSpace($RunRoot)) { [IO.Path]::GetFullPath($RunRoot) }
+    elseif ((Split-Path -Leaf $receiptParentPath) -ceq 'review-artifacts') { Split-Path -Parent $receiptParentPath }
+    else { $receiptParentPath }
+if (-not (Test-Path -LiteralPath $sourceRunRoot -PathType Container)) { throw 'Receipt run root does not exist.' }
+Assert-NoReparsePath -Path $sourceRunRoot -Root $sourceRunRoot -Label 'Source run root'
+$requestFull = [IO.Path]::GetFullPath($SourceRequestPath)
+Assert-NoReparsePath -Path $requestFull -Root $sourceRunRoot -Label 'Source request'
+$request = Read-SourceRequest -Path $requestFull
 $requestedExtension = [IO.Path]::GetExtension([string]$request.fileName).ToLowerInvariant()
 if ($requestedExtension -in @('.rar', '.7z') -or $requestedExtension -ne '.zip') {
     Write-Result -Value (New-WaitingResult -Status 'waiting-user' -Code 'unsupported_archive_format' -Message 'Only ZIP Main files are supported in Schema 15.' -ArchiveFormat $requestedExtension.TrimStart('.') -Path $null)
@@ -207,8 +314,9 @@ $incomingFull = [IO.Path]::GetFullPath($IncomingDirectory)
 if (-not (Split-Path -Leaf $incomingFull).StartsWith('.incoming-', [StringComparison]::Ordinal)) {
     throw 'Incoming directory must use the run-isolated .incoming-<run-id> name.'
 }
-$incomingFull = Assert-RegularDirectoryRoot -Path $incomingFull -Label 'Incoming directory'
-$receiptParent = Assert-RegularDirectoryRoot -Path (Split-Path -Parent ([IO.Path]::GetFullPath($ReceiptPath))) -Label 'Receipt directory'
+$incomingFull = Assert-RegularDirectoryRoot -Path $incomingFull -Label 'Incoming directory' -RunRoot $sourceRunRoot
+$receiptParent = Assert-RegularDirectoryRoot -Path $receiptParentPath -Label 'Receipt directory' -RunRoot $sourceRunRoot
+Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
 
 $providerStart = [Diagnostics.Stopwatch]::StartNew()
 $candidate = if ($Provider -eq 'api') {
@@ -228,6 +336,7 @@ if ($candidate -is [Collections.IDictionary]) {
 }
 
 $candidateFull = [IO.Path]::GetFullPath([string]$candidate)
+Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
 $candidateExtension = [IO.Path]::GetExtension($candidateFull).ToLowerInvariant()
 if ($candidateExtension -in @('.part', '.crdownload')) {
     Write-Result -Value (New-WaitingResult -Status 'waiting-system' -Code 'download_incomplete' -Message 'The provider output is still a partial download.' -ArchiveFormat $null -Path $candidateFull)
@@ -239,6 +348,7 @@ if ($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '
 
 $sampleOne = [ordered]@{ size = [int64]$candidateItem.Length; lastWriteTimeUtc = $candidateItem.LastWriteTimeUtc.ToString('o'); observedAt = Get-UtcTimestamp }
 if ($ObservationIntervalMilliseconds -gt 0) { [Threading.Thread]::Sleep($ObservationIntervalMilliseconds) }
+Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
 $candidateItem = Get-Item -LiteralPath $candidateFull
 $sampleTwo = [ordered]@{ size = [int64]$candidateItem.Length; lastWriteTimeUtc = $candidateItem.LastWriteTimeUtc.ToString('o'); observedAt = Get-UtcTimestamp }
 if ($sampleOne.size -ne $sampleTwo.size -or $sampleOne.lastWriteTimeUtc -cne $sampleTwo.lastWriteTimeUtc) {
@@ -248,8 +358,15 @@ if ($sampleOne.size -ne $sampleTwo.size -or $sampleOne.lastWriteTimeUtc -cne $sa
 if ($sampleTwo.size -le 0) { throw 'Downloaded file is empty.' }
 
 $verifyStart = [Diagnostics.Stopwatch]::StartNew()
-$archiveFormat = Get-ArchiveFormat -Path $candidateFull
-$sha256 = Get-FileSha256 -Path $candidateFull
+Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
+$archiveEvidence = Get-ArchiveEvidence -Path $candidateFull
+if ([int64]$archiveEvidence.size -ne [int64]$sampleTwo.size) {
+    $verifyStart.Stop()
+    Write-Result -Value (New-WaitingResult -Status 'waiting-system' -Code 'download_not_stable' -Message 'The provider output changed while its immutable evidence was computed.' -ArchiveFormat ([string]$archiveEvidence.archiveFormat) -Path $candidateFull)
+    return
+}
+$archiveFormat = [string]$archiveEvidence.archiveFormat
+$sha256 = [string]$archiveEvidence.sha256
 $officialHashPassed = $null
 if (-not [string]::IsNullOrWhiteSpace([string]$request.officialSha256)) {
     if ($request.officialSha256 -notmatch '^[0-9a-f]{64}$') { throw 'officialSha256 must contain 64 hexadecimal characters.' }
@@ -268,7 +385,7 @@ $receipt = [ordered]@{
     provider = $Provider
     sourceUrl = Get-SanitizedUrl -Url $request.pageUrl
     filename = [IO.Path]::GetFileName($candidateFull)
-    size = $sampleTwo.size
+    size = $archiveEvidence.size
     sha256 = $sha256
     archiveFormat = $archiveFormat
     officialSha256 = $request.officialSha256
@@ -288,18 +405,21 @@ $receipt = [ordered]@{
 
 if ($archiveFormat -ne 'zip') {
     $receipt.status = 'unsupported'
+    Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
     Write-AtomicJson -Path $ReceiptPath -Value $receipt
     Write-Result -Value (New-WaitingResult -Status 'waiting-user' -Code 'unsupported_archive_format' -Message "Detected unsupported $archiveFormat archive bytes after download." -ArchiveFormat $archiveFormat -Path $candidateFull)
     return
 }
 if ($false -eq $officialHashPassed) {
     $receipt.status = 'rejected'
+    Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
     Write-AtomicJson -Path $ReceiptPath -Value $receipt
     Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; waitingReason = [ordered]@{ code = 'source_hash_mismatch'; message = 'Downloaded SHA-256 does not match the official hash.' }; retainedPath = $candidateFull })
     return
 }
 if ([IO.Path]::GetFileName($candidateFull) -cne [string]$request.fileName) {
     $receipt.status = 'rejected'
+    Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
     Write-AtomicJson -Path $ReceiptPath -Value $receipt
     Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; waitingReason = [ordered]@{ code = 'source_filename_mismatch'; message = 'Downloaded filename does not match the requested Main file.' }; retainedPath = $candidateFull })
     return
@@ -307,16 +427,20 @@ if ([IO.Path]::GetFileName($candidateFull) -cne [string]$request.fileName) {
 
 $deliveryStart = [Diagnostics.Stopwatch]::StartNew()
 $deliveryFull = [IO.Path]::GetFullPath($DeliveryDirectory)
-$deliveryFull = Assert-RegularDirectoryRoot -Path $deliveryFull -Label 'Delivery directory'
+$deliveryFull = Assert-RegularDirectoryRoot -Path $deliveryFull -Label 'Delivery directory' -RunRoot $sourceRunRoot
 $deliveredPath = Assert-ContainedFilePath -Candidate (Join-Path $deliveryFull $request.fileName) -Root $deliveryFull
 if (Test-Path -LiteralPath $deliveredPath) { throw 'Verified source delivery destination already exists.' }
+Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
 Write-AtomicJson -Path $ReceiptPath -Value $receipt
+Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
+Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source' -AllowMissingLeaf
 [IO.File]::Move($candidateFull, $deliveredPath)
 $deliveryStart.Stop()
 $receipt.status = 'delivered'
 $receipt.deliveredAt = Get-UtcTimestamp
 $receipt.deliveredPath = $deliveredPath
 $receipt.timings.deliverMilliseconds = $deliveryStart.ElapsedMilliseconds
+Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt'
 Write-AtomicJson -Path $ReceiptPath -Value $receipt
 
 Write-Result -Value ([ordered]@{

@@ -41,4 +41,17 @@ Describe 'Immutable Skill source pin' {
         { & $script:fixtureScript -Ref $script:invalidVersionCommit } |
             Should -Throw '*not SemVer-compatible*'
     }
+
+    # Scenario: A consumer needs to prove that every installed Skill byte came from the pinned repository commit.
+    # Purpose: Include a per-file blob and SHA-256 manifest in addition to the whole-repository content hash.
+    It 'InterT30_EmitsAnInstalledSkillFileManifest' {
+        $repositoryScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Get-SourcePin.ps1'
+        $pin = (& $repositoryScript -Ref HEAD | Out-String) | ConvertFrom-Json
+
+        $pin.schemaVersion | Should -Be 1
+        $pin.skillPath | Should -Be '.agents/skills/auto-update-darktide-mod'
+        @($pin.skillFiles).Count | Should -BeGreaterThan 10
+        @($pin.skillFiles | Where-Object repositoryPath -eq '.agents/skills/auto-update-darktide-mod/SKILL.md').Count | Should -Be 1
+        @($pin.skillFiles | Where-Object { $_.blobOid -notmatch '^[0-9a-f]{40}$' -or $_.sha256 -notmatch '^[0-9a-f]{64}$' }).Count | Should -Be 0
+    }
 }

@@ -31,6 +31,8 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
   scripts/LuaLocalizationScanner.psm1
   scripts/New-LocalizationWorkset.ps1
   scripts/Apply-LocalizationWorkset.ps1
+  scripts/Test-LocalizationWorksetReceipt.ps1
+  scripts/Finalize-LocalizationWorksetEvidence.ps1
   scripts/Test-ModUpdateCandidate.ps1
   scripts/Expand-Schema14Reference.ps1
   scripts/Test-ReferenceIntegrity.ps1
@@ -59,7 +61,7 @@ GitHub Actions also runs strict `skill-validator` and `skill-tools` Quality Gate
 
 ## Versioning and rollback
 
-Release and immutable pin rules are in `docs/RELEASE.md`. Consumers roll back by restoring an earlier tag, resolved commit, and deterministic content hash as described in `docs/ROLLBACK.md`. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
+Release and immutable pin rules are in `docs/RELEASE.md`. Consumers start and roll back runs with the complete JSON emitted by `scripts/Get-SourcePin.ps1`, including the tag/ref, resolved commit, deterministic content hash, and installed Skill file manifest, as described in `docs/ROLLBACK.md`. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
 
 The real Reconnect trial, immutable Git evidence, Gate hashes, Review result, and measured 9-minute-18-second wall-clock run are recorded in [`docs/SYP-88-E2E.md`](docs/SYP-88-E2E.md).
 

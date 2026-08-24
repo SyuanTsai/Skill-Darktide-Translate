@@ -5,7 +5,7 @@ Rollback is source-pin based. Do not rewrite a released tag, force-update consum
 ## Consumer rollback
 
 1. Stop selecting the `darktide-mod-maintenance` profile if the Skill must be disabled immediately.
-2. Restore the previous `darktide-translate` requested ref, resolved commit, and repository content SHA-256.
+2. Restore the previous complete `darktide-translate` source-pin JSON: requested ref, resolved commit, repository content SHA-256, and installed-file manifest.
 3. Restore the matching installed Skill files and verify `scripts/Test-ReferenceIntegrity.ps1` from that pinned revision.
 4. Re-run consumer discovery and compatibility filtering.
 5. Resume an existing MOD run only with the exact Workflow/Baseline tuple recorded in that state. Schema 15 also requires its recorded extension, source request, source receipt, verified source, and localization-workset evidence tuple.

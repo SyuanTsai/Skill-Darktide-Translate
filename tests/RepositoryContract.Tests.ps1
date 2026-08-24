@@ -55,6 +55,8 @@ Describe 'Darktide Translate repository contract' {
             '.agents/skills/auto-update-darktide-mod/scripts/LuaLocalizationScanner.psm1',
             '.agents/skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1',
+            '.agents/skills/auto-update-darktide-mod/scripts/Test-LocalizationWorksetReceipt.ps1',
+            '.agents/skills/auto-update-darktide-mod/scripts/Finalize-LocalizationWorksetEvidence.ps1',
             '.github/workflows/validate.yml',
             '.github/workflows/skill-validator.yml',
             'catalog/skills-catalog.json',

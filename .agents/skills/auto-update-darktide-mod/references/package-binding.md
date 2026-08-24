@@ -9,7 +9,7 @@ Read this file before the packaged Schema 14 Workflow. It changes only how the W
 - Skill ID: `auto-update-darktide-mod`
 - Skill path: `.agents/skills/auto-update-darktide-mod`
 
-A new run requires the consumer's immutable source pin: requested tag or ref, resolved 40-character source commit, and deterministic repository content SHA-256. If the installed Skill cannot be tied to that tuple, do not create a claim; stop as `waiting-user`. Resuming a run uses only its previously recorded tuple.
+A new run requires the consumer's immutable source-pin JSON from `scripts/Get-SourcePin.ps1`: requested tag or ref, resolved 40-character source commit, deterministic repository content SHA-256, and the per-file blob/SHA-256 manifest for the installed Skill. Pass that external evidence as `-SkillSourcePinPath`. If `Test-ReferenceIntegrity.ps1 -SkillSourcePinPath ...` cannot tie every installed Skill file to that tuple, do not acquire or claim; stop as `waiting-user`. The runner copies the verified pin to `review-artifacts/skill-source-pin.json`. Resuming a run uses only that run-owned copy and rejects a different supplied pin.
 
 ## Original-to-package path mapping
 
@@ -38,12 +38,12 @@ For new packaged runs:
 - `workflow_commit_oid` records the resolved `darktide-translate` source commit.
 - `workflow_path` records `.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz`.
 - `workflow_sha256` records the expanded Workflow content SHA-256; `workflow_package_sha256` records the compressed container SHA-256.
-- `reference_sources[]` records the Workflow, Review Baseline, this package binding, and `SKILL.md`, including repository-relative path, resolved source commit, compressed and expanded sizes, and both SHA-256 values. `Test-ReferenceIntegrity.ps1` returns this as `path` and retains the Skill-relative location as `packagedPath`. Its `gitBlobOid` is the packaged file's Git blob at `workflow_commit_oid`, so the commit, path, and blob form one directly reproducible tuple.
+- `reference_sources[]` records the Workflow, Review Baseline, this package binding, `SKILL.md`, and Schema 15 extension when applicable, including repository-relative path, resolved source commit, packaged blob, size, and SHA-256. Converted documents also retain expanded sizes and SHA-256 values. The blob values come from the verified runtime pin and are recomputed from the installed bytes, so commit, path, and blob form one directly reproducible tuple.
 - For converted documents, `packagedGitBlobOid` names that packaged gzip blob while `sourceGitBlobOid` retains the original uncompressed authoring blob. The integrity command recomputes both OIDs from their respective bytes. Never substitute `sourceGitBlobOid` into runtime `reference_sources[].gitBlobOid`.
 - The consumer source pin's repository URL and content SHA-256 are retained with the run evidence so a future verifier can reconstruct the package.
 - A Schema 15 run additionally records the repository-relative extension path, Git blob OID, SHA-256, source receipt, and source request hash.
 
-The source provenance in `source-provenance.json` proves which original Schema 14 documents were converted. It is authoring provenance, not a replacement for the current run's immutable Skill source pin.
+The `f2912...` commit in `source-provenance.json` belongs to the original Warhammer document repository and proves which Schema 14 documents were converted. `Test-ReferenceIntegrity.ps1` reports it only as `authoringSourceCommit`. It must never populate `workflow_commit_oid`; it is not a replacement for the current run's immutable `darktide-translate` Skill source pin.
 
 ## Precedence
 

@@ -2,6 +2,8 @@ Describe 'Auto Update Darktide MOD Skill contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
         $skillRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod'
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:skillSourcePinPath = New-TestSkillSourcePin -SkillRoot $skillRoot -OutputPath (Join-Path $TestDrive 'skill-source-pin.json')
     }
 
     # Scenario: A new run loads the packaged Skill entrypoint.
@@ -30,7 +32,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $result.result | Should -Be 'passed'
         $result.workflow.sha256 | Should -Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
         $result.reviewBaseline.sha256 | Should -Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
-        $result.schema15.sha256 | Should -Be 'ee06b79cdb46003807f88a551e7b59bdc2040310a4e6bc0206a108a0de70d262'
+        $result.schema15.sha256 | Should -Be '4ce3fd4a775d9e56bfed420c9ed1a7dfb086d85c32d539c32037e53cfd9e6eab'
         $result.schema15.path | Should -Be '.agents/skills/auto-update-darktide-mod/references/schema-15.md'
         $result.workflow.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz'
         $result.reviewBaseline.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz'
@@ -70,6 +72,26 @@ Describe 'Auto Update Darktide MOD Skill contract' {
             Should -Throw '*Schema 15 reference size mismatch*'
     }
 
+    # Scenario: Packaged Schema 14 authoring provenance comes from the target MOD repository, while a run must pin this Skill repository.
+    # Purpose: Prevent the old document-source commit from being recorded as the immutable darktide-translate Skill commit.
+    It 'UnitT24_SeparatesAuthoringProvenanceFromTheRuntimeSkillSourcePin' {
+        $validatorPath = Join-Path $skillRoot 'scripts/Test-ReferenceIntegrity.ps1'
+        $result = & $validatorPath -PassThru
+        $bound = & $validatorPath -SkillSourcePinPath $script:skillSourcePinPath -PassThru
+        $runner = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/mod-update.ps1') -Raw
+        $candidateValidator = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-ModUpdateCandidate.ps1') -Raw
+
+        $result.authoringSourceCommit | Should -Be 'f2912faf7a52304198aa0ffc096eb12a436bbb45'
+        @($result.PSObject.Properties.Name) | Should -Not -Contain 'sourceCommit'
+        $bound.skillSourcePin.resolvedCommit | Should -Be '1111111111111111111111111111111111111111'
+        $bound.skillSourcePin.fileCount | Should -BeGreaterThan 10
+        $runner | Should -Match '\$SkillSourcePinPath'
+        $runner | Should -Not -Match '\$plannedOwner\.workflowCommitOid\s*=\s*\$integrity\.sourceCommit'
+        $runner | Should -Not -Match 'workflowCommitOid\s*=\s*\$integrity\.sourceCommit'
+        $candidateValidator | Should -Match 'Legacy Schema 14 authoring reference tuple changed'
+        $candidateValidator | Should -Match 'authoringSourceCommit'
+    }
+
     # Scenario: A run loads each normative Schema 14 document only when its stage needs it.
     # Purpose: Prove both compressed packages reconstruct byte-exact originals before an agent reads them.
     It 'UnitT25_ExpandsVerifiedSchema14DocumentsOnDemand' {
@@ -89,6 +111,27 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $baseline.sha256 | Should -Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
         Test-Path -LiteralPath $baseline.path -PathType Leaf | Should -Be $true
         (Get-Item -LiteralPath $baseline.path).Length | Should -Be 20507
+    }
+
+    # Scenario: A packaged reference directory or an external source-pin parent is replaced by a junction.
+    # Purpose: Reject every reparse component before reading integrity-critical reference or pin bytes.
+    It 'UnitT26_RejectsReparseParentsAtReferenceAndSourcePinReadBoundaries' {
+        $fixtureRoot = Join-Path $TestDrive 'reparse-reference-skill'
+        Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
+        $outsideAssets = Join-Path $TestDrive 'reparse-reference-assets'
+        Move-Item -LiteralPath (Join-Path $fixtureRoot 'assets') -Destination $outsideAssets
+        New-Item -ItemType Junction -Path (Join-Path $fixtureRoot 'assets') -Target $outsideAssets | Out-Null
+        { & (Join-Path $fixtureRoot 'scripts/Test-ReferenceIntegrity.ps1') -PassThru } |
+            Should -Throw '*reparse*'
+
+        $outsidePin = Join-Path $TestDrive 'reparse-pin-outside'
+        $linkedPin = Join-Path $TestDrive 'reparse-pin-link'
+        New-Item -ItemType Directory -Path $outsidePin -Force | Out-Null
+        Copy-Item -LiteralPath $script:skillSourcePinPath -Destination (Join-Path $outsidePin 'skill-source-pin.json')
+        New-Item -ItemType Junction -Path $linkedPin -Target $outsidePin | Out-Null
+        { & (Join-Path $skillRoot 'scripts/Test-ReferenceIntegrity.ps1') `
+                -SkillSourcePinPath (Join-Path $linkedPin 'skill-source-pin.json') -PassThru } |
+            Should -Throw '*reparse*'
     }
 
     # Scenario: A temporary materialization path already contains the requested document.

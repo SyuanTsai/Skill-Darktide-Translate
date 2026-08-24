@@ -4,6 +4,7 @@
 param(
     [Parameter(Mandatory)][string] $RepositoryRoot,
     [Parameter(Mandatory)][string] $QueuePath,
+    [string] $SkillSourcePinPath,
     [int] $ThrottleLimit = 4,
     [switch] $PassThru
 )
@@ -28,6 +29,10 @@ foreach ($item in $items) {
     if ([string]$item.provider -notin @('api', 'browser')) { throw 'Queue provider must be api or browser.' }
     if (-not $identities.Add(([string]$item.modDirectory).Trim())) { throw 'Queue contains a duplicate canonical MOD identity.' }
 }
+if ([string]::IsNullOrWhiteSpace($SkillSourcePinPath) -or -not (Test-Path -LiteralPath $SkillSourcePinPath -PathType Leaf)) {
+    throw 'Queue execution requires -SkillSourcePinPath for the immutable darktide-translate source tuple.'
+}
+$skillSourcePinFull = [IO.Path]::GetFullPath($SkillSourcePinPath)
 
 $runner = Join-Path $PSScriptRoot 'mod-update.ps1'
 $results = @(
@@ -37,13 +42,30 @@ $results = @(
             RepositoryRoot = $using:repository
             ModDirectory = [string]$item.modDirectory
             SourceRequestPath = [IO.Path]::GetFullPath([string]$item.sourceRequestPath)
+            SkillSourcePinPath = $using:skillSourcePinFull
             Provider = [string]$item.provider
             PassThru = $true
         }
         if ($item.Contains('runId') -and -not [string]::IsNullOrWhiteSpace([string]$item.runId)) { $arguments.RunId = [string]$item.runId }
         if ($item.Contains('downloadedFilePath') -and -not [string]::IsNullOrWhiteSpace([string]$item.downloadedFilePath)) { $arguments.DownloadedFilePath = [IO.Path]::GetFullPath([string]$item.downloadedFilePath) }
         if ($item.Contains('observationIntervalMilliseconds')) { $arguments.ObservationIntervalMilliseconds = [int]$item.observationIntervalMilliseconds }
-        & $using:runner acquire-source @arguments
+        try {
+            & $using:runner acquire-source @arguments
+        }
+        catch {
+            [ordered]@{
+                result = 'failed'
+                status = 'failed'
+                stage = 'acquire-source'
+                modDirectory = [string]$item.modDirectory
+                runId = if ($arguments.ContainsKey('RunId')) { [string]$arguments.RunId } else { $null }
+                error = [ordered]@{
+                    code = 'worker_failed'
+                    message = 'Source acquisition worker failed before producing a structured result.'
+                    type = $_.Exception.GetType().FullName
+                }
+            }
+        }
     } -ThrottleLimit $ThrottleLimit
 )
 $output = [ordered]@{

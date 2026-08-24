@@ -97,27 +97,135 @@ function Get-LuaTokens {
     @($tokens)
 }
 
+function Get-IoDofileLoaderCallCount {
+    param([object[]] $Tokens)
+    $count = 0
+    for ($index = 0; $index -le ($Tokens.Count - 4); $index++) {
+        if ($Tokens[$index].type -ceq 'identifier' -and $Tokens[$index].text -ceq 'mod' -and
+            $Tokens[$index + 1].text -ceq ':' -and
+            $Tokens[$index + 2].type -ceq 'identifier' -and $Tokens[$index + 2].text -ceq 'io_dofile' -and
+            $Tokens[$index + 3].text -ceq '(') {
+            $count++
+        }
+    }
+    $count
+}
+
+function Test-IoDofileOnlyLoaderTokens {
+    param([object[]] $Tokens)
+    if ($Tokens.Count -eq 0) { return $false }
+    $index = 0
+    $localName = $null
+    if ($Tokens.Count -ge 5 -and
+        $Tokens[0].type -ceq 'identifier' -and $Tokens[0].text -ceq 'local' -and
+        $Tokens[1].type -ceq 'identifier' -and $Tokens[2].text -ceq '=' -and
+        $Tokens[3].text -ceq '{' -and $Tokens[4].text -ceq '}') {
+        $localName = [string]$Tokens[1].text
+        $index = 5
+        if ($index -lt $Tokens.Count -and $Tokens[$index].text -ceq ';') { $index++ }
+    }
+
+    $callCount = 0
+    while (($index + 5) -lt $Tokens.Count -and
+        $Tokens[$index].type -ceq 'identifier' -and $Tokens[$index].text -ceq 'mod' -and
+        $Tokens[$index + 1].text -ceq ':' -and
+        $Tokens[$index + 2].type -ceq 'identifier' -and $Tokens[$index + 2].text -ceq 'io_dofile' -and
+        $Tokens[$index + 3].text -ceq '(' -and
+        $Tokens[$index + 4].type -ceq 'string' -and
+        $Tokens[$index + 5].text -ceq ')') {
+        $callCount++
+        $index += 6
+        if ($index -lt $Tokens.Count -and $Tokens[$index].text -ceq ';') { $index++ }
+    }
+    if ($callCount -eq 0) { return $false }
+
+    if ($null -ne $localName) {
+        if (($index + 1) -ge $Tokens.Count -or
+            $Tokens[$index].type -cne 'identifier' -or $Tokens[$index].text -cne 'return' -or
+            $Tokens[$index + 1].type -cne 'identifier' -or $Tokens[$index + 1].text -cne $localName) {
+            return $false
+        }
+        $index += 2
+        if ($index -lt $Tokens.Count -and $Tokens[$index].text -ceq ';') { $index++ }
+    }
+    $index -eq $Tokens.Count
+}
+
 function ConvertFrom-LuaKeyString {
     param([string] $Literal)
-    if ($Literal.StartsWith('[', [StringComparison]::Ordinal)) { return $Literal }
+    if ($Literal.StartsWith('[', [StringComparison]::Ordinal)) {
+        $longString = [regex]::Match($Literal, '^\[(=*)\[(.*)\]\1\]$', [Text.RegularExpressions.RegexOptions]::Singleline)
+        if (-not $longString.Success) { throw 'Lua long-string key literal is malformed.' }
+        $content = $longString.Groups[2].Value
+        if ($content.StartsWith("`r`n", [StringComparison]::Ordinal)) { $content = $content.Substring(2) }
+        elseif ($content.StartsWith("`n", [StringComparison]::Ordinal) -or $content.StartsWith("`r", [StringComparison]::Ordinal)) { $content = $content.Substring(1) }
+        return ($content -replace "`r`n|`r|`n", "`n")
+    }
     $content = $Literal.Substring(1, $Literal.Length - 2)
-    $builder = [Text.StringBuilder]::new()
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $bytes = [Collections.Generic.List[byte]]::new()
     for ($index = 0; $index -lt $content.Length; $index++) {
-        if ($content[$index] -ne '\' -or ($index + 1) -ge $content.Length) {
-            $null = $builder.Append($content[$index])
+        if ($content[$index] -ne '\') {
+            $characterLength = if ([char]::IsHighSurrogate($content[$index]) -and ($index + 1) -lt $content.Length -and
+                [char]::IsLowSurrogate($content[$index + 1])) { 2 } else { 1 }
+            $bytes.AddRange($encoding.GetBytes($content.Substring($index, $characterLength)))
+            $index += $characterLength - 1
             continue
         }
+        if (($index + 1) -ge $content.Length) { throw 'Lua key string ends with an incomplete escape.' }
         $index++
         $escaped = $content[$index]
-        $value = switch ($escaped) {
-            'n' { "`n" }
-            'r' { "`r" }
-            't' { "`t" }
-            default { [string]$escaped }
+        if ([char]::IsDigit($escaped)) {
+            $digitStart = $index
+            $digitEnd = $index
+            while (($digitEnd + 1) -lt $content.Length -and ($digitEnd - $digitStart) -lt 2 -and [char]::IsDigit($content[$digitEnd + 1])) { $digitEnd++ }
+            $value = [int]$content.Substring($digitStart, $digitEnd - $digitStart + 1)
+            if ($value -gt 255) { throw 'Lua decimal key escape exceeds one byte.' }
+            $bytes.Add([byte]$value)
+            $index = $digitEnd
+            continue
         }
-        $null = $builder.Append($value)
+        switch -CaseSensitive ($escaped) {
+            'a' { $bytes.Add(7) }
+            'b' { $bytes.Add(8) }
+            'f' { $bytes.Add(12) }
+            'n' { $bytes.Add(10) }
+            'r' { $bytes.Add(13) }
+            't' { $bytes.Add(9) }
+            'v' { $bytes.Add(11) }
+            '\' { $bytes.Add(92) }
+            '"' { $bytes.Add(34) }
+            "'" { $bytes.Add(39) }
+            "`n" { $bytes.Add(10) }
+            "`r" {
+                if (($index + 1) -lt $content.Length -and $content[$index + 1] -eq "`n") { $index++ }
+                $bytes.Add(10)
+            }
+            'z' {
+                while (($index + 1) -lt $content.Length -and [char]::IsWhiteSpace($content[$index + 1])) { $index++ }
+            }
+            'x' {
+                if (($index + 2) -ge $content.Length -or $content.Substring($index + 1, 2) -notmatch '^[0-9A-Fa-f]{2}$') {
+                    throw 'Lua hexadecimal key escape must contain exactly two digits.'
+                }
+                $bytes.Add([Convert]::ToByte($content.Substring($index + 1, 2), 16))
+                $index += 2
+            }
+            'u' {
+                $unicode = [regex]::Match($content.Substring($index), '^u\{([0-9A-Fa-f]+)\}')
+                if (-not $unicode.Success) { throw 'Lua Unicode key escape is malformed.' }
+                $codePoint = [Convert]::ToInt32($unicode.Groups[1].Value, 16)
+                if ($codePoint -gt 0x10FFFF -or ($codePoint -ge 0xD800 -and $codePoint -le 0xDFFF)) {
+                    throw 'Lua Unicode key escape is outside the valid scalar range.'
+                }
+                $bytes.AddRange($encoding.GetBytes([char]::ConvertFromUtf32($codePoint)))
+                $index += $unicode.Length - 1
+            }
+            default { throw "Unsupported Lua key string escape: \$escaped" }
+        }
     }
-    $builder.ToString()
+    try { $encoding.GetString($bytes.ToArray()) }
+    catch { '@bytes:' + [Convert]::ToHexString($bytes.ToArray()).ToLowerInvariant() }
 }
 
 function Get-CanonicalTokenText {
@@ -329,7 +437,7 @@ function Get-LuaLocalizationDocument {
         $position++
     }
 
-    $occurrences = @{}
+    $occurrences = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
     $numbered = foreach ($unit in $units) {
         $identityBase = "$($unit.sourceId) :: $($unit.containerPath) :: $($unit.key)"
         if (-not $occurrences.ContainsKey($identityBase)) { $occurrences[$identityBase] = 0 }
@@ -347,6 +455,10 @@ function Get-LuaLocalizationDocument {
             tableCloseByte = $unit.tableCloseByte
         }
     }
+    $withoutCrlf = $text.Replace("`r`n", '')
+    $hasCrlf = $withoutCrlf.Length -ne $text.Length
+    $hasOtherLineBreak = $withoutCrlf.Contains("`n", [StringComparison]::Ordinal) -or $withoutCrlf.Contains("`r", [StringComparison]::Ordinal)
+    $newline = if ($hasCrlf -and $hasOtherLineBreak) { 'mixed' } elseif ($hasCrlf) { 'crlf' } elseif ($hasOtherLineBreak -and $withoutCrlf.Contains("`r", [StringComparison]::Ordinal)) { 'mixed' } else { 'lf' }
     [ordered]@{
         schemaVersion = 1
         sourceId = $SourceId
@@ -354,7 +466,9 @@ function Get-LuaLocalizationDocument {
         sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
         size = $bytes.LongLength
         bom = $bomLength -eq 3
-        newline = if ($text.Contains("`r`n", [StringComparison]::Ordinal)) { 'crlf' } else { 'lf' }
+        newline = $newline
+        ioDofileLoaderCallCount = Get-IoDofileLoaderCallCount -Tokens $tokens
+        isIoDofileOnlyLoader = Test-IoDofileOnlyLoaderTokens -Tokens $tokens
         units = @($numbered)
     }
 }

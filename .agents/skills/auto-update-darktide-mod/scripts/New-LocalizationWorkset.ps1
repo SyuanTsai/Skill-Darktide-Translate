@@ -61,6 +61,19 @@ function Get-ImmutableWorksetContractSha256 {
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
 }
 
+function Get-ReviewWorksetContractSha256 {
+    param($Workset)
+    $reviewContract = @($Workset.units | ForEach-Object {
+        [ordered]@{
+            unitId = $_.unitId
+            reviewStatus = $_.reviewStatus
+            suggestedZhTwExpression = $_.suggestedZhTwExpression
+        }
+    })
+    $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(($reviewContract | ConvertTo-Json -Depth 10 -Compress))
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
 function Invoke-GitText {
     param([string] $WorkingDirectory, [string[]] $Arguments, [switch] $AllowFailure)
     $start = [Diagnostics.ProcessStartInfo]::new()
@@ -106,22 +119,24 @@ function Assert-ContainedPath {
 }
 
 function Assert-NoReparsePath {
-    param([string] $Path, [string] $Root)
-    $rootFull = [IO.Path]::GetFullPath($Root)
-    $current = Get-Item -LiteralPath $Path
-    while ($true) {
-        if ($current.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'NEW localization path contains a symlink or reparse point.' }
-        if ($current.FullName -eq $rootFull) { break }
-        $parent = Split-Path -Parent $current.FullName
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw 'Unable to prove NEW localization containment.' }
-        $current = Get-Item -LiteralPath $parent
+    param([string] $Path, [string] $Root, [switch] $AllowMissing)
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $current = [IO.Path]::GetFullPath($Path)
+    if (-not $current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $current.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Localization workset path escapes its verification root.'
     }
-}
-
-function Get-Utf8Text {
-    param([byte[]] $Bytes)
-    $offset = if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { 3 } else { 0 }
-    [Text.UTF8Encoding]::new($false, $true).GetString($Bytes, $offset, $Bytes.Length - $offset)
+    for ($depth = 0; $depth -lt 2048; $depth++) {
+        if (Test-Path -LiteralPath $current) {
+            if ((Get-Item -LiteralPath $current).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Localization workset path contains a symlink or reparse point.' }
+        }
+        elseif (-not $AllowMissing) { throw 'Localization workset path component is missing.' }
+        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return }
+        $parent = Split-Path -Parent $current
+        if ([string]::IsNullOrWhiteSpace($parent)) { throw 'Unable to prove NEW localization containment.' }
+        $current = $parent
+    }
+    throw 'Unable to prove localization workset containment within 2048 path components.'
 }
 
 function Get-CanonicalExpression {
@@ -145,6 +160,7 @@ function New-UnitRecord {
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { $changeType = 'blocked'; $action = 'BLOCKED' }
     elseif ($null -eq $OldUnit) { $changeType = 'new_key'; $action = 'AI_REQUIRED' }
     elseif ($null -eq $NewUnit) { $changeType = 'deleted_key'; $action = 'ACCEPT_REMOVAL' }
+    elseif ($null -eq $oldZhTw -and $null -eq $newZhTw) { $changeType = 'missing_zh_tw'; $action = 'AI_REQUIRED' }
     elseif ($oldSource -ceq $newSource -and $oldZhTw -ceq $newZhTw) { $changeType = 'unchanged'; $action = 'NONE' }
     elseif ($oldSource -ceq $newSource) { $changeType = 'zh_tw_only_changed'; $action = 'RESTORE_OLD_ZH_TW' }
     elseif ($oldZhTw -ceq $newZhTw) { $changeType = 'source_changed_translation_unchanged'; $action = 'AI_REQUIRED' }
@@ -174,31 +190,65 @@ if (-not (Test-Path -LiteralPath $stagingRoot -PathType Container)) { throw 'Sta
 if ((Split-Path -Leaf $outputFull) -cne 'localization-workset.json' -or (Split-Path -Leaf (Split-Path -Parent $outputFull)) -cne 'review-artifacts') {
     throw 'Localization workset must be review-artifacts/localization-workset.json.'
 }
-$normalizedModPath = $ModRelativePath.Replace('\', '/').Trim('/')
-if ([string]::IsNullOrWhiteSpace($normalizedModPath) -or $normalizedModPath.Contains('..')) { throw 'ModRelativePath is invalid.' }
+$outputParent = Split-Path -Parent $outputFull
+Assert-NoReparsePath -Path $outputParent -Root $repository -AllowMissing
+if (-not (Test-Path -LiteralPath $outputParent -PathType Container)) { New-Item -ItemType Directory -Path $outputParent -Force | Out-Null }
+Assert-NoReparsePath -Path $outputParent -Root $repository
+$rawModPath = $ModRelativePath.Replace('\', '/')
+$normalizedModPath = $rawModPath.Trim('/')
+$modPathSegments = @($normalizedModPath -split '/')
+if ([string]::IsNullOrWhiteSpace($normalizedModPath) -or [IO.Path]::IsPathRooted($rawModPath) -or
+    @($modPathSegments | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -in @('.', '..') }).Count -ne 0) {
+    throw 'ModRelativePath is invalid.'
+}
 $resolvedBaseOid = (Invoke-GitText -WorkingDirectory $repository -Arguments @('rev-parse', "$BaseOid^{commit}")).output.Trim()
 if ($resolvedBaseOid -notmatch '^[0-9a-f]{40}$') { throw 'BaseOid did not resolve to a 40-character commit OID.' }
 $sourceIdentity = if ([string]::IsNullOrWhiteSpace($SourceId)) { $normalizedModPath } else { $SourceId }
 $existingWorkset = if (Test-Path -LiteralPath $outputFull -PathType Leaf) {
+    Assert-NoReparsePath -Path $outputFull -Root $repository
     Get-Content -LiteralPath $outputFull -Raw | ConvertFrom-Json -AsHashtable
 } else { $null }
-if ($existingWorkset -and [string]$existingWorkset.status -ceq 'applied') {
+if ($existingWorkset) {
+    foreach ($unit in @($existingWorkset.units)) {
+        if ([string]$unit.action -cne 'AI_REQUIRED' -and
+            ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
+            throw "Localization review fields were edited outside AI_REQUIRED: $($unit.unitId)"
+        }
+    }
+}
+if ($existingWorkset -and [string]$existingWorkset.status -in @('applying', 'applied')) {
     if ([string]$existingWorkset.baseOid -cne $resolvedBaseOid -or [string]$existingWorkset.sourceId -cne $sourceIdentity -or
         [string]$existingWorkset.modRelativePath -cne $normalizedModPath) {
-        throw 'Existing applied localization workset belongs to a different immutable input tuple.'
+        throw 'Existing applying or applied localization workset belongs to a different immutable input tuple.'
     }
     if ([string]::IsNullOrWhiteSpace([string]$existingWorkset.immutableContractSha256) -or
         (Get-ImmutableWorksetContractSha256 -Workset $existingWorkset) -cne [string]$existingWorkset.immutableContractSha256) {
         throw 'Existing localization workset immutable contract changed.'
     }
+    $expectedApplyStatus = if ([string]$existingWorkset.status -ceq 'applied') { 'applied' } else { 'pending' }
+    if (-not $existingWorkset.Contains('apply') -or -not $existingWorkset.apply -or
+        [string]$existingWorkset.apply.status -cne $expectedApplyStatus -or
+        [string]$existingWorkset.apply.inputSha256 -cne [string]$existingWorkset.new.sha256 -or
+        [string]$existingWorkset.apply.reviewContractSha256 -cne (Get-ReviewWorksetContractSha256 -Workset $existingWorkset) -or
+        [string]$existingWorkset.apply.outputSha256 -notmatch '^[0-9a-f]{64}$' -or [int64]$existingWorkset.apply.outputSize -lt 0) {
+        throw 'Existing applying or applied localization workset review contract or apply receipt changed.'
+    }
     if ([IO.Path]::GetFullPath([string]$existingWorkset.new.root) -cne $stagingRoot) { throw 'Existing applied workset staging root changed.' }
     $existingNewPath = Assert-ContainedPath -Candidate ([string]$existingWorkset.new.path) -Root $stagingRoot
     Assert-NoReparsePath -Path $existingNewPath -Root $stagingRoot
-    if (-not (Test-Path -LiteralPath $existingNewPath -PathType Leaf) -or
-        (Get-FileSha256 -Path $existingNewPath) -cne [string]$existingWorkset.apply.outputSha256) {
-        throw 'Existing applied localization workset output changed.'
+    if (-not (Test-Path -LiteralPath $existingNewPath -PathType Leaf)) { throw 'Existing applying or applied localization workset output is missing.' }
+    $existingNewBytes = [IO.File]::ReadAllBytes($existingNewPath)
+    $existingNewSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($existingNewBytes)).ToLowerInvariant()
+    $allowedHashes = if ([string]$existingWorkset.status -ceq 'applying') {
+        @([string]$existingWorkset.apply.inputSha256, [string]$existingWorkset.apply.outputSha256)
     }
-    Write-Result -Value ([ordered]@{ result = 'passed'; status = 'applied'; idempotent = $true; path = $outputFull; sha256 = Get-FileSha256 -Path $outputFull; unitCount = @($existingWorkset.units).Count })
+    else { @([string]$existingWorkset.apply.outputSha256) }
+    if ($existingNewSha -cnotin $allowedHashes -or
+        ($existingNewSha -ceq [string]$existingWorkset.apply.inputSha256 -and $existingNewBytes.LongLength -ne [int64]$existingWorkset.new.size) -or
+        ($existingNewSha -ceq [string]$existingWorkset.apply.outputSha256 -and $existingNewBytes.LongLength -ne [int64]$existingWorkset.apply.outputSize)) {
+        throw 'Existing applying or applied localization workset output changed.'
+    }
+    Write-Result -Value ([ordered]@{ result = 'passed'; status = [string]$existingWorkset.status; idempotent = $true; path = $outputFull; sha256 = Get-FileSha256 -Path $outputFull; unitCount = @($existingWorkset.units).Count })
     return
 }
 
@@ -222,17 +272,22 @@ $oldPath = [string]$oldPaths[0]
 $oldBytes = Get-GitBlobBytes -WorkingDirectory $repository -Object "$resolvedBaseOid`:$oldPath"
 $newBytes = [IO.File]::ReadAllBytes($newPath)
 $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath $oldPath -SourceId $sourceIdentity
-$newDocument = Get-LuaLocalizationDocument -Path $newPath -SourceId $sourceIdentity
+$newDocument = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newPath -SourceId $sourceIdentity
 
-$loaderPattern = '(?s)\bmod\s*:\s*io_dofile\s*\('
 if (@($oldDocument.units).Count -eq 0 -and @($newDocument.units).Count -eq 0 -and
-    ((Get-Utf8Text -Bytes $oldBytes) -match $loaderPattern -or (Get-Utf8Text -Bytes $newBytes) -match $loaderPattern)) {
+    [bool]$oldDocument.isIoDofileOnlyLoader -and [bool]$newDocument.isIoDofileOnlyLoader) {
     Write-Result -Value ([ordered]@{ result = 'excluded'; status = 'automation-excluded'; reason = 'localization_entry_is_loader'; sourceId = $sourceIdentity })
     return
 }
+if (@($oldDocument.units).Count -eq 0 -or @($newDocument.units).Count -eq 0) {
+    Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; reason = 'localization_structure_not_static'; sourceId = $sourceIdentity })
+    return
+}
 
-$oldById = @{}; foreach ($unit in @($oldDocument.units)) { $oldById[[string]$unit.unitId] = $unit }
-$newById = @{}; foreach ($unit in @($newDocument.units)) { $newById[[string]$unit.unitId] = $unit }
+$oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+foreach ($unit in @($oldDocument.units)) { $oldById[[string]$unit.unitId] = $unit }
+$newById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+foreach ($unit in @($newDocument.units)) { $newById[[string]$unit.unitId] = $unit }
 $records = [Collections.Generic.List[object]]::new()
 foreach ($newUnit in @($newDocument.units)) {
     $oldUnit = if ($oldById.ContainsKey([string]$newUnit.unitId)) { $oldById[[string]$newUnit.unitId] } else { $null }
@@ -242,7 +297,7 @@ foreach ($oldUnit in @($oldDocument.units)) {
     if (-not $newById.ContainsKey([string]$oldUnit.unitId)) { $records.Add((New-UnitRecord -OldUnit $oldUnit -NewUnit $null)) }
 }
 $counts = [ordered]@{}
-foreach ($name in @('unchanged', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
+foreach ($name in @('unchanged', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
     $counts[$name] = @($records | Where-Object { $_.changeType -ceq $name }).Count
 }
 $workset = [ordered]@{
@@ -274,5 +329,7 @@ if ($existingWorkset) {
     Write-Result -Value ([ordered]@{ result = 'passed'; status = $existing.status; idempotent = $true; path = $outputFull; sha256 = Get-FileSha256 -Path $outputFull; unitCount = @($existing.units).Count })
     return
 }
+Assert-NoReparsePath -Path $outputParent -Root $repository
+Assert-NoReparsePath -Path $outputFull -Root $repository -AllowMissing
 Write-AtomicJson -Path $outputFull -Value $workset
 Write-Result -Value ([ordered]@{ result = 'passed'; status = $workset.status; idempotent = $false; path = $outputFull; sha256 = Get-FileSha256 -Path $outputFull; unitCount = $records.Count; counts = $counts })

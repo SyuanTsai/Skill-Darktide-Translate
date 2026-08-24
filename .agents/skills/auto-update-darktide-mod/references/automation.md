@@ -6,10 +6,10 @@ Load this reference only when executing, resuming, diagnosing, or extending the 
 
 Install the complete `auto-update-darktide-mod` Skill directory from one immutable `darktide-translate` source pin. PowerShell 7, Git, and Pester 5 are required. Publication additionally requires authenticated `gh` access to the target MOD repository.
 
-Before a real run, verify the package and materialize the Workflow outside both repositories:
+Before a real run, retain the JSON emitted by `scripts/Get-SourcePin.ps1` for the selected release outside the installed Skill and target repository. Verify the complete installed package against it, then materialize the Workflow outside both repositories:
 
 ```powershell
-./scripts/Test-ReferenceIntegrity.ps1
+./scripts/Test-ReferenceIntegrity.ps1 -SkillSourcePinPath $skillSourcePinPath
 ./scripts/Expand-Schema14Reference.ps1 -Document Workflow -OutputDirectory $freshTemporaryDirectory
 ```
 
@@ -25,7 +25,8 @@ Start a run:
 ./scripts/mod-update.ps1 claim `
   -RepositoryRoot 'D:\Games\Warhammer-40-000-DARKTIDE-Mods' `
   -ArchivePath 'D:\Games\Warhammer-40-000-DARKTIDE-Mods\AI Auto Update\ExampleMod.zip' `
-  -ModDirectory 'ExampleMod'
+  -ModDirectory 'ExampleMod' `
+  -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.0.json'
 ```
 
 ### Schema 15 automatic source
@@ -40,15 +41,16 @@ For an existing signed-in browser session, download only into the fixed run's ex
   -ModDirectory 'ExampleMod' `
   -RunId '11111111-2222-4333-8444-555555555555' `
   -SourceRequestPath 'D:\...\source-request.json' `
+  -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.0.json' `
   -Provider browser `
   -DownloadedFilePath 'D:\...\.incoming-11111111-2222-4333-8444-555555555555\ExampleMod.zip'
 ```
 
 `acquire-source` and receipt-bound `claim` remain separately callable for coordinators and diagnosis. New automatic runs preflight immutable base localization before branch creation; a loader-only entry returns `AUTOMATION_EXCLUDED: localization_entry_is_loader` while retaining acquisition evidence and the per-MOD reservation.
 
-Acquisition atomically archives the supplied request as run-local `review-artifacts/source-request.json`; receipt-bound claim accepts only that exact path and verifies its hash against `source-acquisition.json` and the MOD reservation owner. The API provider reads an ephemeral HTTPS Nexus download URL from `NEXUS_DOWNLOAD_URI` and an optional API key from `NEXUS_API_KEY`. These environment values are never written to state or receipts. Missing URLs, partial files, instability, and rate limits are `waiting-system`; login, OTP, CAPTCHA, terms, permissions, and unsupported archives are `waiting-user`. Identity or hash mismatches are blocked.
+Acquisition atomically archives the supplied request as run-local `review-artifacts/source-request.json` and the verified Skill pin as `review-artifacts/skill-source-pin.json`; receipt-bound claim accepts only that exact tuple and verifies its hashes against `source-acquisition.json` and the MOD reservation owner. Every resume proves that the supplied state file is physically below the requested repository, that its `repositoryRoot`, `statePath`, and `runRoot` self-bind to that file, and that its MOD lock key and path equal the canonical reservation derived from the MOD identity. Every reservation-owner read or write, source read, receipt write, delivery move, workset apply, and workset deletion rechecks all existing path components for reparse points. The API provider reads an ephemeral HTTPS Nexus download URL from `NEXUS_DOWNLOAD_URI` and an optional API key from `NEXUS_API_KEY`. Automatic redirects are disabled; at most ten redirect hops are followed manually, and every hop must remain HTTPS on `nexusmods.com` or one of its subdomains before any credential-bearing request is sent. These environment values are never written to state or receipts. Missing URLs, partial files, instability, and rate limits are `waiting-system`; login, OTP, CAPTCHA, terms, permissions, unsupported archives, and a missing or invalid Skill pin are `waiting-user`. Identity or hash mismatches are blocked.
 
-Use `scripts/Invoke-ModUpdateQueue.ps1` for acquisition concurrency. Its throttle is restricted to one through four distinct MOD identities; duplicate identities are rejected before workers start.
+Use `scripts/Invoke-ModUpdateQueue.ps1 -SkillSourcePinPath <pin.json>` for acquisition concurrency. Its throttle is restricted to one through four distinct MOD identities; duplicate identities are rejected before workers start, and every worker receives the same verified source pin.
 
 The JSON result returns the generated `statePath`. Resume individual stages with that exact file:
 
@@ -66,6 +68,8 @@ The JSON result returns the generated `statePath`. Resume individual stages with
 `run` executes the same ordered stages. After publication it returns `waiting-input` instead of pretending to perform semantic Review. Expand and read the packaged Review Baseline, review the immutable F, write the local Review artifact below, then resume the same `run` with `-StatePath` and `-LocalReviewPath`. The second invocation completes the zero-wait external snapshot and stops at `awaiting-user-merge`. It does not merge a PR or release the MOD identity reservation.
 
 Every result contains the run ID, stage, state, active and waiting milliseconds, and the primary artifact SHA-256. Completed stages are idempotent: rerunning them reuses the matching same-run receipt instead of creating duplicate commits or PRs.
+
+New Schema 14 and Schema 15 states record the runtime Skill pin. A pre-0.3 Schema 14 state that lacks `workflowSourcePinPath` remains on its legacy authoring-reference tuple and is validated through the legacy Schema 14 compatibility path; it is never rewritten or upgraded in place. Schema 15 has no implicit downgrade or pin migration.
 
 ### Localization plan
 
@@ -103,9 +107,9 @@ Spans must not overlap. `oldSha256` binds each decision to the immutable indexed
 
 After raw installation, `localization` creates the fixed run-local `review-artifacts/localization-workset.json` with `New-LocalizationWorkset.ps1`. OLD comes from `baseOid`; NEW is a byte-identical physical staging copy. The scanner never executes Lua.
 
-If the workset contains pending `AI_REQUIRED` units, the runner returns `waiting-input`. Review only those unit IDs, set `reviewStatus` to `approved`, and provide `suggestedZhTwExpression`. Do not edit classification, action, paths, source spans, or non-AI units. `immutableContractSha256` binds every other field and is independently recomputed. Resume the same `localization` stage.
+If the workset contains pending `AI_REQUIRED` units, including active `missing_zh_tw` units, the runner returns `waiting-input`. Review only those unit IDs, set `reviewStatus` to `approved`, and provide `suggestedZhTwExpression`. Do not edit classification, action, paths, source spans, or non-AI units; non-AI review fields remain `not-required` and null. `immutableContractSha256` binds every other field and is independently recomputed. Resume the same `localization` stage.
 
-`Apply-LocalizationWorkset.ps1` selects INSERT, REPLACE, or REMOVE, preserves BOM/newlines, and records byte edits. C2 checkpoints raw upstream localization and C3 applies the merged workset artifact. The independent Gate proves bytes outside workset edits are unchanged. A passing Gate records the workset hash and counts, then deletes the JSON before publication; it is never added to Git.
+`Apply-LocalizationWorkset.ps1` selects INSERT, REPLACE, or REMOVE, preserves BOM/newlines, and records byte edits. It persists a `pending` deterministic apply receipt before replacing NEW bytes; a resume accepts only the recorded input or output hash, then completes the same receipt. C2 checkpoints raw upstream localization and C3 applies the merged workset artifact. `Test-LocalizationWorksetReceipt.ps1` independently recomputes the exact authorized edits from immutable units plus raw NEW bytes and rejects any self-authorizing receipt mutation before the Gate proves the merged and Git bytes. A passing Gate records the workset hash and counts, then deletes the JSON through a separate pending/deleted receipt before publication; it is never added to Git.
 
 ### Local Review artifact
 

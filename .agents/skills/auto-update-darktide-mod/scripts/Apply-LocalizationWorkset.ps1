@@ -45,6 +45,18 @@ function Get-ImmutableWorksetContractSha256 {
     Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress)))
 }
 
+function Get-ReviewWorksetContractSha256 {
+    param($Workset)
+    $reviewContract = @($Workset.units | ForEach-Object {
+        [ordered]@{
+            unitId = $_.unitId
+            reviewStatus = $_.reviewStatus
+            suggestedZhTwExpression = $_.suggestedZhTwExpression
+        }
+    })
+    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($reviewContract | ConvertTo-Json -Depth 10 -Compress)))
+}
+
 function Write-AtomicJson {
     param([string] $Path, $Value)
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
@@ -75,6 +87,29 @@ function Assert-ContainedPath {
         throw 'Workset NEW path escapes its recorded staging root.'
     }
     $candidateFull
+}
+
+function Assert-NoReparsePath {
+    param([string] $Path, [string] $Root)
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    $current = Get-Item -LiteralPath $Path
+    while ($true) {
+        if ($current.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Workset NEW localization path contains a symlink or reparse point.'
+        }
+        if ($current.FullName.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $parent = Split-Path -Parent $current.FullName
+        if ([string]::IsNullOrWhiteSpace($parent)) { throw 'Unable to prove Workset NEW localization containment.' }
+        $current = Get-Item -LiteralPath $parent
+    }
+}
+
+function ConvertTo-NewlineStyle {
+    param([string] $Text, [string] $NewlineStyle)
+    if ($NewlineStyle -notin @('lf', 'crlf')) { throw 'Workset NEW localization newline style must be uniformly LF or CRLF.' }
+    $normalized = $Text -replace "`r`n|`r|`n", "`n"
+    if ($NewlineStyle -ceq 'crlf') { return $normalized.Replace("`n", "`r`n") }
+    $normalized
 }
 
 function Test-SafeLuaExpression {
@@ -124,10 +159,6 @@ function Get-InsertionEdit {
     if ($null -eq $Unit.sourceExpression) { throw 'Cannot insert zh-tw without a stable en source field.' }
     $tableClose = [int64]$Unit.tableCloseByte
     $tableOpen = [int64]$Unit.tableOpenByte
-    $triviaStart = $tableClose
-    while ($triviaStart -gt $tableOpen -and $Bytes[$triviaStart - 1] -in @(9, 10, 13, 32)) { $triviaStart-- }
-    $previous = $triviaStart - 1
-    $separator = if ($previous -ge $tableOpen -and $Bytes[$previous] -in @(44, 59)) { '' } else { ',' }
     $multiline = $false
     for ($index = $tableOpen; $index -lt $tableClose; $index++) { if ($Bytes[$index] -eq 10) { $multiline = $true; break } }
     if ($multiline) {
@@ -137,12 +168,12 @@ function Get-InsertionEdit {
         $indentLength = $sourceStart - ($lineStart + 1)
         $indent = if ($indentLength -gt 0) { [Text.Encoding]::UTF8.GetString($Bytes, $lineStart + 1, $indentLength) } else { '' }
         if ($indent -notmatch '^[\t ]*$') { throw 'Unable to derive safe localization field indentation.' }
-        $replacementText = $separator + $Newline + $indent + '["zh-tw"] = ' + $Expression
+        $replacementText = $Newline + $indent + '["zh-tw"] = ' + $Expression + ','
     }
     else {
-        $replacementText = $separator + ' ["zh-tw"] = ' + $Expression
+        $replacementText = ' ["zh-tw"] = ' + $Expression + ','
     }
-    New-Edit -Start $triviaStart -Length 0 -Replacement ([Text.UTF8Encoding]::new($false, $true).GetBytes($replacementText)) -UnitId ([string]$Unit.unitId) -Operation 'INSERT'
+    New-Edit -Start ($tableOpen + 1) -Length 0 -Replacement ([Text.UTF8Encoding]::new($false, $true).GetBytes($replacementText)) -UnitId ([string]$Unit.unitId) -Operation 'INSERT'
 }
 
 function Invoke-ByteEdits {
@@ -172,6 +203,8 @@ if ((Split-Path -Leaf $worksetFull) -cne 'localization-workset.json' -or (Split-
     throw 'WorksetPath must be review-artifacts/localization-workset.json.'
 }
 if (-not (Test-Path -LiteralPath $worksetFull -PathType Leaf)) { throw 'Localization workset does not exist.' }
+$worksetRunRoot = Split-Path -Parent (Split-Path -Parent $worksetFull)
+Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
 $workset = Get-Content -LiteralPath $worksetFull -Raw | ConvertFrom-Json -AsHashtable
 if ([int]$workset.schemaVersion -ne 1 -or [int]$workset.workflowSchemaVersion -ne 15) { throw 'Localization workset schema is unsupported.' }
 if ([string]::IsNullOrWhiteSpace([string]$workset.immutableContractSha256) -or
@@ -179,23 +212,66 @@ if ([string]::IsNullOrWhiteSpace([string]$workset.immutableContractSha256) -or
     throw 'Localization workset immutable contract changed.'
 }
 if ([string]$workset.status -eq 'blocked' -or @($workset.units | Where-Object { $_.action -ceq 'BLOCKED' }).Count -gt 0) { throw 'Blocked localization workset cannot be applied.' }
+foreach ($unit in @($workset.units)) {
+    if ([string]$unit.action -cne 'AI_REQUIRED' -and
+        ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
+        throw "Localization review fields were edited outside AI_REQUIRED: $($unit.unitId)"
+    }
+}
+$expectedStagingParent = [IO.Path]::GetFullPath((Join-Path $worksetRunRoot 'staging/localization-workset-input'))
+$expectedStagingRoot = [IO.Path]::GetFullPath((Join-Path $expectedStagingParent (Split-Path -Leaf ([string]$workset.modRelativePath))))
+$recordedStagingRoot = [IO.Path]::GetFullPath([string]$workset.new.root)
+if ($recordedStagingRoot -cne $expectedStagingRoot) {
+    throw 'Workset NEW root differs from its fixed run-local staging path.'
+}
 $newPath = Assert-ContainedPath -Candidate ([string]$workset.new.path) -Root ([string]$workset.new.root)
 if (-not (Test-Path -LiteralPath $newPath -PathType Leaf)) { throw 'Workset NEW localization file is missing.' }
-$item = Get-Item -LiteralPath $newPath
-if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Workset NEW localization file is a symlink or reparse point.' }
-$currentSha = Get-FileSha256 -Path $newPath
-if ($workset.Contains('apply') -and $workset.apply -and $currentSha -ceq [string]$workset.apply.outputSha256) {
-    Write-Result -Value ([ordered]@{ result = 'passed'; status = 'applied'; idempotent = $true; path = $newPath; sha256 = $currentSha; editCount = @($workset.apply.edits).Count })
-    return
+Assert-NoReparsePath -Path $newPath -Root ([string]$workset.new.root)
+if ([string]$workset.new.newline -notin @('lf', 'crlf')) { throw 'Workset NEW localization newline style must be uniformly LF or CRLF.' }
+$currentBytes = [IO.File]::ReadAllBytes($newPath)
+$currentSha = Get-Sha256Bytes -Bytes $currentBytes
+if ($workset.Contains('apply') -and $workset.apply) {
+    $applyStatus = if ($workset.apply.Contains('status')) { [string]$workset.apply.status } else { $null }
+    if ($applyStatus -notin @('pending', 'applied') -or
+        [string]$workset.apply.inputSha256 -cne [string]$workset.new.sha256 -or
+        [string]$workset.apply.reviewContractSha256 -cne (Get-ReviewWorksetContractSha256 -Workset $workset) -or
+        [string]$workset.apply.outputSha256 -notmatch '^[0-9a-f]{64}$' -or
+        [int64]$workset.apply.outputSize -lt 0) {
+        throw 'Localization workset apply receipt is malformed.'
+    }
+    if ($currentSha -ceq [string]$workset.apply.outputSha256) {
+        if ($currentBytes.LongLength -ne [int64]$workset.apply.outputSize) {
+            throw 'Workset applied output size differs from its pending receipt.'
+        }
+        if ($applyStatus -ceq 'pending') {
+            Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
+            $workset.apply.status = 'applied'
+            $workset.status = 'applied'
+            Write-AtomicJson -Path $worksetFull -Value $workset
+        }
+        elseif ([string]$workset.status -cne 'applied') {
+            throw 'Localization workset status differs from its applied receipt.'
+        }
+        Write-Result -Value ([ordered]@{ result = 'passed'; status = 'applied'; idempotent = $true; path = $newPath; sha256 = $currentSha; editCount = @($workset.apply.edits).Count; worksetSha256 = Get-FileSha256 -Path $worksetFull })
+        return
+    }
+    if ($applyStatus -cne 'pending' -or $currentSha -cne [string]$workset.apply.inputSha256) {
+        throw 'Workset NEW localization SHA-256 differs from both sides of its pending apply receipt.'
+    }
 }
 if ($currentSha -cne [string]$workset.new.sha256) { throw 'Workset NEW localization SHA-256 changed before apply.' }
-$originalBytes = [IO.File]::ReadAllBytes($newPath)
+$originalBytes = $currentBytes
 $before = Get-LuaLocalizationDocument -Bytes $originalBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId)
-$beforeById = @{}; foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
+$beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
 $edits = [Collections.Generic.List[object]]::new()
-$expectedZhTw = @{}
+$expectedZhTw = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($workset.units)) {
     $action = [string]$unit.action
+    if ($action -cne 'AI_REQUIRED' -and
+        ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
+        throw "Localization review fields were edited outside AI_REQUIRED: $($unit.unitId)"
+    }
     if ($action -in @('NONE', 'ACCEPT_REMOVAL')) { continue }
     if ($action -eq 'BLOCKED') { throw "Blocked localization unit cannot be applied: $($unit.unitId)" }
     if ($null -eq $unit.new) { throw "Localization action requires a NEW unit: $($unit.unitId)" }
@@ -203,11 +279,15 @@ foreach ($unit in @($workset.units)) {
     if ($null -eq $currentUnit) { throw "Localization unit is missing from NEW bytes: $($unit.unitId)" }
     $target = $null
     if ($action -eq 'RESTORE_OLD_ZH_TW') {
-        $target = if ($null -ne $unit.old.zhTwExpression) { [ordered]@{ raw = [string]$unit.old.zhTwExpression.raw; canonical = [string]$unit.old.zhTwExpression.canonical } } else { $null }
+        $target = if ($null -ne $unit.old.zhTwExpression) {
+            [ordered]@{ raw = ConvertTo-NewlineStyle -Text ([string]$unit.old.zhTwExpression.raw) -NewlineStyle ([string]$workset.new.newline); canonical = [string]$unit.old.zhTwExpression.canonical }
+        }
+        else { $null }
     }
     elseif ($action -eq 'AI_REQUIRED') {
         if ([string]$unit.reviewStatus -cne 'approved') { throw "AI_REQUIRED localization unit is not approved: $($unit.unitId)" }
-        $target = Test-SafeLuaExpression -Expression ([string]$unit.suggestedZhTwExpression)
+        $normalizedExpression = ConvertTo-NewlineStyle -Text ([string]$unit.suggestedZhTwExpression) -NewlineStyle ([string]$workset.new.newline)
+        $target = Test-SafeLuaExpression -Expression $normalizedExpression
     }
     else { throw "Unsupported localization workset action: $action" }
 
@@ -228,7 +308,11 @@ foreach ($unit in @($workset.units)) {
 
 $updatedBytes = Invoke-ByteEdits -Bytes $originalBytes -Edits @($edits)
 $after = Get-LuaLocalizationDocument -Bytes $updatedBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId)
-$afterById = @{}; foreach ($unit in @($after.units)) { $afterById[[string]$unit.unitId] = $unit }
+if ([bool]$after.bom -ne [bool]$workset.new.bom -or [string]$after.newline -cne [string]$workset.new.newline) {
+    throw 'Localization apply changed the immutable NEW BOM or newline style.'
+}
+$afterById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+foreach ($unit in @($after.units)) { $afterById[[string]$unit.unitId] = $unit }
 foreach ($beforeUnit in @($before.units)) {
     if (-not $afterById.ContainsKey([string]$beforeUnit.unitId)) { throw "Localization apply removed a non-deleted unit: $($beforeUnit.unitId)" }
     $afterUnit = $afterById[[string]$beforeUnit.unitId]
@@ -242,7 +326,6 @@ foreach ($entry in $expectedZhTw.GetEnumerator()) {
     if ($actual -cne $entry.Value) { throw "Localization apply produced an unexpected zh-tw expression: $($entry.Key)" }
 }
 
-Write-AtomicBytes -Path $newPath -Bytes $updatedBytes
 $serializedEdits = @($edits | ForEach-Object {
     $oldBytes = [byte[]]::new([int64]$_.lengthByte)
     if ($oldBytes.Length -gt 0) { [Array]::Copy($originalBytes, [int64]$_.startByte, $oldBytes, 0, $oldBytes.Length) }
@@ -256,12 +339,31 @@ $serializedEdits = @($edits | ForEach-Object {
         replacementSha256 = $_.replacementSha256
     }
 })
-$workset.status = 'applied'
-$workset.apply = [ordered]@{
+$pendingApply = [ordered]@{
+    status = 'pending'
     inputSha256 = Get-Sha256Bytes -Bytes $originalBytes
+    reviewContractSha256 = Get-ReviewWorksetContractSha256 -Workset $workset
     outputSha256 = Get-Sha256Bytes -Bytes $updatedBytes
     outputSize = $updatedBytes.LongLength
     edits = $serializedEdits
 }
+$pendingApplyJson = $pendingApply | ConvertTo-Json -Depth 40 -Compress
+if ($workset.Contains('apply') -and $workset.apply) {
+    if (($workset.apply | ConvertTo-Json -Depth 40 -Compress) -cne $pendingApplyJson) {
+        throw 'Recovered localization apply plan differs from its pending receipt.'
+    }
+}
+else {
+    $workset.status = 'applying'
+    $workset.apply = $pendingApply
+    Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
+    Write-AtomicJson -Path $worksetFull -Value $workset
+}
+Assert-NoReparsePath -Path $newPath -Root ([string]$workset.new.root)
+Write-AtomicBytes -Path $newPath -Bytes $updatedBytes
+if ((Get-FileSha256 -Path $newPath) -cne [string]$workset.apply.outputSha256) { throw 'Localization apply output changed at the write boundary.' }
+$workset.status = 'applied'
+$workset.apply.status = 'applied'
+Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
 Write-AtomicJson -Path $worksetFull -Value $workset
 Write-Result -Value ([ordered]@{ result = 'passed'; status = 'applied'; idempotent = $false; path = $newPath; sha256 = $workset.apply.outputSha256; editCount = $serializedEdits.Count; worksetSha256 = Get-FileSha256 -Path $worksetFull })

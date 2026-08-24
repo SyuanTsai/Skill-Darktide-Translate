@@ -92,6 +92,7 @@ The deterministic classifications and actions are:
 | Change type | Action |
 | --- | --- |
 | `unchanged` | `NONE` |
+| `missing_zh_tw` | `AI_REQUIRED` |
 | `zh_tw_only_changed` | `RESTORE_OLD_ZH_TW` |
 | `source_changed_translation_unchanged` | `AI_REQUIRED` |
 | `source_and_translation_changed` | `AI_REQUIRED` |
@@ -101,13 +102,15 @@ The deterministic classifications and actions are:
 
 When English/source structure is unchanged, upstream zh-tw drift is reverted to OLD. If OLD has no zh-tw and NEW adds it, remove the NEW field. These decisions are deterministic and are not sent to AI.
 
-AI receives only `AI_REQUIRED` units and may set only `reviewStatus` and `suggestedZhTwExpression` for the same unit ID. AI never chooses byte spans, actions, insertion points, or fields outside zh-tw. The generator records `immutableContractSha256` over every workset input, classification, and action except those two AI fields; generation resume, apply, and the independent Candidate Gate recompute it and reject any other workset mutation.
+An active unit whose OLD and NEW entries both lack zh-tw is `missing_zh_tw`; it remains an explicit translation target and cannot silently pass as unchanged.
+
+AI receives only `AI_REQUIRED` units and may set only `reviewStatus` and `suggestedZhTwExpression` for the same unit ID. Non-AI units must retain `reviewStatus=not-required` and a null suggestion. AI never chooses byte spans, actions, insertion points, or fields outside zh-tw. The generator records `immutableContractSha256` over every workset input, classification, and action except those two AI fields; generation resume, apply, and the independent Candidate Gate recompute it and reject any other workset mutation.
 
 ## Workset apply
 
 `Apply-LocalizationWorkset.ps1` validates the entire NEW SHA-256 before applying anything. It derives INSERT, REPLACE, or REMOVE edits, validates every approved expression as one Lua field value, applies non-overlapping edits from highest byte offset to lowest, and preserves UTF-8 BOM and newline style.
 
-After apply, reparse the result. Every unit identity and non-zh-tw source expression must equal NEW. Record each edit's original SHA-256, replacement bytes, replacement SHA-256, unit ID, and operation so the independent Candidate Gate can prove that bytes outside approved workset edits did not change.
+After apply, reparse the result. Every unit identity and non-zh-tw source expression must equal NEW. Bind all review fields into `reviewContractSha256`, then record each edit's original SHA-256, replacement bytes, replacement SHA-256, unit ID, and operation. The independent Candidate Gate does not trust that mutable receipt: it recomputes the review contract and exact edit plan from the immutable workset units and raw NEW bytes, compares every receipt field, reconstructs merged bytes, and proves that bytes outside the recomputed edits did not change.
 
 ## Git evidence and Candidate Gate
 
