@@ -305,7 +305,7 @@ $requestFull = [IO.Path]::GetFullPath($SourceRequestPath)
 Assert-NoReparsePath -Path $requestFull -Root $sourceRunRoot -Label 'Source request'
 $request = Read-SourceRequest -Path $requestFull
 $requestedExtension = [IO.Path]::GetExtension([string]$request.fileName).ToLowerInvariant()
-if ($requestedExtension -in @('.rar', '.7z') -or $requestedExtension -ne '.zip') {
+if ($requestedExtension -ne '.zip') {
     Write-Result -Value (New-WaitingResult -Status 'waiting-user' -Code 'unsupported_archive_format' -Message 'Only ZIP Main files are supported in Schema 15.' -ArchiveFormat $requestedExtension.TrimStart('.') -Path $null)
     return
 }

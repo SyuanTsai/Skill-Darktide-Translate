@@ -31,7 +31,7 @@ Start a run:
 
 ### Schema 15 automatic source
 
-Read `references/schema-15.md` completely before a new automatic-source run. Supply the normalized SYP-14 source request and a fixed run ID. The request contains identity metadata, never credentials or a signed download URL.
+Read `references/schema-15.md` completely before a new automatic-source run. Supply the normalized Schema 15 source request and a fixed run ID. The request contains identity metadata, never credentials or a signed download URL.
 
 For an existing signed-in browser session, download only into the fixed run's exact `.incoming-<run-id>` directory. A single `run` invocation acquires, independently verifies, receipt-binds, claims, and continues the ordered stages:
 
