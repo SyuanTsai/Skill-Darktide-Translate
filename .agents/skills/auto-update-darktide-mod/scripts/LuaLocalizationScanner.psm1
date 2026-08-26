@@ -8,7 +8,6 @@ function Invoke-LuaScannerHeartbeat {
 }
 
 function Invoke-LuaScannerProgressHeartbeat {
-    param([long] $Position)
     $script:luaScannerHeartbeatProgress++
     if (($script:luaScannerHeartbeatProgress -band 0x3FFF) -eq 0) { Invoke-LuaScannerHeartbeat }
 }
@@ -77,7 +76,7 @@ function Get-LuaTokens {
     $longStringPattern = [regex]::new('\G\[(=*)\[')
     $index = 0
     while ($index -lt $Text.Length) {
-        Invoke-LuaScannerProgressHeartbeat -Position $index
+        Invoke-LuaScannerProgressHeartbeat
         $character = $Text[$index]
         if ([char]::IsWhiteSpace($character)) { $index++; continue }
 
@@ -101,7 +100,7 @@ function Get-LuaTokens {
             $index++
             $closed = $false
             while ($index -lt $Text.Length) {
-                Invoke-LuaScannerProgressHeartbeat -Position $index
+                Invoke-LuaScannerProgressHeartbeat
                 if ($Text[$index] -eq '\') {
                     $index += [Math]::Min(2, $Text.Length - $index)
                     continue
@@ -135,7 +134,7 @@ function Get-LuaTokens {
             $start = $index
             $index++
             while ($index -lt $Text.Length -and ([char]::IsLetterOrDigit($Text[$index]) -or $Text[$index] -eq '_')) {
-                Invoke-LuaScannerProgressHeartbeat -Position $index
+                Invoke-LuaScannerProgressHeartbeat
                 $index++
             }
             Add-LuaToken -Tokens $tokens -Type 'identifier' -Text $Text.Substring($start, $index - $start) -Start $start
@@ -146,7 +145,7 @@ function Get-LuaTokens {
             $start = $index
             $index++
             while ($index -lt $Text.Length -and ($Text[$index] -match '[A-Za-z0-9._]')) {
-                Invoke-LuaScannerProgressHeartbeat -Position $index
+                Invoke-LuaScannerProgressHeartbeat
                 $index++
             }
             Add-LuaToken -Tokens $tokens -Type 'number' -Text $Text.Substring($start, $index - $start) -Start $start
@@ -170,7 +169,7 @@ function Get-IoDofileLoaderCallCount {
     param([object[]] $Tokens)
     $count = 0
     for ($index = 0; $index -le ($Tokens.Count - 4); $index++) {
-        Invoke-LuaScannerProgressHeartbeat -Position $index
+        Invoke-LuaScannerProgressHeartbeat
         if ($Tokens[$index].type -ceq 'identifier' -and $Tokens[$index].text -ceq 'mod' -and
             $Tokens[$index + 1].text -ceq ':' -and
             $Tokens[$index + 2].type -ceq 'identifier' -and $Tokens[$index + 2].text -ceq 'io_dofile' -and
@@ -203,7 +202,7 @@ function Test-IoDofileOnlyLoaderTokens {
         $Tokens[$index + 3].text -ceq '(' -and
         $Tokens[$index + 4].type -ceq 'string' -and
         $Tokens[$index + 5].text -ceq ')') {
-        Invoke-LuaScannerProgressHeartbeat -Position $index
+        Invoke-LuaScannerProgressHeartbeat
         $callCount++
         $index += 6
         if ($index -lt $Tokens.Count -and $Tokens[$index].text -ceq ';') { $index++ }
@@ -236,7 +235,7 @@ function ConvertFrom-LuaKeyString {
     $encoding = [Text.UTF8Encoding]::new($false, $true)
     $bytes = [Collections.Generic.List[byte]]::new()
     for ($index = 0; $index -lt $content.Length; $index++) {
-        Invoke-LuaScannerProgressHeartbeat -Position $index
+        Invoke-LuaScannerProgressHeartbeat
         if ($content[$index] -ne '\') {
             $characterLength = if ([char]::IsHighSurrogate($content[$index]) -and ($index + 1) -lt $content.Length -and
                 [char]::IsLowSurrogate($content[$index + 1])) { 2 } else { 1 }
@@ -276,7 +275,7 @@ function ConvertFrom-LuaKeyString {
             'z' {
                 while (($index + 1) -lt $content.Length -and [char]::IsWhiteSpace($content[$index + 1])) {
                     $index++
-                    Invoke-LuaScannerProgressHeartbeat -Position $index
+                    Invoke-LuaScannerProgressHeartbeat
                 }
             }
             'x' {
@@ -293,7 +292,7 @@ function ConvertFrom-LuaKeyString {
                 $unicodeStart = $index + 2
                 $unicodeEnd = $unicodeStart
                 while ($unicodeEnd -lt $content.Length -and $content[$unicodeEnd] -match '[0-9A-Fa-f]') {
-                    Invoke-LuaScannerProgressHeartbeat -Position $unicodeEnd
+                    Invoke-LuaScannerProgressHeartbeat
                     $unicodeEnd++
                 }
                 if ($unicodeEnd -eq $unicodeStart -or $unicodeEnd -ge $content.Length -or $content[$unicodeEnd] -cne '}') {
@@ -320,7 +319,7 @@ function Get-CanonicalTokenText {
     $builder = [Text.StringBuilder]::new()
     for ($index = $StartIndex; $index -le $EndIndex; $index++) {
         $null = $builder.Append([string]$Tokens[$index].text)
-        Invoke-LuaScannerProgressHeartbeat -Position $index
+        Invoke-LuaScannerProgressHeartbeat
     }
     $builder.ToString()
 }
@@ -329,7 +328,7 @@ function Get-MatchingTokenIndex {
     param([object[]] $Tokens, [int] $StartIndex, [string] $Open, [string] $Close)
     $depth = 0
     for ($index = $StartIndex; $index -lt $Tokens.Count; $index++) {
-        Invoke-LuaScannerProgressHeartbeat -Position $index
+        Invoke-LuaScannerProgressHeartbeat
         if ($Tokens[$index].text -ceq $Open) { $depth++ }
         elseif ($Tokens[$index].text -ceq $Close) {
             $depth--
@@ -434,10 +433,10 @@ function Read-LuaTable {
     $fields = [Collections.Generic.List[object]]::new()
     $position = $OpenIndex + 1
     while ($position -lt $closeIndex) {
-        Invoke-LuaScannerProgressHeartbeat -Position $position
+        Invoke-LuaScannerProgressHeartbeat
         while ($position -lt $closeIndex -and $Tokens[$position].text -in @(',', ';')) {
             $position++
-            Invoke-LuaScannerProgressHeartbeat -Position $position
+            Invoke-LuaScannerProgressHeartbeat
         }
         if ($position -ge $closeIndex) { break }
         $fieldStart = $position
@@ -463,7 +462,7 @@ function Read-LuaTable {
         $valueEnd = $valueStart - 1
         $separatorIndex = $null
         for ($cursor = $valueStart; $cursor -le $closeIndex; $cursor++) {
-            Invoke-LuaScannerProgressHeartbeat -Position $cursor
+            Invoke-LuaScannerProgressHeartbeat
             $token = [string]$Tokens[$cursor].text
             if ($cursor -eq $closeIndex -and $braceDepth -eq 0 -and $parenDepth -eq 0 -and $bracketDepth -eq 0 -and $blockDepth -eq 0) { break }
             if ($token -in @(',', ';') -and $braceDepth -eq 0 -and $parenDepth -eq 0 -and $bracketDepth -eq 0 -and $blockDepth -eq 0) {
@@ -559,7 +558,7 @@ function Get-LuaLocalizationDocument {
         $units = [Collections.Generic.List[object]]::new()
         $position = 0
         while ($position -lt $tokens.Count) {
-            Invoke-LuaScannerProgressHeartbeat -Position $position
+            Invoke-LuaScannerProgressHeartbeat
             if ($tokens[$position].text -ceq '{') {
                 $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength
             }
@@ -569,7 +568,7 @@ function Get-LuaLocalizationDocument {
         $occurrences = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
         $unitIndex = 0
         $numbered = foreach ($unit in $units) {
-            Invoke-LuaScannerProgressHeartbeat -Position $unitIndex
+            Invoke-LuaScannerProgressHeartbeat
             $unitIndex++
             $identityBase = "$($unit.sourceId) :: $($unit.containerPath) :: $($unit.key)"
             if (-not $occurrences.ContainsKey($identityBase)) { $occurrences[$identityBase] = 0 }
@@ -591,7 +590,7 @@ function Get-LuaLocalizationDocument {
         $hasLf = $false
         $hasBareCr = $false
         for ($newlineIndex = 0; $newlineIndex -lt $text.Length; $newlineIndex++) {
-            Invoke-LuaScannerProgressHeartbeat -Position $newlineIndex
+            Invoke-LuaScannerProgressHeartbeat
             if ($text[$newlineIndex] -eq "`r") {
                 if (($newlineIndex + 1) -lt $text.Length -and $text[$newlineIndex + 1] -eq "`n") {
                     $hasCrlf = $true
