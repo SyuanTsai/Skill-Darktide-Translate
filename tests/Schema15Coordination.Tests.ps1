@@ -215,4 +215,39 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
         $receiptRecord = Get-Content -LiteralPath ([string]$receipt.path) -Raw | ConvertFrom-Json -AsHashtable
         [string]$receiptRecord.staleEvidencePath | Should -Be ([string]$newLease.staleEvidencePath)
     }
+
+    It 'InterT182_HeartbeatsWhileWaitingAndRejectsMalformedStaleProcessIdentity' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-wait-contract-repository'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
+            -RunId '18218218-2182-4182-8182-182182182182'
+        try {
+            $counter = [Runtime.CompilerServices.StrongBox[int]]::new(0)
+            $waitHeartbeat = { $counter.Value++ }.GetNewClosure()
+            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
+                -RunId '18218218-3182-4182-8182-182182182182' -TimeoutSeconds 1 `
+                -WaitHeartbeatAction $waitHeartbeat } | Should -Throw '*Timed out*'
+            $counter.Value | Should -BeGreaterThan 1
+
+            $ownerPath = Join-Path ([string]$lease.path) 'owner.json'
+            $validOwnerJson = Get-Content -LiteralPath $ownerPath -Raw
+            try {
+                $malformedOwner = $validOwnerJson | ConvertFrom-Json -AsHashtable
+                $malformedOwner.processStartTicks = 'not-a-number'
+                $malformedOwner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+                $malformedOwner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
+                { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
+                    -RunId '18218218-4182-4182-8182-182182182182' -TimeoutSeconds 1 } |
+                    Should -Throw '*owner contract is invalid*'
+                Test-Path -LiteralPath ([string]$lease.path) -PathType Container | Should -BeTrue
+            }
+            finally {
+                [IO.File]::WriteAllText($ownerPath, $validOwnerJson, [Text.UTF8Encoding]::new($false))
+            }
+        }
+        finally {
+            $null = Exit-SharedCoordinationLease -Lease $lease
+        }
+    }
 }

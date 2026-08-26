@@ -790,6 +790,20 @@ Describe 'Schema 15 source acquisition contract' {
             Should -Throw '*C2 reason*evidence*'
 
         [IO.File]::WriteAllBytes($statePath, $baselineStateBytes)
+        $reasonState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $reasonState.localizationMode = 'none'
+        $reasonState | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $statePath -NoNewline
+        { & (Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1') -StatePath $statePath -PassThru } |
+            Should -Throw '*localization mode contradicts its manifest*'
+
+        [IO.File]::WriteAllBytes($statePath, $baselineStateBytes)
+        $reasonState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $reasonState.localizationMode = 'unknown-mode'
+        $reasonState | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $statePath -NoNewline
+        { & (Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1') -StatePath $statePath -PassThru } |
+            Should -Throw '*localization mode must be exactly none or zh-tw*'
+
+        [IO.File]::WriteAllBytes($statePath, $baselineStateBytes)
         $metadataHashPath = Join-Path ((Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).worktreePath) '.hash/m.hash'
         $metadataHashBytes = [IO.File]::ReadAllBytes($metadataHashPath)
         try {

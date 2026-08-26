@@ -22,11 +22,21 @@ function Get-UtcTimestamp {
 
 function Get-Sha256Bytes {
     param([byte[]] $Bytes)
-    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+    Invoke-Heartbeat
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        for ($offset = 0; $offset -lt $Bytes.Length; $offset += 1MB) {
+            $count = [Math]::Min(1MB, $Bytes.Length - $offset)
+            $hasher.AppendData($Bytes, $offset, $count)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
 }
 
 function Invoke-Heartbeat {
-    if ($HeartbeatAction) { & $HeartbeatAction }
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
 }
 
 function Get-FileSha256 {
@@ -51,6 +61,21 @@ function Copy-StreamWithHeartbeat {
     $buffer = [byte[]]::new(1MB)
     while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
         $Destination.Write($buffer, 0, $readCount)
+        Invoke-Heartbeat
+    }
+}
+
+function Copy-ByteRangeWithHeartbeat {
+    param(
+        [byte[]] $Source,
+        [int64] $SourceOffset,
+        [byte[]] $Destination,
+        [int64] $DestinationOffset,
+        [int64] $Count
+    )
+    for ($copied = [int64]0; $copied -lt $Count; $copied += 1MB) {
+        $chunk = [int64][Math]::Min([int64]1MB, $Count - $copied)
+        [Array]::Copy($Source, $SourceOffset + $copied, $Destination, $DestinationOffset + $copied, $chunk)
         Invoke-Heartbeat
     }
 }
@@ -388,6 +413,9 @@ function Assert-SourceTupleIntegrity {
 
 function Assert-CheckpointReasonIntegrity {
     param([Collections.IDictionary] $State, [Collections.IDictionary] $Chain, [string] $Worktree)
+    if ([string]$State.localizationMode -cne 'none' -and [string]$State.localizationMode -cne 'zh-tw') {
+        throw 'Checkpoint reason localization mode must be exactly none or zh-tw.'
+    }
     $targetPaths = @($State.evidenceTargetPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
     $targetJson = ConvertTo-Json -InputObject @($targetPaths) -Compress
     $targetSha = Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($targetJson))
@@ -396,7 +424,11 @@ function Assert-CheckpointReasonIntegrity {
     $manifestSha = Get-FileSha256 -Path $manifestPath
     if ($manifestSha -cne [string]$State.stageTimings.localization.artifactSha256) { throw 'Checkpoint reason localization manifest changed.' }
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable
-    if ([string]$State.localizationMode -ceq 'none' -and [string]$manifest.mode -cne 'none') { throw 'Checkpoint reason localization mode contradicts its manifest.' }
+    $expectedManifestMode = if ([int]$State.schemaVersion -ge 15 -and [string]$State.localizationMode -ceq 'zh-tw') {
+        'zh-tw-workset'
+    }
+    else { [string]$State.localizationMode }
+    if ([string]$manifest.mode -cne $expectedManifestMode) { throw 'Checkpoint reason localization mode contradicts its manifest.' }
     foreach ($checkpoint in @('C2', 'C3')) {
         $prefix = $checkpoint.ToLowerInvariant()
         $reason = $Chain["${prefix}Reason"]
@@ -571,23 +603,41 @@ function Get-GitBlobBytes {
     foreach ($argument in @('-C', $WorkingDirectory, 'cat-file', 'blob', $Object)) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start independent Git blob validation.' }
-    $memory = [IO.MemoryStream]::new(); Copy-StreamWithHeartbeat -Source $process.StandardOutput.BaseStream -Destination $memory
-    $errorText = $process.StandardError.ReadToEnd(); while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
-    if ($process.ExitCode -ne 0) { throw "Unable to read Git blob: $errorText" }
-    $memory.ToArray()
+    $memory = [IO.MemoryStream]::new()
+    try {
+        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
+            if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
+            else { [Threading.Tasks.Task]::Delay(50).Wait() }
+            Invoke-Heartbeat
+        }
+        $copyTask.GetAwaiter().GetResult()
+        $errorText = $errorTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw "Unable to read Git blob: $errorText" }
+        $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $process.Dispose() }
 }
 
 function Test-CrlfNormalizationOnly {
     param([byte[]] $RawBytes, [byte[]] $IndexedBytes)
     $normalized = [IO.MemoryStream]::new()
-    for ($index = 0; $index -lt $RawBytes.LongLength; $index++) {
-        if ($RawBytes[$index] -eq 13 -and ($index + 1) -lt $RawBytes.LongLength -and $RawBytes[$index + 1] -eq 10) { continue }
-        $normalized.WriteByte($RawBytes[$index])
+    try {
+        for ($index = 0; $index -lt $RawBytes.LongLength; $index++) {
+            if (($index -band 0xFFFFF) -eq 0) { Invoke-Heartbeat }
+            if ($RawBytes[$index] -eq 13 -and ($index + 1) -lt $RawBytes.LongLength -and $RawBytes[$index + 1] -eq 10) { continue }
+            $normalized.WriteByte($RawBytes[$index])
+        }
+        $candidate = $normalized.ToArray()
+        if ($candidate.LongLength -ne $IndexedBytes.LongLength) { return $false }
+        for ($index = 0; $index -lt $candidate.LongLength; $index++) {
+            if (($index -band 0xFFFFF) -eq 0) { Invoke-Heartbeat }
+            if ($candidate[$index] -ne $IndexedBytes[$index]) { return $false }
+        }
+        $true
     }
-    $candidate = $normalized.ToArray()
-    if ($candidate.LongLength -ne $IndexedBytes.LongLength) { return $false }
-    for ($index = 0; $index -lt $candidate.LongLength; $index++) { if ($candidate[$index] -ne $IndexedBytes[$index]) { return $false } }
-    $true
+    finally { $normalized.Dispose() }
 }
 
 function Get-DiffCheckSignatures {
@@ -621,19 +671,22 @@ function Test-ApprovedSpanCandidate {
         }
         $unchangedLength = $start - $indexedCursor
         for ($offset = [int64]0; $offset -lt $unchangedLength; $offset++) {
+            if (($offset -band 0xFFFFF) -eq 0) { Invoke-Heartbeat }
             if ($Indexed[$indexedCursor + $offset] -ne $Merged[$mergedCursor + $offset]) {
                 throw 'Merged candidate changed bytes outside approved localization spans.'
             }
         }
         $mergedCursor += $unchangedLength
         $oldBytes = [byte[]]::new($length)
-        [Array]::Copy($Indexed, $start, $oldBytes, 0, $length)
+        Copy-ByteRangeWithHeartbeat -Source $Indexed -SourceOffset $start `
+            -Destination $oldBytes -DestinationOffset 0 -Count $length
         if ((Get-Sha256Bytes -Bytes $oldBytes) -ne [string]$span.oldSha256) {
             throw 'Approved localization oldSha256 does not match indexed bytes.'
         }
         $replacement = [Convert]::FromBase64String([string]$span.replacementBase64)
         if (($mergedCursor + $replacement.LongLength) -gt $Merged.LongLength) { throw 'Merged candidate truncates an approved replacement.' }
         for ($offset = [int64]0; $offset -lt $replacement.LongLength; $offset++) {
+            if (($offset -band 0xFFFFF) -eq 0) { Invoke-Heartbeat }
             if ($Merged[$mergedCursor + $offset] -ne $replacement[$offset]) { throw 'Merged candidate replacement bytes differ from the approval plan.' }
         }
         $indexedCursor = $start + $length
@@ -642,6 +695,7 @@ function Test-ApprovedSpanCandidate {
     $remaining = $Indexed.LongLength - $indexedCursor
     if (($mergedCursor + $remaining) -ne $Merged.LongLength) { throw 'Merged candidate length differs outside approved localization spans.' }
     for ($offset = [int64]0; $offset -lt $remaining; $offset++) {
+        if (($offset -band 0xFFFFF) -eq 0) { Invoke-Heartbeat }
         if ($Indexed[$indexedCursor + $offset] -ne $Merged[$mergedCursor + $offset]) {
             throw 'Merged candidate changed bytes outside approved localization spans.'
         }
@@ -977,6 +1031,7 @@ Add-ValidationCheck -Name 'raw-install-provenance' -Action {
     $installedFiles = @($rawInstall.files | Sort-Object { $_.path })
     if ($sourceFiles.Count -ne $installedFiles.Count) { throw 'Raw install file count differs from extraction.' }
     for ($index = 0; $index -lt $sourceFiles.Count; $index++) {
+        if (($index -band 0x3FF) -eq 0) { Invoke-Heartbeat }
         if ($sourceFiles[$index].path -cne $installedFiles[$index].path -or $sourceFiles[$index].size -ne $installedFiles[$index].size -or $sourceFiles[$index].sha256 -ne $installedFiles[$index].sha256) { throw 'Raw install differs from immutable extraction.' }
     }
     "$($sourceFiles.Count) raw archive files preserved"
@@ -1007,6 +1062,7 @@ Add-ValidationCheck -Name 'candidate-manifest' -Action {
     $actual = @($actual | Sort-Object { $_.path })
     if ($actual.Count -ne $expected.Count) { throw 'Candidate Git tree path count differs from its manifest.' }
     for ($index = 0; $index -lt $actual.Count; $index++) {
+        if (($index -band 0x3FF) -eq 0) { Invoke-Heartbeat }
         if ($actual[$index].path -cne $expected[$index].path -or $actual[$index].blobOid -ne $expected[$index].blobOid -or $actual[$index].size -ne $expected[$index].size -or $actual[$index].sha256 -ne $expected[$index].sha256) { throw 'Candidate Git tree differs from its manifest.' }
     }
     "$($actual.Count) Git tree manifest files verified"

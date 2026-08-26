@@ -17,7 +17,22 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 
-function Invoke-Heartbeat { if ($HeartbeatAction) { & $HeartbeatAction } }
+function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
+
+function Get-Sha256Bytes {
+    param([byte[]] $Bytes)
+    Invoke-Heartbeat
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        for ($offset = 0; $offset -lt $Bytes.Length; $offset += 1MB) {
+            $count = [Math]::Min(1MB, $Bytes.Length - $offset)
+            $hasher.AppendData($Bytes, $offset, $count)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
+}
 
 function Copy-StreamWithHeartbeat {
     param([IO.Stream] $Source, [IO.Stream] $Destination)
@@ -90,7 +105,7 @@ function Get-ImmutableWorksetContractSha256 {
         units = $unitContracts
     }
     $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress))
-    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    Get-Sha256Bytes -Bytes $bytes
 }
 
 function Get-ReviewWorksetContractSha256 {
@@ -103,7 +118,7 @@ function Get-ReviewWorksetContractSha256 {
         }
     })
     $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(($reviewContract | ConvertTo-Json -Depth 10 -Compress))
-    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    Get-Sha256Bytes -Bytes $bytes
 }
 
 function Invoke-GitText {
@@ -134,10 +149,20 @@ function Get-GitBlobBytes {
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git blob reader for localization workset generation.' }
     $memory = [IO.MemoryStream]::new()
-    Copy-StreamWithHeartbeat -Source $process.StandardOutput.BaseStream -Destination $memory
-    $errorText = $process.StandardError.ReadToEnd(); while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
-    if ($process.ExitCode -ne 0) { throw "Unable to read immutable localization blob: $errorText" }
-    $memory.ToArray()
+    try {
+        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
+            if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
+            else { [Threading.Tasks.Task]::Delay(50).Wait() }
+            Invoke-Heartbeat
+        }
+        $copyTask.GetAwaiter().GetResult()
+        $errorText = $errorTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw "Unable to read immutable localization blob: $errorText" }
+        $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $process.Dispose() }
 }
 
 function Assert-ContainedPath {
@@ -270,7 +295,7 @@ if ($existingWorkset -and [string]$existingWorkset.status -in @('applying', 'app
     Assert-NoReparsePath -Path $existingNewPath -Root $stagingRoot
     if (-not (Test-Path -LiteralPath $existingNewPath -PathType Leaf)) { throw 'Existing applying or applied localization workset output is missing.' }
     $existingNewBytes = Read-FileBytesWithHeartbeat -Path $existingNewPath
-    $existingNewSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($existingNewBytes)).ToLowerInvariant()
+    $existingNewSha = Get-Sha256Bytes -Bytes $existingNewBytes
     $allowedHashes = if ([string]$existingWorkset.status -ceq 'applying') {
         @([string]$existingWorkset.apply.inputSha256, [string]$existingWorkset.apply.outputSha256)
     }
@@ -306,8 +331,8 @@ Assert-NoReparsePath -Path $newPath -Root $stagingRoot
 $oldPath = [string]$oldPaths[0]
 $oldBytes = Get-GitBlobBytes -WorkingDirectory $repository -Object "$resolvedBaseOid`:$oldPath"
 $newBytes = Read-FileBytesWithHeartbeat -Path $newPath
-$oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath $oldPath -SourceId $sourceIdentity
-$newDocument = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newPath -SourceId $sourceIdentity
+$oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath $oldPath -SourceId $sourceIdentity -HeartbeatAction $HeartbeatAction
+$newDocument = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newPath -SourceId $sourceIdentity -HeartbeatAction $HeartbeatAction
 
 if (@($oldDocument.units).Count -eq 0 -and @($newDocument.units).Count -eq 0 -and
     [bool]$oldDocument.isIoDofileOnlyLoader -and [bool]$newDocument.isIoDofileOnlyLoader) {

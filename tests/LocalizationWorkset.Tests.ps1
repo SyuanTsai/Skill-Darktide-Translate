@@ -135,6 +135,23 @@ local side_effect = os.time()
         $sideEffectDocument.isIoDofileOnlyLoader | Should -Be $false
     }
 
+    # Scenario: One localization expression is large enough for tokenization and hashing to cross multiple heartbeat chunks.
+    # Purpose: Keep the immutable MOD reservation fresh during CPU-bound Lua scanning, not only file and child-process waits.
+    It 'UnitT26_HeartbeatsDuringLargeCpuBoundLuaScans' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $counter = [Runtime.CompilerServices.StrongBox[int]]::new(0)
+        $heartbeat = { $counter.Value++; 'heartbeat-noise-must-not-escape' }.GetNewClosure()
+        $largeExpression = 'return { key = { en = "' + [string]::new('a', (2MB + 17)) + '", ["zh-tw"] = "保留" } }'
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($largeExpression)
+
+        $document = Get-LuaLocalizationDocument -Bytes $bytes -DisplayPath '<large-heartbeat>' `
+            -SourceId 'large-heartbeat' -HeartbeatAction $heartbeat
+
+        ($document -is [Collections.IDictionary]) | Should -BeTrue
+        @($document.units).Count | Should -Be 1
+        $counter.Value | Should -BeGreaterThan 4
+    }
+
     # Scenario: The staging file changes after its physical-path check and first byte read.
     # Purpose: Parse only the verified byte snapshot so generation has no second path-based TOCTOU read.
     It 'UnitT27_ParsesTheVerifiedNewByteSnapshot' {

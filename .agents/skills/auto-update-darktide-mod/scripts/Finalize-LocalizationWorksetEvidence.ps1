@@ -16,14 +16,14 @@ function Get-UtcTimestamp {
 
 function Get-FileSha256 {
     param([string] $Path)
-    if ($HeartbeatAction) { & $HeartbeatAction }
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
     try {
         $buffer = [byte[]]::new(1MB)
         while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
             $hasher.AppendData($buffer, 0, $readCount)
-            if ($HeartbeatAction) { & $HeartbeatAction }
+            if ($HeartbeatAction) { $null = & $HeartbeatAction }
         }
         [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
     }
@@ -69,7 +69,7 @@ function Assert-NoReparsePath {
 
 function Write-AtomicJson {
     param([string] $Path, $Value)
-    if ($HeartbeatAction) { & $HeartbeatAction }
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
     $fullPath = [IO.Path]::GetFullPath($Path)
     $parent = Split-Path -Parent $fullPath
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) { throw 'Atomic JSON parent directory is missing.' }
@@ -178,7 +178,7 @@ if ([string]$receipt.status -ceq 'deleted' -and $worksetExists) { throw 'A final
 if ([string]$receipt.status -ceq 'pending' -and $worksetExists) {
     if ((Get-FileSha256 -Path $worksetPath) -cne [string]$receipt.worksetSha256) { throw 'Localization workset changed after deletion became pending.' }
     Assert-NoReparsePath -Path $worksetPath -Root $securityRoot -Label 'Localization workset'
-    if ($HeartbeatAction) { & $HeartbeatAction }
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
     [IO.File]::Delete($worksetPath)
     $worksetExists = $false
 }

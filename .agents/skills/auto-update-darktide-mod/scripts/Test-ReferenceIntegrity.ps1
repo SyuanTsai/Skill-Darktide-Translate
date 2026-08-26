@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $skillRoot = Split-Path -Parent $PSScriptRoot
 
 function Invoke-Heartbeat {
-    if ($HeartbeatAction) { & $HeartbeatAction }
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
 }
 
 function Copy-StreamWithHeartbeat {

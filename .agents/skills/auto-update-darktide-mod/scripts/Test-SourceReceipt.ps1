@@ -23,7 +23,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Invoke-Heartbeat {
-    if ($HeartbeatAction) { & $HeartbeatAction }
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
 }
 
 function Get-FileSha256 {

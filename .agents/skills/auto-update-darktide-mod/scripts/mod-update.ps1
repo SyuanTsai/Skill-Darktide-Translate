@@ -42,7 +42,19 @@ function Get-UtcTimestamp {
 
 function Get-Sha256Bytes {
     param([byte[]] $Bytes)
-    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+    Update-ActiveReservationHeartbeat -Force
+    Update-ActiveSharedCoordinationHeartbeat -Force
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        for ($offset = 0; $offset -lt $Bytes.Length; $offset += 1MB) {
+            $count = [Math]::Min(1MB, $Bytes.Length - $offset)
+            $hasher.AppendData($Bytes, $offset, $count)
+            Update-ActiveReservationHeartbeat
+            Update-ActiveSharedCoordinationHeartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
 }
 
 function Get-FileSha256 {
@@ -293,6 +305,9 @@ function New-CheckpointReason {
         [AllowNull()][string] $ParentTreeOid,
         [AllowNull()][string] $TreeOid
     )
+    if ([string]$State.localizationMode -cne 'none' -and [string]$State.localizationMode -cne 'zh-tw') {
+        throw "$Checkpoint reason localization mode must be exactly none or zh-tw."
+    }
     $targetPaths = @($State.evidenceTargetPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
     $targetPathsJson = ConvertTo-Json -InputObject @($targetPaths) -Compress
     $targetPathsSha256 = Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($targetPathsJson))
@@ -300,6 +315,14 @@ function New-CheckpointReason {
         throw "$Checkpoint reason target paths differ from the immutable localization target contract."
     }
     $manifestSha256 = Get-FileSha256 -Path ([string]$State.localizationManifestPath)
+    $manifest = Get-Content -LiteralPath ([string]$State.localizationManifestPath) -Raw | ConvertFrom-Json -AsHashtable
+    $expectedManifestMode = if ([int]$State.schemaVersion -ge 15 -and [string]$State.localizationMode -ceq 'zh-tw') {
+        'zh-tw-workset'
+    }
+    else { [string]$State.localizationMode }
+    if ([string]$manifest.mode -cne $expectedManifestMode) {
+        throw "$Checkpoint reason localization mode contradicts its immutable manifest."
+    }
     $isNotApplicable = [string]$State.localizationMode -ceq 'none'
     $isKeep = $isNotApplicable -or $ParentTreeOid -ceq $TreeOid
     $code = if ($isNotApplicable) { 'localization-not-applicable' }
@@ -462,6 +485,28 @@ function Write-AtomicJson {
     [IO.File]::Move($temporary, [IO.Path]::GetFullPath($Path), $true)
 }
 
+function Write-BytesWithHeartbeat {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][byte[]] $Bytes
+    )
+    Update-ActiveReservationHeartbeat -Force
+    Update-ActiveSharedCoordinationHeartbeat -Force
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        for ($offset = [int64]0; $offset -lt $Bytes.LongLength; $offset += 1MB) {
+            $count = [int][Math]::Min([int64]1MB, $Bytes.LongLength - $offset)
+            $stream.Write($Bytes, [int]$offset, $count)
+            Update-ActiveReservationHeartbeat
+            Update-ActiveSharedCoordinationHeartbeat
+        }
+        $stream.Flush($true)
+        Update-ActiveReservationHeartbeat -Force
+        Update-ActiveSharedCoordinationHeartbeat -Force
+    }
+    finally { $stream.Dispose() }
+}
+
 function Write-AtomicBytes {
     param(
         [Parameter(Mandatory)][string] $Path,
@@ -473,8 +518,15 @@ function Write-AtomicBytes {
     $parent = Split-Path -Parent $fullPath
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent | Out-Null }
     $temporary = Join-Path $parent ('.tmp-' + [guid]::NewGuid().ToString('N') + '.bin')
-    [IO.File]::WriteAllBytes($temporary, $Bytes)
-    [IO.File]::Move($temporary, $fullPath, $true)
+    try {
+        Write-BytesWithHeartbeat -Path $temporary -Bytes $Bytes
+        Update-ActiveReservationHeartbeat -Force
+        Update-ActiveSharedCoordinationHeartbeat -Force
+        [IO.File]::Move($temporary, $fullPath, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { [IO.File]::Delete($temporary) }
+    }
 }
 
 function Get-SkillSourceFileEntry {
@@ -784,11 +836,24 @@ function Get-GitBlobBytes {
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start git cat-file.' }
     $memory = [IO.MemoryStream]::new()
-    Copy-StreamWithHeartbeat -Source $process.StandardOutput.BaseStream -Destination $memory
-    $errorText = $process.StandardError.ReadToEnd()
-    while (-not $process.WaitForExit(1000)) { Update-ActiveReservationHeartbeat }
-    if ($process.ExitCode -ne 0) { throw "git cat-file failed: $errorText" }
-    $memory.ToArray()
+    try {
+        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
+            if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
+            else { [Threading.Tasks.Task]::Delay(50).Wait() }
+            Update-ActiveReservationHeartbeat
+            Update-ActiveSharedCoordinationHeartbeat
+        }
+        $copyTask.GetAwaiter().GetResult()
+        $errorText = $errorTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw "git cat-file failed: $errorText" }
+        $memory.ToArray()
+    }
+    finally {
+        $memory.Dispose()
+        $process.Dispose()
+    }
 }
 
 function New-Manifest {
@@ -824,18 +889,23 @@ function New-Manifest {
 function Test-CrlfNormalizationOnly {
     param([byte[]] $RawBytes, [byte[]] $IndexedBytes)
     $normalized = [IO.MemoryStream]::new()
-    for ($index = 0; $index -lt $RawBytes.LongLength; $index++) {
-        if ($RawBytes[$index] -eq 13 -and ($index + 1) -lt $RawBytes.LongLength -and $RawBytes[$index + 1] -eq 10) {
-            continue
+    try {
+        for ($index = 0; $index -lt $RawBytes.LongLength; $index++) {
+            if (($index -band 0xFFFFF) -eq 0) { Update-ActiveReservationHeartbeat }
+            if ($RawBytes[$index] -eq 13 -and ($index + 1) -lt $RawBytes.LongLength -and $RawBytes[$index + 1] -eq 10) {
+                continue
+            }
+            $normalized.WriteByte($RawBytes[$index])
         }
-        $normalized.WriteByte($RawBytes[$index])
+        $candidate = $normalized.ToArray()
+        if ($candidate.LongLength -ne $IndexedBytes.LongLength) { return $false }
+        for ($index = 0; $index -lt $candidate.LongLength; $index++) {
+            if (($index -band 0xFFFFF) -eq 0) { Update-ActiveReservationHeartbeat }
+            if ($candidate[$index] -ne $IndexedBytes[$index]) { return $false }
+        }
+        $true
     }
-    $candidate = $normalized.ToArray()
-    if ($candidate.LongLength -ne $IndexedBytes.LongLength) { return $false }
-    for ($index = 0; $index -lt $candidate.LongLength; $index++) {
-        if ($candidate[$index] -ne $IndexedBytes[$index]) { return $false }
-    }
-    $true
+    finally { $normalized.Dispose() }
 }
 
 function Get-StageArtifactPath {
@@ -1042,6 +1112,24 @@ function Get-ReservationStateLabel {
     }
 }
 
+function Test-ReservationLeaseMatchesOwner {
+    param(
+        [AllowNull()][Collections.IDictionary] $Lease,
+        [AllowNull()][Collections.IDictionary] $Owner
+    )
+    if (-not $Lease -or -not $Owner) { return $false }
+    foreach ($field in @('runId', 'reservationToken', 'workerToken', 'machineName', 'workerId', 'workerProcessStartTicks')) {
+        if (-not $Lease.Contains($field) -or -not $Owner.Contains($field)) { return $false }
+    }
+    [string]$Owner.leaseMode -ceq 'active' -and
+        [string]$Owner.runId -ceq [string]$Lease.runId -and
+        [string]$Owner.reservationToken -ceq [string]$Lease.reservationToken -and
+        [string]$Owner.workerToken -ceq [string]$Lease.workerToken -and
+        [string]$Owner.machineName -ceq [string]$Lease.machineName -and
+        [int]$Owner.workerId -eq [int]$Lease.workerId -and
+        [int64]$Owner.workerProcessStartTicks -eq [int64]$Lease.workerProcessStartTicks
+}
+
 function Enter-ModReservationWorker {
     param([Collections.IDictionary] $State)
     Assert-LockOwner -State $State
@@ -1049,11 +1137,7 @@ function Enter-ModReservationWorker {
     $reservationToken = [string]$owner.reservationToken
     $previousWorkerToken = [string]$owner.workerToken
     $identity = Get-CurrentProcessIdentity
-    $sameWorker = [string]$owner.leaseMode -ceq 'active' -and
-        [string]$owner.machineName -ceq [string]$identity.machineName -and
-        [int]$owner.workerId -eq [int]$identity.processId -and
-        [int64]$owner.workerProcessStartTicks -eq [int64]$identity.processStartTicks -and
-        [string]$owner.workerToken -match '^[0-9a-f]{32}$'
+    $sameWorker = Test-ReservationLeaseMatchesOwner -Lease $script:activeReservationLease -Owner $owner
 
     if ([string]$owner.leaseMode -ceq 'active' -and -not $sameWorker) {
         foreach ($field in @('machineName', 'workerId', 'workerProcessStartTicks', 'workerToken', 'heartbeat')) {
@@ -1115,13 +1199,7 @@ function Read-ActiveReservationOwner {
     }
     $lease = $script:activeReservationLease
     $owner = Read-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot)
-    if ([string]$owner.runId -cne [string]$lease.runId -or
-        [string]$owner.reservationToken -cne [string]$lease.reservationToken -or
-        [string]$owner.workerToken -cne [string]$lease.workerToken -or
-        [string]$owner.machineName -cne [string]$lease.machineName -or
-        [int]$owner.workerId -ne [int]$lease.workerId -or
-        [int64]$owner.workerProcessStartTicks -ne [int64]$lease.workerProcessStartTicks -or
-        [string]$owner.leaseMode -cne 'active') {
+    if (-not (Test-ReservationLeaseMatchesOwner -Lease $lease -Owner $owner)) {
         throw 'MOD reservation ownership changed after this worker acquired its immutable lease.'
     }
     $owner
@@ -1263,8 +1341,14 @@ function Ensure-RunWriterLock {
     param([Collections.IDictionary] $State)
     $script:activeStatePath = [string]$State.statePath
     if (-not $script:writerLease) {
-        $script:writerLease = Enter-RunWriterLock -State $State
         Enter-ModReservationWorker -State $State
+        try {
+            $script:writerLease = Enter-RunWriterLock -State $State
+        }
+        catch {
+            Suspend-ModReservationWorker -State $State
+            throw
+        }
         if ($script:writerLease.recovery) {
             $State.lastRecovery = $script:writerLease.recovery
             Save-State -State $State
@@ -1322,6 +1406,7 @@ function Enter-ModReservation {
     New-Item -ItemType Directory -Path $lockRoot -Force | Out-Null
     $null = Assert-NoReparsePath -Path $lockRoot -Root ([string]$Plan.repositoryRoot) -Label 'MOD reservation path'
     $expectedStatePath = [IO.Path]::GetFullPath($PlannedStatePath)
+    $publishedPreparedOwner = $null
     if (-not (Test-Path -LiteralPath ([string]$Plan.modLockPath) -PathType Container)) {
         $preparedLockPath = Join-Path $lockRoot ('.pending-' + [IO.Path]::GetFileName([string]$Plan.modLockPath) + '-' + $ActualRunId + '-' + [guid]::NewGuid().ToString('N'))
         $null = Assert-NoReparsePath -Path $preparedLockPath -Root ([string]$Plan.repositoryRoot) -Label 'Prepared MOD reservation' -AllowMissing
@@ -1348,6 +1433,7 @@ function Enter-ModReservation {
         try {
             $null = Assert-NoReparsePath -Path $preparedLockPath -Root ([string]$Plan.repositoryRoot) -Label 'Prepared MOD reservation'
             [IO.Directory]::Move($preparedLockPath, [string]$Plan.modLockPath)
+            $publishedPreparedOwner = $preparedOwner
         }
         catch {
             if (-not (Test-Path -LiteralPath ([string]$Plan.modLockPath) -PathType Container)) { throw }
@@ -1380,8 +1466,14 @@ function Enter-ModReservation {
     $expectedReservationToken = [string]$owner.reservationToken
     $expectedWorkerToken = [string]$owner.workerToken
     $identity = Get-CurrentProcessIdentity
-    $sameWorker = [string]$owner.leaseMode -ceq 'active' -and [string]$owner.machineName -ceq [string]$identity.machineName -and
-        [int]$owner.workerId -eq [int]$identity.processId -and [int64]$owner.workerProcessStartTicks -eq [int64]$identity.processStartTicks
+    $createdByThisInvocation = $publishedPreparedOwner -and
+        [string]$owner.reservationToken -ceq [string]$publishedPreparedOwner.reservationToken -and
+        [string]$owner.workerToken -ceq [string]$publishedPreparedOwner.workerToken -and
+        [string]$owner.machineName -ceq [string]$publishedPreparedOwner.machineName -and
+        [int]$owner.workerId -eq [int]$publishedPreparedOwner.workerId -and
+        [int64]$owner.workerProcessStartTicks -eq [int64]$publishedPreparedOwner.workerProcessStartTicks
+    $sameWorker = $createdByThisInvocation -or
+        (Test-ReservationLeaseMatchesOwner -Lease $script:activeReservationLease -Owner $owner)
     if ([string]$owner.leaseMode -ceq 'active' -and -not $sameWorker) {
         foreach ($field in @('machineName', 'workerId', 'workerProcessStartTicks', 'workerToken', 'heartbeat')) {
             if (-not $owner.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$owner[$field])) {
@@ -1458,7 +1550,7 @@ function Assert-Schema15BaseLocalizationEligibility {
     foreach ($path in $localizationPaths) {
         $blobOid = (Invoke-Git -WorkingDirectory $Repository -Arguments @('rev-parse', "$BaseOid`:$path")).output.Trim()
         $bytes = Get-GitBlobBytes -WorkingDirectory $Repository -Object $blobOid
-        $document = Get-LuaLocalizationDocument -Bytes $bytes -SourceId $path
+        $document = Get-LuaLocalizationDocument -Bytes $bytes -SourceId $path -HeartbeatAction { Update-ActiveReservationHeartbeat }
         if (@($document.units).Count -eq 0 -and [bool]$document.isIoDofileOnlyLoader) {
             throw "AUTOMATION_EXCLUDED: localization_entry_is_loader ($path)"
         }
@@ -1662,10 +1754,15 @@ function Invoke-AcquireSource {
     }
     elseif ($suppliedRequestPath -cne [IO.Path]::GetFullPath($boundRequestPath)) {
         $temporaryRequestPath = Join-Path $reviewArtifacts ('.source-request-' + [guid]::NewGuid().ToString('N') + '.json')
-        [IO.File]::WriteAllBytes($temporaryRequestPath, $suppliedRequestBytes)
-        $null = Get-Content -LiteralPath $temporaryRequestPath -Raw | ConvertFrom-Json -AsHashtable
-        Update-ActiveReservationHeartbeat -Force
-        [IO.File]::Move($temporaryRequestPath, $boundRequestPath)
+        try {
+            Write-BytesWithHeartbeat -Path $temporaryRequestPath -Bytes $suppliedRequestBytes
+            $null = Get-Content -LiteralPath $temporaryRequestPath -Raw | ConvertFrom-Json -AsHashtable
+            Update-ActiveReservationHeartbeat -Force
+            [IO.File]::Move($temporaryRequestPath, $boundRequestPath)
+        }
+        finally {
+            if (Test-Path -LiteralPath $temporaryRequestPath -PathType Leaf) { [IO.File]::Delete($temporaryRequestPath) }
+        }
     }
     $boundSourceRequest = Get-Content -LiteralPath $boundRequestPath -Raw | ConvertFrom-Json -AsHashtable
     $boundSourceIdentity = ConvertTo-NexusSourceIdentity -Request $boundSourceRequest
@@ -1975,6 +2072,10 @@ function Invoke-Claim {
     $slug = [string]$plan.slug
     $short = [string]$plan.short
     $runRoot = [string]$plan.runRoot
+    $actualStatePath = if ($StatePath) {
+        Assert-ContainedPath -Candidate $StatePath -Root $runRoot -Label 'State path'
+    }
+    else { Join-Path $runRoot 'state.json' }
     $null = Assert-NoReparsePath -Path $runRoot -Root $repository -Label 'Claim run root' -AllowMissing
     $integrityScript = Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1'
     $boundPinPath = Join-Path $runRoot 'review-artifacts/skill-source-pin.json'
@@ -2004,6 +2105,7 @@ function Invoke-Claim {
         $sourceRequestInputFull = $requestFull
         $sourceRequestData = Get-Content -LiteralPath $requestFull -Raw | ConvertFrom-Json -AsHashtable
         $sourceIdentity = ConvertTo-NexusSourceIdentity -Request $sourceRequestData -RequireMetadata
+        $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
         $acquisitionFull = [IO.Path]::GetFullPath((Join-Path $runRoot 'review-artifacts/source-acquisition.json'))
         $null = Assert-NoReparsePath -Path $acquisitionFull -Root $repository -Label 'Source acquisition record'
         if (-not (Test-Path -LiteralPath $acquisitionFull -PathType Leaf)) { throw 'Schema 15 acquisition record is missing.' }
@@ -2089,6 +2191,7 @@ function Invoke-Claim {
         if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw 'Source archive must be a regular file, not a reparse point.'
         }
+        $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
         for ($second = 0; $second -lt 10; $second++) {
             [Threading.Thread]::Sleep(1000)
             Update-ActiveReservationHeartbeat
@@ -2100,7 +2203,6 @@ function Invoke-Claim {
         }
     }
     if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Source archive must be a regular file, not a reparse point.' }
-    $actualStatePath = if ($StatePath) { Assert-ContainedPath -Candidate $StatePath -Root $runRoot -Label 'State path' } else { Join-Path $runRoot 'state.json' }
     if (Test-Path -LiteralPath $actualStatePath -PathType Leaf) {
         $existing = Read-State -Path $actualStatePath
         if ($existing.runId -ne $actualRunId) { throw 'Existing state belongs to another run.' }
@@ -2162,7 +2264,7 @@ function Invoke-Claim {
     $bindingSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath '.agents/skills/auto-update-darktide-mod/references/package-binding.md'
     $skillSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath '.agents/skills/auto-update-darktide-mod/SKILL.md'
     $schema15SourceEntry = if ($sourceReceipt) { Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.schema15.path) } else { $null }
-    $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
+    $plannedOwner = Read-ActiveReservationOwner
     $plannedOwner.workflowCommitOid = $skillSourcePin.resolvedCommit
     $plannedOwner.skillSourceContentSha256 = $skillSourcePin.contentSha256
     $plannedOwner.skillSourcePinSha256 = $skillSourcePin.pinSha256
@@ -2305,7 +2407,7 @@ function Invoke-Claim {
             }
         }
         else { [ordered]@{} }
-        lastRecovery = $null
+        lastRecovery = if ($plannedOwner.Contains('lastRecovery')) { $plannedOwner.lastRecovery } else { $null }
         evidenceChain = [ordered]@{
             c0Oid = $baseOid
             c0TreeOid = $baseTreeOid
@@ -2567,8 +2669,40 @@ function Write-ByteFile {
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     $temporary = Join-Path $parent ('.tmp-' + [guid]::NewGuid().ToString('N'))
-    [IO.File]::WriteAllBytes($temporary, $Bytes)
-    [IO.File]::Move($temporary, [IO.Path]::GetFullPath($Path), $true)
+    try {
+        Write-BytesWithHeartbeat -Path $temporary -Bytes $Bytes
+        Update-ActiveReservationHeartbeat -Force
+        [IO.File]::Move($temporary, [IO.Path]::GetFullPath($Path), $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { [IO.File]::Delete($temporary) }
+    }
+}
+
+function Write-MemoryByteRangeWithHeartbeat {
+    param([IO.Stream] $Destination, [byte[]] $Bytes, [int64] $Offset, [int64] $Count)
+    for ($written = [int64]0; $written -lt $Count; $written += 1MB) {
+        $chunk = [int][Math]::Min([int64]1MB, $Count - $written)
+        $Destination.Write($Bytes, [int]($Offset + $written), $chunk)
+        Update-ActiveReservationHeartbeat
+        Update-ActiveSharedCoordinationHeartbeat
+    }
+}
+
+function Copy-ByteRangeWithHeartbeat {
+    param(
+        [byte[]] $Source,
+        [int64] $SourceOffset,
+        [byte[]] $Destination,
+        [int64] $DestinationOffset,
+        [int64] $Count
+    )
+    for ($copied = [int64]0; $copied -lt $Count; $copied += 1MB) {
+        $chunk = [int64][Math]::Min([int64]1MB, $Count - $copied)
+        [Array]::Copy($Source, $SourceOffset + $copied, $Destination, $DestinationOffset + $copied, $chunk)
+        Update-ActiveReservationHeartbeat
+        Update-ActiveSharedCoordinationHeartbeat
+    }
 }
 
 function Invoke-ApprovedSpans {
@@ -2583,15 +2717,24 @@ function Invoke-ApprovedSpans {
             throw 'Approved localization byte spans overlap or escape the indexed base.'
         }
         $oldBytes = [byte[]]::new($length)
-        [Array]::Copy($IndexedBytes, $start, $oldBytes, 0, $length)
+        Copy-ByteRangeWithHeartbeat -Source $IndexedBytes -SourceOffset $start `
+            -Destination $oldBytes -DestinationOffset 0 -Count $length
         if ((Get-Sha256Bytes -Bytes $oldBytes) -ne [string]$span.oldSha256) { throw 'Approved span oldSha256 does not match indexed bytes.' }
         $replacement = [Convert]::FromBase64String([string]$span.replacementBase64)
         $memory = [IO.MemoryStream]::new()
-        if ($start -gt 0) { $memory.Write($result, 0, $start) }
-        $memory.Write($replacement, 0, $replacement.Length)
-        $tailStart = $start + $length
-        if ($tailStart -lt $result.LongLength) { $memory.Write($result, $tailStart, $result.LongLength - $tailStart) }
-        $result = $memory.ToArray()
+        try {
+            if ($start -gt 0) { Write-MemoryByteRangeWithHeartbeat -Destination $memory -Bytes $result -Offset 0 -Count $start }
+            if ($replacement.Length -gt 0) {
+                Write-MemoryByteRangeWithHeartbeat -Destination $memory -Bytes $replacement -Offset 0 -Count $replacement.Length
+            }
+            $tailStart = $start + $length
+            if ($tailStart -lt $result.LongLength) {
+                Write-MemoryByteRangeWithHeartbeat -Destination $memory -Bytes $result -Offset $tailStart -Count ($result.LongLength - $tailStart)
+            }
+            $updated = $memory.ToArray()
+        }
+        finally { $memory.Dispose() }
+        $result = $updated
         $nextStart = $start
     }
     $result
@@ -2824,7 +2967,8 @@ function New-GitEvidenceFile {
     $path = Join-Path (Join-Path $State.artifactsRoot 'git-evidence') $Name
     New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
     $result = Invoke-Git -WorkingDirectory $State.worktreePath -Arguments $Arguments
-    [IO.File]::WriteAllText($path, $result.output + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    $evidenceBytes = [Text.UTF8Encoding]::new($false).GetBytes($result.output + [Environment]::NewLine)
+    Write-AtomicBytes -Path $path -Bytes $evidenceBytes
     [ordered]@{ path = $path; sha256 = Get-FileSha256 -Path $path }
 }
 

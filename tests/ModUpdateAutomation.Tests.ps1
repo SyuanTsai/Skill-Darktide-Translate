@@ -230,17 +230,23 @@ Describe 'Deterministic Darktide MOD update automation' {
             'function Update-ActiveReservationHeartbeat', 'function Suspend-ModReservationWorker',
             'reservationToken', 'workerToken', 'workerProcessStartTicks', 'owner-history'
         )) { $runner | Should -Match ([regex]::Escape($contract)) }
+        $runner | Should -Match 'lastRecovery = if \(\$plannedOwner\.Contains\(''lastRecovery''\)\)'
         $coordination | Should -Match 'function Enter-SharedCoordinationLease'
         $coordination | Should -Match 'Test-CoordinationLeaseMatchesOwner'
+        $coordination | Should -Match '\[int64\]::TryParse\(\[string\]\$Owner\.processStartTicks'
         $coordination | Should -Match '\.stale-\$ResourceKey'
         $coordination | Should -Match '(?s)\$owner\.acquiredAt = Get-CoordinationUtcTimestamp.*?Directory\]::Move\(\$prepared, \$lockPath\)'
         $coordination | Should -Match '\[scriptblock\] \$WaitHeartbeatAction'
+        $coordination | Should -Match '\$null = & \$WaitHeartbeatAction'
         $queue | Should -Match 'Enter-SharedCoordinationLease.+source-acquisition'
         $runner | Should -Match '\$gitCommand -in @\(''fetch'', ''push''\)'
         $runner | Should -Match '\$gitCommand -ceq ''worktree'''
         $runner | Should -Match 'HeartbeatAction = \{ Update-ActiveReservationHeartbeat \}'
         $runner | Should -Match '-WaitHeartbeatAction \{ Update-ActiveReservationHeartbeat \}'
         $runner | Should -Match '(?s)finally \{.*?Suspend-ModReservationWorker.*?Exit-RunWriterLock'
+        $runner | Should -Match '(?s)if \(-not \[string\]::IsNullOrWhiteSpace\(\$SourceReceiptPath\)\).*?ConvertTo-NexusSourceIdentity.*?\$plannedOwner = Enter-ModReservation.*?\$acquisitionFull'
+        $runner | Should -Match '(?s)else \{.*?ConvertTo-NexusSourceIdentity.*?Source archive must be a regular file.*?\$plannedOwner = Enter-ModReservation.*?for \(\$second = 0; \$second -lt 10'
+        $runner | Should -Match '(?s)\$sourceTuple = New-SourceTupleEvidence.*?\$plannedOwner = Read-ActiveReservationOwner'
         $runner | Should -Not -Match '\$gitCommand -in @\([^\)]*''commit'''
         $runner | Should -Not -Match '\$gitCommand -in @\([^\)]*''gh'''
     }
@@ -282,16 +288,30 @@ Describe 'Deterministic Darktide MOD update automation' {
     It 'UnitT177_RefreshesLeasesAcrossBlockingProcessesAndChunkedFileOperations' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
         $candidate = Get-Content -LiteralPath $validatorPath -Raw
+        $scanner = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/LuaLocalizationScanner.psm1') -Raw
+        $generator = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/New-LocalizationWorkset.ps1') -Raw
+        $worksetReceipt = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-LocalizationWorksetReceipt.ps1') -Raw
         $receipt = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-SourceReceipt.ps1') -Raw
         $reference = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-ReferenceIntegrity.ps1') -Raw
         $runner | Should -Match 'while \(-not \$process\.WaitForExit\(1000\)\)'
         $runner | Should -Match 'function Read-FileBytesWithHeartbeat'
         $runner | Should -Match 'function Copy-FileWithHeartbeat'
         $runner | Should -Match 'function Remove-DirectoryTreeWithHeartbeat'
+        $runner | Should -Match 'function Write-BytesWithHeartbeat'
+        $runner | Should -Match '\.CopyToAsync\(\$memory\)'
         $runner | Should -Not -Match '\.WaitForExit\(\)'
         $runner | Should -Not -Match '\[IO\.File\]::ReadAllBytes|\[IO\.File\]::Copy|Remove-Item[^\r\n]+-Recurse'
         $candidate | Should -Not -Match '\[IO\.File\]::ReadAllBytes'
         $candidate | Should -Not -Match '-HeartbeatAction \{ Invoke-Heartbeat \}'
+        foreach ($content in @($runner, $candidate, $generator, $worksetReceipt)) {
+            $content | Should -Match '\.CopyToAsync\(\$memory\)'
+            $content | Should -Match 'ReadToEndAsync\(\)'
+            $content | Should -Not -Match '\.BaseStream\.CopyTo\('
+        }
+        $scanner | Should -Match '\[scriptblock\] \$HeartbeatAction'
+        $scanner | Should -Match 'function Read-LuaScannerFileBytes'
+        $scanner | Should -Match 'function Get-LuaScannerSha256'
+        $scanner | Should -Match 'finally \{\s*\$script:luaScannerHeartbeatAction = \$previousHeartbeatAction'
         foreach ($content in @($receipt, $reference)) {
             $content | Should -Match '\[scriptblock\] \$HeartbeatAction'
             $content | Should -Match 'IncrementalHash'
@@ -345,6 +365,42 @@ Describe 'Deterministic Darktide MOD update automation' {
         (Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json).heartbeat | Should -Be $attempted.heartbeat
     }
 
+    It 'UnitT179_DoesNotAdoptAnActiveWorkerTokenFromTheSameProcessWithoutItsLease' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-ReservationLeaseMatchesOwner'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $invokeMatch = {
+            param($lease, $owner)
+            Test-ReservationLeaseMatchesOwner -Lease $lease -Owner $owner
+        }
+        $owner = [ordered]@{
+            runId = '17917917-9179-4179-8179-179179179179'
+            reservationToken = [guid]::NewGuid().ToString('N')
+            workerToken = [guid]::NewGuid().ToString('N')
+            machineName = [Environment]::MachineName
+            workerId = $PID
+            workerProcessStartTicks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
+            leaseMode = 'active'
+        }
+        $lease = $owner | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+        (& $module $invokeMatch $null $owner) | Should -BeFalse
+        (& $module $invokeMatch $lease $owner) | Should -BeTrue
+        $lease.workerToken = [guid]::NewGuid().ToString('N')
+        (& $module $invokeMatch $lease $owner) | Should -BeFalse
+
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $runner | Should -Match '\$sameWorker = Test-ReservationLeaseMatchesOwner -Lease \$script:activeReservationLease -Owner \$owner'
+        $runner | Should -Match '(?s)\$createdByThisInvocation = \$publishedPreparedOwner.*?\$sameWorker = \$createdByThisInvocation -or\s+\(Test-ReservationLeaseMatchesOwner'
+    }
+
     # Scenario: A run crashes, repeats a stage, encounters an existing PR, or resumes after publication.
     # Purpose: Require tuple-bound recovery and prevent duplicate commits, PRs, or force-pushed repairs.
     It 'UnitT170_RecordsRecoveryAndIdempotentStageReceipts' {
@@ -358,6 +414,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'LocalReviewPath'
         $runner | Should -Match 'review-completion-validation\.json'
         $runner | Should -Match 'function Ensure-RunWriterLock'
+        $runner | Should -Match '(?s)function Ensure-RunWriterLock.*?Enter-ModReservationWorker -State \$State.*?\$script:writerLease = Enter-RunWriterLock -State \$State'
         $runner | Should -Match '(?s)Ensure-RunWriterLock -State \$state\s+Write-AtomicJson -Path \$state\.statePath'
         $runner | Should -Match 'if \(-not \$script:writerLease\)'
         $runner | Should -Match '\$script:writerLease = Enter-RunWriterLock -State \$State'
