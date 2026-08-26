@@ -10,7 +10,7 @@ This repository is versioned independently from the target DARKTIDE MOD reposito
 2. Run `pwsh -File ./.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1`.
 3. Run `pwsh -File ./scripts/Get-SourcePin.ps1 -Ref HEAD` and retain the complete JSON: resolved commit, content SHA-256, Skill path, and per-file blob/SHA-256 manifest.
 4. Confirm the catalog exposes only `auto-update-darktide-mod` through the opt-in `darktide-mod-maintenance` profile.
-5. Confirm Schema 15 acquisition tests cover known unsupported extensions before download, signature detection, partial downloads, URL sanitization, receipt verification, same-run claim, loader preflight, queue deduplication, and the concurrency ceiling.
+5. Confirm Schema 15 acquisition and multi-process tests cover known unsupported extensions before download, signature detection, partial downloads, URL sanitization, receipt verification, same-run claim, loader preflight, queue deduplication, the concurrency ceiling, distinct-MOD isolation, competing generations, stale-owner recovery, and old-token rejection.
 6. Confirm localization-workset tests cover deterministic classification (including missing zh-tw), byte spans, AI-only edit authorization, pure-loader exclusion, independent receipt-plan recomputation, idempotence, and Candidate Gate rejection outside approved edits.
 7. Confirm the GitHub `Validate` and `Skill Quality Gate` workflows pass on the exact PR head.
 8. Merge the approved release commit to `main`.

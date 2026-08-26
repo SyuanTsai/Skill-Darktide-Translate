@@ -28,6 +28,7 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
   scripts/Receive-NexusMainFile.ps1
   scripts/Test-SourceReceipt.ps1
   scripts/Invoke-ModUpdateQueue.ps1
+  scripts/SharedCoordinationLock.psm1
   scripts/LuaLocalizationScanner.psm1
   scripts/New-LocalizationWorkset.ps1
   scripts/Apply-LocalizationWorkset.ps1

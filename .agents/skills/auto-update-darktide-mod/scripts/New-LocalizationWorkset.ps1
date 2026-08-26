@@ -8,6 +8,7 @@ param(
     [Parameter(Mandatory)][string] $StagingModPath,
     [Parameter(Mandatory)][string] $OutputPath,
     [string] $SourceId,
+    [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
 
@@ -16,6 +17,26 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 
+function Invoke-Heartbeat { if ($HeartbeatAction) { & $HeartbeatAction } }
+
+function Copy-StreamWithHeartbeat {
+    param([IO.Stream] $Source, [IO.Stream] $Destination)
+    Invoke-Heartbeat
+    $buffer = [byte[]]::new(1MB)
+    while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $Destination.Write($buffer, 0, $readCount)
+        Invoke-Heartbeat
+    }
+}
+
+function Read-FileBytesWithHeartbeat {
+    param([string] $Path)
+    $source = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $memory = [IO.MemoryStream]::new()
+    try { Copy-StreamWithHeartbeat -Source $source -Destination $memory; $memory.ToArray() }
+    finally { $memory.Dispose(); $source.Dispose() }
+}
+
 function Write-Result {
     param($Value)
     if ($PassThru) { $Value } else { $Value | ConvertTo-Json -Depth 30 -Compress }
@@ -23,6 +44,7 @@ function Write-Result {
 
 function Write-AtomicJson {
     param([string] $Path, $Value)
+    Invoke-Heartbeat
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     $temporary = Join-Path $parent ('.tmp-' + [guid]::NewGuid().ToString('N') + '.json')
@@ -33,7 +55,17 @@ function Write-AtomicJson {
 
 function Get-FileSha256 {
     param([string] $Path)
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    Invoke-Heartbeat
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount); Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose(); $stream.Dispose() }
 }
 
 function Get-ImmutableWorksetContractSha256 {
@@ -85,7 +117,7 @@ function Invoke-GitText {
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git for localization workset generation.' }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
+    while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
     $result = [ordered]@{ exitCode = $process.ExitCode; output = $stdoutTask.Result.TrimEnd(); warning = $stderrTask.Result.TrimEnd() }
     if ($result.exitCode -ne 0 -and -not $AllowFailure) { throw "Git localization query failed: $($result.warning) $($result.output)" }
     $result
@@ -102,8 +134,8 @@ function Get-GitBlobBytes {
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git blob reader for localization workset generation.' }
     $memory = [IO.MemoryStream]::new()
-    $process.StandardOutput.BaseStream.CopyTo($memory)
-    $errorText = $process.StandardError.ReadToEnd(); $process.WaitForExit()
+    Copy-StreamWithHeartbeat -Source $process.StandardOutput.BaseStream -Destination $memory
+    $errorText = $process.StandardError.ReadToEnd(); while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
     if ($process.ExitCode -ne 0) { throw "Unable to read immutable localization blob: $errorText" }
     $memory.ToArray()
 }
@@ -237,7 +269,7 @@ if ($existingWorkset -and [string]$existingWorkset.status -in @('applying', 'app
     $existingNewPath = Assert-ContainedPath -Candidate ([string]$existingWorkset.new.path) -Root $stagingRoot
     Assert-NoReparsePath -Path $existingNewPath -Root $stagingRoot
     if (-not (Test-Path -LiteralPath $existingNewPath -PathType Leaf)) { throw 'Existing applying or applied localization workset output is missing.' }
-    $existingNewBytes = [IO.File]::ReadAllBytes($existingNewPath)
+    $existingNewBytes = Read-FileBytesWithHeartbeat -Path $existingNewPath
     $existingNewSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($existingNewBytes)).ToLowerInvariant()
     $allowedHashes = if ([string]$existingWorkset.status -ceq 'applying') {
         @([string]$existingWorkset.apply.inputSha256, [string]$existingWorkset.apply.outputSha256)
@@ -261,7 +293,10 @@ if ($oldPaths.Count -ne 1) {
     Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; reason = 'localization_entry_not_unique'; oldCount = $oldPaths.Count })
     return
 }
-$newFiles = @(Get-ChildItem -LiteralPath $stagingRoot -File -Recurse | Where-Object { $_.Name -like '*_localization.lua' })
+$newFiles = @(Get-ChildItem -LiteralPath $stagingRoot -File -Recurse | ForEach-Object {
+    Invoke-Heartbeat
+    if ($_.Name -like '*_localization.lua') { $_ }
+})
 if ($newFiles.Count -ne 1) {
     Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; reason = 'localization_entry_not_unique'; newCount = $newFiles.Count })
     return
@@ -270,7 +305,7 @@ $newPath = Assert-ContainedPath -Candidate $newFiles[0].FullName -Root $stagingR
 Assert-NoReparsePath -Path $newPath -Root $stagingRoot
 $oldPath = [string]$oldPaths[0]
 $oldBytes = Get-GitBlobBytes -WorkingDirectory $repository -Object "$resolvedBaseOid`:$oldPath"
-$newBytes = [IO.File]::ReadAllBytes($newPath)
+$newBytes = Read-FileBytesWithHeartbeat -Path $newPath
 $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath $oldPath -SourceId $sourceIdentity
 $newDocument = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newPath -SourceId $sourceIdentity
 

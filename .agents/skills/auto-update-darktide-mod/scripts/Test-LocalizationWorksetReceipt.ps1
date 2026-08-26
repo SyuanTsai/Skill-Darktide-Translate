@@ -9,6 +9,7 @@ param(
     [string] $RepositoryRoot,
     [string] $ExpectedBaseOid,
     [string] $ExpectedModRelativePath,
+    [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
 
@@ -16,6 +17,25 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
+
+function Invoke-Heartbeat { if ($HeartbeatAction) { & $HeartbeatAction } }
+
+function Copy-StreamWithHeartbeat {
+    param([IO.Stream] $Source, [IO.Stream] $Destination)
+    Invoke-Heartbeat
+    $buffer = [byte[]]::new(1MB)
+    while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $Destination.Write($buffer, 0, $readCount); Invoke-Heartbeat
+    }
+}
+
+function Read-FileBytesWithHeartbeat {
+    param([string] $Path)
+    $source = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $memory = [IO.MemoryStream]::new()
+    try { Copy-StreamWithHeartbeat -Source $source -Destination $memory; $memory.ToArray() }
+    finally { $memory.Dispose(); $source.Dispose() }
+}
 
 function Get-Sha256Bytes {
     param([byte[]] $Bytes)
@@ -102,8 +122,8 @@ function Get-GitBlobBytes {
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git for independent OLD localization verification.' }
     $memory = [IO.MemoryStream]::new()
-    $process.StandardOutput.BaseStream.CopyTo($memory)
-    $errorText = $process.StandardError.ReadToEnd(); $process.WaitForExit()
+    Copy-StreamWithHeartbeat -Source $process.StandardOutput.BaseStream -Destination $memory
+    $errorText = $process.StandardError.ReadToEnd(); while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
     if ($process.ExitCode -ne 0) { throw "Unable to read immutable OLD localization blob: $errorText" }
     $memory.ToArray()
 }
@@ -313,8 +333,8 @@ if (($applyKeys -join ',') -cne 'edits,inputSha256,outputSha256,outputSize,revie
     throw 'Localization workset apply receipt fields are malformed.'
 }
 
-$newBytes = [IO.File]::ReadAllBytes($newFull)
-$mergedBytes = [IO.File]::ReadAllBytes($mergedFull)
+$newBytes = Read-FileBytesWithHeartbeat -Path $newFull
+$mergedBytes = Read-FileBytesWithHeartbeat -Path $mergedFull
 if ((Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.new.sha256 -or
     (Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.apply.inputSha256) {
     throw 'Raw NEW localization evidence differs from the workset input.'

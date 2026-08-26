@@ -3,6 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $WorksetPath,
+    [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
 
@@ -11,6 +12,23 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 
+function Invoke-Heartbeat { if ($HeartbeatAction) { & $HeartbeatAction } }
+
+function Read-FileBytesWithHeartbeat {
+    param([string] $Path)
+    Invoke-Heartbeat
+    $source = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $memory = [IO.MemoryStream]::new()
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $memory.Write($buffer, 0, $readCount); Invoke-Heartbeat
+        }
+        $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $source.Dispose() }
+}
+
 function Get-Sha256Bytes {
     param([byte[]] $Bytes)
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
@@ -18,7 +36,8 @@ function Get-Sha256Bytes {
 
 function Get-FileSha256 {
     param([string] $Path)
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $bytes = Read-FileBytesWithHeartbeat -Path $Path
+    Get-Sha256Bytes -Bytes $bytes
 }
 
 function Get-ImmutableWorksetContractSha256 {
@@ -59,6 +78,7 @@ function Get-ReviewWorksetContractSha256 {
 
 function Write-AtomicJson {
     param([string] $Path, $Value)
+    Invoke-Heartbeat
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
     $temporary = Join-Path $parent ('.tmp-' + [guid]::NewGuid().ToString('N') + '.json')
     [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
@@ -68,6 +88,7 @@ function Write-AtomicJson {
 
 function Write-AtomicBytes {
     param([string] $Path, [byte[]] $Bytes)
+    Invoke-Heartbeat
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
     $temporary = Join-Path $parent ('.tmp-' + [guid]::NewGuid().ToString('N') + '.lua')
     [IO.File]::WriteAllBytes($temporary, $Bytes)
@@ -228,7 +249,7 @@ $newPath = Assert-ContainedPath -Candidate ([string]$workset.new.path) -Root ([s
 if (-not (Test-Path -LiteralPath $newPath -PathType Leaf)) { throw 'Workset NEW localization file is missing.' }
 Assert-NoReparsePath -Path $newPath -Root ([string]$workset.new.root)
 if ([string]$workset.new.newline -notin @('lf', 'crlf')) { throw 'Workset NEW localization newline style must be uniformly LF or CRLF.' }
-$currentBytes = [IO.File]::ReadAllBytes($newPath)
+$currentBytes = Read-FileBytesWithHeartbeat -Path $newPath
 $currentSha = Get-Sha256Bytes -Bytes $currentBytes
 if ($workset.Contains('apply') -and $workset.apply) {
     $applyStatus = if ($workset.apply.Contains('status')) { [string]$workset.apply.status } else { $null }

@@ -143,7 +143,7 @@ local side_effect = os.time()
 
         $generator | Should -Match 'Get-LuaLocalizationDocument\s+-Bytes\s+\$newBytes\s+-DisplayPath\s+\$newPath'
         $generator | Should -Not -Match 'Get-LuaLocalizationDocument\s+-Path\s+\$newPath'
-        $applier | Should -Match '(?s)\$currentBytes = \[IO\.File\]::ReadAllBytes\(\$newPath\).*\$currentSha = Get-Sha256Bytes -Bytes \$currentBytes.*\$originalBytes = \$currentBytes'
+        $applier | Should -Match '(?s)\$currentBytes = Read-FileBytesWithHeartbeat -Path \$newPath.*\$currentSha = Get-Sha256Bytes -Bytes \$currentBytes.*\$originalBytes = \$currentBytes'
         $applier | Should -Not -Match '\$currentSha = Get-FileSha256 -Path \$newPath'
     }
 
@@ -812,7 +812,7 @@ return localization
         $runner | Should -Match 'New-LocalizationWorkset\.ps1'
         $runner | Should -Match 'Apply-LocalizationWorkset\.ps1'
         $runner | Should -Not -Match 'Write-ByteFile\s+-Path\s+\$worktreeFile\s+-Bytes\s+\$mergedRawBytes'
-        $runner | Should -Match 'Write-ByteFile\s+-Path\s+\$destination\s+-Bytes\s+\(\[IO\.File\]::ReadAllBytes\(\$mergedPath\)\)'
+        $runner | Should -Match 'Write-ByteFile\s+-Path\s+\$destination\s+-Bytes\s+\(Read-FileBytesWithHeartbeat -Path \$mergedPath\)'
         $runner | Should -Match "result = 'waiting-input'.*stage = 'localization-workset'"
         $validator | Should -Match "Add-ValidationCheck -Name 'localization-workset-boundary'"
         $validator | Should -Match 'replacementBase64'

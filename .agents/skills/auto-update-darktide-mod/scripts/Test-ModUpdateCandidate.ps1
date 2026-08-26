@@ -31,6 +31,7 @@ function Invoke-Heartbeat {
 
 function Get-FileSha256 {
     param([string] $Path)
+    Invoke-Heartbeat
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
     try {
@@ -46,10 +47,25 @@ function Get-FileSha256 {
 
 function Copy-StreamWithHeartbeat {
     param([IO.Stream] $Source, [IO.Stream] $Destination)
+    Invoke-Heartbeat
     $buffer = [byte[]]::new(1MB)
     while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
         $Destination.Write($buffer, 0, $readCount)
         Invoke-Heartbeat
+    }
+}
+
+function Read-FileBytesWithHeartbeat {
+    param([Parameter(Mandatory)][string] $Path)
+    $source = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $memory = [IO.MemoryStream]::new()
+    try {
+        Copy-StreamWithHeartbeat -Source $source -Destination $memory
+        $memory.ToArray()
+    }
+    finally {
+        $memory.Dispose()
+        $source.Dispose()
     }
 }
 
@@ -76,12 +92,28 @@ function Test-MetadataSourceFieldMatch {
             nexusMainFileUploadedAtUtc = 'main_file_uploaded_at_utc'; archiveFileName = 'filename'
             archiveSize = 'size_bytes'; archiveSha256 = 'sha256'; acquisitionMethod = 'acquisition_method'
         }
-        if (-not $hashKeys.Contains($FieldName)) { return $Text.Contains($FieldValue, [StringComparison]::Ordinal) }
+        if (-not $hashKeys.Contains($FieldName)) { return $false }
         $key = [regex]::Escape([string]$hashKeys[$FieldName])
         $matchesForKey = @([regex]::Matches($Text, "(?m)^$key=([^`r`n]*)`r?$") )
         return $matchesForKey.Count -eq 1 -and [string]$matchesForKey[0].Groups[1].Value -ceq $FieldValue
     }
-    $Text.Contains($FieldValue, [StringComparison]::Ordinal)
+    if ($RelativePath -cne 'README.md') { return $false }
+    $readmeLabels = [ordered]@{
+        nexusModId = 'Nexus MOD ID'; nexusPageUrl = 'Nexus URL'; nexusPageVersion = 'Nexus page version'
+        nexusPageUpdatedAt = 'Nexus last updated'; nexusMainFileId = 'Main file ID'; nexusMainFileVersion = 'Main file version'
+        nexusMainFileUploadedAtUtc = 'Main file uploaded at UTC'; archiveFileName = 'Archive filename'
+        archiveSize = 'Archive size bytes'; archiveSha256 = 'Archive SHA-256'; acquisitionMethod = 'Acquisition method'
+    }
+    if (-not $readmeLabels.Contains($FieldName)) { return $false }
+    $label = [regex]::Escape([string]$readmeLabels[$FieldName])
+    $matchesForLabel = @([regex]::Matches($Text, "(?m)^\s*-\s+$label\s*:\s*([^`r`n]*)`r?$") )
+    if ($matchesForLabel.Count -ne 1) { return $false }
+    $recorded = ([string]$matchesForLabel[0].Groups[1].Value).Trim()
+    if ($recorded.Length -ge 2 -and $recorded.StartsWith('`', [StringComparison]::Ordinal) -and
+        $recorded.EndsWith('`', [StringComparison]::Ordinal)) {
+        $recorded = $recorded.Substring(1, $recorded.Length - 2)
+    }
+    $recorded -ceq $FieldValue
 }
 
 function Assert-NoReparsePath {
@@ -112,10 +144,13 @@ function Assert-NoReparseTree {
     param([string] $Path, [string] $Root, [string] $Label)
     $treeFull = Assert-NoReparsePath -Path $Path -Root $Root -Label $Label
     if (-not (Test-Path -LiteralPath $treeFull -PathType Container)) { throw "$Label is not a directory." }
-    foreach ($item in @(Get-ChildItem -LiteralPath $treeFull -Recurse -Force)) {
+    Invoke-Heartbeat
+    Get-ChildItem -LiteralPath $treeFull -Recurse -Force | ForEach-Object {
+        $item = $_
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "$Label contains a symlink or reparse point."
         }
+        Invoke-Heartbeat
     }
     $treeFull
 }
@@ -176,7 +211,8 @@ function Assert-SourceReceiptIntegrity {
         throw 'Schema 15 source evidence is outside its fixed run-local paths.'
     }
     $verifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
-    $verification = & $verifier -ReceiptPath $receiptFull -SourceRequestPath $requestFull -RunRoot $sourceRunRoot -PassThru
+    $verification = & $verifier -ReceiptPath $receiptFull -SourceRequestPath $requestFull -RunRoot $sourceRunRoot `
+        -HeartbeatAction $HeartbeatAction -PassThru
     if ($verification.result -cne 'passed') { throw 'Independent source receipt verifier rejected Schema 15 evidence.' }
     if ((Get-FileSha256 -Path ([string]$State.sourceReceipt.path)) -cne [string]$State.sourceReceipt.sha256) { throw 'Schema 15 source receipt SHA-256 changed.' }
     if ((Get-FileSha256 -Path ([string]$State.sourceReceipt.sourceRequestPath)) -cne [string]$State.sourceReceipt.sourceRequestSha256) { throw 'Schema 15 source request SHA-256 changed.' }
@@ -314,12 +350,13 @@ function Assert-SourceTupleIntegrity {
     }
     $previewFiles = @($preview.files)
     if ($previewFiles.Count -ne @($State.metadataPaths).Count) { throw 'Metadata preview file count differs from metadataPaths.' }
+    $completeSourceFieldNames = @(
+        'nexusModId', 'nexusPageUrl', 'nexusPageVersion', 'nexusPageUpdatedAt', 'nexusMainFileId', 'nexusMainFileVersion',
+        'nexusMainFileUploadedAtUtc', 'archiveFileName', 'archiveSize', 'archiveSha256', 'acquisitionMethod'
+    )
     $requiredMetadataFields = [ordered]@{
-        'README.md' = @('nexusPageUrl', 'nexusPageVersion', 'nexusPageUpdatedAt', 'archiveFileName')
-        ".hash/$($State.modSlug).hash" = @(
-            'nexusModId', 'nexusPageUrl', 'nexusPageVersion', 'nexusPageUpdatedAt', 'nexusMainFileId', 'nexusMainFileVersion',
-            'nexusMainFileUploadedAtUtc', 'archiveFileName', 'archiveSize', 'archiveSha256', 'acquisitionMethod'
-        )
+        'README.md' = $completeSourceFieldNames
+        ".hash/$($State.modSlug).hash" = $completeSourceFieldNames
     }
     $actualMetadataPaths = @($previewFiles | ForEach-Object { ([string]$_.path).Replace('\', '/') } | Sort-Object)
     $expectedMetadataPaths = @($requiredMetadataFields.Keys | Sort-Object)
@@ -330,7 +367,7 @@ function Assert-SourceTupleIntegrity {
         $relative = ([string]$file.path).Replace('\', '/')
         if ($relative -cnotin @($State.metadataPaths | ForEach-Object { ([string]$_).Replace('\', '/') })) { throw 'Metadata preview contains a path outside metadataPaths.' }
         $full = Assert-NoReparsePath -Path (Join-Path ([string]$State.worktreePath) $relative) -Root ([string]$State.worktreePath) -Label 'Metadata preview source file'
-        $bytes = [IO.File]::ReadAllBytes($full)
+        $bytes = Read-FileBytesWithHeartbeat -Path $full
         if ((Get-Sha256Bytes -Bytes $bytes) -cne [string]$file.sha256 -or $bytes.Length -ne [int64]$file.size) { throw 'Metadata preview source file bytes changed.' }
         $textValue = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
         foreach ($fieldName in $expectedFields.Keys) {
@@ -405,7 +442,7 @@ function Assert-ReferenceIntegrity {
     param([Collections.IDictionary] $State)
     if (-not $State.Contains('workflowSourcePinPath') -or [string]::IsNullOrWhiteSpace([string]$State.workflowSourcePinPath)) {
         if ([int]$State.schemaVersion -ne 14) { throw 'Schema 15 state is missing its immutable Skill source pin.' }
-        $legacyIntegrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') -PassThru
+        $legacyIntegrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') -HeartbeatAction $HeartbeatAction -PassThru
         if ($legacyIntegrity.result -cne 'passed' -or [string]$legacyIntegrity.authoringSourceCommit -cne [string]$State.workflowCommitOid -or
             [string]$State.workflowPath -cne [string]$legacyIntegrity.workflow.originalPath -or
             [string]$State.workflowBlobOid -cne [string]$legacyIntegrity.workflow.gitBlobOid -or
@@ -423,7 +460,8 @@ function Assert-ReferenceIntegrity {
     if ((Get-FileSha256 -Path ([string]$State.workflowSourcePinPath)) -cne [string]$State.workflowSourcePinSha256) {
         throw 'Recorded Skill source pin bytes changed.'
     }
-    $integrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') -SkillSourcePinPath ([string]$State.workflowSourcePinPath) -PassThru
+    $integrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') `
+        -SkillSourcePinPath ([string]$State.workflowSourcePinPath) -HeartbeatAction $HeartbeatAction -PassThru
     if ($integrity.result -cne 'passed' -or -not $integrity.skillSourcePin -or
         [string]$integrity.skillSourcePin.pinSha256 -cne [string]$State.workflowSourcePinSha256 -or
         [string]$integrity.skillSourcePin.repository -cne [string]$State.workflowSourceRepository -or
@@ -471,6 +509,7 @@ function Assert-ReferenceIntegrity {
 
 function Write-AtomicJson {
     param([string] $Path, $Value)
+    Invoke-Heartbeat
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     $temporary = Join-Path $parent ('.validation-' + [guid]::NewGuid().ToString('N') + '.json')
@@ -982,7 +1021,7 @@ Add-ValidationCheck -Name 'install-normalization' -Action {
     foreach ($file in $install.files) {
         if (-not $candidateByPath.ContainsKey($file.path) -or -not $normalizationByPath.ContainsKey($file.path)) { throw "Install path is missing from Git candidate evidence: $($file.path). Candidate paths: $($candidateByPath.Keys -join ', '). Normalization paths: $($normalizationByPath.Keys -join ', ')." }
         $rawPath = Assert-NoReparsePath -Path (Join-Path $state.installRoot $file.path) -Root $worktree -Label 'Installed candidate file'
-        $raw = [IO.File]::ReadAllBytes($rawPath)
+        $raw = Read-FileBytesWithHeartbeat -Path $rawPath
         $candidateBytes = Get-GitBlobBytes -WorkingDirectory $worktree -Object ([string]$candidateByPath[$file.path].blobOid)
         $same = (Get-Sha256Bytes -Bytes $raw) -eq (Get-Sha256Bytes -Bytes $candidateBytes)
         if (-not $same -and -not (Test-CrlfNormalizationOnly -RawBytes $raw -IndexedBytes $candidateBytes)) { throw "Candidate changed bytes beyond CRLF-to-LF for $($file.path)" }
@@ -1084,16 +1123,17 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
         $newPath = Assert-NoReparsePath -Path $newPath -Root ([string]$state.repositoryRoot) -Label 'Raw NEW localization evidence'
         $mergedPath = Assert-NoReparsePath -Path $mergedPath -Root ([string]$state.repositoryRoot) -Label 'Merged localization evidence'
         $mergedIndexedPath = Assert-NoReparsePath -Path $mergedIndexedPath -Root ([string]$state.repositoryRoot) -Label 'Merged indexed localization evidence'
-        $newBytes = [IO.File]::ReadAllBytes($newPath)
-        $mergedBytes = [IO.File]::ReadAllBytes($mergedPath)
-        $mergedIndexedBytes = [IO.File]::ReadAllBytes($mergedIndexedPath)
+        $newBytes = Read-FileBytesWithHeartbeat -Path $newPath
+        $mergedBytes = Read-FileBytesWithHeartbeat -Path $mergedPath
+        $mergedIndexedBytes = Read-FileBytesWithHeartbeat -Path $mergedIndexedPath
         if ((Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.apply.inputSha256 -or (Get-Sha256Bytes -Bytes $newBytes) -cne [string]$record.rawSha256) { throw 'Workset NEW bytes differ from raw localization evidence.' }
         if ((Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$workset.apply.outputSha256 -or (Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$record.mergedRawSha256) { throw 'Workset merged bytes differ from apply evidence.' }
         if ((Get-Sha256Bytes -Bytes $mergedIndexedBytes) -cne [string]$record.mergedSha256) { throw 'Workset merged indexed bytes changed.' }
         $receiptVerifier = Join-Path $PSScriptRoot 'Test-LocalizationWorksetReceipt.ps1'
         $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath `
             -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) `
-            -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) -PassThru
+            -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) `
+            -HeartbeatAction $HeartbeatAction -PassThru
         if ($receiptVerification.result -cne 'passed') { throw 'Independent localization apply receipt verification failed.' }
         $null = Test-LocalizationWorksetCandidate -NewBytes $newBytes -MergedBytes $mergedBytes -Edits @($workset.apply.edits)
         $targetPath = Join-Path $worktree ([string]$record.relativePath)
@@ -1117,9 +1157,9 @@ Add-ValidationCheck -Name 'localization-byte-boundary' -Action {
         $decisionsPath = Join-Path ([string]$record.artifactDirectory) 'decisions.json'
         if ((Get-FileSha256 -Path $decisionsPath) -ne $record.decisionsSha256) { throw 'Localization decisions artifact SHA-256 changed.' }
         $decision = Get-Content -LiteralPath $decisionsPath -Raw | ConvertFrom-Json -AsHashtable
-        $raw = [IO.File]::ReadAllBytes($newPath)
-        $indexed = [IO.File]::ReadAllBytes($indexedPath)
-        $merged = [IO.File]::ReadAllBytes($mergedPath)
+        $raw = Read-FileBytesWithHeartbeat -Path $newPath
+        $indexed = Read-FileBytesWithHeartbeat -Path $indexedPath
+        $merged = Read-FileBytesWithHeartbeat -Path $mergedPath
         if ((Get-Sha256Bytes -Bytes $raw) -ne $record.rawSha256) { throw 'Raw localization artifact sha256 mismatch.' }
         if ((Get-Sha256Bytes -Bytes $indexed) -ne $record.indexedSha256) { throw 'Indexed localization artifact sha256 mismatch.' }
         if ((Get-Sha256Bytes -Bytes $merged) -ne $record.mergedSha256) { throw 'Merged localization artifact sha256 mismatch.' }

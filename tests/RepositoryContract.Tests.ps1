@@ -52,6 +52,7 @@ Describe 'Darktide Translate repository contract' {
             '.agents/skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1',
+            '.agents/skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1',
             '.agents/skills/auto-update-darktide-mod/scripts/LuaLocalizationScanner.psm1',
             '.agents/skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1',

@@ -67,7 +67,7 @@ Every resume uses the same run ID, source request hash, receipt hash, MOD lock o
 
 The active reservation worker is bound to machine, PID, process-start time, reservation token, and worker token. Long-running reads and child processes refresh heartbeat atomically. Every owner write rechecks both tokens. A normal exit or a `waiting-user`, `waiting-system`, or `awaiting-user-merge` stop clears the worker identity and leaves the run reservation in `reserved`; stale same-run reattachment retains the previous owner as evidence and never deletes a newer owner.
 
-Use `source-acquisition.lock` only around queue inventory/claim and source destination moves. Use `git-coordination.lock` only around shared fetch, branch, and worktree metadata operations. Both are short, owner-checked leases with retained stale evidence; neither may wrap download, localization, evidence commits, Candidate Gate, push, PR, or Review lifecycle work.
+Use `source-acquisition.lock` only around queue inventory/claim and source destination moves. Use `git-coordination.lock` only around shared fetch, branch/worktree metadata, and the remote-ref publication performed by `git push`. Both are short, owner-checked leases with retained stale evidence; neither may wrap download, localization, evidence commits, Candidate Gate, GitHub PR mutation, Review, or the overall run lifecycle.
 
 ## Localization eligibility
 
@@ -132,6 +132,8 @@ The existing C0/C1/C2/C3/F boundaries remain normative:
 The independent Candidate Gate revalidates the source request, preserved receipt source, claimed archive, workset SHA-256, classification permissions, edit spans, raw and merged artifacts, Git-normalized blobs, C0/C1/C2/C3/F trees, manifests, and target paths.
 
 When C2 or C3 has the same tree as its parent, state still records a non-empty structured `KEEP` reason. The reason binds checkpoint, recognized code, localization mode, parent/current trees, target-path hash/count, localization-manifest SHA-256, and a reconstructible contract SHA-256. Missing, blank, unknown, contradictory, or evidence-mismatched reasons fail closed. `metadata-preview.json` binds the immutable source tuple and independently rechecked README/formal-hash fields; both metadata files retain the complete archive filename including extension and may not mix facts from different Nexus Main files.
+
+README and formal-hash source facts both preserve the complete 11-field tuple: Nexus MOD ID, page URL/version/updated time, Main file ID/version/upload time, full archive filename, size, SHA-256, and acquisition method. README uses one unique labeled list entry per field, such as `- Nexus URL: ...` and `- Archive filename: ...`; the value after every label must equal the tuple value exactly (optional paired Markdown code ticks are allowed). Substring, prefix/suffix, duplicate-label, missing-label, and contradictory values fail. Formal hash records likewise require exactly one anchored `key=value` entry for every tuple field.
 
 The PR body contains a deterministic classification-count table and receipt/workset hashes. Delete `localization-workset.json` after a passed Candidate Gate and before publication. Preserve its SHA-256, counts, edit count, validation result, and deletion evidence in state and the Gate report. The workset must never be added to Git.
 

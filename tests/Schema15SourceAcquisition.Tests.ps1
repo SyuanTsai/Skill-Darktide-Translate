@@ -408,7 +408,12 @@ Describe 'Schema 15 source acquisition contract' {
         $ownerPath = Join-Path $first.modLockPath 'owner.json'
         $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
         $owner.leaseMode = 'active'
-        $owner.workerId = 999999
+        $owner.machineName = [Environment]::MachineName
+        $owner.workerId = $PID
+        $owner.workerProcessStartTicks = 1
+        $owner.workerToken = [guid]::NewGuid().ToString('N')
+        $owner.reservationState = 'running'
+        $owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-31).ToString('o')
         $null = $owner.Remove('waitingReason')
         $owner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
 
@@ -724,8 +729,12 @@ Describe 'Schema 15 source acquisition contract' {
         $candidateArchiveSha = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
         $candidateArchiveSize = (Get-Item -LiteralPath $downloadPath).Length
         (@(
-            'https://www.nexusmods.com/warhammer40kdarktide/mods/434', '2.0.0',
-            '2026-01-02T00:00:00.0000000+00:00', 'Main file ID: 545', 'M.zip'
+            '- Nexus MOD ID: 434', '- Nexus URL: https://www.nexusmods.com/warhammer40kdarktide/mods/434',
+            '- Nexus page version: 2.0.0', '- Nexus last updated: 2026-01-02T00:00:00.0000000+00:00',
+            '- Main file ID: 545', '- Main file version: 2.0.0',
+            '- Main file uploaded at UTC: 2026-01-01T00:00:00.0000000+00:00',
+            '- Archive filename: M.zip', "- Archive size bytes: $candidateArchiveSize",
+            "- Archive SHA-256: $candidateArchiveSha", '- Acquisition method: nexus-browser'
         ) -join "`n") | Set-Content -LiteralPath (Join-Path $repository 'README.md') -NoNewline
         $candidateHashRoot = Join-Path $repository '.hash'
         New-Item -ItemType Directory -Path $candidateHashRoot -Force | Out-Null

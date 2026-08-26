@@ -14,7 +14,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         Test-Path -LiteralPath $runnerPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath $validatorPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath (Join-Path $skillRoot 'references/automation.md') -PathType Leaf | Should -Be $true
-        foreach ($script in @('Receive-NexusMainFile.ps1', 'Test-SourceReceipt.ps1', 'Invoke-ModUpdateQueue.ps1', 'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1')) {
+        foreach ($script in @('Receive-NexusMainFile.ps1', 'Test-SourceReceipt.ps1', 'Invoke-ModUpdateQueue.ps1', 'SharedCoordinationLock.psm1', 'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1')) {
             Test-Path -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') $script) -PathType Leaf | Should -Be $true
         }
 
@@ -63,7 +63,8 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'ExternalAttributes'
         $runner | Should -Match 'CreateNew'
         $runner | Should -Match 'ExpectedSha256'
-        $runner | Should -Match 'HashData\(\$stream\)'
+        $runner | Should -Match 'function Get-FileSha256'
+        $runner | Should -Match 'Copy-StreamWithHeartbeat'
         $runner | Should -Match 'Source archive must be a regular file, not a reparse point'
         $runner | Should -Match 'Claimed archive must be a regular file, not a reparse point'
         $runner | Should -Match '\$entryStream\s*=\s*\$entry\.Open\(\)'
@@ -156,7 +157,7 @@ Describe 'Deterministic Darktide MOD update automation' {
     It 'UnitT147_RechecksTheRawLocalizationPathBeforeResumeReads' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
 
-        $runner | Should -Match '(?s)\$worktreeFile = Assert-ContainedPath.*?\$worktreeFile = Assert-NoReparsePath -Path \$worktreeFile -Root \(\[string\]\$State\.worktreePath\) -Label ''Raw worktree localization input''.*?Get-FileSha256 -Path \$worktreeFile.*?ReadAllBytes\(\$worktreeFile\)'
+        $runner | Should -Match '(?s)\$worktreeFile = Assert-ContainedPath.*?\$worktreeFile = Assert-NoReparsePath -Path \$worktreeFile -Root \(\[string\]\$State\.worktreePath\) -Label ''Raw worktree localization input''.*?Get-FileSha256 -Path \$worktreeFile.*?Read-FileBytesWithHeartbeat -Path \$worktreeFile'
     }
 
     # Scenario: The completed extraction tree is swapped for a junction before install resumes.
@@ -221,16 +222,127 @@ Describe 'Deterministic Darktide MOD update automation' {
 
     It 'UnitT175_UsesShortSharedLocksAndTokenGuardedReservationHeartbeats' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $coordination = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/SharedCoordinationLock.psm1') -Raw
+        $queue = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Invoke-ModUpdateQueue.ps1') -Raw
         foreach ($contract in @(
             'function Enter-SharedCoordinationLock', 'source-acquisition', 'git-coordination',
+            'function Read-ActiveReservationOwner', 'function Write-ActiveReservationOwner',
             'function Update-ActiveReservationHeartbeat', 'function Suspend-ModReservationWorker',
             'reservationToken', 'workerToken', 'workerProcessStartTicks', 'owner-history'
         )) { $runner | Should -Match ([regex]::Escape($contract)) }
-        $runner | Should -Match 'worktree\\s\+\(add\|remove\|prune\)'
+        $coordination | Should -Match 'function Enter-SharedCoordinationLease'
+        $coordination | Should -Match 'Test-CoordinationLeaseMatchesOwner'
+        $coordination | Should -Match '\.stale-\$ResourceKey'
+        $coordination | Should -Match '(?s)\$owner\.acquiredAt = Get-CoordinationUtcTimestamp.*?Directory\]::Move\(\$prepared, \$lockPath\)'
+        $coordination | Should -Match '\[scriptblock\] \$WaitHeartbeatAction'
+        $queue | Should -Match 'Enter-SharedCoordinationLease.+source-acquisition'
+        $runner | Should -Match '\$gitCommand -in @\(''fetch'', ''push''\)'
+        $runner | Should -Match '\$gitCommand -ceq ''worktree'''
         $runner | Should -Match 'HeartbeatAction = \{ Update-ActiveReservationHeartbeat \}'
+        $runner | Should -Match '-WaitHeartbeatAction \{ Update-ActiveReservationHeartbeat \}'
         $runner | Should -Match '(?s)finally \{.*?Suspend-ModReservationWorker.*?Exit-RunWriterLock'
-        $runner | Should -Not -Match "requiresCoordination.*commit\\s"
-        $runner | Should -Not -Match "requiresCoordination.*push\\s"
+        $runner | Should -Not -Match '\$gitCommand -in @\([^\)]*''commit'''
+        $runner | Should -Not -Match '\$gitCommand -in @\([^\)]*''gh'''
+    }
+
+    It 'UnitT176_RequiresUniqueExactLabeledSourceMetadataValues' {
+        $candidateSource = Get-Content -LiteralPath $validatorPath -Raw
+        $candidateSource | Should -Match '''README\.md''\s*=\s*\$completeSourceFieldNames'
+        foreach ($path in @($runnerPath, $validatorPath)) {
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors)
+            @($parseErrors).Count | Should -Be 0
+            $functionAst = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-MetadataSourceFieldMatch'
+            }, $true)
+            $functionAst | Should -Not -BeNullOrEmpty
+            $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+            $invokeMatch = {
+                param($relativePath, $textValue, $fieldName, $fieldValue)
+                Test-MetadataSourceFieldMatch -RelativePath $relativePath -Text $textValue -FieldName $fieldName -FieldValue $fieldValue
+            }
+
+            (& $module $invokeMatch 'README.md' '- Archive filename: ExampleMod.zip' 'archiveFileName' 'ExampleMod.zip') |
+                Should -BeTrue
+            (& $module $invokeMatch 'README.md' '- Archive filename: prefix-ExampleMod.zip.bak' 'archiveFileName' 'ExampleMod.zip') |
+                Should -BeFalse
+            (& $module $invokeMatch 'README.md' ("- Archive filename: ExampleMod.zip`n- Archive filename: ExampleMod.zip") 'archiveFileName' 'ExampleMod.zip') |
+                Should -BeFalse
+            (& $module $invokeMatch 'README.md' '- Main file ID: 999' 'nexusMainFileId' '456') |
+                Should -BeFalse
+            (& $module $invokeMatch '.hash/examplemod.hash' 'filename=ExampleMod.zip' 'archiveFileName' 'ExampleMod.zip') |
+                Should -BeTrue
+            (& $module $invokeMatch '.hash/examplemod.hash' 'filename=prefix-ExampleMod.zip.bak' 'archiveFileName' 'ExampleMod.zip') |
+                Should -BeFalse
+        }
+    }
+
+    It 'UnitT177_RefreshesLeasesAcrossBlockingProcessesAndChunkedFileOperations' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $candidate = Get-Content -LiteralPath $validatorPath -Raw
+        $receipt = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-SourceReceipt.ps1') -Raw
+        $reference = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-ReferenceIntegrity.ps1') -Raw
+        $runner | Should -Match 'while \(-not \$process\.WaitForExit\(1000\)\)'
+        $runner | Should -Match 'function Read-FileBytesWithHeartbeat'
+        $runner | Should -Match 'function Copy-FileWithHeartbeat'
+        $runner | Should -Match 'function Remove-DirectoryTreeWithHeartbeat'
+        $runner | Should -Not -Match '\.WaitForExit\(\)'
+        $runner | Should -Not -Match '\[IO\.File\]::ReadAllBytes|\[IO\.File\]::Copy|Remove-Item[^\r\n]+-Recurse'
+        $candidate | Should -Not -Match '\[IO\.File\]::ReadAllBytes'
+        $candidate | Should -Not -Match '-HeartbeatAction \{ Invoke-Heartbeat \}'
+        foreach ($content in @($receipt, $reference)) {
+            $content | Should -Match '\[scriptblock\] \$HeartbeatAction'
+            $content | Should -Match 'IncrementalHash'
+        }
+        $runner | Should -Match 'Test-SourceReceipt\.ps1'
+        $runner | Should -Match '-HeartbeatAction \{ Update-ActiveReservationHeartbeat \}'
+    }
+
+    It 'UnitT178_RejectsAnOldReservationTokenWithoutChangingTheNewOwner' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $requiredFunctions = @('Assert-NoReparsePath', 'Write-AtomicJson', 'Get-ModReservationOwnerPath', 'Write-ModReservationOwner')
+        $allFunctions = $ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst]
+        }, $true)
+        $functionTexts = foreach ($name in $requiredFunctions) {
+            $functionAst = @($allFunctions | Where-Object Name -eq $name)[0]
+            $functionAst | Should -Not -BeNullOrEmpty
+            $functionAst.Extent.Text
+        }
+        $module = New-Module -ScriptBlock ([scriptblock]::Create(($functionTexts -join "`n")))
+        $repository = Join-Path $TestDrive 'old-reservation-token-repository'
+        $lockPath = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod/test.lock'
+        New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
+        $ownerPath = Join-Path $lockPath 'owner.json'
+        $newReservationToken = [guid]::NewGuid().ToString('N')
+        $newWorkerToken = [guid]::NewGuid().ToString('N')
+        $owner = [ordered]@{
+            schemaVersion = 2; runId = '17817817-8178-4178-8178-178178178178'
+            reservationToken = $newReservationToken; workerToken = $newWorkerToken
+            machineName = [Environment]::MachineName; workerId = $PID; workerProcessStartTicks = 1
+            leaseMode = 'active'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
+        }
+        $owner | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ownerPath -NoNewline
+        $ownerBefore = [IO.File]::ReadAllBytes($ownerPath)
+        $attempted = $owner | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+        $attempted.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(1).ToString('o')
+        $invokeWrite = {
+            param($actualLockPath, $actualRepository, $value, $reservationToken, $workerToken)
+            Write-ModReservationOwner -ModLockPath $actualLockPath -Repository $actualRepository -Value $value `
+                -ExpectedReservationToken $reservationToken -ExpectedWorkerToken $workerToken
+        }
+        { & $module $invokeWrite $lockPath $repository $attempted ([guid]::NewGuid().ToString('N')) $newWorkerToken } |
+            Should -Throw '*ownership changed*'
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($ownerPath)) | Should -Be ([Convert]::ToHexString($ownerBefore))
+        { & $module $invokeWrite $lockPath $repository $attempted $newReservationToken $newWorkerToken } |
+            Should -Not -Throw
+        (Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json).heartbeat | Should -Be $attempted.heartbeat
     }
 
     # Scenario: A run crashes, repeats a stage, encounters an existing PR, or resumes after publication.
@@ -335,8 +447,12 @@ Describe 'Deterministic Darktide MOD update automation' {
         $manualArchiveSha = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
         $manualArchiveSize = (Get-Item -LiteralPath $archivePath).Length
         (@(
-            'https://www.nexusmods.com/warhammer40kdarktide/mods/123', '2.0.0',
-            '2026-01-02T00:00:00.0000000+00:00', 'Main file ID: 456', 'ExampleMod.zip'
+            '- Nexus MOD ID: 123', '- Nexus URL: https://www.nexusmods.com/warhammer40kdarktide/mods/123',
+            '- Nexus page version: 2.0.0', '- Nexus last updated: 2026-01-02T00:00:00.0000000+00:00',
+            '- Main file ID: 456', '- Main file version: 2.0.0',
+            '- Main file uploaded at UTC: 2026-01-01T00:00:00.0000000+00:00',
+            '- Archive filename: ExampleMod.zip', "- Archive size bytes: $manualArchiveSize",
+            "- Archive SHA-256: $manualArchiveSha", '- Acquisition method: manual-queue'
         ) -join "`n") | Set-Content -LiteralPath (Join-Path $fixtureRepo 'README.md') -NoNewline
         $manualHashDirectory = Join-Path $fixtureRepo '.hash'
         New-Item -ItemType Directory -Path $manualHashDirectory -Force | Out-Null
@@ -632,8 +748,12 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         $owner = [ordered]@{
+            schemaVersion = 2
             runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
             plannedStatePath = $statePath; statePath = $statePath
+            reservationToken = [guid]::NewGuid().ToString('N'); workerToken = $null
+            machineName = $null; workerId = $null; workerProcessStartTicks = $null
+            leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
         }
         [IO.File]::WriteAllText((Join-Path $lockPath 'owner.json'), ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 
@@ -682,8 +802,12 @@ Describe 'Deterministic Darktide MOD update automation' {
             }
             [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
             $owner = [ordered]@{
+                schemaVersion = 2
                 runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
                 plannedStatePath = $statePath; statePath = $statePath
+                reservationToken = [guid]::NewGuid().ToString('N'); workerToken = $null
+                machineName = $null; workerId = $null; workerProcessStartTicks = $null
+                leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
             }
             [IO.File]::WriteAllText((Join-Path $lockPath 'owner.json'), ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
             $expected = switch ($case) {
@@ -732,8 +856,12 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         $owner = [ordered]@{
+            schemaVersion = 2
             runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
             plannedStatePath = $statePath; statePath = $statePath
+            reservationToken = [guid]::NewGuid().ToString('N'); workerToken = $null
+            machineName = $null; workerId = $null; workerProcessStartTicks = $null
+            leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
         }
         $ownerPath = Join-Path $outside 'owner.json'
         [IO.File]::WriteAllText($ownerPath, ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
@@ -779,8 +907,12 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         [ordered]@{
+            schemaVersion = 2
             runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
             plannedStatePath = $statePath; statePath = $statePath
+            reservationToken = [guid]::NewGuid().ToString('N'); workerToken = $null
+            machineName = $null; workerId = $null; workerProcessStartTicks = $null
+            leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $lockPath 'owner.json') -NoNewline
 
         { & $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru } |

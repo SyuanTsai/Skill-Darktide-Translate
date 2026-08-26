@@ -14,15 +14,35 @@ param(
 
     [switch] $AllowNonDelivered,
 
+    [scriptblock] $HeartbeatAction,
+
     [switch] $PassThru
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Invoke-Heartbeat {
+    if ($HeartbeatAction) { & $HeartbeatAction }
+}
+
 function Get-FileSha256 {
     param([string] $Path)
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    Invoke-Heartbeat
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
 }
 
 function ConvertTo-InvariantString {
@@ -43,19 +63,18 @@ function Get-SanitizedUrl {
 
 function Get-ArchiveEvidence {
     param([string] $Path)
+    Invoke-Heartbeat
     $bytes = [byte[]]::new(8)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         $size = $stream.Length
         $read = $stream.Read($bytes, 0, $bytes.Length)
-        $stream.Position = 0
-        $sha256 = [Convert]::ToHexString($hasher.ComputeHash($stream)).ToLowerInvariant()
+        Invoke-Heartbeat
     }
     finally {
-        $hasher.Dispose()
         $stream.Dispose()
     }
+    $sha256 = Get-FileSha256 -Path $Path
     $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
         (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
         'zip'

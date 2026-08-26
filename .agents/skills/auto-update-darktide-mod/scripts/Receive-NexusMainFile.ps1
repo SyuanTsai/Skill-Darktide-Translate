@@ -44,6 +44,7 @@ function Invoke-Heartbeat {
 
 function Get-FileSha256 {
     param([Parameter(Mandatory)][string] $Path)
+    Invoke-Heartbeat
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
     try {
@@ -59,6 +60,7 @@ function Get-FileSha256 {
 
 function Copy-StreamWithHeartbeat {
     param([IO.Stream] $Source, [IO.Stream] $Destination)
+    Invoke-Heartbeat
     $buffer = [byte[]]::new(1MB)
     while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
         $Destination.Write($buffer, 0, $readCount)
@@ -66,11 +68,22 @@ function Copy-StreamWithHeartbeat {
     }
 }
 
+function Wait-TaskWithHeartbeat {
+    param([Parameter(Mandatory)][Threading.Tasks.Task] $Task)
+    Invoke-Heartbeat
+    while (-not $Task.IsCompleted) {
+        [Threading.Thread]::Sleep(1000)
+        Invoke-Heartbeat
+    }
+    $Task.GetAwaiter().GetResult()
+}
+
 function Write-AtomicJson {
     param(
         [Parameter(Mandatory)][string] $Path,
         [Parameter(Mandatory)] $Value
     )
+    Invoke-Heartbeat
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
@@ -264,6 +277,7 @@ function Move-ApiPartialToRetainedEvidence {
     if (-not $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         $retainedName = '.retained-partial-' + [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') + '-' + [guid]::NewGuid().ToString('N') + '-' + $item.Name
         $retainedPath = Assert-ContainedFilePath -Candidate (Join-Path $IncomingRoot $retainedName) -Root $IncomingRoot
+        Invoke-Heartbeat
         [IO.File]::Move($item.FullName, $retainedPath)
         return $retainedPath
     }
@@ -294,7 +308,8 @@ function Invoke-ApiDownload {
         $currentUri = $downloadUri
         for ($redirectCount = 0; $redirectCount -le 10; $redirectCount++) {
             if ($response) { $response.Dispose(); $response = $null }
-            $response = $client.GetAsync($currentUri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            $responseTask = $client.GetAsync($currentUri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+            $response = Wait-TaskWithHeartbeat -Task $responseTask
             if ([int]$response.StatusCode -notin @(301, 302, 303, 307, 308)) { break }
             if ($redirectCount -eq 10) { throw 'API download exceeded the ten-redirect safety limit.' }
             $location = $response.Headers.Location
@@ -309,9 +324,10 @@ function Invoke-ApiDownload {
             return New-WaitingResult -Status 'waiting-user' -Code 'nexus_permission_required' -Message 'Nexus login or download permission requires user action.' -Path $retainedPartialPath
         }
         $response.EnsureSuccessStatusCode()
-        $responseStream = $response.Content.ReadAsStream()
+        $responseStream = Wait-TaskWithHeartbeat -Task ($response.Content.ReadAsStreamAsync())
         $outputStream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try { Copy-StreamWithHeartbeat -Source $responseStream -Destination $outputStream } finally { $outputStream.Dispose(); $responseStream.Dispose() }
+        Invoke-Heartbeat
         [IO.File]::Move($temporaryPath, $finalPath)
         $finalPath
     }
@@ -482,6 +498,7 @@ Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source rece
 Write-AtomicJson -Path $ReceiptPath -Value $receipt
 Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
 Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source' -AllowMissingLeaf
+Invoke-Heartbeat
 [IO.File]::Move($candidateFull, $deliveredPath)
 $deliveryStart.Stop()
 $receipt.status = 'delivered'
