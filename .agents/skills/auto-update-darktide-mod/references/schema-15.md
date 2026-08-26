@@ -14,8 +14,12 @@ A Schema 15 source request is unique only when all of these values are present:
 - Main file version
 - expected filename
 - canonical Nexus page URL
+- Nexus page Version and Last updated values
+- Main file uploaded-at UTC timestamp
 
 Do not use an older file, alternate file, mirror, or filename-only match when the tuple cannot be proven. An official SHA-256 may strengthen the tuple but does not replace the Main file ID and version.
+
+Use source-request `schemaVersion: 2` before claim. Claim archives the request and writes one immutable `review-artifacts/source-tuple.json` that binds the run ID, acquisition method, complete Nexus page/Main-file identity, full archive filename including extension, size, SHA-256, request SHA-256, and receipt SHA-256 when applicable. Schema 14 manual ZIP claims use the same complete Nexus metadata tuple with `acquisitionMethod=manual-queue`; they do not invent a receipt.
 
 ## Acquisition ordering
 
@@ -60,6 +64,10 @@ The receipt records request identity, provider, sanitized source URL, filename, 
 At most four distinct canonical MOD identities may acquire concurrently. The same canonical MOD has one reservation and writer. Waiting workers release their execution slot but retain their exact run reservation.
 
 Every resume uses the same run ID, source request hash, receipt hash, MOD lock owner, Skill source pin, base OID, and paths. A changed tuple stops. A crash after receipt creation or source delivery reattaches only when the preserved bytes and receipt still pass independent verification.
+
+The active reservation worker is bound to machine, PID, process-start time, reservation token, and worker token. Long-running reads and child processes refresh heartbeat atomically. Every owner write rechecks both tokens. A normal exit or a `waiting-user`, `waiting-system`, or `awaiting-user-merge` stop clears the worker identity and leaves the run reservation in `reserved`; stale same-run reattachment retains the previous owner as evidence and never deletes a newer owner.
+
+Use `source-acquisition.lock` only around queue inventory/claim and source destination moves. Use `git-coordination.lock` only around shared fetch, branch, and worktree metadata operations. Both are short, owner-checked leases with retained stale evidence; neither may wrap download, localization, evidence commits, Candidate Gate, push, PR, or Review lifecycle work.
 
 ## Localization eligibility
 
@@ -122,6 +130,8 @@ The existing C0/C1/C2/C3/F boundaries remain normative:
 - F adds only allowlisted metadata after C3 when required.
 
 The independent Candidate Gate revalidates the source request, preserved receipt source, claimed archive, workset SHA-256, classification permissions, edit spans, raw and merged artifacts, Git-normalized blobs, C0/C1/C2/C3/F trees, manifests, and target paths.
+
+When C2 or C3 has the same tree as its parent, state still records a non-empty structured `KEEP` reason. The reason binds checkpoint, recognized code, localization mode, parent/current trees, target-path hash/count, localization-manifest SHA-256, and a reconstructible contract SHA-256. Missing, blank, unknown, contradictory, or evidence-mismatched reasons fail closed. `metadata-preview.json` binds the immutable source tuple and independently rechecked README/formal-hash fields; both metadata files retain the complete archive filename including extension and may not mix facts from different Nexus Main files.
 
 The PR body contains a deterministic classification-count table and receipt/workset hashes. Delete `localization-workset.json` after a passed Candidate Gate and before publication. Preserve its SHA-256, counts, edit count, validation result, and deletion evidence in state and the Gate report. The workset must never be added to Git.
 

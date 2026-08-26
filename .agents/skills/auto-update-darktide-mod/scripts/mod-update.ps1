@@ -47,7 +47,237 @@ function Get-Sha256Bytes {
 
 function Get-FileSha256 {
     param([Parameter(Mandatory)][string] $Path)
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $read)
+            Update-ActiveReservationHeartbeat
+            Update-ActiveSharedCoordinationHeartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Copy-StreamWithHeartbeat {
+    param(
+        [Parameter(Mandatory)][IO.Stream] $Source,
+        [Parameter(Mandatory)][IO.Stream] $Destination
+    )
+    $buffer = [byte[]]::new(1MB)
+    while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $Destination.Write($buffer, 0, $readCount)
+        Update-ActiveReservationHeartbeat
+        Update-ActiveSharedCoordinationHeartbeat
+    }
+}
+
+function ConvertTo-InvariantString {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function ConvertTo-NexusSourceIdentity {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $Request,
+        [switch] $RequireMetadata
+    )
+    if ([int]$Request.schemaVersion -notin @(1, 2)) { throw 'Source request schemaVersion must be 1 or 2.' }
+    foreach ($field in @('gameDomain', 'modId', 'mainFileId', 'version', 'fileName', 'pageUrl')) {
+        if (-not $Request.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $Request[$field]))) {
+            throw "Source request requires a unique $field value."
+        }
+    }
+    if ($RequireMetadata) {
+        if ([int]$Request.schemaVersion -ne 2) {
+            throw 'Claimed source requests must use schemaVersion 2 with the complete immutable Nexus Main identity.'
+        }
+        foreach ($field in @('pageVersion', 'pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+            if (-not $Request.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $Request[$field]))) {
+                throw "Source request requires immutable Nexus metadata field $field before claim."
+            }
+        }
+        foreach ($timestampField in @('pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+            $timestamp = [DateTimeOffset]::MinValue
+            if (-not [DateTimeOffset]::TryParseExact(
+                (ConvertTo-InvariantString $Request[$timestampField]),
+                'o',
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind,
+                [ref]$timestamp
+            )) {
+                throw "Source request $timestampField must be an ISO-8601 round-trip timestamp."
+            }
+        }
+    }
+    $pageUri = [Uri](ConvertTo-InvariantString $Request.pageUrl)
+    if (-not $pageUri.IsAbsoluteUri -or $pageUri.Scheme -cne 'https' -or
+        -not [string]::IsNullOrEmpty($pageUri.UserInfo) -or -not [string]::IsNullOrEmpty($pageUri.Query) -or
+        -not [string]::IsNullOrEmpty($pageUri.Fragment) -or -not $pageUri.IsDefaultPort) {
+        throw 'Source request pageUrl must be a canonical absolute HTTPS URL without user-info, query, fragment, or a custom port.'
+    }
+    $gameDomain = ConvertTo-InvariantString $Request.gameDomain
+    $modId = ConvertTo-InvariantString $Request.modId
+    if ($gameDomain -cne 'warhammer40kdarktide' -or
+        $pageUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+        $pageUri.AbsolutePath.TrimEnd('/') -cne "/warhammer40kdarktide/mods/$modId") {
+        throw 'Source request must identify the official Nexus MOD page for warhammer40kdarktide.'
+    }
+    $fileName = ConvertTo-InvariantString $Request.fileName
+    if ([IO.Path]::GetFileName($fileName) -cne $fileName -or $fileName.TrimEnd([char[]]' .') -cne $fileName -or
+        $fileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw 'Source request fileName must be one safe single file name.'
+    }
+    if ($fileName -match '(?i)^(con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$') {
+        throw 'Source request fileName uses a reserved Windows device name.'
+    }
+    $officialSha256 = if ($Request.Contains('officialSha256') -and
+        -not [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $Request.officialSha256))) {
+        (ConvertTo-InvariantString $Request.officialSha256).ToLowerInvariant()
+    }
+    else { $null }
+    if ($null -ne $officialSha256 -and $officialSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'Source request officialSha256 must contain 64 hexadecimal characters.'
+    }
+    $identity = [ordered]@{
+        gameDomain = $gameDomain
+        modId = $modId
+        pageUrl = $pageUri.AbsoluteUri.TrimEnd('/')
+        pageVersion = if ($Request.Contains('pageVersion')) { ConvertTo-InvariantString $Request.pageVersion } else { $null }
+        pageUpdatedAt = if ($Request.Contains('pageUpdatedAt')) { ConvertTo-InvariantString $Request.pageUpdatedAt } else { $null }
+        mainFileId = ConvertTo-InvariantString $Request.mainFileId
+        mainFileVersion = ConvertTo-InvariantString $Request.version
+        mainFileUploadedAtUtc = if ($Request.Contains('mainFileUploadedAtUtc')) { ConvertTo-InvariantString $Request.mainFileUploadedAtUtc } else { $null }
+        fileName = $fileName
+        officialSha256 = $officialSha256
+    }
+    foreach ($field in $identity.Keys) {
+        $fieldValue = [string]$identity[$field]
+        if (-not [string]::IsNullOrEmpty($fieldValue) -and @($fieldValue.ToCharArray() | Where-Object { [char]::IsControl($_) }).Count -ne 0) {
+            throw "Source request $field contains a control character."
+        }
+    }
+    $identity
+}
+
+function Get-SourceTupleContractSha256 {
+    param([Parameter(Mandatory)][Collections.IDictionary] $Contract)
+    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes(
+        ($Contract | ConvertTo-Json -Depth 20 -Compress)
+    ))
+}
+
+function New-SourceTupleEvidence {
+    param(
+        [Parameter(Mandatory)][string] $OutputPath,
+        [Parameter(Mandatory)][string] $ActualRunId,
+        [Parameter(Mandatory)][string] $AcquisitionMethod,
+        [Parameter(Mandatory)][Collections.IDictionary] $NexusIdentity,
+        [Parameter(Mandatory)][string] $ArchiveFileName,
+        [Parameter(Mandatory)][int64] $ArchiveSize,
+        [Parameter(Mandatory)][string] $ArchiveSha256,
+        [Parameter(Mandatory)][string] $BoundSourceRequestPath,
+        [AllowNull()][string] $BoundSourceReceiptPath
+    )
+    if ($ArchiveFileName -cne [string]$NexusIdentity.fileName) {
+        throw 'Archive full filename does not match the immutable Nexus Main file tuple.'
+    }
+    $requestFull = [IO.Path]::GetFullPath($BoundSourceRequestPath)
+    $receiptFull = if ([string]::IsNullOrWhiteSpace($BoundSourceReceiptPath)) { $null } else { [IO.Path]::GetFullPath($BoundSourceReceiptPath) }
+    $contract = [ordered]@{
+        runId = $ActualRunId
+        acquisitionMethod = $AcquisitionMethod
+        nexus = $NexusIdentity
+        archive = [ordered]@{ fileName = $ArchiveFileName; size = $ArchiveSize; sha256 = $ArchiveSha256 }
+        sourceRequestSha256 = Get-FileSha256 -Path $requestFull
+        sourceReceiptSha256 = if ($receiptFull) { Get-FileSha256 -Path $receiptFull } else { $null }
+    }
+    $contractSha256 = Get-SourceTupleContractSha256 -Contract $contract
+    $record = [ordered]@{
+        schemaVersion = 1
+        contract = $contract
+        contractSha256 = $contractSha256
+        sourceRequestPath = $requestFull
+        sourceReceiptPath = $receiptFull
+        capturedAt = Get-UtcTimestamp
+    }
+    Write-AtomicJson -Path $OutputPath -Value $record
+    [ordered]@{
+        path = [IO.Path]::GetFullPath($OutputPath)
+        sha256 = Get-FileSha256 -Path $OutputPath
+        contractSha256 = $contractSha256
+        contract = $contract
+    }
+}
+
+function New-CheckpointReason {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][ValidateSet('C2', 'C3')][string] $Checkpoint,
+        [AllowNull()][string] $ParentTreeOid,
+        [AllowNull()][string] $TreeOid
+    )
+    $targetPaths = @($State.evidenceTargetPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
+    $targetPathsJson = ConvertTo-Json -InputObject @($targetPaths) -Compress
+    $targetPathsSha256 = Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($targetPathsJson))
+    if ($targetPathsSha256 -cne [string]$State.evidenceTargetPathsSha256) {
+        throw "$Checkpoint reason target paths differ from the immutable localization target contract."
+    }
+    $manifestSha256 = Get-FileSha256 -Path ([string]$State.localizationManifestPath)
+    $isNotApplicable = [string]$State.localizationMode -ceq 'none'
+    $isKeep = $isNotApplicable -or $ParentTreeOid -ceq $TreeOid
+    $code = if ($isNotApplicable) { 'localization-not-applicable' }
+        elseif ($Checkpoint -ceq 'C2' -and $isKeep) { 'upstream-localization-unchanged' }
+        elseif ($Checkpoint -ceq 'C2') { 'upstream-localization-changed' }
+        elseif ($isKeep) { 'approved-localization-unchanged' }
+        else { 'approved-localization-changed' }
+    $contract = [ordered]@{
+        checkpoint = $Checkpoint
+        code = $code
+        disposition = if ($isKeep) { 'KEEP' } else { 'APPLY' }
+        localizationMode = [string]$State.localizationMode
+        parentTreeOid = $ParentTreeOid
+        treeOid = $TreeOid
+        targetPathsSha256 = $targetPathsSha256
+        targetPathCount = $targetPaths.Count
+        localizationManifestSha256 = $manifestSha256
+    }
+    [ordered]@{
+        schemaVersion = 1
+        code = $code
+        disposition = $contract.disposition
+        localizationMode = $contract.localizationMode
+        parentTreeOid = $ParentTreeOid
+        treeOid = $TreeOid
+        targetPathsSha256 = $targetPathsSha256
+        targetPathCount = $targetPaths.Count
+        localizationManifestSha256 = $manifestSha256
+        contractSha256 = Get-SourceTupleContractSha256 -Contract $contract
+    }
+}
+
+function Test-MetadataSourceFieldMatch {
+    param([string] $RelativePath, [string] $Text, [string] $FieldName, [string] $FieldValue)
+    if ([string]::IsNullOrWhiteSpace($FieldValue)) { return $false }
+    if ($RelativePath.StartsWith('.hash/', [StringComparison]::Ordinal)) {
+        $hashKeys = [ordered]@{
+            nexusModId = 'nexus_id'; nexusPageUrl = 'nexus_url'; nexusPageVersion = 'nexus_page_version'
+            nexusPageUpdatedAt = 'nexus_last_updated'; nexusMainFileId = 'main_file_id'; nexusMainFileVersion = 'version'
+            nexusMainFileUploadedAtUtc = 'main_file_uploaded_at_utc'; archiveFileName = 'filename'
+            archiveSize = 'size_bytes'; archiveSha256 = 'sha256'; acquisitionMethod = 'acquisition_method'
+        }
+        if (-not $hashKeys.Contains($FieldName)) { return $Text.Contains($FieldValue, [StringComparison]::Ordinal) }
+        $key = [regex]::Escape([string]$hashKeys[$FieldName])
+        $matchesForKey = @([regex]::Matches($Text, "(?m)^$key=([^`r`n]*)`r?$") )
+        return $matchesForKey.Count -eq 1 -and [string]$matchesForKey[0].Groups[1].Value -ceq $FieldValue
+    }
+    $Text.Contains($FieldValue, [StringComparison]::Ordinal)
 }
 
 function ConvertTo-SafeSlug {
@@ -185,12 +415,244 @@ function Write-ModReservationOwner {
     param(
         [Parameter(Mandatory)][string] $ModLockPath,
         [Parameter(Mandatory)][string] $Repository,
-        [Parameter(Mandatory)][Collections.IDictionary] $Value
+        [Parameter(Mandatory)][Collections.IDictionary] $Value,
+        [string] $ExpectedReservationToken,
+        [AllowNull()][string] $ExpectedWorkerToken
     )
     $ownerPath = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository -AllowMissingOwner
-    Write-AtomicJson -Path $ownerPath -Value $Value
-    $null = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository
-    $null = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+    $ownerExists = Test-Path -LiteralPath $ownerPath -PathType Leaf
+    $guardStream = $null
+    try {
+        if ($ownerExists) {
+            if ([string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
+                throw 'Updating an existing MOD reservation requires its current reservation token.'
+            }
+            $guardPath = Join-Path ([IO.Path]::GetFullPath($ModLockPath)) 'owner-update.guard'
+            for ($attempt = 0; $attempt -lt 80 -and -not $guardStream; $attempt++) {
+                try {
+                    $guardStream = [IO.File]::Open($guardPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                }
+                catch [IO.IOException] { [Threading.Thread]::Sleep(25) }
+            }
+            if (-not $guardStream) { throw 'Unable to acquire the short MOD owner update guard.' }
+            $current = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+            if ([string]$current.reservationToken -cne $ExpectedReservationToken -or
+                [string]$current.workerToken -cne [string]$ExpectedWorkerToken) {
+                throw 'MOD reservation ownership changed before its owner update.'
+            }
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
+            throw 'MOD reservation owner disappeared before its guarded update.'
+        }
+        Write-AtomicJson -Path $ownerPath -Value $Value
+        $null = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository
+        $written = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$written.reservationToken -cne [string]$Value.reservationToken -or
+            [string]$written.workerToken -cne [string]$Value.workerToken) {
+            throw 'MOD reservation owner write did not preserve its guarded token tuple.'
+        }
+    }
+    finally {
+        if ($guardStream) { $guardStream.Dispose() }
+    }
+}
+
+function Get-CurrentProcessIdentity {
+    $process = Get-Process -Id $PID -ErrorAction Stop
+    [ordered]@{
+        machineName = [Environment]::MachineName
+        processId = $PID
+        processStartTicks = $process.StartTime.ToUniversalTime().Ticks
+    }
+}
+
+function Test-ProcessIdentityActive {
+    param([Collections.IDictionary] $Owner, [string] $ProcessIdField = 'processId', [string] $ProcessStartField = 'processStartTicks')
+    if (-not $Owner -or [string]$Owner.machineName -cne [Environment]::MachineName -or
+        -not $Owner.Contains($ProcessIdField) -or -not $Owner.Contains($ProcessStartField) -or
+        -not $Owner[$ProcessIdField] -or -not $Owner[$ProcessStartField]) {
+        return $false
+    }
+    try {
+        $process = Get-Process -Id ([int]$Owner[$ProcessIdField]) -ErrorAction Stop
+        $process.StartTime.ToUniversalTime().Ticks -eq [int64]$Owner[$ProcessStartField]
+    }
+    catch { $false }
+}
+
+function Write-SharedCoordinationReceipt {
+    param([Collections.IDictionary] $Lease, [string] $ReceiptRoot, [string] $Disposition)
+    if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) { return $null }
+    $receiptDirectory = Join-Path $ReceiptRoot 'coordination-locks'
+    New-Item -ItemType Directory -Path $receiptDirectory -Force | Out-Null
+    $receiptPath = Join-Path $receiptDirectory ("$($Lease.resourceKey)-$($Lease.receiptId).json")
+    $receipt = [ordered]@{
+        schemaVersion = 1
+        runId = $Lease.runId
+        resourceKey = $Lease.resourceKey
+        lockPath = $Lease.path
+        machineName = $Lease.machineName
+        processId = $Lease.processId
+        processStartTicks = $Lease.processStartTicks
+        token = $Lease.token
+        acquiredAt = $Lease.acquiredAt
+        completedAt = Get-UtcTimestamp
+        disposition = $Disposition
+        staleEvidencePath = $Lease.staleEvidencePath
+    }
+    Write-AtomicJson -Path $receiptPath -Value $receipt
+    [ordered]@{ path = $receiptPath; sha256 = Get-FileSha256 -Path $receiptPath; resourceKey = $Lease.resourceKey }
+}
+
+function Enter-SharedOwnerGuard {
+    param([Parameter(Mandatory)][string] $LockRoot, [Parameter(Mandatory)][string] $ResourceKey)
+    $guardPath = Join-Path $LockRoot "$ResourceKey.owner-update.guard"
+    for ($attempt = 0; $attempt -lt 80; $attempt++) {
+        try {
+            return [IO.File]::Open($guardPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        }
+        catch [IO.IOException] { [Threading.Thread]::Sleep(25) }
+    }
+    throw "Unable to acquire the short $ResourceKey owner update guard."
+}
+
+function Enter-SharedCoordinationLock {
+    param(
+        [Parameter(Mandatory)][string] $Repository,
+        [Parameter(Mandatory)][ValidateSet('source-acquisition', 'git-coordination')][string] $ResourceKey,
+        [Parameter(Mandatory)][string] $ActualRunId,
+        [string] $ReceiptRoot,
+        [ValidateRange(1, 64)][int] $MaxAttempts = 32
+    )
+    $repositoryFull = [IO.Path]::GetFullPath($Repository)
+    $lockRoot = Join-Path $repositoryFull 'AI Auto Update/In Progress/.locks'
+    $null = Assert-NoReparsePath -Path $lockRoot -Root $repositoryFull -Label 'Shared coordination lock root' -AllowMissing
+    New-Item -ItemType Directory -Path $lockRoot -Force | Out-Null
+    $null = Assert-NoReparsePath -Path $lockRoot -Root $repositoryFull -Label 'Shared coordination lock root'
+    $lockPath = Join-Path $lockRoot "$ResourceKey.lock"
+    $identity = Get-CurrentProcessIdentity
+    $token = [guid]::NewGuid().ToString('N')
+    $staleEvidencePath = $null
+    for ($attempt = 0; $attempt -lt $MaxAttempts; $attempt++) {
+        $prepared = Join-Path $lockRoot (".pending-$ResourceKey-$ActualRunId-$([guid]::NewGuid().ToString('N'))")
+        New-Item -ItemType Directory -Path $prepared -ErrorAction Stop | Out-Null
+        $owner = [ordered]@{
+            schemaVersion = 1
+            runId = $ActualRunId
+            resourceKey = $ResourceKey
+            machineName = $identity.machineName
+            processId = $identity.processId
+            processStartTicks = $identity.processStartTicks
+            token = $token
+            acquiredAt = Get-UtcTimestamp
+            heartbeat = Get-UtcTimestamp
+        }
+        Write-AtomicJson -Path (Join-Path $prepared 'owner.json') -Value $owner
+        try {
+            [IO.Directory]::Move($prepared, $lockPath)
+            $lease = [ordered]@{
+                path = $lockPath; token = $token; runId = $ActualRunId; resourceKey = $ResourceKey
+                machineName = $identity.machineName; processId = $identity.processId; processStartTicks = $identity.processStartTicks
+                acquiredAt = $owner.acquiredAt; receiptRoot = $ReceiptRoot; receiptId = [guid]::NewGuid().ToString('N')
+                staleEvidencePath = $staleEvidencePath; lastHeartbeatUtc = [DateTimeOffset]::UtcNow
+            }
+            $script:activeSharedCoordinationLease = $lease
+            return $lease
+        }
+        catch [IO.IOException] {
+            if (Test-Path -LiteralPath $prepared -PathType Container) {
+                [IO.File]::Delete((Join-Path $prepared 'owner.json'))
+                [IO.Directory]::Delete($prepared)
+            }
+            $ownerGuard = Enter-SharedOwnerGuard -LockRoot $lockRoot -ResourceKey $ResourceKey
+            try {
+                if (-not (Test-Path -LiteralPath $lockPath -PathType Container)) { continue }
+                try { $existing = Get-Content -LiteralPath (Join-Path $lockPath 'owner.json') -Raw | ConvertFrom-Json -AsHashtable }
+                catch { throw "Existing $ResourceKey coordination lock owner is unreadable; preserve it for explicit recovery." }
+                foreach ($field in @('runId', 'resourceKey', 'machineName', 'processId', 'processStartTicks', 'token', 'heartbeat')) {
+                    if (-not $existing.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$existing[$field])) {
+                        throw "Existing $ResourceKey coordination lock owner is missing $field."
+                    }
+                }
+                if ([string]$existing.resourceKey -cne $ResourceKey -or [string]$existing.token -notmatch '^[0-9a-f]{32}$') {
+                    throw "Existing $ResourceKey coordination lock owner contract is invalid."
+                }
+                $existingHeartbeat = [DateTimeOffset]::MinValue
+                if (-not [DateTimeOffset]::TryParseExact(
+                    [string]$existing.heartbeat,
+                    'o',
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind,
+                    [ref]$existingHeartbeat
+                )) {
+                    throw "Existing $ResourceKey coordination lock heartbeat is invalid."
+                }
+                if ((Test-ProcessIdentityActive -Owner $existing) -or
+                    ([DateTimeOffset]::UtcNow - $existingHeartbeat).TotalMinutes -le 3) {
+                    [Threading.Thread]::Sleep([Math]::Min(1000, 25 * [Math]::Pow(2, [Math]::Min($attempt, 5))))
+                    continue
+                }
+                $stalePath = Join-Path $lockRoot (".stale-$ResourceKey-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))-$([guid]::NewGuid().ToString('N'))")
+                try {
+                    [IO.Directory]::Move($lockPath, $stalePath)
+                    $staleEvidencePath = $stalePath
+                }
+                catch [IO.IOException] { continue }
+            }
+            finally { $ownerGuard.Dispose() }
+        }
+    }
+    throw "Unable to acquire the short-lived $ResourceKey coordination lock."
+}
+
+function Update-ActiveSharedCoordinationHeartbeat {
+    param([switch] $Force)
+    if (-not $script:activeSharedCoordinationLease) { return }
+    $lease = $script:activeSharedCoordinationLease
+    if (-not $Force -and ([DateTimeOffset]::UtcNow - [DateTimeOffset]$lease.lastHeartbeatUtc).TotalSeconds -lt 30) { return }
+    $guard = Enter-SharedOwnerGuard -LockRoot (Split-Path -Parent ([string]$lease.path)) -ResourceKey ([string]$lease.resourceKey)
+    try {
+        $ownerPath = Join-Path ([string]$lease.path) 'owner.json'
+        if (-not (Test-Path -LiteralPath $ownerPath -PathType Leaf)) { throw 'Shared coordination owner disappeared before heartbeat refresh.' }
+        $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$owner.runId -cne [string]$lease.runId -or [string]$owner.resourceKey -cne [string]$lease.resourceKey -or
+            [string]$owner.token -cne [string]$lease.token -or [string]$owner.machineName -cne [string]$lease.machineName -or
+            [int]$owner.processId -ne [int]$lease.processId -or [int64]$owner.processStartTicks -ne [int64]$lease.processStartTicks) {
+            throw 'Shared coordination ownership changed before heartbeat refresh.'
+        }
+        $owner.heartbeat = Get-UtcTimestamp
+        Write-AtomicJson -Path $ownerPath -Value $owner
+        $verified = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$verified.token -cne [string]$lease.token) { throw 'Shared coordination token changed during heartbeat refresh.' }
+    }
+    finally { $guard.Dispose() }
+    $lease.lastHeartbeatUtc = [DateTimeOffset]::UtcNow
+}
+
+function Exit-SharedCoordinationLock {
+    param([Collections.IDictionary] $Lease)
+    if (-not $Lease) { return $null }
+    $guard = Enter-SharedOwnerGuard -LockRoot (Split-Path -Parent ([string]$Lease.path)) -ResourceKey ([string]$Lease.resourceKey)
+    try {
+        if (-not (Test-Path -LiteralPath $Lease.path -PathType Container)) {
+            throw 'Shared coordination lock disappeared before owner-checked release.'
+        }
+        $ownerPath = Join-Path $Lease.path 'owner.json'
+        $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$owner.runId -cne [string]$Lease.runId -or [string]$owner.resourceKey -cne [string]$Lease.resourceKey -or
+            [string]$owner.token -cne [string]$Lease.token -or [string]$owner.machineName -cne [string]$Lease.machineName -or
+            [int]$owner.processId -ne [int]$Lease.processId -or [int64]$owner.processStartTicks -ne [int64]$Lease.processStartTicks) {
+            throw 'Shared coordination lock ownership changed before release.'
+        }
+        [IO.File]::Delete($ownerPath)
+        [IO.Directory]::Delete([string]$Lease.path)
+    }
+    finally { $guard.Dispose() }
+    if ($script:activeSharedCoordinationLease -and
+        [string]$script:activeSharedCoordinationLease.token -ceq [string]$Lease.token) {
+        $script:activeSharedCoordinationLease = $null
+    }
+    Write-SharedCoordinationReceipt -Lease $Lease -ReceiptRoot ([string]$Lease.receiptRoot) -Disposition 'released'
 }
 
 function Read-State {
@@ -219,6 +681,7 @@ function Read-State {
 
 function Save-State {
     param([Parameter(Mandatory)][Collections.IDictionary] $State)
+    Update-ActiveReservationHeartbeat -Force
     $State.updatedAt = Get-UtcTimestamp
     Write-AtomicJson -Path ([string]$State.statePath) -Value $State
 }
@@ -229,28 +692,50 @@ function Invoke-Git {
         [Parameter(Mandatory)][string[]] $Arguments,
         [switch] $AllowFailure
     )
-    $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = 'git'
-    $start.UseShellExecute = $false
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    foreach ($argument in @('-C', $WorkingDirectory) + $Arguments) { $start.ArgumentList.Add($argument) }
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $start
-    if (-not $process.Start()) { throw 'Unable to start Git.' }
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
-    $output = $stdoutTask.Result.TrimEnd()
-    $warning = $stderrTask.Result.TrimEnd()
-    $exitCode = $process.ExitCode
-    if ($exitCode -ne 0 -and -not $AllowFailure) {
-        throw "git $($Arguments -join ' ') failed ($exitCode): $warning $output"
+    $argumentLine = ' ' + ($Arguments -join ' ') + ' '
+    $requiresCoordination = $argumentLine -match ' (worktree\s+(add|remove|prune)|fetch\s|branch\s+(-[dDmM]|--delete|--move))'
+    $coordinationLease = $null
+    try {
+        if ($requiresCoordination) {
+            $coordinationRunId = if ($script:activeReservationLease) { [string]$script:activeReservationLease.runId }
+                elseif (-not [string]::IsNullOrWhiteSpace($RunId)) { [guid]::Parse($RunId).ToString() }
+                else { 'unbound-' + [guid]::NewGuid().ToString('N') }
+            $receiptRoot = if ($script:activeReservationState -and $script:activeReservationState.Contains('artifactsRoot')) {
+                [string]$script:activeReservationState.artifactsRoot
+            }
+            else { $null }
+            $coordinationLease = Enter-SharedCoordinationLock -Repository ([IO.Path]::GetFullPath($RepositoryRoot)) `
+                -ResourceKey 'git-coordination' -ActualRunId $coordinationRunId -ReceiptRoot $receiptRoot
+        }
+        $start = [Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = 'git'
+        $start.UseShellExecute = $false
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        foreach ($argument in @('-C', $WorkingDirectory) + $Arguments) { $start.ArgumentList.Add($argument) }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $start
+        if (-not $process.Start()) { throw 'Unable to start Git.' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        while (-not $process.WaitForExit(1000)) {
+            Update-ActiveReservationHeartbeat
+            Update-ActiveSharedCoordinationHeartbeat
+        }
+        $output = $stdoutTask.Result.TrimEnd()
+        $warning = $stderrTask.Result.TrimEnd()
+        $exitCode = $process.ExitCode
+        if ($exitCode -ne 0 -and -not $AllowFailure) {
+            throw "git $($Arguments -join ' ') failed ($exitCode): $warning $output"
+        }
+        [pscustomobject]@{
+            exitCode = $exitCode
+            output = $output
+            warning = $warning
+        }
     }
-    [pscustomobject]@{
-        exitCode = $exitCode
-        output = $output
-        warning = $warning
+    finally {
+        if ($coordinationLease) { $null = Exit-SharedCoordinationLock -Lease $coordinationLease }
     }
 }
 
@@ -323,9 +808,9 @@ function Get-GitBlobBytes {
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start git cat-file.' }
     $memory = [IO.MemoryStream]::new()
-    $process.StandardOutput.BaseStream.CopyTo($memory)
+    Copy-StreamWithHeartbeat -Source $process.StandardOutput.BaseStream -Destination $memory
     $errorText = $process.StandardError.ReadToEnd()
-    $process.WaitForExit()
+    while (-not $process.WaitForExit(1000)) { Update-ActiveReservationHeartbeat }
     if ($process.ExitCode -ne 0) { throw "git cat-file failed: $errorText" }
     $memory.ToArray()
 }
@@ -551,7 +1036,7 @@ function Assert-LockOwner {
         throw 'MOD identity lock path differs from the canonical reservation tuple.'
     }
     $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository $repository
-    foreach ($field in @('runId', 'canonicalModRelativePath', 'modLockKey', 'plannedStatePath', 'statePath')) {
+    foreach ($field in @('runId', 'canonicalModRelativePath', 'modLockKey', 'plannedStatePath', 'statePath', 'reservationToken', 'leaseMode')) {
         if (-not $owner.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$owner[$field])) { throw "MOD identity lock owner is missing $field." }
     }
     $statePathFull = [IO.Path]::GetFullPath([string]$State.statePath)
@@ -562,6 +1047,134 @@ function Assert-LockOwner {
         [IO.Path]::GetFullPath([string]$owner.statePath) -cne $statePathFull) {
         throw 'MOD identity lock does not belong to this same run tuple.'
     }
+    if ([int]$owner.schemaVersion -ne 2 -or [string]$owner.reservationToken -notmatch '^[0-9a-f]{32}$' -or
+        [string]$owner.leaseMode -notin @('active', 'reserved')) {
+        throw 'MOD identity lock owner contract is invalid.'
+    }
+}
+
+function Get-ReservationStateLabel {
+    param([Collections.IDictionary] $State)
+    if (-not $State -or -not $State.Contains('status')) { return 'between-stages' }
+    switch ([string]$State.status) {
+        'waiting-input' { 'waiting-user' }
+        'waiting-user' { 'waiting-user' }
+        'waiting-system' { 'waiting-system' }
+        'blocked' { 'waiting-user' }
+        'awaiting-user-merge' { 'awaiting-user-merge' }
+        default { 'between-stages' }
+    }
+}
+
+function Enter-ModReservationWorker {
+    param([Collections.IDictionary] $State)
+    Assert-LockOwner -State $State
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+    $reservationToken = [string]$owner.reservationToken
+    $previousWorkerToken = [string]$owner.workerToken
+    $identity = Get-CurrentProcessIdentity
+    $sameWorker = [string]$owner.leaseMode -ceq 'active' -and
+        [string]$owner.machineName -ceq [string]$identity.machineName -and
+        [int]$owner.workerId -eq [int]$identity.processId -and
+        [int64]$owner.workerProcessStartTicks -eq [int64]$identity.processStartTicks -and
+        [string]$owner.workerToken -match '^[0-9a-f]{32}$'
+
+    if ([string]$owner.leaseMode -ceq 'active' -and -not $sameWorker) {
+        foreach ($field in @('machineName', 'workerId', 'workerProcessStartTicks', 'workerToken', 'heartbeat')) {
+            if (-not $owner.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$owner[$field])) {
+                throw "Active MOD reservation owner is missing $field."
+            }
+        }
+        $heartbeat = [DateTimeOffset]::MinValue
+        $heartbeatValid = [DateTimeOffset]::TryParseExact(
+            [string]$owner.heartbeat,
+            'o',
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$heartbeat
+        )
+        $sameMachineWorkerActive = [string]$owner.machineName -ceq [Environment]::MachineName -and
+            (Test-ProcessIdentityActive -Owner $owner -ProcessIdField 'workerId' -ProcessStartField 'workerProcessStartTicks')
+        if (-not $heartbeatValid -or $sameMachineWorkerActive -or ([DateTimeOffset]::UtcNow - $heartbeat).TotalMinutes -le 30) {
+            throw 'The same run reservation still has an active worker; reattachment requires a stale heartbeat and a dead process identity.'
+        }
+        $historyRoot = Join-Path ([string]$State.modLockPath) 'owner-history'
+        New-Item -ItemType Directory -Path $historyRoot -Force | Out-Null
+        $historyPath = Join-Path $historyRoot ("stale-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))-$([guid]::NewGuid().ToString('N')).json")
+        Write-AtomicJson -Path $historyPath -Value $owner
+        $State.lastRecovery = [ordered]@{ at = Get-UtcTimestamp; reason = 'stale same-run reservation worker reattached'; retainedPath = $historyPath }
+    }
+    elseif ([string]$owner.leaseMode -ceq 'reserved') {
+        if (-not [string]::IsNullOrWhiteSpace([string]$owner.workerToken) -or $owner.workerId -or $owner.workerProcessStartTicks) {
+            throw 'Reserved MOD owner must not retain an active worker identity.'
+        }
+    }
+
+    if (-not $sameWorker) { $owner.workerToken = [guid]::NewGuid().ToString('N') }
+    $owner.machineName = $identity.machineName
+    $owner.workerId = $identity.processId
+    $owner.workerProcessStartTicks = $identity.processStartTicks
+    $owner.leaseMode = 'active'
+    $owner.reservationState = 'running'
+    $owner.heartbeat = Get-UtcTimestamp
+    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) -Value $owner `
+        -ExpectedReservationToken $reservationToken -ExpectedWorkerToken $previousWorkerToken
+    $script:activeReservationLease = [ordered]@{
+        modLockPath = [string]$State.modLockPath
+        repositoryRoot = [string]$State.repositoryRoot
+        runId = [string]$State.runId
+        reservationToken = $reservationToken
+        workerToken = [string]$owner.workerToken
+        machineName = $identity.machineName
+        workerId = $identity.processId
+        workerProcessStartTicks = $identity.processStartTicks
+        lastHeartbeatUtc = [DateTimeOffset]::UtcNow
+    }
+    $script:activeReservationState = $State
+}
+
+function Update-ActiveReservationHeartbeat {
+    param([switch] $Force)
+    if (-not $script:activeReservationLease) { return }
+    $lease = $script:activeReservationLease
+    if (-not $Force -and ([DateTimeOffset]::UtcNow - [DateTimeOffset]$lease.lastHeartbeatUtc).TotalSeconds -lt 30) { return }
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot)
+    if ([string]$owner.runId -cne [string]$lease.runId -or
+        [string]$owner.reservationToken -cne [string]$lease.reservationToken -or
+        [string]$owner.workerToken -cne [string]$lease.workerToken -or
+        [string]$owner.machineName -cne [string]$lease.machineName -or
+        [int]$owner.workerId -ne [int]$lease.workerId -or
+        [int64]$owner.workerProcessStartTicks -ne [int64]$lease.workerProcessStartTicks -or
+        [string]$owner.leaseMode -cne 'active') {
+        throw 'MOD reservation ownership changed before heartbeat refresh.'
+    }
+    $owner.heartbeat = Get-UtcTimestamp
+    Write-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot) -Value $owner `
+        -ExpectedReservationToken ([string]$lease.reservationToken) -ExpectedWorkerToken ([string]$lease.workerToken)
+    $lease.lastHeartbeatUtc = [DateTimeOffset]::UtcNow
+}
+
+function Suspend-ModReservationWorker {
+    param([Collections.IDictionary] $State)
+    if (-not $script:activeReservationLease) { return }
+    $lease = $script:activeReservationLease
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot)
+    if ([string]$owner.runId -cne [string]$lease.runId -or
+        [string]$owner.reservationToken -cne [string]$lease.reservationToken -or
+        [string]$owner.workerToken -cne [string]$lease.workerToken) {
+        throw 'MOD reservation ownership changed before worker suspension.'
+    }
+    $owner.leaseMode = 'reserved'
+    $owner.reservationState = Get-ReservationStateLabel -State $State
+    $owner.machineName = $null
+    $owner.workerId = $null
+    $owner.workerProcessStartTicks = $null
+    $owner.workerToken = $null
+    $owner.heartbeat = Get-UtcTimestamp
+    Write-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot) -Value $owner `
+        -ExpectedReservationToken ([string]$lease.reservationToken) -ExpectedWorkerToken ([string]$lease.workerToken)
+    $script:activeReservationLease = $null
+    $script:activeReservationState = $null
 }
 
 function Test-RunWriterOwnerActive {
@@ -643,6 +1256,7 @@ function Ensure-RunWriterLock {
     $script:activeStatePath = [string]$State.statePath
     if (-not $script:writerLease) {
         $script:writerLease = Enter-RunWriterLock -State $State
+        Enter-ModReservationWorker -State $State
         if ($script:writerLease.recovery) {
             $State.lastRecovery = $script:writerLease.recovery
             Save-State -State $State
@@ -704,15 +1318,21 @@ function Enter-ModReservation {
         $preparedLockPath = Join-Path $lockRoot ('.pending-' + [IO.Path]::GetFileName([string]$Plan.modLockPath) + '-' + $ActualRunId + '-' + [guid]::NewGuid().ToString('N'))
         $null = Assert-NoReparsePath -Path $preparedLockPath -Root ([string]$Plan.repositoryRoot) -Label 'Prepared MOD reservation' -AllowMissing
         New-Item -ItemType Directory -Path $preparedLockPath -ErrorAction Stop | Out-Null
+        $identity = Get-CurrentProcessIdentity
         $preparedOwner = [ordered]@{
-            schemaVersion = 1
+            schemaVersion = 2
             runId = $ActualRunId
             canonicalModRelativePath = $Plan.modRelativePath
             modLockKey = $Plan.lockKey
             plannedStatePath = $expectedStatePath
             statePath = $expectedStatePath
-            workerId = $PID
+            reservationToken = [guid]::NewGuid().ToString('N')
+            workerToken = [guid]::NewGuid().ToString('N')
+            machineName = $identity.machineName
+            workerId = $identity.processId
+            workerProcessStartTicks = $identity.processStartTicks
             leaseMode = 'active'
+            reservationState = 'claiming'
             acquiredAt = Get-UtcTimestamp
             heartbeat = Get-UtcTimestamp
         }
@@ -746,13 +1366,66 @@ function Enter-ModReservation {
         -not $owner.Contains('statePath') -or [IO.Path]::GetFullPath([string]$owner.statePath) -cne $expectedStatePath) {
         throw 'Existing canonical MOD reservation owner tuple changed.'
     }
+    if ([int]$owner.schemaVersion -ne 2 -or [string]$owner.reservationToken -notmatch '^[0-9a-f]{32}$') {
+        throw 'Existing canonical MOD reservation owner token contract is invalid.'
+    }
+    $expectedReservationToken = [string]$owner.reservationToken
+    $expectedWorkerToken = [string]$owner.workerToken
+    $identity = Get-CurrentProcessIdentity
+    $sameWorker = [string]$owner.leaseMode -ceq 'active' -and [string]$owner.machineName -ceq [string]$identity.machineName -and
+        [int]$owner.workerId -eq [int]$identity.processId -and [int64]$owner.workerProcessStartTicks -eq [int64]$identity.processStartTicks
+    if ([string]$owner.leaseMode -ceq 'active' -and -not $sameWorker) {
+        foreach ($field in @('machineName', 'workerId', 'workerProcessStartTicks', 'workerToken', 'heartbeat')) {
+            if (-not $owner.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$owner[$field])) {
+                throw "Active canonical MOD reservation owner is missing $field."
+            }
+        }
+        if ([string]$owner.workerToken -notmatch '^[0-9a-f]{32}$') { throw 'Active canonical MOD reservation worker token is invalid.' }
+        $heartbeat = [DateTimeOffset]::MinValue
+        $heartbeatValid = [DateTimeOffset]::TryParseExact(
+            [string]$owner.heartbeat,
+            'o',
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$heartbeat
+        )
+        $workerActive = Test-ProcessIdentityActive -Owner $owner -ProcessIdField 'workerId' -ProcessStartField 'workerProcessStartTicks'
+        if ($workerActive -or -not $heartbeatValid -or ([DateTimeOffset]::UtcNow - $heartbeat).TotalMinutes -le 30) {
+            throw 'The same run reservation still has an active worker; only a stale same-run owner may reattach.'
+        }
+        $historyRoot = Join-Path ([string]$Plan.modLockPath) 'owner-history'
+        New-Item -ItemType Directory -Path $historyRoot -Force | Out-Null
+        $historyPath = Join-Path $historyRoot ("stale-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))-$([guid]::NewGuid().ToString('N')).json")
+        Write-AtomicJson -Path $historyPath -Value $owner
+        $owner.lastRecovery = [ordered]@{ at = Get-UtcTimestamp; reason = 'stale same-run reservation worker reattached'; retainedPath = $historyPath }
+    }
+    elseif ([string]$owner.leaseMode -ceq 'reserved' -and
+        (-not [string]::IsNullOrWhiteSpace([string]$owner.workerToken) -or $owner.workerId -or $owner.workerProcessStartTicks -or $owner.machineName)) {
+        throw 'Reserved canonical MOD owner retains a contradictory active worker identity.'
+    }
     $owner.modLockKey = $Plan.lockKey
     $owner.plannedStatePath = [IO.Path]::GetFullPath($PlannedStatePath)
     $owner.statePath = [IO.Path]::GetFullPath($PlannedStatePath)
-    $owner.workerId = $PID
+    $owner.workerToken = if ($sameWorker) { $owner.workerToken } else { [guid]::NewGuid().ToString('N') }
+    $owner.machineName = $identity.machineName
+    $owner.workerId = $identity.processId
+    $owner.workerProcessStartTicks = $identity.processStartTicks
     $owner.leaseMode = 'active'
+    $owner.reservationState = 'claiming'
     $owner.heartbeat = Get-UtcTimestamp
-    Write-ModReservationOwner -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot) -Value $owner
+    Write-ModReservationOwner -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot) -Value $owner `
+        -ExpectedReservationToken $expectedReservationToken -ExpectedWorkerToken $expectedWorkerToken
+    $script:activeReservationLease = [ordered]@{
+        modLockPath = [string]$Plan.modLockPath
+        repositoryRoot = [string]$Plan.repositoryRoot
+        runId = $ActualRunId
+        reservationToken = [string]$owner.reservationToken
+        workerToken = [string]$owner.workerToken
+        machineName = [string]$owner.machineName
+        workerId = [int]$owner.workerId
+        workerProcessStartTicks = [int64]$owner.workerProcessStartTicks
+        lastHeartbeatUtc = [DateTimeOffset]::UtcNow
+    }
     $owner
 }
 
@@ -791,7 +1464,7 @@ function Test-SourceRequestPreflight {
     $null = Assert-NoReparsePath -Path $full -Root ([IO.Path]::GetPathRoot($full)) -Label 'Source request'
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'Source request does not exist.' }
     $request = Get-Content -LiteralPath $full -Raw | ConvertFrom-Json -AsHashtable
-    if ([int]$request.schemaVersion -ne 1) { throw 'Source request schemaVersion must be 1.' }
+    if ([int]$request.schemaVersion -notin @(1, 2)) { throw 'Source request schemaVersion must be 1 or 2.' }
     foreach ($field in @('gameDomain', 'modId', 'mainFileId', 'version', 'fileName', 'pageUrl')) {
         if (-not $request.Contains($field) -or [string]::IsNullOrWhiteSpace([Convert]::ToString($request[$field], [Globalization.CultureInfo]::InvariantCulture))) {
             throw "Source request requires a unique $field value."
@@ -972,7 +1645,8 @@ function Invoke-AcquireSource {
     $reservationOwner.workflowCommitOid = $boundSkillSourcePin.resolvedCommit
     $reservationOwner.skillSourceContentSha256 = $boundSkillSourcePin.contentSha256
     $reservationOwner.skillSourcePinSha256 = $boundSkillSourcePin.pinSha256
-    Write-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot) -Value $reservationOwner
+    Write-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot) -Value $reservationOwner `
+        -ExpectedReservationToken ([string]$reservationOwner.reservationToken) -ExpectedWorkerToken ([string]$reservationOwner.workerToken)
     $suppliedRequestPath = [IO.Path]::GetFullPath($SourceRequestPath)
     $null = Assert-NoReparsePath -Path $suppliedRequestPath -Root ([IO.Path]::GetPathRoot($suppliedRequestPath)) -Label 'Supplied source request'
     $boundRequestPath = Join-Path $reviewArtifacts 'source-request.json'
@@ -988,6 +1662,8 @@ function Invoke-AcquireSource {
         $null = Get-Content -LiteralPath $temporaryRequestPath -Raw | ConvertFrom-Json -AsHashtable
         [IO.File]::Move($temporaryRequestPath, $boundRequestPath)
     }
+    $boundSourceRequest = Get-Content -LiteralPath $boundRequestPath -Raw | ConvertFrom-Json -AsHashtable
+    $boundSourceIdentity = ConvertTo-NexusSourceIdentity -Request $boundSourceRequest
     $acquisitionPath = Join-Path $reviewArtifacts 'source-acquisition.json'
     if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
         $preservedReceipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
@@ -1015,6 +1691,8 @@ function Invoke-AcquireSource {
                     workflowSchemaVersion = 15
                     runId = $actualRunId
                     mod = $ModDirectory
+                    acquisitionMethod = "nexus-$Provider"
+                    nexus = $boundSourceIdentity
                     sourceRequestPath = [IO.Path]::GetFullPath($boundRequestPath)
                     sourceRequestSha256 = $requestSha
                     skillSourcePinPath = [IO.Path]::GetFullPath($plannedPinPath)
@@ -1044,11 +1722,11 @@ function Invoke-AcquireSource {
                 throw 'Preserved non-delivered acquisition record changed.'
             }
             $owner = Read-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot)
-            $owner.leaseMode = 'reserved'
-            $owner.workerId = $null
             $owner.waitingReason = $verifiedResult.waitingReason
             $owner.heartbeat = Get-UtcTimestamp
-            Write-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot) -Value $owner
+            Write-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot) -Value $owner `
+                -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
+            $script:activeReservationState = [ordered]@{ status = [string]$verifiedResult.status }
             return [ordered]@{
                 result = $verifiedResult.result; status = $verifiedResult.status; idempotent = $true; runId = $actualRunId; stage = 'acquire-source'
                 plannedStatePath = $plannedStatePath; runRoot = $plan.runRoot; modLockPath = $plan.modLockPath
@@ -1089,6 +1767,7 @@ function Invoke-AcquireSource {
         else {
             $record = [ordered]@{
                 schemaVersion = 1; workflowSchemaVersion = 15; runId = $actualRunId; mod = $ModDirectory
+                acquisitionMethod = "nexus-$Provider"; nexus = $boundSourceIdentity
                 sourceRequestPath = [IO.Path]::GetFullPath($boundRequestPath); sourceRequestSha256 = $requestSha
                 skillSourcePinPath = [IO.Path]::GetFullPath($plannedPinPath); skillSourcePinSha256 = Get-FileSha256 -Path $plannedPinPath
                 skillSourceCommit = $boundSkillSourcePin.resolvedCommit; skillSourceContentSha256 = $boundSkillSourcePin.contentSha256
@@ -1101,7 +1780,8 @@ function Invoke-AcquireSource {
         $owner.sourceReceiptSha256 = $receiptSha
         $owner.sourceSha256 = [string]$preservedReceipt.sha256
         $owner.heartbeat = Get-UtcTimestamp
-        Write-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot) -Value $owner
+        Write-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot) -Value $owner `
+            -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
         return [ordered]@{
             result = 'passed'; status = 'delivered'; idempotent = $true; runId = $actualRunId; stage = 'acquire-source'
             plannedStatePath = $plannedStatePath; runRoot = $plan.runRoot; modLockPath = $plan.modLockPath
@@ -1121,6 +1801,7 @@ function Invoke-AcquireSource {
         ReceiptPath = $receiptPath
         RunRoot = [string]$plan.runRoot
         ObservationIntervalMilliseconds = $ObservationIntervalMilliseconds
+        HeartbeatAction = { Update-ActiveReservationHeartbeat }
         PassThru = $true
     }
     if (-not [string]::IsNullOrWhiteSpace($DownloadedFilePath)) { $arguments.DownloadedFilePath = [IO.Path]::GetFullPath($DownloadedFilePath) }
@@ -1130,6 +1811,8 @@ function Invoke-AcquireSource {
         workflowSchemaVersion = 15
         runId = $actualRunId
         mod = $ModDirectory
+        acquisitionMethod = "nexus-$Provider"
+        nexus = $boundSourceIdentity
         sourceRequestPath = [IO.Path]::GetFullPath($boundRequestPath)
         sourceRequestSha256 = Get-FileSha256 -Path ([IO.Path]::GetFullPath($boundRequestPath))
         skillSourcePinPath = [IO.Path]::GetFullPath($plannedPinPath)
@@ -1148,12 +1831,12 @@ function Invoke-AcquireSource {
         $owner.sourceSha256 = (Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable).sha256
     }
     else {
-        $owner.leaseMode = 'reserved'
-        $owner.workerId = $null
         $owner.waitingReason = $acquired.waitingReason
     }
     $owner.heartbeat = Get-UtcTimestamp
-    Write-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot) -Value $owner
+    Write-ModReservationOwner -ModLockPath ([string]$plan.modLockPath) -Repository ([string]$plan.repositoryRoot) -Value $owner `
+        -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
+    if ($acquired.status -ne 'delivered') { $script:activeReservationState = [ordered]@{ status = [string]$acquired.status } }
     [ordered]@{
         result = $acquired.result
         status = $acquired.status
@@ -1206,20 +1889,31 @@ function Complete-IncompleteClaim {
 
     $coordinatorArchive = [string]$State.claimCoordinatorArchivePath
     $claimedArchive = [string]$State.archive.path
-    if (-not (Test-Path -LiteralPath $coordinatorArchive -PathType Leaf) -and
-        -not (Test-Path -LiteralPath $claimedArchive -PathType Leaf) -and
-        $State.archive.Contains('originalPath') -and
-        (Test-Path -LiteralPath ([string]$State.archive.originalPath) -PathType Leaf)) {
-        if ($State.archive.Contains('preserveOriginal') -and $State.archive.preserveOriginal) {
-            [IO.File]::Copy([string]$State.archive.originalPath, $coordinatorArchive)
+    if (-not (Test-Path -LiteralPath $claimedArchive -PathType Leaf)) {
+        $sourceLease = Enter-SharedCoordinationLock -Repository $repository -ResourceKey 'source-acquisition' `
+            -ActualRunId ([string]$State.runId) -ReceiptRoot ([string]$State.artifactsRoot)
+        try {
+            if (-not (Test-Path -LiteralPath $coordinatorArchive -PathType Leaf) -and
+                -not (Test-Path -LiteralPath $claimedArchive -PathType Leaf) -and
+                $State.archive.Contains('originalPath') -and
+                (Test-Path -LiteralPath ([string]$State.archive.originalPath) -PathType Leaf)) {
+                if ($State.archive.Contains('preserveOriginal') -and $State.archive.preserveOriginal) {
+                    [IO.File]::Copy([string]$State.archive.originalPath, $coordinatorArchive)
+                }
+                else {
+                    [IO.File]::Move([string]$State.archive.originalPath, $coordinatorArchive)
+                }
+            }
+            if (Test-Path -LiteralPath $coordinatorArchive -PathType Leaf) {
+                if (Test-Path -LiteralPath $claimedArchive) { throw 'Incomplete claim has both coordinator and run-owned archive copies.' }
+                [IO.File]::Move($coordinatorArchive, $claimedArchive)
+            }
         }
-        else {
-            [IO.File]::Move([string]$State.archive.originalPath, $coordinatorArchive)
+        finally {
+            $recoveryCoordinationReceipt = Exit-SharedCoordinationLock -Lease $sourceLease
+            $priorCoordinationReceipts = if ($State.Contains('coordinationReceipts')) { @($State.coordinationReceipts) } else { @() }
+            $State.coordinationReceipts = @($priorCoordinationReceipts + @($recoveryCoordinationReceipt))
         }
-    }
-    if (Test-Path -LiteralPath $coordinatorArchive -PathType Leaf) {
-        if (Test-Path -LiteralPath $claimedArchive) { throw 'Incomplete claim has both coordinator and run-owned archive copies.' }
-        [IO.File]::Move($coordinatorArchive, $claimedArchive)
     }
     $claimedArchiveItem = Get-Item -LiteralPath $claimedArchive -ErrorAction SilentlyContinue
     if ($claimedArchiveItem -and ($claimedArchiveItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
@@ -1232,7 +1926,8 @@ function Complete-IncompleteClaim {
     $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
     $owner.worktree = $State.worktreePath
     $owner.heartbeat = Get-UtcTimestamp
-    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) -Value $owner
+    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) -Value $owner `
+        -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
 
     $claimRecord = Get-Content -LiteralPath $State.claimPath -Raw | ConvertFrom-Json -AsHashtable
     $claimRecord.status = 'worktree-ready'
@@ -1262,8 +1957,9 @@ function Invoke-Claim {
         if ($completed) { return $completed }
         return Complete-IncompleteClaim -State $existing
     }
-    if ([string]::IsNullOrWhiteSpace($ArchivePath) -or [string]::IsNullOrWhiteSpace($ModDirectory)) {
-        throw 'claim requires -ArchivePath and -ModDirectory.'
+    if ([string]::IsNullOrWhiteSpace($ArchivePath) -or [string]::IsNullOrWhiteSpace($ModDirectory) -or
+        [string]::IsNullOrWhiteSpace($SourceRequestPath)) {
+        throw 'claim requires -ArchivePath, -ModDirectory, and a complete -SourceRequestPath Nexus Main file tuple.'
     }
     $repository = [IO.Path]::GetFullPath($RepositoryRoot)
     $actualRunId = if ($RunId) { [guid]::Parse($RunId).ToString() } else { [guid]::NewGuid().ToString() }
@@ -1287,6 +1983,8 @@ function Invoke-Claim {
     if ($integrity.result -cne 'passed' -or -not $integrity.skillSourcePin) { throw 'The immutable Skill source pin or packaged references failed integrity validation.' }
     $sourceReceipt = $null
     $sourceAcquisitionRecord = $null
+    $sourceIdentity = $null
+    $sourceRequestInputFull = $null
     if (-not [string]::IsNullOrWhiteSpace($SourceReceiptPath)) {
         if ([string]::IsNullOrWhiteSpace($SourceRequestPath)) { throw 'Receipt-bound claim requires -SourceRequestPath.' }
         $receiptFull = Assert-ContainedPath -Candidate $SourceReceiptPath -Root $runRoot -Label 'Source receipt path'
@@ -1296,6 +1994,9 @@ function Invoke-Claim {
         if ($requestFull -cne [IO.Path]::GetFullPath((Join-Path $runRoot 'review-artifacts/source-request.json'))) {
             throw 'Receipt-bound claim requires the run-archived source request.'
         }
+        $sourceRequestInputFull = $requestFull
+        $sourceRequestData = Get-Content -LiteralPath $requestFull -Raw | ConvertFrom-Json -AsHashtable
+        $sourceIdentity = ConvertTo-NexusSourceIdentity -Request $sourceRequestData -RequireMetadata
         $acquisitionFull = [IO.Path]::GetFullPath((Join-Path $runRoot 'review-artifacts/source-acquisition.json'))
         $null = Assert-NoReparsePath -Path $acquisitionFull -Root $repository -Label 'Source acquisition record'
         if (-not (Test-Path -LiteralPath $acquisitionFull -PathType Leaf)) { throw 'Schema 15 acquisition record is missing.' }
@@ -1365,6 +2066,11 @@ function Invoke-Claim {
         }
     }
     else {
+        $sourceRequestInputFull = [IO.Path]::GetFullPath($SourceRequestPath)
+        $null = Assert-NoReparsePath -Path $sourceRequestInputFull -Root ([IO.Path]::GetPathRoot($sourceRequestInputFull)) -Label 'Manual source request'
+        if (-not (Test-Path -LiteralPath $sourceRequestInputFull -PathType Leaf)) { throw 'Manual source request is missing.' }
+        $sourceRequestData = Get-Content -LiteralPath $sourceRequestInputFull -Raw | ConvertFrom-Json -AsHashtable
+        $sourceIdentity = ConvertTo-NexusSourceIdentity -Request $sourceRequestData -RequireMetadata
         $sourceFull = Assert-ContainedPath -Candidate $ArchivePath -Root $queueRoot -Label 'Archive path'
         if ((Split-Path -Parent $sourceFull) -ne [IO.Path]::GetFullPath($queueRoot)) {
             throw 'Archive must be a direct child of AI Auto Update.'
@@ -1375,7 +2081,10 @@ function Invoke-Claim {
         if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw 'Source archive must be a regular file, not a reparse point.'
         }
-        [Threading.Thread]::Sleep(10000)
+        for ($second = 0; $second -lt 10; $second++) {
+            [Threading.Thread]::Sleep(1000)
+            Update-ActiveReservationHeartbeat
+        }
         $null = Assert-NoReparsePath -Path $sourceFull -Root $repository -Label 'Source archive'
         $sampleTwo = Get-Item -LiteralPath $sourceFull
         if ($sampleOne.Length -ne $sampleTwo.Length -or $sampleOne.LastWriteTimeUtc -ne $sampleTwo.LastWriteTimeUtc) {
@@ -1402,6 +2111,22 @@ function Invoke-Claim {
         $integrity = & $integrityScript -SkillSourcePinPath $boundPinPath -PassThru
     }
     if ((Get-FileSha256 -Path $boundPinPath) -cne [string]$integrity.skillSourcePin.pinSha256) { throw 'Bound Skill source pin bytes changed before claim.' }
+    $boundSourceRequestPath = Join-Path $reviewArtifacts 'source-request.json'
+    if ([IO.Path]::GetFullPath($sourceRequestInputFull) -cne [IO.Path]::GetFullPath($boundSourceRequestPath)) {
+        $requestBytes = [IO.File]::ReadAllBytes($sourceRequestInputFull)
+        if (Test-Path -LiteralPath $boundSourceRequestPath -PathType Leaf) {
+            if ((Get-FileSha256 -Path $boundSourceRequestPath) -cne (Get-Sha256Bytes -Bytes $requestBytes)) {
+                throw 'Run-bound source request already exists with different bytes.'
+            }
+        }
+        else { Write-AtomicBytes -Path $boundSourceRequestPath -Bytes $requestBytes }
+    }
+    $sourceTuplePath = Join-Path $reviewArtifacts 'source-tuple.json'
+    $sourceTuple = New-SourceTupleEvidence -OutputPath $sourceTuplePath -ActualRunId $actualRunId `
+        -AcquisitionMethod $(if ($sourceReceipt) { "nexus-$($sourceReceipt.provider)" } else { 'manual-queue' }) `
+        -NexusIdentity $sourceIdentity -ArchiveFileName ([IO.Path]::GetFileName($sourceFull)) `
+        -ArchiveSize ([int64]$sampleTwo.Length) -ArchiveSha256 $archiveSha -BoundSourceRequestPath $boundSourceRequestPath `
+        -BoundSourceReceiptPath $(if ($sourceReceipt) { [string]$sourceReceipt.path } else { $null })
 
     $baseOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', "$BaseRef^{commit}")).output.Trim()
     $baseTreeOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', "$baseOid^{tree}")).output.Trim()
@@ -1434,9 +2159,11 @@ function Invoke-Claim {
     $plannedOwner.skillSourceContentSha256 = $skillSourcePin.contentSha256
     $plannedOwner.skillSourcePinSha256 = $skillSourcePin.pinSha256
     $plannedOwner.sourceSha256 = $archiveSha
+    $plannedOwner.sourceTupleContractSha256 = $sourceTuple.contractSha256
     $plannedOwner.claimPath = [IO.Path]::GetFullPath($claimPath)
     $plannedOwner.worktree = $null
-    Write-ModReservationOwner -ModLockPath $modLockPath -Repository $repository -Value $plannedOwner
+    Write-ModReservationOwner -ModLockPath $modLockPath -Repository $repository -Value $plannedOwner `
+        -ExpectedReservationToken ([string]$plannedOwner.reservationToken) -ExpectedWorkerToken ([string]$plannedOwner.workerToken)
     New-Item -ItemType Directory -Path $claimSourceRoot -Force | Out-Null
     $claimRecord = [ordered]@{
         runId = $actualRunId
@@ -1455,6 +2182,7 @@ function Invoke-Claim {
         canonicalModRelativePath = $modRelativePath
         plannedStatePath = [IO.Path]::GetFullPath($actualStatePath)
         sourceReceipt = $sourceReceipt
+        sourceTuple = $sourceTuple
         archive = [ordered]@{
             filename = [IO.Path]::GetFileName($coordinatorArchive)
             originalPath = $sourceFull
@@ -1498,6 +2226,7 @@ function Invoke-Claim {
         checkedMainOid = $baseOid
         metadataPaths = @($MetadataPath)
         sourceReceipt = $sourceReceipt
+        sourceTuple = $sourceTuple
         sourceAcquisition = if ($sourceReceipt) {
             [ordered]@{
                 recordPath = $sourceAcquisitionRecord.recordPath
@@ -1610,8 +2339,20 @@ function Invoke-Claim {
     }
     Ensure-RunWriterLock -State $state
     Write-AtomicJson -Path $state.statePath -Value $state
-    if ($sourceReceipt) { [IO.File]::Copy($sourceFull, $coordinatorArchive) }
-    else { [IO.File]::Move($sourceFull, $coordinatorArchive) }
+    $sourceCoordination = Enter-SharedCoordinationLock -Repository $repository -ResourceKey 'source-acquisition' `
+        -ActualRunId $actualRunId -ReceiptRoot ([string]$state.artifactsRoot)
+    try {
+        if ((Get-FileSha256 -Path $sourceFull) -cne $archiveSha) {
+            throw 'Source archive changed before the coordinated claim move.'
+        }
+        if ($sourceReceipt) { [IO.File]::Copy($sourceFull, $coordinatorArchive) }
+        else { [IO.File]::Move($sourceFull, $coordinatorArchive) }
+    }
+    finally {
+        $sourceCoordinationReceipt = Exit-SharedCoordinationLock -Lease $sourceCoordination
+    }
+    $state.coordinationReceipts = @($sourceCoordinationReceipt)
+    Save-State -State $state
     Complete-IncompleteClaim -State $state
 }
 
@@ -1621,13 +2362,12 @@ function Get-ZipEntries {
         [Parameter(Mandatory)][string] $ExpectedSha256
     )
     Add-Type -AssemblyName System.IO.Compression
+    $actualSha256 = Get-FileSha256 -Path $Path
+    if ($actualSha256 -ne $ExpectedSha256) {
+        throw 'Claimed archive SHA-256 changed before ZIP processing.'
+    }
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
-        $actualSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
-        $stream.Position = 0
-        if ($actualSha256 -ne $ExpectedSha256) {
-            throw 'Claimed archive SHA-256 changed before ZIP processing.'
-        }
         $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Read, $false)
         $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         $entries = @()
@@ -1733,7 +2473,7 @@ function Invoke-Extract {
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
             $entryStream = $entry.Open()
             $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-            try { $entryStream.CopyTo($output) } finally { $output.Dispose(); $entryStream.Dispose() }
+            try { Copy-StreamWithHeartbeat -Source $entryStream -Destination $output } finally { $output.Dispose(); $entryStream.Dispose() }
         }
     }
     finally {
@@ -2114,6 +2854,8 @@ function Invoke-BuildCommits {
         $State.evidenceChain.c2Oid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD')).output.Trim()
         $State.evidenceChain.c2TreeOid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD^{tree}')).output.Trim()
         $State.evidenceChain.c2Status = 'committed'
+        $State.evidenceChain.c2Reason = New-CheckpointReason -State $State -Checkpoint C2 `
+            -ParentTreeOid ([string]$State.evidenceChain.c2ParentTreeOid) -TreeOid ([string]$State.evidenceChain.c2TreeOid)
         $State.evidenceChain.c3ParentOid = $State.evidenceChain.c2Oid
         $State.evidenceChain.c3ParentTreeOid = $State.evidenceChain.c2TreeOid
         $null = Assert-NoReparseTree -Path ([string]$State.installRoot) -Root $worktree -Label 'Installed MOD tree before merged localization write'
@@ -2132,14 +2874,34 @@ function Invoke-BuildCommits {
         $State.evidenceChain.c3Oid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD')).output.Trim()
         $State.evidenceChain.c3TreeOid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD^{tree}')).output.Trim()
         $State.evidenceChain.c3Status = 'committed'
+        $State.evidenceChain.c3Reason = New-CheckpointReason -State $State -Checkpoint C3 `
+            -ParentTreeOid ([string]$State.evidenceChain.c3ParentTreeOid) -TreeOid ([string]$State.evidenceChain.c3TreeOid)
     }
     else {
         $State.evidenceChain.c2Status = 'not-applicable'
-        $State.evidenceChain.c2Reason = 'localization mode none'
+        $State.evidenceChain.c2Reason = New-CheckpointReason -State $State -Checkpoint C2 -ParentTreeOid $null -TreeOid $null
         $State.evidenceChain.c3Status = 'not-applicable'
-        $State.evidenceChain.c3Reason = 'localization mode none'
+        $State.evidenceChain.c3Reason = New-CheckpointReason -State $State -Checkpoint C3 -ParentTreeOid $null -TreeOid $null
     }
 
+    if (-not $State.Contains('sourceTuple') -or -not $State.sourceTuple) { throw 'Build commits requires the immutable Nexus Main file source tuple.' }
+    $sourceTuplePath = [string]$State.sourceTuple.path
+    if ((Get-FileSha256 -Path $sourceTuplePath) -cne [string]$State.sourceTuple.sha256) { throw 'Source tuple bytes changed before metadata preview.' }
+    $sourceTupleRecord = Get-Content -LiteralPath $sourceTuplePath -Raw | ConvertFrom-Json -AsHashtable
+    if ([string]$sourceTupleRecord.contractSha256 -cne [string]$State.sourceTuple.contractSha256) { throw 'Source tuple contract changed before metadata preview.' }
+    $sourceFields = [ordered]@{
+        nexusModId = [string]$sourceTupleRecord.contract.nexus.modId
+        nexusPageUrl = [string]$sourceTupleRecord.contract.nexus.pageUrl
+        nexusPageVersion = [string]$sourceTupleRecord.contract.nexus.pageVersion
+        nexusPageUpdatedAt = [string]$sourceTupleRecord.contract.nexus.pageUpdatedAt
+        nexusMainFileId = [string]$sourceTupleRecord.contract.nexus.mainFileId
+        nexusMainFileVersion = [string]$sourceTupleRecord.contract.nexus.mainFileVersion
+        nexusMainFileUploadedAtUtc = [string]$sourceTupleRecord.contract.nexus.mainFileUploadedAtUtc
+        archiveFileName = [string]$sourceTupleRecord.contract.archive.fileName
+        archiveSize = ConvertTo-InvariantString $sourceTupleRecord.contract.archive.size
+        archiveSha256 = [string]$sourceTupleRecord.contract.archive.sha256
+        acquisitionMethod = [string]$sourceTupleRecord.contract.acquisitionMethod
+    }
     $metadataRecords = @()
     foreach ($metadataRelative in @($State.metadataPaths)) {
         $metadataNormalized = $metadataRelative.Replace('\', '/')
@@ -2148,11 +2910,38 @@ function Invoke-BuildCommits {
         }
         $metadataFull = Assert-ContainedPath -Candidate (Join-Path $worktree $metadataRelative) -Root $worktree -Label 'Metadata path'
         if (-not (Test-Path -LiteralPath $metadataFull -PathType Leaf)) { throw "Metadata path is missing: $metadataRelative" }
-        $metadataRecords += [ordered]@{ path = $metadataNormalized; sha256 = Get-FileSha256 -Path $metadataFull; size = (Get-Item -LiteralPath $metadataFull).Length }
+        $metadataBytes = [IO.File]::ReadAllBytes($metadataFull)
+        $metadataText = [Text.UTF8Encoding]::new($false, $true).GetString($metadataBytes)
+        $fieldMatches = [ordered]@{}
+        foreach ($fieldName in $sourceFields.Keys) {
+            $fieldValue = [string]$sourceFields[$fieldName]
+            $fieldMatches[$fieldName] = Test-MetadataSourceFieldMatch -RelativePath $metadataNormalized `
+                -Text $metadataText -FieldName $fieldName -FieldValue $fieldValue
+        }
+        $metadataRecords += [ordered]@{
+            path = $metadataNormalized
+            sha256 = Get-Sha256Bytes -Bytes $metadataBytes
+            size = $metadataBytes.Length
+            sourceFieldMatches = $fieldMatches
+        }
     }
     $metadataPreviewPath = Join-Path $State.artifactsRoot 'metadata-preview.json'
-    Write-AtomicJson -Path $metadataPreviewPath -Value ([ordered]@{ schemaVersion = 1; files = $metadataRecords; generatedAt = Get-UtcTimestamp })
-    $State.metadataPreview = [ordered]@{ path = $metadataPreviewPath; sha256 = Get-FileSha256 -Path $metadataPreviewPath; fileCount = $metadataRecords.Count }
+    Write-AtomicJson -Path $metadataPreviewPath -Value ([ordered]@{
+        schemaVersion = 2
+        runId = $State.runId
+        sourceTuplePath = $sourceTuplePath
+        sourceTupleSha256 = $State.sourceTuple.sha256
+        sourceTupleContractSha256 = $State.sourceTuple.contractSha256
+        sourceFields = $sourceFields
+        files = $metadataRecords
+        generatedAt = Get-UtcTimestamp
+    })
+    $State.metadataPreview = [ordered]@{
+        path = $metadataPreviewPath
+        sha256 = Get-FileSha256 -Path $metadataPreviewPath
+        fileCount = $metadataRecords.Count
+        sourceTupleContractSha256 = $State.sourceTuple.contractSha256
+    }
     if (@($State.metadataPaths).Count -gt 0) {
         $null = Invoke-Git -WorkingDirectory $worktree -Arguments (@('add', '--') + @($State.metadataPaths))
         $staged = Invoke-Git -WorkingDirectory $worktree -Arguments @('diff', '--cached', '--quiet') -AllowFailure
@@ -2262,7 +3051,7 @@ function Invoke-Validate {
     if ($completed -and $State.candidateGate.status -eq 'passed') { return $completed }
     $stage = Start-Stage -Name 'validate'
     if ([string]$State.candidateGate.status -cne 'passed') {
-        $result = & $validator -StatePath $State.statePath -PassThru
+        $result = & $validator -StatePath $State.statePath -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
         $State = Read-State -Path $State.statePath
         if ($result.result -ne 'passed') { throw 'Independent Final Candidate Gate rejected the candidate.' }
         if ([int]$State.schemaVersion -ge 15) {
@@ -2314,8 +3103,8 @@ function Get-PrBody {
 - HEAD/F: $($State.evidenceChain.fOid)
 - C0: $($State.evidenceChain.c0Oid)
 - C1: $($State.evidenceChain.c1Oid)
-- C2: $($State.evidenceChain.c2Oid) ($($State.evidenceChain.c2Status): $($State.evidenceChain.c2Reason))
-- C3: $($State.evidenceChain.c3Oid) ($($State.evidenceChain.c3Status): $($State.evidenceChain.c3Reason))
+- C2: $($State.evidenceChain.c2Oid) ($($State.evidenceChain.c2Status): $($State.evidenceChain.c2Reason.code), $($State.evidenceChain.c2Reason.disposition))
+- C3: $($State.evidenceChain.c3Oid) ($($State.evidenceChain.c3Status): $($State.evidenceChain.c3Reason.code), $($State.evidenceChain.c3Reason.disposition))
 - Trees C0/C1/C2/C3/F: $($State.evidenceChain.c0TreeOid) / $($State.evidenceChain.c1TreeOid) / $($State.evidenceChain.c2TreeOid) / $($State.evidenceChain.c3TreeOid) / $($State.evidenceChain.fTreeOid)
 - Parent-tree Gate: C1^=$($State.evidenceChain.c1ParentTreeOid); C2^=$($State.evidenceChain.c2ParentTreeOid); C3^=$($State.evidenceChain.c3ParentTreeOid)
 - C0..C1 diff/name-status SHA-256: $($State.evidenceDiffs.c0C1Diff.sha256) / $($State.evidenceDiffs.c0C1NameStatus.sha256)
@@ -2340,6 +3129,7 @@ function Get-PrBody {
 - Localization target/approved-span/unchanged/removed/BLOCKED counts: $(@($State.evidenceTargetPaths).Count) / $approvedSpanCount / $unchangedTargetCount / $removedTargetCount / 0
 - Localization scope: $localizationScope
 - Archive filename/SHA-256: $($State.archive.filename) / $($State.archive.sha256)
+- Source tuple contract SHA-256: $($State.sourceTuple.contractSha256)
 - Source receipt SHA-256: $(if ($State.Contains('sourceReceipt') -and $State.sourceReceipt) { $State.sourceReceipt.sha256 } else { 'not-applicable' })
 - Security overrides: $(@($State.securityOverrides) -join ', ')
 - External review: $($State.externalReview.status)
@@ -2498,12 +3288,10 @@ function Invoke-ReviewSnapshot {
     $updatedBody = Get-PrBody -State $State
     $null = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'edit', [string]$State.prNumber, '--body', $updatedBody)
     $validator = Join-Path $PSScriptRoot 'Test-ModUpdateCandidate.ps1'
-    $completion = & $validator -StatePath $State.statePath -ReviewCompletion -PassThru
+    $completion = & $validator -StatePath $State.statePath -ReviewCompletion `
+        -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
     if ($completion.result -ne 'passed') { throw 'Independent Review completion validation rejected the current F.' }
     $State.status = 'awaiting-user-merge'
-    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
-    $owner.leaseMode = 'reserved'; $owner.workerId = $null; $owner.heartbeat = Get-UtcTimestamp
-    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) -Value $owner
     Complete-Stage -State $State -Context $stage -ArtifactSha256 $completion.sha256 -Data ([ordered]@{ externalReview = $external; localReview = $State.localReview; completionValidation = $completion })
 }
 
@@ -2529,6 +3317,9 @@ function Invoke-StageCommand {
 
 $writerLease = $null
 $activeStatePath = $null
+$activeReservationLease = $null
+$activeReservationState = $null
+$activeSharedCoordinationLease = $null
 try {
     $result = if ($Command -eq 'acquire-source') {
         Invoke-AcquireSource
@@ -2614,5 +3405,16 @@ catch {
     exit 1
 }
 finally {
-    if ($writerLease) { Exit-RunWriterLock -Lease $writerLease }
+    try {
+        if ($activeReservationLease) {
+            $reservationState = if ($activeStatePath -and (Test-Path -LiteralPath $activeStatePath -PathType Leaf)) {
+                try { Read-State -Path $activeStatePath } catch { $activeReservationState }
+            }
+            else { $activeReservationState }
+            Suspend-ModReservationWorker -State $reservationState
+        }
+    }
+    finally {
+        if ($writerLease) { Exit-RunWriterLock -Lease $writerLease }
+    }
 }

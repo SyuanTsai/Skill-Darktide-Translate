@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)]
     [string] $StatePath,
     [switch] $ReviewCompletion,
+    [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
 
@@ -24,9 +25,63 @@ function Get-Sha256Bytes {
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
 }
 
+function Invoke-Heartbeat {
+    if ($HeartbeatAction) { & $HeartbeatAction }
+}
+
 function Get-FileSha256 {
     param([string] $Path)
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose(); $stream.Dispose() }
+}
+
+function Copy-StreamWithHeartbeat {
+    param([IO.Stream] $Source, [IO.Stream] $Destination)
+    $buffer = [byte[]]::new(1MB)
+    while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $Destination.Write($buffer, 0, $readCount)
+        Invoke-Heartbeat
+    }
+}
+
+function ConvertTo-InvariantString {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-ContractSha256 {
+    param([Collections.IDictionary] $Contract)
+    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes(
+        ($Contract | ConvertTo-Json -Depth 20 -Compress)
+    ))
+}
+
+function Test-MetadataSourceFieldMatch {
+    param([string] $RelativePath, [string] $Text, [string] $FieldName, [string] $FieldValue)
+    if ([string]::IsNullOrWhiteSpace($FieldValue)) { return $false }
+    if ($RelativePath.StartsWith('.hash/', [StringComparison]::Ordinal)) {
+        $hashKeys = [ordered]@{
+            nexusModId = 'nexus_id'; nexusPageUrl = 'nexus_url'; nexusPageVersion = 'nexus_page_version'
+            nexusPageUpdatedAt = 'nexus_last_updated'; nexusMainFileId = 'main_file_id'; nexusMainFileVersion = 'version'
+            nexusMainFileUploadedAtUtc = 'main_file_uploaded_at_utc'; archiveFileName = 'filename'
+            archiveSize = 'size_bytes'; archiveSha256 = 'sha256'; acquisitionMethod = 'acquisition_method'
+        }
+        if (-not $hashKeys.Contains($FieldName)) { return $Text.Contains($FieldValue, [StringComparison]::Ordinal) }
+        $key = [regex]::Escape([string]$hashKeys[$FieldName])
+        $matchesForKey = @([regex]::Matches($Text, "(?m)^$key=([^`r`n]*)`r?$") )
+        return $matchesForKey.Count -eq 1 -and [string]$matchesForKey[0].Groups[1].Value -ceq $FieldValue
+    }
+    $Text.Contains($FieldValue, [StringComparison]::Ordinal)
 }
 
 function Assert-NoReparsePath {
@@ -86,7 +141,7 @@ function Assert-ClaimedArchiveIntegrity {
         if ($stream.Length -ne [int64]$Archive.size) {
             throw 'claimed-archive size changed after claim.'
         }
-        $actualSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+        $actualSha256 = Get-FileSha256 -Path $archivePath
         if ($actualSha256 -ne [string]$Archive.sha256) {
             throw 'claimed-archive SHA-256 changed after claim.'
         }
@@ -158,6 +213,192 @@ function Assert-SourceReceiptIntegrity {
         throw 'acquire-source stage timing is not bound to the source receipt.'
     }
     [string]$State.sourceReceipt.sha256
+}
+
+function Assert-SourceTupleIntegrity {
+    param([Collections.IDictionary] $State)
+    if (-not $State.Contains('sourceTuple') -or -not $State.sourceTuple) { throw 'Immutable Nexus Main file source tuple is missing.' }
+    foreach ($field in @('path', 'sha256', 'contractSha256')) {
+        if (-not $State.sourceTuple.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$State.sourceTuple[$field])) {
+            throw "Source tuple $field is missing."
+        }
+    }
+    $tuplePath = Assert-NoReparsePath -Path ([string]$State.sourceTuple.path) -Root ([string]$State.repositoryRoot) -Label 'Source tuple'
+    if ($tuplePath -cne [IO.Path]::GetFullPath((Join-Path ([string]$State.runRoot) 'review-artifacts/source-tuple.json'))) {
+        throw 'Source tuple is outside its fixed run-local path.'
+    }
+    if ((Get-FileSha256 -Path $tuplePath) -cne [string]$State.sourceTuple.sha256) { throw 'Source tuple SHA-256 changed.' }
+    $tuple = Get-Content -LiteralPath $tuplePath -Raw | ConvertFrom-Json -AsHashtable
+    if ([int]$tuple.schemaVersion -ne 1 -or -not $tuple.contract) { throw 'Source tuple schema or contract is invalid.' }
+    $contractSha256 = Get-ContractSha256 -Contract $tuple.contract
+    if ($contractSha256 -cne [string]$tuple.contractSha256 -or $contractSha256 -cne [string]$State.sourceTuple.contractSha256) {
+        throw 'Source tuple contract SHA-256 cannot be reconstructed.'
+    }
+    $contract = $tuple.contract
+    foreach ($field in @('runId', 'acquisitionMethod', 'nexus', 'archive', 'sourceRequestSha256')) {
+        if (-not $contract.Contains($field) -or $null -eq $contract[$field] -or
+            ($field -ne 'nexus' -and $field -ne 'archive' -and [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $contract[$field])))) {
+            throw "Source tuple contract field is missing: $field"
+        }
+    }
+    if ([string]$contract.runId -cne [string]$State.runId -or
+        [string]$contract.archive.fileName -cne [string]$State.archive.filename -or
+        [int64]$contract.archive.size -ne [int64]$State.archive.size -or
+        [string]$contract.archive.sha256 -cne [string]$State.archive.sha256) {
+        throw 'Source tuple does not bind the run and claimed archive.'
+    }
+    if ([IO.Path]::GetExtension([string]$contract.archive.fileName).ToLowerInvariant() -cne '.zip') {
+        throw 'Source tuple archive filename must retain its complete ZIP extension.'
+    }
+    $requestPath = Assert-NoReparsePath -Path ([string]$tuple.sourceRequestPath) -Root ([string]$State.repositoryRoot) -Label 'Source tuple request'
+    if ($requestPath -cne [IO.Path]::GetFullPath((Join-Path ([string]$State.runRoot) 'review-artifacts/source-request.json')) -or
+        (Get-FileSha256 -Path $requestPath) -cne [string]$contract.sourceRequestSha256) {
+        throw 'Source tuple request path or SHA-256 changed.'
+    }
+    $request = Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([int]$request.schemaVersion -ne 2) { throw 'Claimed source request must use complete tuple schemaVersion 2.' }
+    $fieldMap = [ordered]@{
+        gameDomain = 'gameDomain'; modId = 'modId'; pageUrl = 'pageUrl'; pageVersion = 'pageVersion'
+        pageUpdatedAt = 'pageUpdatedAt'; mainFileId = 'mainFileId'; version = 'mainFileVersion'
+        mainFileUploadedAtUtc = 'mainFileUploadedAtUtc'; fileName = 'fileName'; officialSha256 = 'officialSha256'
+    }
+    foreach ($requestField in $fieldMap.Keys) {
+        $nexusField = [string]$fieldMap[$requestField]
+        $requestValue = if ($request.Contains($requestField)) { ConvertTo-InvariantString $request[$requestField] } else { $null }
+        $tupleValue = if ($contract.nexus.Contains($nexusField)) { ConvertTo-InvariantString $contract.nexus[$nexusField] } else { $null }
+        if ($requestField -ne 'officialSha256' -and [string]::IsNullOrWhiteSpace($requestValue)) { throw "Source request complete tuple field is missing: $requestField" }
+        if ([string]$requestValue -cne [string]$tupleValue) { throw "Source tuple Nexus field differs from its request: $requestField" }
+    }
+    foreach ($timestampField in @('pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+        $timestamp = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParseExact([string]$request[$timestampField], 'o', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$timestamp)) { throw "Source tuple timestamp is invalid: $timestampField" }
+    }
+    $pageUri = [Uri][string]$contract.nexus.pageUrl
+    if (-not $pageUri.IsAbsoluteUri -or $pageUri.Scheme -cne 'https' -or $pageUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+        $pageUri.AbsolutePath.TrimEnd('/') -cne "/warhammer40kdarktide/mods/$($contract.nexus.modId)" -or $pageUri.Query -or $pageUri.Fragment -or $pageUri.UserInfo) {
+        throw 'Source tuple Nexus page URL is not canonical.'
+    }
+    if ([int]$State.schemaVersion -ge 15) {
+        if ([string]$contract.acquisitionMethod -cne "nexus-$($State.sourceReceipt.provider)" -or
+            [string]$tuple.sourceReceiptPath -cne [string]$State.sourceReceipt.path -or
+            [string]$contract.sourceReceiptSha256 -cne [string]$State.sourceReceipt.sha256) {
+            throw 'Schema 15 source tuple acquisition method or receipt binding changed.'
+        }
+    }
+    elseif ([string]$contract.acquisitionMethod -cne 'manual-queue' -or $null -ne $contract.sourceReceiptSha256 -or $null -ne $tuple.sourceReceiptPath) {
+        throw 'Schema 14 source tuple must identify one manual queue acquisition without a receipt.'
+    }
+
+    $previewPath = Assert-NoReparsePath -Path ([string]$State.metadataPreview.path) -Root ([string]$State.repositoryRoot) -Label 'Metadata preview'
+    if ((Get-FileSha256 -Path $previewPath) -cne [string]$State.metadataPreview.sha256) { throw 'Metadata preview SHA-256 changed.' }
+    $preview = Get-Content -LiteralPath $previewPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([int]$preview.schemaVersion -ne 2 -or [string]$preview.runId -cne [string]$State.runId -or
+        [string]$preview.sourceTuplePath -cne $tuplePath -or [string]$preview.sourceTupleSha256 -cne [string]$State.sourceTuple.sha256 -or
+        [string]$preview.sourceTupleContractSha256 -cne $contractSha256 -or
+        [string]$State.metadataPreview.sourceTupleContractSha256 -cne $contractSha256) {
+        throw 'Metadata preview is not bound to the immutable source tuple.'
+    }
+    $expectedFields = [ordered]@{
+        nexusModId = [string]$contract.nexus.modId; nexusPageUrl = [string]$contract.nexus.pageUrl
+        nexusPageVersion = [string]$contract.nexus.pageVersion; nexusPageUpdatedAt = [string]$contract.nexus.pageUpdatedAt
+        nexusMainFileId = [string]$contract.nexus.mainFileId; nexusMainFileVersion = [string]$contract.nexus.mainFileVersion
+        nexusMainFileUploadedAtUtc = [string]$contract.nexus.mainFileUploadedAtUtc; archiveFileName = [string]$contract.archive.fileName
+        archiveSize = ConvertTo-InvariantString $contract.archive.size; archiveSha256 = [string]$contract.archive.sha256
+        acquisitionMethod = [string]$contract.acquisitionMethod
+    }
+    foreach ($fieldName in $expectedFields.Keys) {
+        if (-not $preview.sourceFields.Contains($fieldName) -or [string]$preview.sourceFields[$fieldName] -cne [string]$expectedFields[$fieldName]) {
+            throw "Metadata preview source field differs from the tuple: $fieldName"
+        }
+    }
+    $previewFiles = @($preview.files)
+    if ($previewFiles.Count -ne @($State.metadataPaths).Count) { throw 'Metadata preview file count differs from metadataPaths.' }
+    $requiredMetadataFields = [ordered]@{
+        'README.md' = @('nexusPageUrl', 'nexusPageVersion', 'nexusPageUpdatedAt', 'archiveFileName')
+        ".hash/$($State.modSlug).hash" = @(
+            'nexusModId', 'nexusPageUrl', 'nexusPageVersion', 'nexusPageUpdatedAt', 'nexusMainFileId', 'nexusMainFileVersion',
+            'nexusMainFileUploadedAtUtc', 'archiveFileName', 'archiveSize', 'archiveSha256', 'acquisitionMethod'
+        )
+    }
+    $actualMetadataPaths = @($previewFiles | ForEach-Object { ([string]$_.path).Replace('\', '/') } | Sort-Object)
+    $expectedMetadataPaths = @($requiredMetadataFields.Keys | Sort-Object)
+    if (($actualMetadataPaths -join "`n") -cne ($expectedMetadataPaths -join "`n")) {
+        throw 'Metadata preview requires exactly README.md and this MOD formal hash file.'
+    }
+    foreach ($file in $previewFiles) {
+        $relative = ([string]$file.path).Replace('\', '/')
+        if ($relative -cnotin @($State.metadataPaths | ForEach-Object { ([string]$_).Replace('\', '/') })) { throw 'Metadata preview contains a path outside metadataPaths.' }
+        $full = Assert-NoReparsePath -Path (Join-Path ([string]$State.worktreePath) $relative) -Root ([string]$State.worktreePath) -Label 'Metadata preview source file'
+        $bytes = [IO.File]::ReadAllBytes($full)
+        if ((Get-Sha256Bytes -Bytes $bytes) -cne [string]$file.sha256 -or $bytes.Length -ne [int64]$file.size) { throw 'Metadata preview source file bytes changed.' }
+        $textValue = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        foreach ($fieldName in $expectedFields.Keys) {
+            $expectedMatch = Test-MetadataSourceFieldMatch -RelativePath $relative -Text $textValue `
+                -FieldName $fieldName -FieldValue ([string]$expectedFields[$fieldName])
+            if (-not $file.sourceFieldMatches.Contains($fieldName) -or [bool]$file.sourceFieldMatches[$fieldName] -ne $expectedMatch) {
+                throw "Metadata preview field evidence is inconsistent: $relative / $fieldName"
+            }
+        }
+        foreach ($requiredField in @($requiredMetadataFields[$relative])) {
+            if (-not [bool]$file.sourceFieldMatches[$requiredField]) {
+                throw "Metadata file is missing or mixes an immutable source tuple field: $relative / $requiredField"
+            }
+        }
+    }
+    $contractSha256
+}
+
+function Assert-CheckpointReasonIntegrity {
+    param([Collections.IDictionary] $State, [Collections.IDictionary] $Chain, [string] $Worktree)
+    $targetPaths = @($State.evidenceTargetPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
+    $targetJson = ConvertTo-Json -InputObject @($targetPaths) -Compress
+    $targetSha = Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($targetJson))
+    if ($targetSha -cne [string]$State.evidenceTargetPathsSha256) { throw 'Checkpoint reason target path contract cannot be reconstructed.' }
+    $manifestPath = Assert-NoReparsePath -Path ([string]$State.localizationManifestPath) -Root ([string]$State.repositoryRoot) -Label 'Checkpoint localization manifest'
+    $manifestSha = Get-FileSha256 -Path $manifestPath
+    if ($manifestSha -cne [string]$State.stageTimings.localization.artifactSha256) { throw 'Checkpoint reason localization manifest changed.' }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([string]$State.localizationMode -ceq 'none' -and [string]$manifest.mode -cne 'none') { throw 'Checkpoint reason localization mode contradicts its manifest.' }
+    foreach ($checkpoint in @('C2', 'C3')) {
+        $prefix = $checkpoint.ToLowerInvariant()
+        $reason = $Chain["${prefix}Reason"]
+        if ($reason -isnot [Collections.IDictionary]) { throw "$checkpoint reason must be a non-empty structured object." }
+        foreach ($field in @('schemaVersion', 'code', 'disposition', 'localizationMode', 'targetPathsSha256', 'targetPathCount', 'localizationManifestSha256', 'contractSha256')) {
+            if (-not $reason.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $reason[$field]))) { throw "$checkpoint reason is missing $field." }
+        }
+        $notApplicable = [string]$State.localizationMode -ceq 'none'
+        if ($notApplicable) {
+            if ([string]$Chain["${prefix}Status"] -cne 'not-applicable' -or $Chain["${prefix}Oid"] -or $Chain["${prefix}TreeOid"]) {
+                throw "$checkpoint not-applicable reason contradicts checkpoint state."
+            }
+            $parentTree = $null; $tree = $null; $keep = $true; $code = 'localization-not-applicable'
+        }
+        else {
+            if ([string]$Chain["${prefix}Status"] -cne 'committed') { throw "$checkpoint active localization checkpoint is not committed." }
+            $parentTree = (Invoke-GitCheck -WorkingDirectory $Worktree -Arguments @('rev-parse', "$($Chain["${prefix}Oid"])^1^{tree}")).output.Trim()
+            $tree = (Invoke-GitCheck -WorkingDirectory $Worktree -Arguments @('rev-parse', "$($Chain["${prefix}Oid"])^{tree}")).output.Trim()
+            $keep = $parentTree -ceq $tree
+            $code = if ($checkpoint -ceq 'C2' -and $keep) { 'upstream-localization-unchanged' }
+                elseif ($checkpoint -ceq 'C2') { 'upstream-localization-changed' }
+                elseif ($keep) { 'approved-localization-unchanged' }
+                else { 'approved-localization-changed' }
+        }
+        $disposition = if ($keep) { 'KEEP' } else { 'APPLY' }
+        $contract = [ordered]@{
+            checkpoint = $checkpoint; code = $code; disposition = $disposition; localizationMode = [string]$State.localizationMode
+            parentTreeOid = $parentTree; treeOid = $tree; targetPathsSha256 = $targetSha; targetPathCount = $targetPaths.Count
+            localizationManifestSha256 = $manifestSha
+        }
+        if ([int]$reason.schemaVersion -ne 1 -or [string]$reason.code -cne $code -or [string]$reason.disposition -cne $disposition -or
+            [string]$reason.localizationMode -cne [string]$State.localizationMode -or [string]$reason.parentTreeOid -cne [string]$parentTree -or
+            [string]$reason.treeOid -cne [string]$tree -or [string]$reason.targetPathsSha256 -cne $targetSha -or
+            [int]$reason.targetPathCount -ne $targetPaths.Count -or [string]$reason.localizationManifestSha256 -cne $manifestSha -or
+            [string]$reason.contractSha256 -cne (Get-ContractSha256 -Contract $contract)) {
+            throw "$checkpoint reason is unknown, blank, contradictory, or not bound to independently revalidated evidence."
+        }
+    }
+    'C2/C3 structured reasons independently reconstructed'
 }
 
 function Assert-ReferenceIntegrity {
@@ -251,7 +492,7 @@ function Invoke-GitCheck {
     if (-not $process.Start()) { throw 'Unable to start Git validation.' }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
+    while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
     $output = $stdoutTask.Result.TrimEnd()
     $warning = $stderrTask.Result.TrimEnd()
     $exitCode = $process.ExitCode
@@ -275,7 +516,7 @@ function Invoke-GhCheck {
     if (-not $process.Start()) { throw 'Unable to start GitHub CLI validation.' }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
+    while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
     $result = [ordered]@{ exitCode = $process.ExitCode; output = $stdoutTask.Result.TrimEnd(); warning = $stderrTask.Result.TrimEnd() }
     if ($result.exitCode -ne 0 -and -not $AllowFailure) { throw "GitHub CLI validation failed: $($result.warning) $($result.output)" }
     $result
@@ -291,8 +532,8 @@ function Get-GitBlobBytes {
     foreach ($argument in @('-C', $WorkingDirectory, 'cat-file', 'blob', $Object)) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start independent Git blob validation.' }
-    $memory = [IO.MemoryStream]::new(); $process.StandardOutput.BaseStream.CopyTo($memory)
-    $errorText = $process.StandardError.ReadToEnd(); $process.WaitForExit()
+    $memory = [IO.MemoryStream]::new(); Copy-StreamWithHeartbeat -Source $process.StandardOutput.BaseStream -Destination $memory
+    $errorText = $process.StandardError.ReadToEnd(); while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
     if ($process.ExitCode -ne 0) { throw "Unable to read Git blob: $errorText" }
     $memory.ToArray()
 }
@@ -431,6 +672,12 @@ if ($ReviewCompletion) {
     Add-ReviewCheck -Name 'source-receipt' -Action {
         Assert-SourceReceiptIntegrity -State $state
     }
+    Add-ReviewCheck -Name 'source-tuple' -Action {
+        Assert-SourceTupleIntegrity -State $state
+    }
+    Add-ReviewCheck -Name 'checkpoint-reasons' -Action {
+        Assert-CheckpointReasonIntegrity -State $state -Chain $state.evidenceChain -Worktree ([string]$state.worktreePath)
+    }
     Add-ReviewCheck -Name 'reference-integrity' -Action {
         Assert-ReferenceIntegrity -State $state
     }
@@ -542,6 +789,10 @@ Add-ValidationCheck -Name 'source-receipt' -Action {
     Assert-SourceReceiptIntegrity -State $state
 }
 
+Add-ValidationCheck -Name 'source-tuple' -Action {
+    Assert-SourceTupleIntegrity -State $state
+}
+
 Add-ValidationCheck -Name 'reference-integrity' -Action {
     Assert-ReferenceIntegrity -State $state
 }
@@ -571,6 +822,10 @@ Add-ValidationCheck -Name 'parent-tree-invariants' -Action {
         if ($c3ParentTree -ne $chain.c3ParentTreeOid -or $c3ParentTree -ne $chain.c2TreeOid) { throw 'C3 parent tree does not equal C2 tree.' }
     }
     'parent tree invariants passed'
+}
+
+Add-ValidationCheck -Name 'checkpoint-reasons' -Action {
+    Assert-CheckpointReasonIntegrity -State $state -Chain $chain -Worktree $worktree
 }
 
 Add-ValidationCheck -Name 'commit-trees' -Action {
@@ -663,7 +918,7 @@ Add-ValidationCheck -Name 'diff-readability' -Action {
 }
 
 Add-ValidationCheck -Name 'artifact-sha256' -Action {
-    foreach ($artifact in @($state.extractionManifest, $state.rawInstallManifest, $state.installManifest, $state.gitIndexNormalization, $state.metadataPreview, $state.candidateTreeManifest, $state.evidenceReceipt)) {
+    foreach ($artifact in @($state.sourceTuple, $state.extractionManifest, $state.rawInstallManifest, $state.installManifest, $state.gitIndexNormalization, $state.metadataPreview, $state.candidateTreeManifest, $state.evidenceReceipt)) {
         if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf)) { throw "Missing manifest or evidence artifact: $($artifact.path)" }
         if ((Get-FileSha256 -Path $artifact.path) -ne $artifact.sha256) { throw "Artifact sha256 mismatch: $($artifact.path)" }
     }
@@ -902,6 +1157,7 @@ $report = [ordered]@{
     workflow = [ordered]@{ commitOid = $state.workflowCommitOid; path = $state.workflowPath; blobOid = $state.workflowBlobOid; sha256 = $state.workflowSha256 }
     reviewBaseline = [ordered]@{ path = $state.reviewBaselinePath; blobOid = $state.reviewBaselineBlobOid; sha256 = $state.reviewBaselineSha256 }
     archive = $state.archive
+    sourceTuple = $state.sourceTuple
     sourceReceipt = $sourceReceiptEvidence
     evidenceGeneration = $state.evidenceGeneration
     evidenceTargetPaths = $state.evidenceTargetPaths
@@ -948,6 +1204,8 @@ $state.candidateGate = [ordered]@{
     candidateTreeManifestSha256 = $state.candidateTreeManifest.sha256
     gitIndexNormalizationSha256 = $state.gitIndexNormalization.sha256
     metadataPreviewSha256 = $state.metadataPreview.sha256
+    sourceTupleSha256 = $state.sourceTuple.sha256
+    sourceTupleContractSha256 = $state.sourceTuple.contractSha256
     evidenceGenerationReceiptSha256 = $state.evidenceReceipt.sha256
     diffReadabilitySha256 = $state.diffReadability.sha256
     localizationWorksetSha256 = if ([int]$state.schemaVersion -ge 15) { $state.localizationWorkset.sha256 } else { $null }

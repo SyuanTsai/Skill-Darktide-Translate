@@ -126,6 +126,12 @@ Describe 'Schema 15 source acquisition contract' {
         $first.status | Should -Be 'waiting-user'
         $ownerPath = Join-Path $first.modLockPath 'owner.json'
         $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        $owner.leaseMode | Should -Be 'reserved'
+        $owner.reservationState | Should -Be 'waiting-user'
+        $owner.reservationToken | Should -Match '^[0-9a-f]{32}$'
+        $owner.workerToken | Should -BeNullOrEmpty
+        $owner.workerId | Should -BeNullOrEmpty
+        $owner.workerProcessStartTicks | Should -BeNullOrEmpty
         $owner.canonicalModRelativePath = 'Warhammer 40,000 DARKTIDE/mods/OtherMod'
         $owner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
 
@@ -618,8 +624,9 @@ Describe 'Schema 15 source acquisition contract' {
         finally { $zip.Dispose(); $stream.Dispose() }
         $requestPath = Join-Path $runRoot 'source-request.json'
         [ordered]@{
-            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 321; mainFileId = 654
+            schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 321; mainFileId = 654
             version = '2.0.0'; fileName = 'TeamKills-2.0.0.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/321'
+            pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
         $runner = Join-Path $scriptRoot 'mod-update.ps1'
         $acquired = & $runner acquire-source -RepositoryRoot $repository -ModDirectory 'TeamKills' -RunId $runId `
@@ -661,8 +668,9 @@ Describe 'Schema 15 source acquisition contract' {
         finally { $zip.Dispose(); $stream.Dispose() }
         $requestPath = Join-Path $TestDrive 'automatic-run-source-request.json'
         [ordered]@{
-            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 777; mainFileId = 888
+            schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 777; mainFileId = 888
             version = '2.0.0'; fileName = 'AutoMod-2.0.0.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/777'
+            pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
 
         $result = & (Join-Path $scriptRoot 'mod-update.ps1') run `
@@ -709,15 +717,32 @@ Describe 'Schema 15 source acquisition contract' {
         finally { $zip.Dispose(); $stream.Dispose() }
         $requestPath = Join-Path $TestDrive 'r.json'
         [ordered]@{
-            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 434; mainFileId = 545
+            schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 434; mainFileId = 545
             version = '2.0.0'; fileName = 'M.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/434'
+            pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
+        $candidateArchiveSha = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $candidateArchiveSize = (Get-Item -LiteralPath $downloadPath).Length
+        (@(
+            'https://www.nexusmods.com/warhammer40kdarktide/mods/434', '2.0.0',
+            '2026-01-02T00:00:00.0000000+00:00', 'Main file ID: 545', 'M.zip'
+        ) -join "`n") | Set-Content -LiteralPath (Join-Path $repository 'README.md') -NoNewline
+        $candidateHashRoot = Join-Path $repository '.hash'
+        New-Item -ItemType Directory -Path $candidateHashRoot -Force | Out-Null
+        (@(
+            'nexus_id=434', 'nexus_url=https://www.nexusmods.com/warhammer40kdarktide/mods/434',
+            'nexus_page_version=2.0.0', 'nexus_last_updated=2026-01-02T00:00:00.0000000+00:00',
+            'main_file_id=545', 'version=2.0.0', 'main_file_uploaded_at_utc=2026-01-01T00:00:00.0000000+00:00',
+            'filename=M.zip', "size_bytes=$candidateArchiveSize", "sha256=$candidateArchiveSha", 'acquisition_method=nexus-browser'
+        ) -join "`n") | Set-Content -LiteralPath (Join-Path $candidateHashRoot 'm.hash') -NoNewline
+        & git -C $repository add README.md .hash/m.hash
+        & git -C $repository commit --quiet -m 'base source metadata'
 
         $runner = Join-Path $scriptRoot 'mod-update.ps1'
         $sourceVerified = & $runner run -RepositoryRoot $repository -ModDirectory 'M' -RunId $runId `
             -SourceRequestPath $requestPath -Provider browser -DownloadedFilePath $downloadPath `
             -SkillSourcePinPath $script:skillSourcePinPath -ObservationIntervalMilliseconds 0 -BaseRef HEAD `
-            -Until source-verified -PassThru
+            -MetadataPath 'README.md', '.hash/m.hash' -Until source-verified -PassThru
         $sourceVerified.result | Should -Be 'passed'
         $statePath = $sourceVerified.statePath
         foreach ($stage in @('extract', 'install', 'localization', 'build-commits')) {
@@ -728,6 +753,44 @@ Describe 'Schema 15 source acquisition contract' {
         $baselineStateBytes = [IO.File]::ReadAllBytes($statePath)
         $baselineValidation = & (Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1') -StatePath $statePath -PassThru
         $baselineValidation.result | Should -Be 'passed'
+        $reasonState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $reasonState.evidenceChain.c2Reason.disposition | Should -Be 'KEEP'
+        $reasonState.evidenceChain.c3Reason.disposition | Should -Be 'KEEP'
+        $reasonState.evidenceChain.c2Reason.code | Should -Be 'upstream-localization-unchanged'
+        $reasonState.evidenceChain.c3Reason.code | Should -Be 'approved-localization-unchanged'
+
+        [IO.File]::WriteAllBytes($statePath, $baselineStateBytes)
+        $reasonState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $reasonState.evidenceChain.c2Reason = $null
+        $reasonState | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $statePath -NoNewline
+        { & (Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1') -StatePath $statePath -PassThru } |
+            Should -Throw '*C2 reason*structured object*'
+
+        [IO.File]::WriteAllBytes($statePath, $baselineStateBytes)
+        $reasonState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $reasonState.evidenceChain.c3Reason.code = 'self-declared-no-change'
+        $reasonState | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $statePath -NoNewline
+        { & (Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1') -StatePath $statePath -PassThru } |
+            Should -Throw '*C3 reason*unknown*'
+
+        [IO.File]::WriteAllBytes($statePath, $baselineStateBytes)
+        $reasonState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $reasonState.evidenceChain.c2Reason.localizationManifestSha256 = '0' * 64
+        $reasonState | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $statePath -NoNewline
+        { & (Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1') -StatePath $statePath -PassThru } |
+            Should -Throw '*C2 reason*evidence*'
+
+        [IO.File]::WriteAllBytes($statePath, $baselineStateBytes)
+        $metadataHashPath = Join-Path ((Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).worktreePath) '.hash/m.hash'
+        $metadataHashBytes = [IO.File]::ReadAllBytes($metadataHashPath)
+        try {
+            (Get-Content -LiteralPath $metadataHashPath -Raw).Replace('filename=M.zip', 'filename=M') |
+                Set-Content -LiteralPath $metadataHashPath -NoNewline
+            { & (Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1') -StatePath $statePath -PassThru } |
+                Should -Throw '*Metadata preview source file bytes changed*'
+        }
+        finally { [IO.File]::WriteAllBytes($metadataHashPath, $metadataHashBytes) }
+
         [IO.File]::WriteAllBytes($statePath, $baselineStateBytes)
         $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
         @($state.localizationFiles).Count | Should -Be 1
@@ -796,8 +859,9 @@ Describe 'Schema 15 source acquisition contract' {
         finally { $zip.Dispose(); $stream.Dispose() }
         $requestPath = Join-Path $runRoot 'source-request.json'
         [ordered]@{
-            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
+            schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
             version = '2.0.0'; fileName = 'ExampleMod-2.0.0.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+            pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
         $runner = Join-Path $scriptRoot 'mod-update.ps1'
 
@@ -878,6 +942,13 @@ Describe 'Schema 15 source acquisition contract' {
         $state.sourceReceipt.sha256 | Should -Be $acquired.receiptSha256
         $state.sourceAcquisition.recordPath | Should -Be $acquired.acquisitionPath
         $state.sourceAcquisition.recordSha256 | Should -Be $acquired.acquisitionSha256
+        $state.sourceTuple.contract.runId | Should -Be $runId
+        $state.sourceTuple.contract.acquisitionMethod | Should -Be 'nexus-browser'
+        $state.sourceTuple.contract.nexus.mainFileId | Should -Be '456'
+        $state.sourceTuple.contract.nexus.mainFileUploadedAtUtc | Should -Be '2026-01-01T00:00:00.0000000+00:00'
+        $state.sourceTuple.contract.archive.fileName | Should -Be 'ExampleMod-2.0.0.zip'
+        $state.sourceTuple.contract.archive.sha256 | Should -Be $state.archive.sha256
+        $state.sourceTuple.contractSha256 | Should -Match '^[0-9a-f]{64}$'
         @($state.completedStages) | Should -Contain 'acquire-source'
         @($state.completedStages) | Should -Contain 'claim'
         (Get-Content -LiteralPath (Join-Path $state.modLockPath 'owner.json') -Raw | ConvertFrom-Json).runId | Should -Be $runId

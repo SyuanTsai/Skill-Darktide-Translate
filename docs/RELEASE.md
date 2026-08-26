@@ -33,3 +33,5 @@ A live Nexus smoke test is optional and must never persist API keys, ephemeral d
 Do not move a released tag or use a mutable branch as the consumer's only pin.
 
 Version `0.3.0` is the minor release that introduces Schema 15. A Schema 14 manual run remains on Schema 14 even when executed by 0.3.x.
+
+Version `0.3.1` is the compatible hardening release for structured C2/C3 reasons, the complete Schema 14/15 Nexus source tuple and metadata preview, short shared coordination locks, and token-guarded reservation heartbeat/lifecycle recovery. It does not migrate existing run state implicitly.

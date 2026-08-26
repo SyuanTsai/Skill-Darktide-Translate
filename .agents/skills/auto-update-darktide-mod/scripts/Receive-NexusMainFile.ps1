@@ -27,6 +27,7 @@ param(
 
     [string] $ApiDownloadUriEnvironmentVariable = 'NEXUS_DOWNLOAD_URI',
     [string] $ApiKeyEnvironmentVariable = 'NEXUS_API_KEY',
+    [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
 
@@ -37,9 +38,32 @@ function Get-UtcTimestamp {
     [DateTimeOffset]::UtcNow.ToString('o')
 }
 
+function Invoke-Heartbeat {
+    if ($HeartbeatAction) { & $HeartbeatAction }
+}
+
 function Get-FileSha256 {
     param([Parameter(Mandatory)][string] $Path)
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose(); $stream.Dispose() }
+}
+
+function Copy-StreamWithHeartbeat {
+    param([IO.Stream] $Source, [IO.Stream] $Destination)
+    $buffer = [byte[]]::new(1MB)
+    while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $Destination.Write($buffer, 0, $readCount)
+        Invoke-Heartbeat
+    }
 }
 
 function Write-AtomicJson {
@@ -117,10 +141,24 @@ function Read-SourceRequest {
     param([string] $Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Source request does not exist.' }
     $request = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
-    if ([int]$request.schemaVersion -ne 1) { throw 'Source request schemaVersion must be 1.' }
+    if ([int]$request.schemaVersion -notin @(1, 2)) { throw 'Source request schemaVersion must be 1 or 2.' }
     foreach ($field in @('gameDomain', 'modId', 'mainFileId', 'version', 'fileName', 'pageUrl')) {
         if (-not $request.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request[$field]))) {
             throw "Source request requires a unique $field value."
+        }
+    }
+    if ([int]$request.schemaVersion -eq 2) {
+        foreach ($field in @('pageVersion', 'pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+            if (-not $request.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request[$field]))) {
+                throw "Schema 2 source request requires immutable Nexus metadata field $field."
+            }
+        }
+        foreach ($timestampField in @('pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+            $timestamp = [DateTimeOffset]::MinValue
+            if (-not [DateTimeOffset]::TryParseExact(
+                (ConvertTo-InvariantString $request[$timestampField]), 'o', [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind, [ref]$timestamp
+            )) { throw "Schema 2 source request $timestampField must be an ISO-8601 round-trip timestamp." }
         }
     }
     $pageUri = [Uri](ConvertTo-InvariantString $request.pageUrl)
@@ -146,13 +184,16 @@ function Read-SourceRequest {
         throw 'Source request fileName uses a reserved Windows device name.'
     }
     [ordered]@{
-        schemaVersion = 1
+        schemaVersion = [int]$request.schemaVersion
         gameDomain = ConvertTo-InvariantString $request.gameDomain
         modId = ConvertTo-InvariantString $request.modId
         mainFileId = ConvertTo-InvariantString $request.mainFileId
         version = ConvertTo-InvariantString $request.version
         fileName = ConvertTo-InvariantString $request.fileName
         pageUrl = ConvertTo-InvariantString $request.pageUrl
+        pageVersion = if ($request.Contains('pageVersion')) { ConvertTo-InvariantString $request.pageVersion } else { $null }
+        pageUpdatedAt = if ($request.Contains('pageUpdatedAt')) { ConvertTo-InvariantString $request.pageUpdatedAt } else { $null }
+        mainFileUploadedAtUtc = if ($request.Contains('mainFileUploadedAtUtc')) { ConvertTo-InvariantString $request.mainFileUploadedAtUtc } else { $null }
         officialSha256 = if ($request.Contains('officialSha256') -and
             -not [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request.officialSha256))) {
             (ConvertTo-InvariantString $request.officialSha256).ToLowerInvariant()
@@ -183,17 +224,12 @@ function Get-ArchiveEvidence {
     param([string] $Path)
     $bytes = [byte[]]::new(8)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         $size = $stream.Length
         $read = $stream.Read($bytes, 0, $bytes.Length)
-        $stream.Position = 0
-        $sha256 = [Convert]::ToHexString($hasher.ComputeHash($stream)).ToLowerInvariant()
     }
-    finally {
-        $hasher.Dispose()
-        $stream.Dispose()
-    }
+    finally { $stream.Dispose() }
+    $sha256 = Get-FileSha256 -Path $Path
     $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
         (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
         'zip'
@@ -251,7 +287,7 @@ function Invoke-ApiDownload {
     $handler.AllowAutoRedirect = $false
     $client = [Net.Http.HttpClient]::new($handler, $true)
     $response = $null
-    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.3.0')
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.3.1')
     $apiKey = [Environment]::GetEnvironmentVariable($ApiKeyEnvironmentVariable)
     if (-not [string]::IsNullOrWhiteSpace($apiKey)) { $client.DefaultRequestHeaders.Add('apikey', $apiKey) }
     try {
@@ -275,7 +311,7 @@ function Invoke-ApiDownload {
         $response.EnsureSuccessStatusCode()
         $responseStream = $response.Content.ReadAsStream()
         $outputStream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $responseStream.CopyTo($outputStream) } finally { $outputStream.Dispose(); $responseStream.Dispose() }
+        try { Copy-StreamWithHeartbeat -Source $responseStream -Destination $outputStream } finally { $outputStream.Dispose(); $responseStream.Dispose() }
         [IO.File]::Move($temporaryPath, $finalPath)
         $finalPath
     }
@@ -347,7 +383,15 @@ $candidateItem = Get-Item -LiteralPath $candidateFull
 if ($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Downloaded file must be a regular file, not a reparse point.' }
 
 $sampleOne = [ordered]@{ size = [int64]$candidateItem.Length; lastWriteTimeUtc = $candidateItem.LastWriteTimeUtc.ToString('o'); observedAt = Get-UtcTimestamp }
-if ($ObservationIntervalMilliseconds -gt 0) { [Threading.Thread]::Sleep($ObservationIntervalMilliseconds) }
+if ($ObservationIntervalMilliseconds -gt 0) {
+    $remainingMilliseconds = $ObservationIntervalMilliseconds
+    while ($remainingMilliseconds -gt 0) {
+        $slice = [Math]::Min(1000, $remainingMilliseconds)
+        [Threading.Thread]::Sleep($slice)
+        $remainingMilliseconds -= $slice
+        Invoke-Heartbeat
+    }
+}
 Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
 $candidateItem = Get-Item -LiteralPath $candidateFull
 $sampleTwo = [ordered]@{ size = [int64]$candidateItem.Length; lastWriteTimeUtc = $candidateItem.LastWriteTimeUtc.ToString('o'); observedAt = Get-UtcTimestamp }
@@ -381,6 +425,10 @@ $receipt = [ordered]@{
         mainFileId = $request.mainFileId
         version = $request.version
         fileName = $request.fileName
+        pageUrl = $request.pageUrl
+        pageVersion = $request.pageVersion
+        pageUpdatedAt = $request.pageUpdatedAt
+        mainFileUploadedAtUtc = $request.mainFileUploadedAtUtc
     }
     provider = $Provider
     sourceUrl = Get-SanitizedUrl -Url $request.pageUrl

@@ -159,7 +159,7 @@ $receipt = Get-Content -LiteralPath $receiptFull -Raw | ConvertFrom-Json -AsHash
 $null = Assert-NoReparsePath -Path $requestFull -Root $sourceRunRoot -Label 'Source request'
 $request = Get-Content -LiteralPath $requestFull -Raw | ConvertFrom-Json -AsHashtable
 if ([int]$receipt.schemaVersion -ne 1) { throw 'Source receipt schemaVersion must be 1.' }
-if ([int]$request.schemaVersion -ne 1) { throw 'Source request schemaVersion must be 1.' }
+if ([int]$request.schemaVersion -notin @(1, 2)) { throw 'Source request schemaVersion must be 1 or 2.' }
 $receiptStatus = [string]$receipt.status
 $isRetainedNonDelivered = $receiptStatus -in @('unsupported', 'rejected')
 if ($receiptStatus -cne 'delivered' -and (-not $AllowNonDelivered -or -not $isRetainedNonDelivered)) {
@@ -168,6 +168,25 @@ if ($receiptStatus -cne 'delivered' -and (-not $AllowNonDelivered -or -not $isRe
 foreach ($field in @('gameDomain', 'modId', 'mainFileId', 'version', 'fileName')) {
     if ((ConvertTo-InvariantString $receipt.sourceRequest[$field]) -cne (ConvertTo-InvariantString $request[$field])) {
         throw "Source receipt $field does not match the immutable source request."
+    }
+}
+if ([int]$request.schemaVersion -eq 2) {
+    foreach ($field in @('pageUrl', 'pageVersion', 'pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+        if (-not $request.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request[$field])) -or
+            -not $receipt.sourceRequest.Contains($field) -or
+            (ConvertTo-InvariantString $receipt.sourceRequest[$field]) -cne (ConvertTo-InvariantString $request[$field])) {
+            throw "Source receipt $field does not match the complete immutable source request."
+        }
+    }
+    foreach ($timestampField in @('pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+        $timestamp = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParseExact(
+            (ConvertTo-InvariantString $request[$timestampField]),
+            'o',
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$timestamp
+        )) { throw "Source request $timestampField is not an ISO-8601 round-trip value." }
     }
 }
 $sourceUri = [Uri]$receipt.sourceUrl

@@ -213,7 +213,24 @@ Describe 'Deterministic Darktide MOD update automation' {
         $validator | Should -Match '\$state\.externalReview\.Contains\(''pollingWaitSeconds''\)'
         $runner | Should -Match 'requested-pending'
         $runner | Should -Match 'unavailable'
-        $runner | Should -Not -Match 'Start-Sleep|--watch|while\s*\('
+        $reviewStart = $runner.IndexOf('function Invoke-ReviewSnapshot')
+        $reviewEnd = $runner.IndexOf('function Resolve-InitialState', $reviewStart)
+        $reviewSnapshot = $runner.Substring($reviewStart, $reviewEnd - $reviewStart)
+        $reviewSnapshot | Should -Not -Match 'Start-Sleep|--watch|while\s*\('
+    }
+
+    It 'UnitT175_UsesShortSharedLocksAndTokenGuardedReservationHeartbeats' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        foreach ($contract in @(
+            'function Enter-SharedCoordinationLock', 'source-acquisition', 'git-coordination',
+            'function Update-ActiveReservationHeartbeat', 'function Suspend-ModReservationWorker',
+            'reservationToken', 'workerToken', 'workerProcessStartTicks', 'owner-history'
+        )) { $runner | Should -Match ([regex]::Escape($contract)) }
+        $runner | Should -Match 'worktree\\s\+\(add\|remove\|prune\)'
+        $runner | Should -Match 'HeartbeatAction = \{ Update-ActiveReservationHeartbeat \}'
+        $runner | Should -Match '(?s)finally \{.*?Suspend-ModReservationWorker.*?Exit-RunWriterLock'
+        $runner | Should -Not -Match "requiresCoordination.*commit\\s"
+        $runner | Should -Not -Match "requiresCoordination.*push\\s"
     }
 
     # Scenario: A run crashes, repeats a stage, encounters an existing PR, or resumes after publication.
@@ -309,14 +326,48 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
         finally { $archive.Dispose(); $archiveStream.Dispose() }
 
-        $claim = & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $archivePath -ModDirectory 'ExampleMod' -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD -PassThru
+        $manualSourceRequestPath = Join-Path $TestDrive 'manual-source-request.json'
+        [ordered]@{
+            schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
+            version = '2.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+            pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
+        } | ConvertTo-Json | Set-Content -LiteralPath $manualSourceRequestPath -NoNewline
+        $manualArchiveSha = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $manualArchiveSize = (Get-Item -LiteralPath $archivePath).Length
+        (@(
+            'https://www.nexusmods.com/warhammer40kdarktide/mods/123', '2.0.0',
+            '2026-01-02T00:00:00.0000000+00:00', 'Main file ID: 456', 'ExampleMod.zip'
+        ) -join "`n") | Set-Content -LiteralPath (Join-Path $fixtureRepo 'README.md') -NoNewline
+        $manualHashDirectory = Join-Path $fixtureRepo '.hash'
+        New-Item -ItemType Directory -Path $manualHashDirectory -Force | Out-Null
+        (@(
+            'nexus_id=123', 'nexus_url=https://www.nexusmods.com/warhammer40kdarktide/mods/123',
+            'nexus_page_version=2.0.0', 'nexus_last_updated=2026-01-02T00:00:00.0000000+00:00',
+            'main_file_id=456', 'version=2.0.0', 'main_file_uploaded_at_utc=2026-01-01T00:00:00.0000000+00:00',
+            'filename=ExampleMod.zip', "size_bytes=$manualArchiveSize", "sha256=$manualArchiveSha", 'acquisition_method=manual-queue'
+        ) -join "`n") | Set-Content -LiteralPath (Join-Path $manualHashDirectory 'examplemod.hash') -NoNewline
+        & git -C $fixtureRepo add README.md .hash/examplemod.hash
+        & git -C $fixtureRepo commit --quiet -m 'fixture source metadata'
+        $claim = & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $archivePath -ModDirectory 'ExampleMod' `
+            -SourceRequestPath $manualSourceRequestPath -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD `
+            -MetadataPath 'README.md', '.hash/examplemod.hash' -PassThru
         $claim.result | Should -Be 'passed'
         $statePath = $claim.statePath
+        $claimStateAfterExit = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        $claimOwner = Get-Content -LiteralPath (Join-Path $claimStateAfterExit.modLockPath 'owner.json') -Raw | ConvertFrom-Json
+        $claimOwner.leaseMode | Should -Be 'reserved'
+        $claimOwner.workerToken | Should -BeNullOrEmpty
+        $claimOwner.workerId | Should -BeNullOrEmpty
 
         $claimedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         $secondArchivePath = Join-Path $queueRoot 'ExampleMod-second.zip'
         [IO.File]::Copy($claimedState.archive.path, $secondArchivePath)
-        { & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $secondArchivePath -ModDirectory 'ExampleMod' -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD -PassThru } |
+        $secondSourceRequestPath = Join-Path $TestDrive 'manual-source-request-second.json'
+        $secondSourceRequest = Get-Content -LiteralPath $manualSourceRequestPath -Raw | ConvertFrom-Json
+        $secondSourceRequest.fileName = 'ExampleMod-second.zip'
+        $secondSourceRequest | ConvertTo-Json | Set-Content -LiteralPath $secondSourceRequestPath -NoNewline
+        { & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $secondArchivePath -ModDirectory 'ExampleMod' `
+                -SourceRequestPath $secondSourceRequestPath -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD -PassThru } |
             Should -Throw '*already owns this canonical MOD identity*'
         Test-Path -LiteralPath $secondArchivePath -PathType Leaf | Should -Be $true
         [IO.File]::Delete($secondArchivePath)
@@ -454,6 +505,9 @@ Describe 'Deterministic Darktide MOD update automation' {
 
         $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
         $state.candidateGate.status | Should -Be 'passed'
+        $state.sourceTuple.contract.acquisitionMethod | Should -Be 'manual-queue'
+        $state.sourceTuple.contract.archive.fileName | Should -Be 'ExampleMod.zip'
+        $state.metadataPreview.sourceTupleContractSha256 | Should -Be $state.sourceTuple.contractSha256
         foreach ($field in @('c0Oid', 'c1Oid', 'c2Oid', 'c3Oid', 'fOid', 'c0TreeOid', 'c1TreeOid', 'c2TreeOid', 'c3TreeOid', 'fTreeOid')) {
             $state.evidenceChain[$field] | Should -Match '^[0-9a-f]{40}$'
         }
