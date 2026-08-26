@@ -36,7 +36,7 @@ function Invoke-GitBytes {
             if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
             else { [Threading.Tasks.Task]::Delay(50).Wait() }
         }
-        $copyTask.GetAwaiter().GetResult()
+        $null = $copyTask.GetAwaiter().GetResult()
         $errorText = $errorTask.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) { throw "git $($Arguments -join ' ') failed: $errorText" }
         $memory.ToArray()

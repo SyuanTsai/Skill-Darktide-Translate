@@ -911,7 +911,7 @@ Describe 'Schema 15 source acquisition contract' {
             Remove-Item -LiteralPath $runRoot -Force
             Move-Item -LiteralPath $relocatedRunRoot -Destination $runRoot
         }
-        $interruptedReceipt = Get-Content -LiteralPath $acquired.receiptPath -Raw | ConvertFrom-Json
+        $interruptedReceipt = Get-Content -LiteralPath $acquired.receiptPath -Raw | ConvertFrom-TestJson
         $interruptedReceipt.status = 'verified'
         $interruptedReceipt.deliveredAt = $null
         $interruptedReceipt.deliveredPath = $null
@@ -940,7 +940,7 @@ Describe 'Schema 15 source acquisition contract' {
             Should -Throw '*acquisition result*'
         [IO.File]::WriteAllBytes($acquired.acquisitionPath, $deliveredAcquisitionBytes)
         $boundRequestBytes = [IO.File]::ReadAllBytes($acquired.sourceRequestPath)
-        $tamperedRequest = Get-Content -LiteralPath $acquired.sourceRequestPath -Raw | ConvertFrom-Json
+        $tamperedRequest = Get-Content -LiteralPath $acquired.sourceRequestPath -Raw | ConvertFrom-TestJson
         $tamperedRequest.mainFileId = 999
         $tamperedRequest | ConvertTo-Json | Set-Content -LiteralPath $acquired.sourceRequestPath -NoNewline
         { & $runner claim -RepositoryRoot $repository -ModDirectory 'ExampleMod' -RunId $runId `
@@ -960,7 +960,7 @@ Describe 'Schema 15 source acquisition contract' {
 
         $acquired.status | Should -Be 'delivered'
         $claimed.result | Should -Be 'passed'
-        $state = Get-Content -LiteralPath $claimed.statePath -Raw | ConvertFrom-Json
+        $state = Get-Content -LiteralPath $claimed.statePath -Raw | ConvertFrom-TestJson
         $state.schemaVersion | Should -Be 15
         $state.sourceReceipt.sha256 | Should -Be $acquired.receiptSha256
         $state.sourceAcquisition.recordPath | Should -Be $acquired.acquisitionPath
@@ -1003,6 +1003,8 @@ Describe 'Schema 15 source acquisition contract' {
         $receiver | Should -Match 'function Get-ArchiveEvidence'
         $receiver | Should -Match '\[IO\.File\]::Open\(\$Path, \[IO\.FileMode\]::Open, \[IO\.FileAccess\]::Read, \[IO\.FileShare\]::Read\)'
         $receiver | Should -Match '(?s)Assert-NoReparsePath -Path \$candidateFull.*\$archiveEvidence = Get-ArchiveEvidence -Path \$candidateFull'
+        $receiver | Should -Match '(?s)\$archiveEvidence\.stream\.Position = 0.*Copy-StreamWithHeartbeat -Source \$archiveEvidence\.stream'
+        $receiver | Should -Not -Match '\[IO\.File\]::Move\(\$candidateFull, \$deliveredPath\)'
         $receiver | Should -Not -Match '(?s)\$archiveFormat = Get-ArchiveFormat -Path \$candidateFull.*\$sha256 = Get-FileSha256 -Path \$candidateFull'
         $verifier | Should -Match 'function Get-ArchiveEvidence'
         $verifier | Should -Match '\[IO\.File\]::Open\(\$Path, \[IO\.FileMode\]::Open, \[IO\.FileAccess\]::Read, \[IO\.FileShare\]::Read\)'

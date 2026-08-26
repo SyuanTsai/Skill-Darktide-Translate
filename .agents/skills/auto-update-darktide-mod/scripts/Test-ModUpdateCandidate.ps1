@@ -12,6 +12,55 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function ConvertFrom-JsonToken {
+    param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
+    if ($null -eq $Token -or $Token.Type -in @(
+        [Newtonsoft.Json.Linq.JTokenType]::Null,
+        [Newtonsoft.Json.Linq.JTokenType]::Undefined
+    )) { return $null }
+    if ($Token -is [Newtonsoft.Json.Linq.JObject]) {
+        $properties = [ordered]@{}
+        foreach ($property in $Token.Properties()) {
+            $properties[[string]$property.Name] = ConvertFrom-JsonToken -Token $property.Value -AsHashtable:$AsHashtable
+        }
+        if ($AsHashtable) { return $properties }
+        return [pscustomobject]$properties
+    }
+    if ($Token -is [Newtonsoft.Json.Linq.JArray]) {
+        $items = [object[]]::new($Token.Count)
+        for ($index = 0; $index -lt $Token.Count; $index++) {
+            $items[$index] = ConvertFrom-JsonToken -Token $Token[$index] -AsHashtable:$AsHashtable
+        }
+        Write-Output -NoEnumerate $items
+        return
+    }
+    ([Newtonsoft.Json.Linq.JValue]$Token).Value
+}
+
+function ConvertFrom-Json {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string] $InputObject,
+        [switch] $AsHashtable
+    )
+    process {
+        $parameters = @{ InputObject = $InputObject }
+        if ($AsHashtable) { $parameters.AsHashtable = $true }
+        $nativeCommand = Get-Command -Name 'Microsoft.PowerShell.Utility\ConvertFrom-Json'
+        if ($nativeCommand.Parameters.ContainsKey('DateKind')) {
+            $parameters.DateKind = 'String'
+            Microsoft.PowerShell.Utility\ConvertFrom-Json @parameters
+            return
+        }
+        $settings = [Newtonsoft.Json.JsonSerializerSettings]::new()
+        $settings.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+        $token = [Newtonsoft.Json.JsonConvert]::DeserializeObject($InputObject, $settings)
+        ConvertFrom-JsonToken -Token $token -AsHashtable:$AsHashtable
+    }
+}
+
 # This validator intentionally does not import the generator entrypoint. It
 # independently reads committed Git objects, manifests,
 # approvedSpans, and artifact sha256 values.
@@ -97,6 +146,8 @@ function Read-FileBytesWithHeartbeat {
 function ConvertTo-InvariantString {
     param($Value)
     if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) { return ([DateTimeOffset]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
     [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -612,7 +663,7 @@ function Get-GitBlobBytes {
             else { [Threading.Tasks.Task]::Delay(50).Wait() }
             Invoke-Heartbeat
         }
-        $copyTask.GetAwaiter().GetResult()
+        $null = $copyTask.GetAwaiter().GetResult()
         $errorText = $errorTask.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) { throw "Unable to read Git blob: $errorText" }
         $memory.ToArray()

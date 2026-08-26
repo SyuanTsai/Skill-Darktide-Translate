@@ -164,7 +164,7 @@ function Get-GitBlobBytes {
             else { [Threading.Tasks.Task]::Delay(50).Wait() }
             Invoke-Heartbeat
         }
-        $copyTask.GetAwaiter().GetResult()
+        $null = $copyTask.GetAwaiter().GetResult()
         $errorText = $errorTask.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) { throw "Unable to read immutable OLD localization blob: $errorText" }
         $memory.ToArray()

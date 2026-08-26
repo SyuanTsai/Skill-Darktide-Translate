@@ -22,6 +22,55 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function ConvertFrom-JsonToken {
+    param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
+    if ($null -eq $Token -or $Token.Type -in @(
+        [Newtonsoft.Json.Linq.JTokenType]::Null,
+        [Newtonsoft.Json.Linq.JTokenType]::Undefined
+    )) { return $null }
+    if ($Token -is [Newtonsoft.Json.Linq.JObject]) {
+        $properties = [ordered]@{}
+        foreach ($property in $Token.Properties()) {
+            $properties[[string]$property.Name] = ConvertFrom-JsonToken -Token $property.Value -AsHashtable:$AsHashtable
+        }
+        if ($AsHashtable) { return $properties }
+        return [pscustomobject]$properties
+    }
+    if ($Token -is [Newtonsoft.Json.Linq.JArray]) {
+        $items = [object[]]::new($Token.Count)
+        for ($index = 0; $index -lt $Token.Count; $index++) {
+            $items[$index] = ConvertFrom-JsonToken -Token $Token[$index] -AsHashtable:$AsHashtable
+        }
+        Write-Output -NoEnumerate $items
+        return
+    }
+    ([Newtonsoft.Json.Linq.JValue]$Token).Value
+}
+
+function ConvertFrom-Json {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string] $InputObject,
+        [switch] $AsHashtable
+    )
+    process {
+        $parameters = @{ InputObject = $InputObject }
+        if ($AsHashtable) { $parameters.AsHashtable = $true }
+        $nativeCommand = Get-Command -Name 'Microsoft.PowerShell.Utility\ConvertFrom-Json'
+        if ($nativeCommand.Parameters.ContainsKey('DateKind')) {
+            $parameters.DateKind = 'String'
+            Microsoft.PowerShell.Utility\ConvertFrom-Json @parameters
+            return
+        }
+        $settings = [Newtonsoft.Json.JsonSerializerSettings]::new()
+        $settings.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+        $token = [Newtonsoft.Json.JsonConvert]::DeserializeObject($InputObject, $settings)
+        ConvertFrom-JsonToken -Token $token -AsHashtable:$AsHashtable
+    }
+}
+
 function Invoke-Heartbeat {
     if ($HeartbeatAction) { $null = & $HeartbeatAction }
 }
@@ -48,6 +97,8 @@ function Get-FileSha256 {
 function ConvertTo-InvariantString {
     param($Value)
     if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) { return ([DateTimeOffset]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
     [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -66,15 +117,22 @@ function Get-ArchiveEvidence {
     Invoke-Heartbeat
     $bytes = [byte[]]::new(8)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
     try {
         $size = $stream.Length
         $read = $stream.Read($bytes, 0, $bytes.Length)
-        Invoke-Heartbeat
+        $stream.Position = 0
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        $sha256 = [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
     }
     finally {
+        $hasher.Dispose()
         $stream.Dispose()
     }
-    $sha256 = Get-FileSha256 -Path $Path
     $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
         (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
         'zip'

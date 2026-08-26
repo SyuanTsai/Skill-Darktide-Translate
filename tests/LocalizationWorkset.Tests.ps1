@@ -801,8 +801,9 @@ return localization
         finally { $zip.Dispose(); $stream.Dispose() }
         $requestPath = Join-Path $TestDrive 'rename-source-request.json'
         [ordered]@{
-            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 777; mainFileId = 888
+            schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 777; mainFileId = 888
             version = '2.0.0'; fileName = 'RenameMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/777'
+            pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
         $runner = Join-Path $scriptRoot 'mod-update.ps1'
 

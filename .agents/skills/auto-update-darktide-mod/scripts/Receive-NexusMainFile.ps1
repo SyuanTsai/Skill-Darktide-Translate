@@ -34,6 +34,55 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function ConvertFrom-JsonToken {
+    param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
+    if ($null -eq $Token -or $Token.Type -in @(
+        [Newtonsoft.Json.Linq.JTokenType]::Null,
+        [Newtonsoft.Json.Linq.JTokenType]::Undefined
+    )) { return $null }
+    if ($Token -is [Newtonsoft.Json.Linq.JObject]) {
+        $properties = [ordered]@{}
+        foreach ($property in $Token.Properties()) {
+            $properties[[string]$property.Name] = ConvertFrom-JsonToken -Token $property.Value -AsHashtable:$AsHashtable
+        }
+        if ($AsHashtable) { return $properties }
+        return [pscustomobject]$properties
+    }
+    if ($Token -is [Newtonsoft.Json.Linq.JArray]) {
+        $items = [object[]]::new($Token.Count)
+        for ($index = 0; $index -lt $Token.Count; $index++) {
+            $items[$index] = ConvertFrom-JsonToken -Token $Token[$index] -AsHashtable:$AsHashtable
+        }
+        Write-Output -NoEnumerate $items
+        return
+    }
+    ([Newtonsoft.Json.Linq.JValue]$Token).Value
+}
+
+function ConvertFrom-Json {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string] $InputObject,
+        [switch] $AsHashtable
+    )
+    process {
+        $parameters = @{ InputObject = $InputObject }
+        if ($AsHashtable) { $parameters.AsHashtable = $true }
+        $nativeCommand = Get-Command -Name 'Microsoft.PowerShell.Utility\ConvertFrom-Json'
+        if ($nativeCommand.Parameters.ContainsKey('DateKind')) {
+            $parameters.DateKind = 'String'
+            Microsoft.PowerShell.Utility\ConvertFrom-Json @parameters
+            return
+        }
+        $settings = [Newtonsoft.Json.JsonSerializerSettings]::new()
+        $settings.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+        $token = [Newtonsoft.Json.JsonConvert]::DeserializeObject($InputObject, $settings)
+        ConvertFrom-JsonToken -Token $token -AsHashtable:$AsHashtable
+    }
+}
+
 function Get-UtcTimestamp {
     [DateTimeOffset]::UtcNow.ToString('o')
 }
@@ -147,6 +196,8 @@ function Assert-RegularDirectoryRoot {
 function ConvertTo-InvariantString {
     param($Value)
     if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) { return ([DateTimeOffset]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
     [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -237,26 +288,39 @@ function Get-ArchiveEvidence {
     param([string] $Path)
     $bytes = [byte[]]::new(8)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
     try {
         $size = $stream.Length
         $read = $stream.Read($bytes, 0, $bytes.Length)
+        $stream.Position = 0
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        $sha256 = [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+        $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
+            (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
+            'zip'
+        }
+        elseif ($read -ge 7 -and $bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and
+            $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07 -and $bytes[6] -in @(0x00, 0x01)) {
+            'rar'
+        }
+        elseif ($read -ge 6 -and $bytes[0] -eq 0x37 -and $bytes[1] -eq 0x7A -and $bytes[2] -eq 0xBC -and
+            $bytes[3] -eq 0xAF -and $bytes[4] -eq 0x27 -and $bytes[5] -eq 0x1C) {
+            '7z'
+        }
+        else { 'unknown' }
+        [ordered]@{ size = [int64]$size; sha256 = $sha256; archiveFormat = $format; stream = $stream }
     }
-    finally { $stream.Dispose() }
-    $sha256 = Get-FileSha256 -Path $Path
-    $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
-        (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
-        'zip'
+    catch {
+        $stream.Dispose()
+        throw
     }
-    elseif ($read -ge 7 -and $bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and
-        $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07 -and $bytes[6] -in @(0x00, 0x01)) {
-        'rar'
+    finally {
+        $hasher.Dispose()
     }
-    elseif ($read -ge 6 -and $bytes[0] -eq 0x37 -and $bytes[1] -eq 0x7A -and $bytes[2] -eq 0xBC -and
-        $bytes[3] -eq 0xAF -and $bytes[4] -eq 0x27 -and $bytes[5] -eq 0x1C) {
-        '7z'
-    }
-    else { 'unknown' }
-    [ordered]@{ size = [int64]$size; sha256 = $sha256; archiveFormat = $format }
 }
 
 function New-WaitingResult {
@@ -420,6 +484,9 @@ if ($sampleTwo.size -le 0) { throw 'Downloaded file is empty.' }
 $verifyStart = [Diagnostics.Stopwatch]::StartNew()
 Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
 $archiveEvidence = Get-ArchiveEvidence -Path $candidateFull
+$temporaryDelivery = $null
+$deleteCandidateAfterDelivery = $false
+try {
 if ([int64]$archiveEvidence.size -ne [int64]$sampleTwo.size) {
     $verifyStart.Stop()
     Write-Result -Value (New-WaitingResult -Status 'waiting-system' -Code 'download_not_stable' -Message 'The provider output changed while its immutable evidence was computed.' -ArchiveFormat ([string]$archiveEvidence.archiveFormat) -Path $candidateFull)
@@ -499,7 +566,17 @@ Write-AtomicJson -Path $ReceiptPath -Value $receipt
 Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
 Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source' -AllowMissingLeaf
 Invoke-Heartbeat
-[IO.File]::Move($candidateFull, $deliveredPath)
+$temporaryDelivery = Assert-ContainedFilePath -Candidate (Join-Path $deliveryFull ('.delivery-' + [guid]::NewGuid().ToString('N') + '.tmp')) -Root $deliveryFull
+$destination = [IO.File]::Open($temporaryDelivery, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try {
+    $archiveEvidence.stream.Position = 0
+    Copy-StreamWithHeartbeat -Source $archiveEvidence.stream -Destination $destination
+    $destination.Flush($true)
+}
+finally { $destination.Dispose() }
+[IO.File]::Move($temporaryDelivery, $deliveredPath)
+$temporaryDelivery = $null
+$deleteCandidateAfterDelivery = $true
 $deliveryStart.Stop()
 $receipt.status = 'delivered'
 $receipt.deliveredAt = Get-UtcTimestamp
@@ -516,3 +593,14 @@ Write-Result -Value ([ordered]@{
     receiptSha256 = Get-FileSha256 -Path $ReceiptPath
     timings = $receipt.timings
 })
+}
+finally {
+    if ($archiveEvidence.stream) { $archiveEvidence.stream.Dispose() }
+    if ($temporaryDelivery -and (Test-Path -LiteralPath $temporaryDelivery -PathType Leaf)) {
+        [IO.File]::Delete($temporaryDelivery)
+    }
+    if ($deleteCandidateAfterDelivery -and (Test-Path -LiteralPath $candidateFull -PathType Leaf)) {
+        Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Delivered source input cleanup'
+        [IO.File]::Delete($candidateFull)
+    }
+}

@@ -10,6 +10,25 @@ Describe 'Schema 15 multi-process coordination contract' {
             -OutputPath (Join-Path $TestDrive 'coordination-skill-source-pin.json')
     }
 
+    # Scenario: PowerShell predates ConvertFrom-Json -DateKind but reads an immutable UTC source tuple.
+    # Purpose: Preserve timestamp text exactly instead of converting it to the machine's local time zone.
+    It 'UnitT10_PreservesJsonTimestampStringsWithoutNativeDateKind' {
+        Import-Module -Name $coordinationModule -Force
+        InModuleScope SharedCoordinationLock {
+            Mock Get-Command { [pscustomobject]@{ Parameters = @{} } } `
+                -ParameterFilter { $Name -ceq 'Microsoft.PowerShell.Utility\ConvertFrom-Json' }
+            $expected = '2026-01-02T03:04:05.0000000+00:00'
+            $parsed = '{"at":"2026-01-02T03:04:05.0000000+00:00","items":[{"value":1}],"empty":[]}' |
+                ConvertFrom-Json -AsHashtable
+
+            $parsed.at.GetType() | Should -Be ([string])
+            $parsed.at | Should -BeExactly $expected
+            @($parsed.items).Count | Should -Be 1
+            $parsed.items[0].value | Should -Be 1
+            @($parsed.empty).Count | Should -Be 0
+        }
+    }
+
     It 'InterT180_SerializesTwoModsAndRejectsACompetingGenerationAcrossProcesses' -Tag 'MultiProcess' {
         $repository = Join-Path $TestDrive 'multi-process-repository'
         $modsRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods'
@@ -112,9 +131,9 @@ Describe 'Schema 15 multi-process coordination contract' {
             @($successful.mod | Sort-Object) | Should -Be @('ModA', 'ModB')
             $failed[0].mod | Should -Be 'ModA'
 
-            $successfulResults = @($successful | ForEach-Object { $_.stdoutText | ConvertFrom-Json -AsHashtable })
+            $successfulResults = @($successful | ForEach-Object { $_.stdoutText | ConvertFrom-TestJson -AsHashtable })
             foreach ($result in $successfulResults) { [string]$result.result | Should -Be 'passed' }
-            $states = @($successfulResults | ForEach-Object { Get-Content -LiteralPath ([string]$_.statePath) -Raw | ConvertFrom-Json -AsHashtable })
+            $states = @($successfulResults | ForEach-Object { Get-Content -LiteralPath ([string]$_.statePath) -Raw | ConvertFrom-TestJson -AsHashtable })
             @($states.repoModDirectory | Sort-Object) | Should -Be @('ModA', 'ModB')
             @($states.runId | Sort-Object -Unique).Count | Should -Be 2
             @($states.claimPath | Sort-Object -Unique).Count | Should -Be 2
@@ -125,7 +144,7 @@ Describe 'Schema 15 multi-process coordination contract' {
                 Test-Path -LiteralPath ([string]$state.archive.path) -PathType Leaf | Should -BeTrue
                 [string]$state.prNumber | Should -BeNullOrEmpty
                 [bool]$state.published | Should -BeFalse
-                $owner = Get-Content -LiteralPath (Join-Path ([string]$state.modLockPath) 'owner.json') -Raw | ConvertFrom-Json -AsHashtable
+                $owner = Get-Content -LiteralPath (Join-Path ([string]$state.modLockPath) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
                 [string]$owner.leaseMode | Should -Be 'reserved'
                 [string]$owner.workerToken | Should -BeNullOrEmpty
                 $owner.workerId | Should -BeNullOrEmpty
@@ -137,7 +156,7 @@ Describe 'Schema 15 multi-process coordination contract' {
             @(Get-ChildItem -LiteralPath (Join-Path $queueRoot 'In Progress/.locks/mod') -Directory).Count | Should -Be 2
 
             $receipts = @($states.coordinationReceipts | ForEach-Object {
-                Get-Content -LiteralPath ([string]$_.path) -Raw | ConvertFrom-Json -AsHashtable
+                Get-Content -LiteralPath ([string]$_.path) -Raw | ConvertFrom-TestJson -AsHashtable
             })
             foreach ($resourceKey in @('source-acquisition', 'git-coordination')) {
                 $timeline = @($receipts | Where-Object { $_.resourceKey -ceq $resourceKey } | Sort-Object { [DateTimeOffset]$_.acquiredAt })
@@ -187,9 +206,9 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
         $crashProcess.WaitForExit(30000) | Should -BeTrue
         $crashProcess.ExitCode | Should -Be 91 -Because ($crashError.Result + $crashOutput.Result)
         $crashProcess.Dispose()
-        $oldLease = Get-Content -LiteralPath $oldLeasePath -Raw | ConvertFrom-Json -AsHashtable
+        $oldLease = Get-Content -LiteralPath $oldLeasePath -Raw | ConvertFrom-TestJson -AsHashtable
         $ownerPath = Join-Path ([string]$oldLease.path) 'owner.json'
-        $oldOwner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        $oldOwner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-TestJson -AsHashtable
         $oldOwner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
         $oldOwner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
 
@@ -200,19 +219,19 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
             Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Container | Should -BeTrue
             { Exit-SharedCoordinationLease -Lease $oldLease } | Should -Throw '*ownership changed*'
             Test-Path -LiteralPath ([string]$newLease.path) -PathType Container | Should -BeTrue
-            $newOwner = Get-Content -LiteralPath (Join-Path ([string]$newLease.path) 'owner.json') -Raw | ConvertFrom-Json -AsHashtable
+            $newOwner = Get-Content -LiteralPath (Join-Path ([string]$newLease.path) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
             [string]$newOwner.token | Should -Be ([string]$newLease.token)
             $beforeHeartbeat = [DateTimeOffset]$newOwner.heartbeat
             Start-Sleep -Milliseconds 20
             Update-SharedCoordinationLease -Lease $newLease -Force
-            $refreshedOwner = Get-Content -LiteralPath (Join-Path ([string]$newLease.path) 'owner.json') -Raw | ConvertFrom-Json -AsHashtable
+            $refreshedOwner = Get-Content -LiteralPath (Join-Path ([string]$newLease.path) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
             [DateTimeOffset]$refreshedOwner.heartbeat | Should -BeGreaterThan $beforeHeartbeat
         }
         finally {
             $receipt = Exit-SharedCoordinationLease -Lease $newLease
         }
         Test-Path -LiteralPath ([string]$newLease.path) | Should -BeFalse
-        $receiptRecord = Get-Content -LiteralPath ([string]$receipt.path) -Raw | ConvertFrom-Json -AsHashtable
+        $receiptRecord = Get-Content -LiteralPath ([string]$receipt.path) -Raw | ConvertFrom-TestJson -AsHashtable
         [string]$receiptRecord.staleEvidencePath | Should -Be ([string]$newLease.staleEvidencePath)
     }
 
@@ -233,7 +252,7 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
             $ownerPath = Join-Path ([string]$lease.path) 'owner.json'
             $validOwnerJson = Get-Content -LiteralPath $ownerPath -Raw
             try {
-                $malformedOwner = $validOwnerJson | ConvertFrom-Json -AsHashtable
+                $malformedOwner = $validOwnerJson | ConvertFrom-TestJson -AsHashtable
                 $malformedOwner.processStartTicks = 'not-a-number'
                 $malformedOwner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
                 $malformedOwner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline

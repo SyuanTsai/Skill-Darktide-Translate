@@ -244,7 +244,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'HeartbeatAction = \{ Update-ActiveReservationHeartbeat \}'
         $runner | Should -Match '-WaitHeartbeatAction \{ Update-ActiveReservationHeartbeat \}'
         $runner | Should -Match '(?s)finally \{.*?Suspend-ModReservationWorker.*?Exit-RunWriterLock'
-        $runner | Should -Match '(?s)if \(-not \[string\]::IsNullOrWhiteSpace\(\$SourceReceiptPath\)\).*?ConvertTo-NexusSourceIdentity.*?\$plannedOwner = Enter-ModReservation.*?\$acquisitionFull'
+        $runner | Should -Match '(?s)if \(-not \[string\]::IsNullOrWhiteSpace\(\$SourceReceiptPath\)\).*?ConvertTo-NexusSourceIdentity.*?\$acquisitionFull.*?\$baseOid = .*?\$plannedOwner = Enter-ModReservation'
         $runner | Should -Match '(?s)else \{.*?ConvertTo-NexusSourceIdentity.*?Source archive must be a regular file.*?\$plannedOwner = Enter-ModReservation.*?for \(\$second = 0; \$second -lt 10'
         $runner | Should -Match '(?s)\$sourceTuple = New-SourceTupleEvidence.*?\$plannedOwner = Read-ActiveReservationOwner'
         $runner | Should -Not -Match '\$gitCommand -in @\([^\)]*''commit'''
@@ -362,7 +362,8 @@ Describe 'Deterministic Darktide MOD update automation' {
         [Convert]::ToHexString([IO.File]::ReadAllBytes($ownerPath)) | Should -Be ([Convert]::ToHexString($ownerBefore))
         { & $module $invokeWrite $lockPath $repository $attempted $newReservationToken $newWorkerToken } |
             Should -Not -Throw
-        (Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json).heartbeat | Should -Be $attempted.heartbeat
+        [DateTimeOffset](Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json).heartbeat |
+            Should -Be ([DateTimeOffset]$attempted.heartbeat)
     }
 
     It 'UnitT179_DoesNotAdoptAnActiveWorkerTokenFromTheSameProcessWithoutItsLease' {
@@ -536,7 +537,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $secondArchivePath = Join-Path $queueRoot 'ExampleMod-second.zip'
         [IO.File]::Copy($claimedState.archive.path, $secondArchivePath)
         $secondSourceRequestPath = Join-Path $TestDrive 'manual-source-request-second.json'
-        $secondSourceRequest = Get-Content -LiteralPath $manualSourceRequestPath -Raw | ConvertFrom-Json
+        $secondSourceRequest = Get-Content -LiteralPath $manualSourceRequestPath -Raw | ConvertFrom-TestJson
         $secondSourceRequest.fileName = 'ExampleMod-second.zip'
         $secondSourceRequest | ConvertTo-Json | Set-Content -LiteralPath $secondSourceRequestPath -NoNewline
         { & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $secondArchivePath -ModDirectory 'ExampleMod' `
@@ -545,7 +546,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         Test-Path -LiteralPath $secondArchivePath -PathType Leaf | Should -Be $true
         [IO.File]::Delete($secondArchivePath)
 
-        $incompleteClaim = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $incompleteClaim = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         $incompleteClaim.status = 'claiming'
         $incompleteClaim.completedStages = @($incompleteClaim.completedStages | Where-Object { $_ -ne 'claim' })
         $incompleteClaim.stageTimings.Remove('claim')
@@ -558,7 +559,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         Test-Path -LiteralPath $incompleteClaim.archive.path -PathType Leaf | Should -Be $true
         (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).lastRecovery.reason | Should -Be 'incomplete claim reattached to original run tuple'
 
-        $writerState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $writerState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         $writerLockPath = Join-Path $writerState.runRoot '.writer.lock'
         $liveWriter = [ordered]@{
             schemaVersion = 1; runId = $writerState.runId; statePath = $statePath; token = [guid]::NewGuid().ToString()
@@ -577,7 +578,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $writerRecoveryState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         $writerRecoveryState.lastRecovery.reason | Should -Be 'stale run writer lock retained'
         Test-Path -LiteralPath $writerRecoveryState.lastRecovery.retainedPath -PathType Leaf | Should -Be $true
-        $preExtractState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $preExtractState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         $archiveBackupPath = Join-Path $preExtractState.runRoot 'archive-before-tamper.zip'
         [IO.File]::Copy([string]$preExtractState.archive.path, $archiveBackupPath)
         try {
@@ -594,7 +595,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         [IO.File]::WriteAllText((Join-Path $partialExtraction 'partial.txt'), 'crash residue', [Text.UTF8Encoding]::new($false))
         (& $runnerPath extract -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
 
-        $preInstallState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $preInstallState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         $worktreeModRoot = Join-Path ([string]$preInstallState.worktreePath) 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
         $outsideInstallTarget = Join-Path $TestDrive 'install-junction-target'
         Move-Item -LiteralPath $worktreeModRoot -Destination $outsideInstallTarget
@@ -663,7 +664,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         [IO.File]::WriteAllText($planPath, ($plan | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         (& $runnerPath localization -RepositoryRoot $fixtureRepo -StatePath $statePath -LocalizationPlanPath $planPath -PassThru).result | Should -Be 'passed'
         (& $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
-        $preGateState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $preGateState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         try {
             $appendStream = [IO.File]::Open([string]$preGateState.archive.path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
             try { $appendStream.WriteByte(0) } finally { $appendStream.Dispose() }
@@ -676,7 +677,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $validation = & $runnerPath validate -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru
         $validation.result | Should -Be 'passed'
 
-        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         $state.candidateGate.status | Should -Be 'passed'
         $state.sourceTuple.contract.acquisitionMethod | Should -Be 'manual-queue'
         $state.sourceTuple.contract.archive.fileName | Should -Be 'ExampleMod.zip'

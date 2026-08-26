@@ -36,6 +36,55 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function ConvertFrom-JsonToken {
+    param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
+    if ($null -eq $Token -or $Token.Type -in @(
+        [Newtonsoft.Json.Linq.JTokenType]::Null,
+        [Newtonsoft.Json.Linq.JTokenType]::Undefined
+    )) { return $null }
+    if ($Token -is [Newtonsoft.Json.Linq.JObject]) {
+        $properties = [ordered]@{}
+        foreach ($property in $Token.Properties()) {
+            $properties[[string]$property.Name] = ConvertFrom-JsonToken -Token $property.Value -AsHashtable:$AsHashtable
+        }
+        if ($AsHashtable) { return $properties }
+        return [pscustomobject]$properties
+    }
+    if ($Token -is [Newtonsoft.Json.Linq.JArray]) {
+        $items = [object[]]::new($Token.Count)
+        for ($index = 0; $index -lt $Token.Count; $index++) {
+            $items[$index] = ConvertFrom-JsonToken -Token $Token[$index] -AsHashtable:$AsHashtable
+        }
+        Write-Output -NoEnumerate $items
+        return
+    }
+    ([Newtonsoft.Json.Linq.JValue]$Token).Value
+}
+
+function ConvertFrom-Json {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string] $InputObject,
+        [switch] $AsHashtable
+    )
+    process {
+        $parameters = @{ InputObject = $InputObject }
+        if ($AsHashtable) { $parameters.AsHashtable = $true }
+        $nativeCommand = Get-Command -Name 'Microsoft.PowerShell.Utility\ConvertFrom-Json'
+        if ($nativeCommand.Parameters.ContainsKey('DateKind')) {
+            $parameters.DateKind = 'String'
+            Microsoft.PowerShell.Utility\ConvertFrom-Json @parameters
+            return
+        }
+        $settings = [Newtonsoft.Json.JsonSerializerSettings]::new()
+        $settings.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+        $token = [Newtonsoft.Json.JsonConvert]::DeserializeObject($InputObject, $settings)
+        ConvertFrom-JsonToken -Token $token -AsHashtable:$AsHashtable
+    }
+}
+
 function Get-UtcTimestamp {
     [DateTimeOffset]::UtcNow.ToString('o')
 }
@@ -162,6 +211,8 @@ function Remove-DirectoryTreeWithHeartbeat {
 function ConvertTo-InvariantString {
     param($Value)
     if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) { return ([DateTimeOffset]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
     [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -757,7 +808,7 @@ function Invoke-Git {
                 $priorReceipts = if ($script:activeReservationState.Contains('coordinationReceipts')) {
                     @($script:activeReservationState.coordinationReceipts)
                 } else { @() }
-                $script:activeReservationState.coordinationReceipts = @($priorReceipts + @($coordinationReceipt))
+                $script:activeReservationState.coordinationReceipts = @($priorReceipts) + @($coordinationReceipt)
             }
         }
     }
@@ -845,7 +896,7 @@ function Get-GitBlobBytes {
             Update-ActiveReservationHeartbeat
             Update-ActiveSharedCoordinationHeartbeat
         }
-        $copyTask.GetAwaiter().GetResult()
+        $null = $copyTask.GetAwaiter().GetResult()
         $errorText = $errorTask.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) { throw "git cat-file failed: $errorText" }
         $memory.ToArray()
@@ -1237,12 +1288,18 @@ function Write-ActiveReservationOwner {
 
 function Update-ActiveReservationHeartbeat {
     param([switch] $Force)
-    if (-not $script:activeReservationLease) { return }
-    $lease = $script:activeReservationLease
+    # Child scripts invoke the supplied heartbeat callback in their own script
+    # scope. Use dynamic lookup here, then keep the immutable lease explicit.
+    $lease = $activeReservationLease
+    if (-not $lease) { return }
     if (-not $Force -and ([DateTimeOffset]::UtcNow - [DateTimeOffset]$lease.lastHeartbeatUtc).TotalSeconds -lt 30) { return }
-    $owner = Read-ActiveReservationOwner
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot)
+    if (-not (Test-ReservationLeaseMatchesOwner -Lease $lease -Owner $owner)) {
+        throw 'MOD reservation ownership changed after this worker acquired its immutable lease.'
+    }
     $owner.heartbeat = Get-UtcTimestamp
-    Write-ActiveReservationOwner -Value $owner
+    Write-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot) -Value $owner `
+        -ExpectedReservationToken ([string]$lease.reservationToken) -ExpectedWorkerToken ([string]$lease.workerToken)
     $lease.lastHeartbeatUtc = [DateTimeOffset]::UtcNow
 }
 
@@ -1642,25 +1699,52 @@ function Complete-InterruptedSourceDelivery {
     $deliveredCandidate = [IO.Path]::GetFullPath((Join-Path $DeliveryDirectory ([string]$receipt.filename)))
     $incomingExists = Test-Path -LiteralPath $incomingCandidate -PathType Leaf
     $deliveredExists = Test-Path -LiteralPath $deliveredCandidate -PathType Leaf
-    if ($incomingExists -and $deliveredExists) { throw 'Interrupted source delivery has both incoming and delivered copies.' }
     if (-not $incomingExists -and -not $deliveredExists) { throw 'Interrupted source delivery has no recoverable file.' }
     $candidate = if ($deliveredExists) { $deliveredCandidate } else { $incomingCandidate }
     $null = Assert-NoReparsePath -Path $candidate -Root $RepositoryRoot -Label 'Interrupted source file'
-    $candidateSize = (Get-Item -LiteralPath $candidate).Length
-    $candidateSha256 = Get-FileSha256 -Path $candidate
-    if ([int64]$candidateSize -ne [int64]$receipt.size -or $candidateSha256 -cne [string]$receipt.sha256) {
-        throw 'Interrupted source delivery file no longer matches its receipt.'
+    $source = [IO.File]::Open($candidate, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $temporaryDelivery = $null
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Update-ActiveReservationHeartbeat
+        }
+        $candidateSha256 = [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+        if ([int64]$source.Length -ne [int64]$receipt.size -or $candidateSha256 -cne [string]$receipt.sha256) {
+            throw 'Interrupted source delivery file no longer matches its receipt.'
+        }
+        if (-not $deliveredExists) {
+            if (-not (Test-Path -LiteralPath $DeliveryDirectory -PathType Container)) {
+                $null = Assert-NoReparsePath -Path (Split-Path -Parent $DeliveryDirectory) -Root $RepositoryRoot -Label 'Interrupted delivery parent'
+                New-Item -ItemType Directory -Path $DeliveryDirectory | Out-Null
+            }
+            $null = Assert-NoReparsePath -Path $DeliveryDirectory -Root $RepositoryRoot -Label 'Interrupted delivery directory'
+            $null = Assert-NoReparsePath -Path $deliveredCandidate -Root $RepositoryRoot -Label 'Interrupted delivered source' -AllowMissing
+            $temporaryDelivery = Join-Path $DeliveryDirectory ('.delivery-' + [guid]::NewGuid().ToString('N') + '.tmp')
+            $null = Assert-NoReparsePath -Path $temporaryDelivery -Root $RepositoryRoot -Label 'Interrupted temporary delivery' -AllowMissing
+            $destination = [IO.File]::Open($temporaryDelivery, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try {
+                $source.Position = 0
+                Copy-StreamWithHeartbeat -Source $source -Destination $destination
+                $destination.Flush($true)
+            }
+            finally { $destination.Dispose() }
+            [IO.File]::Move($temporaryDelivery, $deliveredCandidate)
+            $temporaryDelivery = $null
+        }
+    }
+    finally {
+        $hasher.Dispose()
+        $source.Dispose()
+        if ($temporaryDelivery -and (Test-Path -LiteralPath $temporaryDelivery -PathType Leaf)) {
+            [IO.File]::Delete($temporaryDelivery)
+        }
     }
     if ($incomingExists) {
-        if (-not (Test-Path -LiteralPath $DeliveryDirectory -PathType Container)) {
-            $null = Assert-NoReparsePath -Path (Split-Path -Parent $DeliveryDirectory) -Root $RepositoryRoot -Label 'Interrupted delivery parent'
-            New-Item -ItemType Directory -Path $DeliveryDirectory | Out-Null
-        }
-        $null = Assert-NoReparsePath -Path $DeliveryDirectory -Root $RepositoryRoot -Label 'Interrupted delivery directory'
         $null = Assert-NoReparsePath -Path $incomingCandidate -Root $RepositoryRoot -Label 'Interrupted incoming source'
-        $null = Assert-NoReparsePath -Path $deliveredCandidate -Root $RepositoryRoot -Label 'Interrupted delivered source' -AllowMissing
-        Update-ActiveReservationHeartbeat -Force
-        [IO.File]::Move($incomingCandidate, $deliveredCandidate)
+        [IO.File]::Delete($incomingCandidate)
     }
     $receipt.status = 'delivered'
     $receipt.deliveredAt = Get-UtcTimestamp
@@ -2105,7 +2189,6 @@ function Invoke-Claim {
         $sourceRequestInputFull = $requestFull
         $sourceRequestData = Get-Content -LiteralPath $requestFull -Raw | ConvertFrom-Json -AsHashtable
         $sourceIdentity = ConvertTo-NexusSourceIdentity -Request $sourceRequestData -RequireMetadata
-        $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
         $acquisitionFull = [IO.Path]::GetFullPath((Join-Path $runRoot 'review-artifacts/source-acquisition.json'))
         $null = Assert-NoReparsePath -Path $acquisitionFull -Root $repository -Label 'Source acquisition record'
         if (-not (Test-Path -LiteralPath $acquisitionFull -PathType Leaf)) { throw 'Schema 15 acquisition record is missing.' }
@@ -2174,6 +2257,10 @@ function Invoke-Claim {
             [string]$acquisition.skillSourceContentSha256 -cne [string]$integrity.skillSourcePin.contentSha256) {
             throw 'Schema 15 acquisition record no longer matches its immutable Skill source pin.'
         }
+        $baseOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', "$BaseRef^{commit}")).output.Trim()
+        $baseTreeOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', "$baseOid^{tree}")).output.Trim()
+        Assert-Schema15BaseLocalizationEligibility -Repository $repository -BaseOid $baseOid -ModRelativePath ([string]$plan.modRelativePath)
+        $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
     }
     else {
         $sourceRequestInputFull = [IO.Path]::GetFullPath($SourceRequestPath)
@@ -2181,6 +2268,8 @@ function Invoke-Claim {
         if (-not (Test-Path -LiteralPath $sourceRequestInputFull -PathType Leaf)) { throw 'Manual source request is missing.' }
         $sourceRequestData = Get-Content -LiteralPath $sourceRequestInputFull -Raw | ConvertFrom-Json -AsHashtable
         $sourceIdentity = ConvertTo-NexusSourceIdentity -Request $sourceRequestData -RequireMetadata
+        $baseOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', "$BaseRef^{commit}")).output.Trim()
+        $baseTreeOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', "$baseOid^{tree}")).output.Trim()
         $sourceFull = Assert-ContainedPath -Candidate $ArchivePath -Root $queueRoot -Label 'Archive path'
         if ((Split-Path -Parent $sourceFull) -ne [IO.Path]::GetFullPath($queueRoot)) {
             throw 'Archive must be a direct child of AI Auto Update.'
@@ -2238,11 +2327,6 @@ function Invoke-Claim {
         -ArchiveSize ([int64]$sampleTwo.Length) -ArchiveSha256 $archiveSha -BoundSourceRequestPath $boundSourceRequestPath `
         -BoundSourceReceiptPath $(if ($sourceReceipt) { [string]$sourceReceipt.path } else { $null })
 
-    $baseOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', "$BaseRef^{commit}")).output.Trim()
-    $baseTreeOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', "$baseOid^{tree}")).output.Trim()
-    if ($sourceReceipt) {
-        Assert-Schema15BaseLocalizationEligibility -Repository $repository -BaseOid $baseOid -ModRelativePath ([string]$plan.modRelativePath)
-    }
     $branch = "Update/$slug/$([DateTimeOffset]::Now.ToString('yyyyMMdd'))-$short"
     $worktreeParent = if ([string]::IsNullOrWhiteSpace($WorktreeParent)) {
         Join-Path (Split-Path -Parent $repository) ((Split-Path -Leaf $repository) + '-worktrees')

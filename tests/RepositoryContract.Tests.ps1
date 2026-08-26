@@ -72,12 +72,12 @@ Describe 'Darktide Translate repository contract' {
             Test-Path -LiteralPath (Join-Path $repoRoot $path) | Should -Be $true
         }
 
-        $skillRoot = Join-Path $repoRoot '.agents/skills'
         $actualSkillDirectories = @(
-            Get-ChildItem -LiteralPath $skillRoot -Directory |
-                Select-Object -ExpandProperty Name |
-                Sort-Object
+            & git -C $repoRoot ls-files -- '.agents/skills/*' |
+                ForEach-Object { (([string]$_).Replace('\', '/') -split '/')[2] } |
+                Sort-Object -Unique
         )
+        $LASTEXITCODE | Should -Be 0
         ($actualSkillDirectories -join "`n") | Should -Be 'auto-update-darktide-mod'
     }
 
