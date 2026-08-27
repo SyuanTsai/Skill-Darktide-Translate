@@ -19,6 +19,8 @@ Do not copy only `mod-update.ps1`; the runner, independent validator, packaged W
 
 For a Schema 14 manual claim, the archive must be a stable, ordinary ZIP directly under the target repository's `AI Auto Update` directory. The canonical MOD directory must already be known and must match the ZIP's single root directory.
 
+Manual and automatic claims both require a source-request `schemaVersion: 2` containing the complete Nexus page/Main-file tuple: game domain, MOD ID, canonical page URL, page Version/Last updated, Main file ID/version/uploaded-at UTC, and the full filename including extension. The claim copies it to `review-artifacts/source-request.json` and binds it with archive size/SHA-256 and acquisition method in `source-tuple.json`.
+
 Start a run:
 
 ```powershell
@@ -26,7 +28,9 @@ Start a run:
   -RepositoryRoot 'D:\Games\Warhammer-40-000-DARKTIDE-Mods' `
   -ArchivePath 'D:\Games\Warhammer-40-000-DARKTIDE-Mods\AI Auto Update\ExampleMod.zip' `
   -ModDirectory 'ExampleMod' `
-  -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.0.json'
+  -SourceRequestPath 'D:\Source Facts\ExampleMod-source-request.json' `
+  -MetadataPath 'README.md', '.hash/examplemod.hash' `
+  -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.1.json'
 ```
 
 ### Schema 15 automatic source
@@ -41,14 +45,14 @@ For an existing signed-in browser session, download only into the fixed run's ex
   -ModDirectory 'ExampleMod' `
   -RunId '11111111-2222-4333-8444-555555555555' `
   -SourceRequestPath 'D:\...\source-request.json' `
-  -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.0.json' `
+  -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.1.json' `
   -Provider browser `
   -DownloadedFilePath 'D:\...\.incoming-11111111-2222-4333-8444-555555555555\ExampleMod.zip'
 ```
 
 `acquire-source` and receipt-bound `claim` remain separately callable for coordinators and diagnosis. New automatic runs preflight immutable base localization before branch creation; a loader-only entry returns `AUTOMATION_EXCLUDED: localization_entry_is_loader` while retaining acquisition evidence and the per-MOD reservation.
 
-Acquisition atomically archives the supplied request as run-local `review-artifacts/source-request.json` and the verified Skill pin as `review-artifacts/skill-source-pin.json`; receipt-bound claim accepts only that exact tuple and verifies its hashes against `source-acquisition.json` and the MOD reservation owner. Every resume proves that the supplied state file is physically below the requested repository, that its `repositoryRoot`, `statePath`, and `runRoot` self-bind to that file, and that its MOD lock key and path equal the canonical reservation derived from the MOD identity. Every reservation-owner read or write, source read, receipt write, delivery move, workset apply, and workset deletion rechecks all existing path components for reparse points. The API provider reads an ephemeral HTTPS Nexus download URL from `NEXUS_DOWNLOAD_URI` and an optional API key from `NEXUS_API_KEY`. Automatic redirects are disabled; at most ten redirect hops are followed manually, and every hop must remain HTTPS on `nexusmods.com` or one of its subdomains before any credential-bearing request is sent. These environment values are never written to state or receipts. Missing URLs, partial files, instability, and rate limits are `waiting-system`; login, OTP, CAPTCHA, terms, permissions, unsupported archives, and a missing or invalid Skill pin are `waiting-user`. Identity or hash mismatches are blocked.
+Acquisition atomically archives the supplied request as run-local `review-artifacts/source-request.json` and the verified Skill pin as `review-artifacts/skill-source-pin.json`; receipt-bound claim accepts only that exact tuple and verifies its hashes against `source-acquisition.json` and the MOD reservation owner. Claim then creates `source-tuple.json`, whose contract SHA binds run, acquisition method, complete Nexus facts, request/receipt, and archive filename/size/SHA. Every resume proves that the supplied state file is physically below the requested repository, that its `repositoryRoot`, `statePath`, and `runRoot` self-bind to that file, and that its MOD lock key and path equal the canonical reservation derived from the MOD identity. Every reservation-owner read or write, source read, receipt write, delivery move, workset apply, and workset deletion rechecks all existing path components for reparse points. The API provider reads an ephemeral HTTPS Nexus download URL from `NEXUS_DOWNLOAD_URI` and an optional API key from `NEXUS_API_KEY`. Automatic redirects are disabled; at most ten redirect hops are followed manually, and every hop must remain HTTPS on `nexusmods.com` or one of its subdomains before any credential-bearing request is sent. These environment values are never written to state or receipts. Missing URLs, partial files, instability, and rate limits are `waiting-system`; login, OTP, CAPTCHA, terms, permissions, unsupported archives, and a missing or invalid Skill pin are `waiting-user`. Identity or hash mismatches are blocked.
 
 Use `scripts/Invoke-ModUpdateQueue.ps1 -SkillSourcePinPath <pin.json>` for acquisition concurrency. Its throttle is restricted to one through four distinct MOD identities; duplicate identities are rejected before workers start, and every worker receives the same verified source pin.
 
@@ -136,9 +140,12 @@ Keep `state.json`, the claimed archive, MOD identity lock, worktree, branch, and
 - A completed stage returns its existing receipt only after re-hashing its primary artifact, rechecking the lock-owner tuple, and—after evidence exists—confirming HEAD still equals F.
 - Claim resolves the immutable base and worktree plan before taking the MOD identity lock, records the fixed Workflow/Baseline source tuple, and writes writer-protected `state.json` before moving the stable source into `.claims/<run-id>/source` or creating the worktree. Retrying that state can recover the ZIP from its original queue path, reattach a partially created worktree or branch, and move the same claimed archive into the run; it never starts a replacement generation. `claim.json` and `owner.json` retain the planned state path so the narrower pre-state crash window remains attributable to the same run.
 - Every state-mutating resume uses an atomic run-local writer lock bound to machine, PID, process start time, state path, and an unguessable token. A live owner blocks the second writer; a stale lock is retained as evidence before the original run resumes.
+- The MOD reservation separately binds reservation/worker tokens plus machine, PID, and process-start time. Active workers refresh heartbeat during long file, Git, download, and Gate operations; every owner write is token-guarded. Normal process exit and waiting states atomically clear the active worker tuple and retain the same run as `reserved`.
+- `source-acquisition.lock` protects only queue inventory/claim/destination moves; `git-coordination.lock` protects only shared fetch/branch/worktree metadata and remote-ref publication by `git push`. Both are short-lived and owner-checked, stale lock directories are retained instead of overwritten, and neither lock wraps commits, Candidate Gate, GitHub PR/Review calls, or the run lifecycle.
 - An interrupted extraction preserves the previous directory under a recovery name before atomically installing the new extraction.
 - An incomplete `build-commits` may resume only while HEAD still equals C0. A partial C1/C2/C3 history is retained and stops for explicit user-directed recovery instead of appending duplicate evidence commits.
 - Recorded C0/C1/C2/C3/F OIDs and trees are revalidated by the independent Gate before publication.
+- Empty C2/C3 trees require structured `KEEP` reasons bound to target paths, localization mode/manifest, parent/current trees, and a reconstructible contract hash. The Gate rejects missing, fake, unknown, or contradictory reasons and independently binds README/formal-hash metadata preview fields to the same complete source tuple. Both files must preserve all 11 tuple fields. README uses unique labeled list entries with exact values; substring, prefix/suffix, missing, duplicate, and contradictory matches fail.
 - GitHub CLI operations run from the recorded worktree and publication uses the remote stored in state. An existing open PR is updated; a second PR is not created. A closed, retargeted, or head-mismatched PR stops for user recovery.
 - After publication, history is append-only. Never reset, rebase, squash, force-push, or replace rejected evidence.
 - External review takes one zero-wait snapshot. `requested-pending` is non-blocking and schedules no watcher.

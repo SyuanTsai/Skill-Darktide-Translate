@@ -1,3 +1,52 @@
+function ConvertFrom-TestJsonToken {
+    param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
+    if ($null -eq $Token -or $Token.Type -in @(
+        [Newtonsoft.Json.Linq.JTokenType]::Null,
+        [Newtonsoft.Json.Linq.JTokenType]::Undefined
+    )) { return $null }
+    if ($Token -is [Newtonsoft.Json.Linq.JObject]) {
+        $properties = [ordered]@{}
+        foreach ($property in $Token.Properties()) {
+            $properties[[string]$property.Name] = ConvertFrom-TestJsonToken -Token $property.Value -AsHashtable:$AsHashtable
+        }
+        if ($AsHashtable) { return $properties }
+        return [pscustomobject]$properties
+    }
+    if ($Token -is [Newtonsoft.Json.Linq.JArray]) {
+        $items = [object[]]::new($Token.Count)
+        for ($index = 0; $index -lt $Token.Count; $index++) {
+            $items[$index] = ConvertFrom-TestJsonToken -Token $Token[$index] -AsHashtable:$AsHashtable
+        }
+        Write-Output -NoEnumerate $items
+        return
+    }
+    ([Newtonsoft.Json.Linq.JValue]$Token).Value
+}
+
+function ConvertFrom-TestJson {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string] $InputObject,
+        [switch] $AsHashtable
+    )
+    process {
+        $parameters = @{ InputObject = $InputObject }
+        if ($AsHashtable) { $parameters.AsHashtable = $true }
+        $nativeCommand = Get-Command -Name 'Microsoft.PowerShell.Utility\ConvertFrom-Json'
+        if ($nativeCommand.Parameters.ContainsKey('DateKind')) {
+            $parameters.DateKind = 'String'
+            Microsoft.PowerShell.Utility\ConvertFrom-Json @parameters
+            return
+        }
+        $settings = [Newtonsoft.Json.JsonSerializerSettings]::new()
+        $settings.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+        $token = [Newtonsoft.Json.JsonConvert]::DeserializeObject($InputObject, $settings)
+        ConvertFrom-TestJsonToken -Token $token -AsHashtable:$AsHashtable
+    }
+}
+
 function New-TestSkillSourcePin {
     param(
         [Parameter(Mandatory)][string] $SkillRoot,

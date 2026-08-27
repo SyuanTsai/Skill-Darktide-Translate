@@ -52,6 +52,7 @@ Describe 'Darktide Translate repository contract' {
             '.agents/skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1',
+            '.agents/skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1',
             '.agents/skills/auto-update-darktide-mod/scripts/LuaLocalizationScanner.psm1',
             '.agents/skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1',
@@ -71,12 +72,12 @@ Describe 'Darktide Translate repository contract' {
             Test-Path -LiteralPath (Join-Path $repoRoot $path) | Should -Be $true
         }
 
-        $skillRoot = Join-Path $repoRoot '.agents/skills'
         $actualSkillDirectories = @(
-            Get-ChildItem -LiteralPath $skillRoot -Directory |
-                Select-Object -ExpandProperty Name |
-                Sort-Object
+            & git -C $repoRoot ls-files -- '.agents/skills/*' |
+                ForEach-Object { (([string]$_).Replace('\', '/') -split '/')[2] } |
+                Sort-Object -Unique
         )
+        $LASTEXITCODE | Should -Be 0
         ($actualSkillDirectories -join "`n") | Should -Be 'auto-update-darktide-mod'
     }
 

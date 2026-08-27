@@ -9,6 +9,7 @@ param(
     [string] $RepositoryRoot,
     [string] $ExpectedBaseOid,
     [string] $ExpectedModRelativePath,
+    [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
 
@@ -17,9 +18,62 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 
+function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
+
+function Copy-StreamWithHeartbeat {
+    param([IO.Stream] $Source, [IO.Stream] $Destination)
+    Invoke-Heartbeat
+    $buffer = [byte[]]::new(1MB)
+    while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $Destination.Write($buffer, 0, $readCount); Invoke-Heartbeat
+    }
+}
+
+function Read-FileBytesWithHeartbeat {
+    param([string] $Path)
+    $source = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $memory = [IO.MemoryStream]::new()
+    try { Copy-StreamWithHeartbeat -Source $source -Destination $memory; $memory.ToArray() }
+    finally { $memory.Dispose(); $source.Dispose() }
+}
+
 function Get-Sha256Bytes {
     param([byte[]] $Bytes)
-    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+    Invoke-Heartbeat
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        for ($offset = 0; $offset -lt $Bytes.Length; $offset += 1MB) {
+            $count = [Math]::Min(1MB, $Bytes.Length - $offset)
+            $hasher.AppendData($Bytes, $offset, $count)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
+}
+
+function Write-ByteRangeWithHeartbeat {
+    param([IO.Stream] $Destination, [byte[]] $Bytes, [int64] $Offset, [int64] $Count)
+    for ($written = [int64]0; $written -lt $Count; $written += 1MB) {
+        $chunk = [int][Math]::Min([int64]1MB, $Count - $written)
+        $Destination.Write($Bytes, [int]($Offset + $written), $chunk)
+        Invoke-Heartbeat
+    }
+}
+
+function Copy-ByteRangeWithHeartbeat {
+    param(
+        [byte[]] $Source,
+        [int64] $SourceOffset,
+        [byte[]] $Destination,
+        [int64] $DestinationOffset,
+        [int64] $Count
+    )
+    for ($copied = [int64]0; $copied -lt $Count; $copied += 1MB) {
+        $chunk = [int64][Math]::Min([int64]1MB, $Count - $copied)
+        [Array]::Copy($Source, $SourceOffset + $copied, $Destination, $DestinationOffset + $copied, $chunk)
+        Invoke-Heartbeat
+    }
 }
 
 function Assert-RegularFile {
@@ -102,10 +156,20 @@ function Get-GitBlobBytes {
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git for independent OLD localization verification.' }
     $memory = [IO.MemoryStream]::new()
-    $process.StandardOutput.BaseStream.CopyTo($memory)
-    $errorText = $process.StandardError.ReadToEnd(); $process.WaitForExit()
-    if ($process.ExitCode -ne 0) { throw "Unable to read immutable OLD localization blob: $errorText" }
-    $memory.ToArray()
+    try {
+        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
+            if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
+            else { [Threading.Tasks.Task]::Delay(50).Wait() }
+            Invoke-Heartbeat
+        }
+        $null = $copyTask.GetAwaiter().GetResult()
+        $errorText = $errorTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw "Unable to read immutable OLD localization blob: $errorText" }
+        $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $process.Dispose() }
 }
 
 function Get-ExpressionSnapshot {
@@ -170,7 +234,7 @@ function Test-SafeLuaExpression {
     if ([string]::IsNullOrWhiteSpace($Expression)) { throw 'Approved zh-tw expression cannot be empty.' }
     $trimmed = $Expression.Trim()
     $wrapper = "return { unit = { en = $trimmed } }"
-    $document = Get-LuaLocalizationDocument -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes($wrapper)) -DisplayPath '<approved-expression>' -SourceId 'expression-check'
+    $document = Get-LuaLocalizationDocument -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes($wrapper)) -DisplayPath '<approved-expression>' -SourceId 'expression-check' -HeartbeatAction $HeartbeatAction
     if (@($document.units).Count -ne 1 -or $document.units[0].sourceExpression.raw -cne $trimmed) {
         throw 'Approved zh-tw expression escapes a single Lua field value.'
     }
@@ -199,7 +263,10 @@ function Get-RemovalEdits {
         return @($edits)
     }
     $cursor = $fieldStart - 1
-    while ($cursor -ge 0 -and $Bytes[$cursor] -in @(9, 10, 13, 32)) { $cursor-- }
+    while ($cursor -ge 0 -and $Bytes[$cursor] -in @(9, 10, 13, 32)) {
+        if (($cursor -band 0xFFFFF) -eq 0) { Invoke-Heartbeat }
+        $cursor--
+    }
     if ($cursor -ge 0 -and $Bytes[$cursor] -in @(44, 59)) {
         $edits.Add((New-Edit -Start $cursor -Length 1 -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE_SEPARATOR'))
     }
@@ -214,12 +281,16 @@ function Get-InsertionEdit {
     $tableOpen = [int64]$Unit.tableOpenByte
     $multiline = $false
     for ($index = $tableOpen; $index -lt $tableClose; $index++) {
+        if (($index -band 0xFFFFF) -eq 0) { Invoke-Heartbeat }
         if ($Bytes[$index] -eq 10) { $multiline = $true; break }
     }
     if ($multiline) {
         $sourceStart = [int64]$Unit.sourceExpression.fieldStartByte
         $lineStart = $sourceStart - 1
-        while ($lineStart -ge 0 -and $Bytes[$lineStart] -ne 10) { $lineStart-- }
+        while ($lineStart -ge 0 -and $Bytes[$lineStart] -ne 10) {
+            if (($lineStart -band 0xFFFFF) -eq 0) { Invoke-Heartbeat }
+            $lineStart--
+        }
         $indentLength = $sourceStart - ($lineStart + 1)
         $indent = if ($indentLength -gt 0) { [Text.Encoding]::UTF8.GetString($Bytes, $lineStart + 1, $indentLength) } else { '' }
         if ($indent -notmatch '^[\t ]*$') { throw 'Unable to derive safe localization field indentation.' }
@@ -243,12 +314,18 @@ function Invoke-ByteEdits {
             throw 'Localization workset edits overlap or escape NEW bytes.'
         }
         $memory = [IO.MemoryStream]::new()
-        if ($start -gt 0) { $memory.Write($result, 0, $start) }
-        $replacement = [byte[]]$edit.replacement
-        if ($replacement.Length -gt 0) { $memory.Write($replacement, 0, $replacement.Length) }
-        $tailStart = $start + $length
-        if ($tailStart -lt $result.LongLength) { $memory.Write($result, $tailStart, $result.LongLength - $tailStart) }
-        $result = $memory.ToArray()
+        try {
+            if ($start -gt 0) { Write-ByteRangeWithHeartbeat -Destination $memory -Bytes $result -Offset 0 -Count $start }
+            $replacement = [byte[]]$edit.replacement
+            if ($replacement.Length -gt 0) { Write-ByteRangeWithHeartbeat -Destination $memory -Bytes $replacement -Offset 0 -Count $replacement.Length }
+            $tailStart = $start + $length
+            if ($tailStart -lt $result.LongLength) {
+                Write-ByteRangeWithHeartbeat -Destination $memory -Bytes $result -Offset $tailStart -Count ($result.LongLength - $tailStart)
+            }
+            $updated = $memory.ToArray()
+        }
+        finally { $memory.Dispose() }
+        $result = $updated
         $previousStart = $start
     }
     $result
@@ -313,20 +390,20 @@ if (($applyKeys -join ',') -cne 'edits,inputSha256,outputSha256,outputSize,revie
     throw 'Localization workset apply receipt fields are malformed.'
 }
 
-$newBytes = [IO.File]::ReadAllBytes($newFull)
-$mergedBytes = [IO.File]::ReadAllBytes($mergedFull)
+$newBytes = Read-FileBytesWithHeartbeat -Path $newFull
+$mergedBytes = Read-FileBytesWithHeartbeat -Path $mergedFull
 if ((Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.new.sha256 -or
     (Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.apply.inputSha256) {
     throw 'Raw NEW localization evidence differs from the workset input.'
 }
-$before = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newFull -SourceId ([string]$workset.sourceId)
+$before = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newFull -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
 $beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
 $oldDocument = $null
 $oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 if ($bindingValueCount -eq 3) {
     $oldBytes = Get-GitBlobBytes -WorkingDirectory $repositoryFull -Object "$ExpectedBaseOid`:$([string]$workset.old.path)"
-    $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath ([string]$workset.old.path) -SourceId ([string]$workset.sourceId)
+    $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath ([string]$workset.old.path) -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
     if ((Get-Sha256Bytes -Bytes $oldBytes) -cne [string]$workset.old.sha256 -or
         $oldBytes.LongLength -ne [int64]$workset.old.size -or [bool]$oldDocument.bom -ne [bool]$workset.old.bom -or
         [string]$oldDocument.newline -cne [string]$workset.old.newline) {
@@ -427,8 +504,12 @@ foreach ($unit in @($workset.units)) {
 }
 
 $expectedReceiptEdits = @($expectedEdits | ForEach-Object {
+    Invoke-Heartbeat
     $oldBytes = [byte[]]::new([int64]$_.lengthByte)
-    if ($oldBytes.Length -gt 0) { [Array]::Copy($newBytes, [int64]$_.startByte, $oldBytes, 0, $oldBytes.Length) }
+    if ($oldBytes.Length -gt 0) {
+        Copy-ByteRangeWithHeartbeat -Source $newBytes -SourceOffset ([int64]$_.startByte) `
+            -Destination $oldBytes -DestinationOffset 0 -Count $oldBytes.Length
+    }
     [ordered]@{
         unitId = [string]$_.unitId
         operation = [string]$_.operation
@@ -442,6 +523,7 @@ $expectedReceiptEdits = @($expectedEdits | ForEach-Object {
 $actualReceiptEdits = @($workset.apply.edits)
 if ($actualReceiptEdits.Count -ne $expectedReceiptEdits.Count) { throw 'Localization apply receipt differs from the deterministic edit plan.' }
 for ($index = 0; $index -lt $expectedReceiptEdits.Count; $index++) {
+    if (($index -band 0x3FF) -eq 0) { Invoke-Heartbeat }
     $actual = $actualReceiptEdits[$index]
     $expected = $expectedReceiptEdits[$index]
     $actualKeys = @($actual.Keys | Sort-Object)

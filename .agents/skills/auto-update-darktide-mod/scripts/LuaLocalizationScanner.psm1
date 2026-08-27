@@ -1,5 +1,63 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:luaScannerHeartbeatAction = $null
+$script:luaScannerHeartbeatProgress = 0
+
+function Invoke-LuaScannerHeartbeat {
+    if ($script:luaScannerHeartbeatAction) { $null = & $script:luaScannerHeartbeatAction }
+}
+
+function Invoke-LuaScannerProgressHeartbeat {
+    $script:luaScannerHeartbeatProgress++
+    if (($script:luaScannerHeartbeatProgress -band 0x3FFF) -eq 0) { Invoke-LuaScannerHeartbeat }
+}
+
+function Find-LuaDelimiterIndex {
+    param(
+        [Parameter(Mandatory)][string] $Text,
+        [Parameter(Mandatory)][string] $Delimiter,
+        [Parameter(Mandatory)][int] $StartIndex
+    )
+    if ($Delimiter.Length -eq 0) { throw 'Lua delimiter must not be empty.' }
+    $cursor = $StartIndex
+    while ($cursor -le ($Text.Length - $Delimiter.Length)) {
+        $count = [Math]::Min((1MB + $Delimiter.Length - 1), $Text.Length - $cursor)
+        $found = $Text.IndexOf($Delimiter, $cursor, $count, [StringComparison]::Ordinal)
+        if ($found -ge 0) { return $found }
+        $cursor += 1MB
+        Invoke-LuaScannerHeartbeat
+    }
+    -1
+}
+
+function Read-LuaScannerFileBytes {
+    param([Parameter(Mandatory)][string] $Path)
+    $source = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $memory = [IO.MemoryStream]::new()
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $memory.Write($buffer, 0, $readCount)
+            Invoke-LuaScannerHeartbeat
+        }
+        $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $source.Dispose() }
+}
+
+function Get-LuaScannerSha256 {
+    param([Parameter(Mandatory)][byte[]] $Bytes)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        for ($offset = 0; $offset -lt $Bytes.Length; $offset += 1MB) {
+            $count = [Math]::Min(1MB, $Bytes.Length - $offset)
+            $hasher.AppendData($Bytes, $offset, $count)
+            Invoke-LuaScannerHeartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
+}
 
 function Add-LuaToken {
     param(
@@ -14,20 +72,23 @@ function Add-LuaToken {
 function Get-LuaTokens {
     param([Parameter(Mandatory)][string] $Text)
     $tokens = [Collections.Generic.List[object]]::new()
+    $longCommentPattern = [regex]::new('\G--\[(=*)\[')
+    $longStringPattern = [regex]::new('\G\[(=*)\[')
     $index = 0
     while ($index -lt $Text.Length) {
+        Invoke-LuaScannerProgressHeartbeat
         $character = $Text[$index]
         if ([char]::IsWhiteSpace($character)) { $index++; continue }
 
         if ($character -eq '-' -and ($index + 1) -lt $Text.Length -and $Text[$index + 1] -eq '-') {
-            $longComment = [regex]::Match($Text.Substring($index), '^--\[(=*)\[')
+            $longComment = $longCommentPattern.Match($Text, $index)
             if ($longComment.Success) {
                 $closing = ']' + $longComment.Groups[1].Value + ']'
-                $closingIndex = $Text.IndexOf($closing, $index + $longComment.Length, [StringComparison]::Ordinal)
+                $closingIndex = Find-LuaDelimiterIndex -Text $Text -Delimiter $closing -StartIndex ($index + $longComment.Length)
                 $index = if ($closingIndex -lt 0) { $Text.Length } else { $closingIndex + $closing.Length }
             }
             else {
-                $lineEnd = $Text.IndexOf("`n", $index, [StringComparison]::Ordinal)
+                $lineEnd = Find-LuaDelimiterIndex -Text $Text -Delimiter "`n" -StartIndex $index
                 $index = if ($lineEnd -lt 0) { $Text.Length } else { $lineEnd + 1 }
             }
             continue
@@ -39,6 +100,7 @@ function Get-LuaTokens {
             $index++
             $closed = $false
             while ($index -lt $Text.Length) {
+                Invoke-LuaScannerProgressHeartbeat
                 if ($Text[$index] -eq '\') {
                     $index += [Math]::Min(2, $Text.Length - $index)
                     continue
@@ -56,11 +118,11 @@ function Get-LuaTokens {
         }
 
         if ($character -eq '[') {
-            $longString = [regex]::Match($Text.Substring($index), '^\[(=*)\[')
+            $longString = $longStringPattern.Match($Text, $index)
             if ($longString.Success) {
                 $start = $index
                 $closing = ']' + $longString.Groups[1].Value + ']'
-                $closingIndex = $Text.IndexOf($closing, $index + $longString.Length, [StringComparison]::Ordinal)
+                $closingIndex = Find-LuaDelimiterIndex -Text $Text -Delimiter $closing -StartIndex ($index + $longString.Length)
                 if ($closingIndex -lt 0) { throw "Unterminated Lua long string at character $start." }
                 $index = $closingIndex + $closing.Length
                 Add-LuaToken -Tokens $tokens -Type 'string' -Text $Text.Substring($start, $index - $start) -Start $start
@@ -71,7 +133,10 @@ function Get-LuaTokens {
         if ([char]::IsLetter($character) -or $character -eq '_') {
             $start = $index
             $index++
-            while ($index -lt $Text.Length -and ([char]::IsLetterOrDigit($Text[$index]) -or $Text[$index] -eq '_')) { $index++ }
+            while ($index -lt $Text.Length -and ([char]::IsLetterOrDigit($Text[$index]) -or $Text[$index] -eq '_')) {
+                Invoke-LuaScannerProgressHeartbeat
+                $index++
+            }
             Add-LuaToken -Tokens $tokens -Type 'identifier' -Text $Text.Substring($start, $index - $start) -Start $start
             continue
         }
@@ -79,7 +144,10 @@ function Get-LuaTokens {
         if ([char]::IsDigit($character)) {
             $start = $index
             $index++
-            while ($index -lt $Text.Length -and ($Text[$index] -match '[A-Za-z0-9._]')) { $index++ }
+            while ($index -lt $Text.Length -and ($Text[$index] -match '[A-Za-z0-9._]')) {
+                Invoke-LuaScannerProgressHeartbeat
+                $index++
+            }
             Add-LuaToken -Tokens $tokens -Type 'number' -Text $Text.Substring($start, $index - $start) -Start $start
             continue
         }
@@ -101,6 +169,7 @@ function Get-IoDofileLoaderCallCount {
     param([object[]] $Tokens)
     $count = 0
     for ($index = 0; $index -le ($Tokens.Count - 4); $index++) {
+        Invoke-LuaScannerProgressHeartbeat
         if ($Tokens[$index].type -ceq 'identifier' -and $Tokens[$index].text -ceq 'mod' -and
             $Tokens[$index + 1].text -ceq ':' -and
             $Tokens[$index + 2].type -ceq 'identifier' -and $Tokens[$index + 2].text -ceq 'io_dofile' -and
@@ -133,6 +202,7 @@ function Test-IoDofileOnlyLoaderTokens {
         $Tokens[$index + 3].text -ceq '(' -and
         $Tokens[$index + 4].type -ceq 'string' -and
         $Tokens[$index + 5].text -ceq ')') {
+        Invoke-LuaScannerProgressHeartbeat
         $callCount++
         $index += 6
         if ($index -lt $Tokens.Count -and $Tokens[$index].text -ceq ';') { $index++ }
@@ -165,6 +235,7 @@ function ConvertFrom-LuaKeyString {
     $encoding = [Text.UTF8Encoding]::new($false, $true)
     $bytes = [Collections.Generic.List[byte]]::new()
     for ($index = 0; $index -lt $content.Length; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
         if ($content[$index] -ne '\') {
             $characterLength = if ([char]::IsHighSurrogate($content[$index]) -and ($index + 1) -lt $content.Length -and
                 [char]::IsLowSurrogate($content[$index + 1])) { 2 } else { 1 }
@@ -202,7 +273,10 @@ function ConvertFrom-LuaKeyString {
                 $bytes.Add(10)
             }
             'z' {
-                while (($index + 1) -lt $content.Length -and [char]::IsWhiteSpace($content[$index + 1])) { $index++ }
+                while (($index + 1) -lt $content.Length -and [char]::IsWhiteSpace($content[$index + 1])) {
+                    $index++
+                    Invoke-LuaScannerProgressHeartbeat
+                }
             }
             'x' {
                 if (($index + 2) -ge $content.Length -or $content.Substring($index + 1, 2) -notmatch '^[0-9A-Fa-f]{2}$') {
@@ -212,14 +286,25 @@ function ConvertFrom-LuaKeyString {
                 $index += 2
             }
             'u' {
-                $unicode = [regex]::Match($content.Substring($index), '^u\{([0-9A-Fa-f]+)\}')
-                if (-not $unicode.Success) { throw 'Lua Unicode key escape is malformed.' }
-                $codePoint = [Convert]::ToInt32($unicode.Groups[1].Value, 16)
+                if (($index + 2) -ge $content.Length -or $content[$index + 1] -cne '{') {
+                    throw 'Lua Unicode key escape is malformed.'
+                }
+                $unicodeStart = $index + 2
+                $unicodeEnd = $unicodeStart
+                while ($unicodeEnd -lt $content.Length -and $content[$unicodeEnd] -match '[0-9A-Fa-f]') {
+                    Invoke-LuaScannerProgressHeartbeat
+                    $unicodeEnd++
+                }
+                if ($unicodeEnd -eq $unicodeStart -or $unicodeEnd -ge $content.Length -or $content[$unicodeEnd] -cne '}') {
+                    throw 'Lua Unicode key escape is malformed.'
+                }
+                try { $codePoint = [Convert]::ToInt32($content.Substring($unicodeStart, $unicodeEnd - $unicodeStart), 16) }
+                catch { throw 'Lua Unicode key escape is outside the valid scalar range.' }
                 if ($codePoint -gt 0x10FFFF -or ($codePoint -ge 0xD800 -and $codePoint -le 0xDFFF)) {
                     throw 'Lua Unicode key escape is outside the valid scalar range.'
                 }
                 $bytes.AddRange($encoding.GetBytes([char]::ConvertFromUtf32($codePoint)))
-                $index += $unicode.Length - 1
+                $index = $unicodeEnd
             }
             default { throw "Unsupported Lua key string escape: \$escaped" }
         }
@@ -231,13 +316,19 @@ function ConvertFrom-LuaKeyString {
 function Get-CanonicalTokenText {
     param([object[]] $Tokens, [int] $StartIndex, [int] $EndIndex)
     if ($EndIndex -lt $StartIndex) { return '' }
-    (@($Tokens[$StartIndex..$EndIndex] | ForEach-Object { $_.text }) -join '')
+    $builder = [Text.StringBuilder]::new()
+    for ($index = $StartIndex; $index -le $EndIndex; $index++) {
+        $null = $builder.Append([string]$Tokens[$index].text)
+        Invoke-LuaScannerProgressHeartbeat
+    }
+    $builder.ToString()
 }
 
 function Get-MatchingTokenIndex {
     param([object[]] $Tokens, [int] $StartIndex, [string] $Open, [string] $Close)
     $depth = 0
     for ($index = $StartIndex; $index -lt $Tokens.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
         if ($Tokens[$index].text -ceq $Open) { $depth++ }
         elseif ($Tokens[$index].text -ceq $Close) {
             $depth--
@@ -261,9 +352,32 @@ function Get-LuaKey {
     $null
 }
 
+function Get-LuaUtf8ByteCount {
+    param([string] $Text, [int] $StartIndex, [int] $CharacterCount)
+    if ($StartIndex -lt 0 -or $CharacterCount -lt 0 -or ($StartIndex + $CharacterCount) -gt $Text.Length) {
+        throw 'Lua UTF-8 byte-count range escapes the source text.'
+    }
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $total = [int64]0
+    $offset = $StartIndex
+    $remaining = $CharacterCount
+    while ($remaining -gt 0) {
+        $count = [Math]::Min(1MB, $remaining)
+        if ($count -lt $remaining -and [char]::IsHighSurrogate($Text[$offset + $count - 1]) -and
+            [char]::IsLowSurrogate($Text[$offset + $count])) {
+            $count--
+        }
+        $total += $encoding.GetByteCount($Text, $offset, $count)
+        $offset += $count
+        $remaining -= $count
+        Invoke-LuaScannerHeartbeat
+    }
+    $total
+}
+
 function ConvertTo-Utf8ByteOffset {
     param([string] $Text, [int] $CharacterIndex, [int] $BomLength)
-    $BomLength + [Text.UTF8Encoding]::new($false, $true).GetByteCount($Text.Substring(0, $CharacterIndex))
+    $BomLength + (Get-LuaUtf8ByteCount -Text $Text -StartIndex 0 -CharacterCount $CharacterIndex)
 }
 
 function New-ExpressionRecord {
@@ -283,16 +397,16 @@ function New-ExpressionRecord {
     if ($null -ne $Field.separatorIndex) {
         $separatorToken = $Tokens[[int]$Field.separatorIndex]
         $separatorStart = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex ([int]$separatorToken.start) -BomLength $BomLength
-        $separatorLength = [Text.UTF8Encoding]::new($false, $true).GetByteCount([string]$separatorToken.text)
+        $separatorLength = Get-LuaUtf8ByteCount -Text ([string]$separatorToken.text) -StartIndex 0 -CharacterCount ([int]$separatorToken.length)
         $fieldEnd = [int]$separatorToken.start + [int]$separatorToken.length
     }
     [ordered]@{
         raw = $Text.Substring($valueStart, $valueEnd - $valueStart)
         canonical = Get-CanonicalTokenText -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
         startByte = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex $valueStart -BomLength $BomLength
-        lengthByte = [Text.UTF8Encoding]::new($false, $true).GetByteCount($Text.Substring($valueStart, $valueEnd - $valueStart))
+        lengthByte = Get-LuaUtf8ByteCount -Text $Text -StartIndex $valueStart -CharacterCount ($valueEnd - $valueStart)
         fieldStartByte = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex $fieldStart -BomLength $BomLength
-        fieldLengthByte = [Text.UTF8Encoding]::new($false, $true).GetByteCount($Text.Substring($fieldStart, $fieldEnd - $fieldStart))
+        fieldLengthByte = Get-LuaUtf8ByteCount -Text $Text -StartIndex $fieldStart -CharacterCount ($fieldEnd - $fieldStart)
         separatorStartByte = $separatorStart
         separatorLengthByte = $separatorLength
     }
@@ -319,7 +433,11 @@ function Read-LuaTable {
     $fields = [Collections.Generic.List[object]]::new()
     $position = $OpenIndex + 1
     while ($position -lt $closeIndex) {
-        while ($position -lt $closeIndex -and $Tokens[$position].text -in @(',', ';')) { $position++ }
+        Invoke-LuaScannerProgressHeartbeat
+        while ($position -lt $closeIndex -and $Tokens[$position].text -in @(',', ';')) {
+            $position++
+            Invoke-LuaScannerProgressHeartbeat
+        }
         if ($position -ge $closeIndex) { break }
         $fieldStart = $position
         $keyEnd = $position
@@ -344,6 +462,7 @@ function Read-LuaTable {
         $valueEnd = $valueStart - 1
         $separatorIndex = $null
         for ($cursor = $valueStart; $cursor -le $closeIndex; $cursor++) {
+            Invoke-LuaScannerProgressHeartbeat
             $token = [string]$Tokens[$cursor].text
             if ($cursor -eq $closeIndex -and $braceDepth -eq 0 -and $parenDepth -eq 0 -and $bracketDepth -eq 0 -and $blockDepth -eq 0) { break }
             if ($token -in @(',', ';') -and $braceDepth -eq 0 -and $parenDepth -eq 0 -and $bracketDepth -eq 0 -and $blockDepth -eq 0) {
@@ -415,61 +534,93 @@ function Get-LuaLocalizationDocument {
         [Parameter(Mandatory, ParameterSetName = 'Path')][string] $Path,
         [Parameter(Mandatory, ParameterSetName = 'Bytes')][byte[]] $Bytes,
         [Parameter(ParameterSetName = 'Bytes')][string] $DisplayPath = '<memory>',
-        [Parameter(Mandatory)][string] $SourceId
+        [Parameter(Mandatory)][string] $SourceId,
+        [scriptblock] $HeartbeatAction
     )
-    $fullPath = if ($PSCmdlet.ParameterSetName -eq 'Path') { [IO.Path]::GetFullPath($Path) } else { $DisplayPath }
-    if ($PSCmdlet.ParameterSetName -eq 'Path') {
-        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw 'Lua localization source does not exist.' }
-        $Bytes = [IO.File]::ReadAllBytes($fullPath)
-    }
-    $bytes = $Bytes
-    $bomLength = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
-    $encoding = [Text.UTF8Encoding]::new($false, $true)
-    try { $text = $encoding.GetString($bytes, $bomLength, $bytes.Length - $bomLength) }
-    catch { throw 'Lua localization source must be valid UTF-8.' }
-    $tokens = @(Get-LuaTokens -Text $text)
-    $units = [Collections.Generic.List[object]]::new()
-    $position = 0
-    while ($position -lt $tokens.Count) {
-        if ($tokens[$position].text -ceq '{') {
-            $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength
+    $previousHeartbeatAction = $script:luaScannerHeartbeatAction
+    $previousHeartbeatProgress = $script:luaScannerHeartbeatProgress
+    $script:luaScannerHeartbeatAction = $HeartbeatAction
+    $script:luaScannerHeartbeatProgress = 0
+    try {
+        Invoke-LuaScannerHeartbeat
+        $fullPath = if ($PSCmdlet.ParameterSetName -eq 'Path') { [IO.Path]::GetFullPath($Path) } else { $DisplayPath }
+        if ($PSCmdlet.ParameterSetName -eq 'Path') {
+            if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw 'Lua localization source does not exist.' }
+            $Bytes = Read-LuaScannerFileBytes -Path $fullPath
         }
-        $position++
-    }
+        $bytes = $Bytes
+        $bomLength = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
+        $encoding = [Text.UTF8Encoding]::new($false, $true)
+        try { $text = $encoding.GetString($bytes, $bomLength, $bytes.Length - $bomLength) }
+        catch { throw 'Lua localization source must be valid UTF-8.' }
+        Invoke-LuaScannerHeartbeat
+        $tokens = @(Get-LuaTokens -Text $text)
+        $units = [Collections.Generic.List[object]]::new()
+        $position = 0
+        while ($position -lt $tokens.Count) {
+            Invoke-LuaScannerProgressHeartbeat
+            if ($tokens[$position].text -ceq '{') {
+                $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength
+            }
+            $position++
+        }
 
-    $occurrences = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
-    $numbered = foreach ($unit in $units) {
-        $identityBase = "$($unit.sourceId) :: $($unit.containerPath) :: $($unit.key)"
-        if (-not $occurrences.ContainsKey($identityBase)) { $occurrences[$identityBase] = 0 }
-        $occurrences[$identityBase]++
+        $occurrences = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
+        $unitIndex = 0
+        $numbered = foreach ($unit in $units) {
+            Invoke-LuaScannerProgressHeartbeat
+            $unitIndex++
+            $identityBase = "$($unit.sourceId) :: $($unit.containerPath) :: $($unit.key)"
+            if (-not $occurrences.ContainsKey($identityBase)) { $occurrences[$identityBase] = 0 }
+            $occurrences[$identityBase]++
+            [ordered]@{
+                sourceId = $unit.sourceId
+                containerPath = $unit.containerPath
+                key = $unit.key
+                occurrence = $occurrences[$identityBase]
+                unitId = "$identityBase :: $($occurrences[$identityBase])"
+                blockedReason = $unit.blockedReason
+                sourceExpression = $unit.sourceExpression
+                zhTwExpression = $unit.zhTwExpression
+                tableOpenByte = $unit.tableOpenByte
+                tableCloseByte = $unit.tableCloseByte
+            }
+        }
+        $hasCrlf = $false
+        $hasLf = $false
+        $hasBareCr = $false
+        for ($newlineIndex = 0; $newlineIndex -lt $text.Length; $newlineIndex++) {
+            Invoke-LuaScannerProgressHeartbeat
+            if ($text[$newlineIndex] -eq "`r") {
+                if (($newlineIndex + 1) -lt $text.Length -and $text[$newlineIndex + 1] -eq "`n") {
+                    $hasCrlf = $true
+                    $newlineIndex++
+                }
+                else { $hasBareCr = $true }
+            }
+            elseif ($text[$newlineIndex] -eq "`n") { $hasLf = $true }
+        }
+        $newline = if ($hasCrlf -and ($hasLf -or $hasBareCr)) { 'mixed' }
+            elseif ($hasCrlf) { 'crlf' }
+            elseif ($hasBareCr) { 'mixed' }
+            else { 'lf' }
+        Invoke-LuaScannerHeartbeat
         [ordered]@{
-            sourceId = $unit.sourceId
-            containerPath = $unit.containerPath
-            key = $unit.key
-            occurrence = $occurrences[$identityBase]
-            unitId = "$identityBase :: $($occurrences[$identityBase])"
-            blockedReason = $unit.blockedReason
-            sourceExpression = $unit.sourceExpression
-            zhTwExpression = $unit.zhTwExpression
-            tableOpenByte = $unit.tableOpenByte
-            tableCloseByte = $unit.tableCloseByte
+            schemaVersion = 1
+            sourceId = $SourceId
+            path = $fullPath
+            sha256 = Get-LuaScannerSha256 -Bytes $bytes
+            size = $bytes.LongLength
+            bom = $bomLength -eq 3
+            newline = $newline
+            ioDofileLoaderCallCount = Get-IoDofileLoaderCallCount -Tokens $tokens
+            isIoDofileOnlyLoader = Test-IoDofileOnlyLoaderTokens -Tokens $tokens
+            units = @($numbered)
         }
     }
-    $withoutCrlf = $text.Replace("`r`n", '')
-    $hasCrlf = $withoutCrlf.Length -ne $text.Length
-    $hasOtherLineBreak = $withoutCrlf.Contains("`n", [StringComparison]::Ordinal) -or $withoutCrlf.Contains("`r", [StringComparison]::Ordinal)
-    $newline = if ($hasCrlf -and $hasOtherLineBreak) { 'mixed' } elseif ($hasCrlf) { 'crlf' } elseif ($hasOtherLineBreak -and $withoutCrlf.Contains("`r", [StringComparison]::Ordinal)) { 'mixed' } else { 'lf' }
-    [ordered]@{
-        schemaVersion = 1
-        sourceId = $SourceId
-        path = $fullPath
-        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
-        size = $bytes.LongLength
-        bom = $bomLength -eq 3
-        newline = $newline
-        ioDofileLoaderCallCount = Get-IoDofileLoaderCallCount -Tokens $tokens
-        isIoDofileOnlyLoader = Test-IoDofileOnlyLoaderTokens -Tokens $tokens
-        units = @($numbered)
+    finally {
+        $script:luaScannerHeartbeatAction = $previousHeartbeatAction
+        $script:luaScannerHeartbeatProgress = $previousHeartbeatProgress
     }
 }
 

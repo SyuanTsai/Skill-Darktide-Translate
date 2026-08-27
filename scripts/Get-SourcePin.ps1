@@ -30,9 +30,14 @@ function Invoke-GitBytes {
     if (-not $process.Start()) { throw 'Unable to start Git for source-pin blob hashing.' }
     $memory = [IO.MemoryStream]::new()
     try {
-        $process.StandardOutput.BaseStream.CopyTo($memory)
-        $errorText = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
+        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
+            if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
+            else { [Threading.Tasks.Task]::Delay(50).Wait() }
+        }
+        $null = $copyTask.GetAwaiter().GetResult()
+        $errorText = $errorTask.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) { throw "git $($Arguments -join ' ') failed: $errorText" }
         $memory.ToArray()
     }
