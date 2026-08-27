@@ -81,6 +81,24 @@ Describe 'Darktide Translate repository contract' {
         ($actualSkillDirectories -join "`n") | Should -Be 'auto-update-darktide-mod'
     }
 
+    # Scenario: Windows Git checkout applies core.autocrlf while immutable Skill bytes are verified exactly.
+    # Purpose: Ensure Lua source is checked out as LF so git mode and archive/download mode produce identical package bytes.
+    It 'UnitT22_PreservesLuaBytesAcrossWindowsCheckout' {
+        $attributesPath = Join-Path $repoRoot '.gitattributes'
+        Test-Path -LiteralPath $attributesPath | Should -Be $true
+        $attributes = Get-Content -LiteralPath $attributesPath -Raw
+        $attributes | Should -Match '(?m)^\*\.lua text eol=lf$'
+
+        $luaPaths = @(& git -C $repoRoot ls-files -- '*.lua')
+        $LASTEXITCODE | Should -Be 0
+        $luaPaths.Count | Should -BeGreaterThan 0
+        foreach ($luaPath in $luaPaths) {
+            $attribute = & git -C $repoRoot check-attr eol -- $luaPath
+            $LASTEXITCODE | Should -Be 0
+            $attribute | Should -Match ': eol: lf$'
+        }
+    }
+
     # Scenario: The independent source remains intentionally outside AI-Instructions fan-out.
     # Purpose: Prevent the Darktide Skill from being reintroduced into an unrelated consumer Catalog or bootstrap contract.
     It 'UnitT25_RemainsAnIndependentRepositorySource' {
