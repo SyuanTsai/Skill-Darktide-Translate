@@ -694,6 +694,10 @@ function Enter-SharedCoordinationLock {
     $lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey $ResourceKey `
         -RunId $ActualRunId -ReceiptRoot $ReceiptRoot -WaitHeartbeatAction { Update-ActiveReservationHeartbeat } `
         -TimeoutSeconds $TimeoutSeconds
+    if ($script:activeStageContext -and $lease.Contains('waitingMilliseconds')) {
+        $null = Add-StageWait -Context $script:activeStageContext -Reason 'coordination' `
+            -Milliseconds ([int64]$lease.waitingMilliseconds)
+    }
     $script:activeSharedCoordinationLease = $lease
     $lease
 }
@@ -1040,11 +1044,46 @@ function New-GitTreeManifest {
 }
 
 function Start-Stage {
-    param([string] $Name)
-    [ordered]@{
+    param(
+        [string] $Name,
+        [scriptblock] $MonotonicClock = { [Environment]::TickCount64 }
+    )
+    $context = [ordered]@{
         name = $Name
         startedAt = Get-UtcTimestamp
-        stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        monotonicClock = $MonotonicClock
+        startedMonotonicMilliseconds = [int64](& $MonotonicClock)
+        stabilityObservationMilliseconds = [int64]0
+        coordinationWaitMilliseconds = [int64]0
+    }
+    $script:activeStageContext = $context
+    $context
+}
+
+function Add-StageWait {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $Context,
+        [Parameter(Mandatory)][ValidateSet('stability-observation', 'coordination')][string] $Reason,
+        [Parameter(Mandatory)][ValidateRange(0, [int64]::MaxValue)][int64] $Milliseconds
+    )
+    $field = if ($Reason -ceq 'stability-observation') { 'stabilityObservationMilliseconds' } else { 'coordinationWaitMilliseconds' }
+    $Context[$field] = [int64]$Context[$field] + $Milliseconds
+}
+
+function Get-StageTimingBreakdown {
+    param([Parameter(Mandatory)][Collections.IDictionary] $Context)
+    $wallClockMilliseconds = [int64](& $Context.monotonicClock) - [int64]$Context.startedMonotonicMilliseconds
+    if ($wallClockMilliseconds -lt 0) { throw 'Stage monotonic clock moved backwards.' }
+    $stabilityObservationMilliseconds = [int64]$Context.stabilityObservationMilliseconds
+    $coordinationWaitMilliseconds = [int64]$Context.coordinationWaitMilliseconds
+    $waitingMilliseconds = $stabilityObservationMilliseconds + $coordinationWaitMilliseconds
+    if ($waitingMilliseconds -gt $wallClockMilliseconds) { throw 'Classified stage waits exceed measured wall-clock time.' }
+    [ordered]@{
+        wallClockMilliseconds = $wallClockMilliseconds
+        activeMilliseconds = $wallClockMilliseconds - $waitingMilliseconds
+        waitingMilliseconds = $waitingMilliseconds
+        stabilityObservationMilliseconds = $stabilityObservationMilliseconds
+        coordinationWaitMilliseconds = $coordinationWaitMilliseconds
     }
 }
 
@@ -1055,22 +1094,26 @@ function Complete-Stage {
         [Parameter(Mandatory)][string] $ArtifactSha256,
         [Collections.IDictionary] $Data = @{}
     )
-    $Context.stopwatch.Stop()
     $name = [string]$Context.name
     if (-not $State.Contains('stageTimings')) { $State.stageTimings = [ordered]@{} }
     if (-not $State.Contains('completedStages')) { $State.completedStages = @() }
     $previousAttempt = if ($State.stageTimings.Contains($name)) { [int]$State.stageTimings[$name].attempt } else { 0 }
+    $breakdown = Get-StageTimingBreakdown -Context $Context
     $timing = [ordered]@{
         attempt = $previousAttempt + 1
         startedAt = $Context.startedAt
         completedAt = Get-UtcTimestamp
-        activeMilliseconds = $Context.stopwatch.ElapsedMilliseconds
-        waitingMilliseconds = 0
+        wallClockMilliseconds = $breakdown.wallClockMilliseconds
+        activeMilliseconds = $breakdown.activeMilliseconds
+        waitingMilliseconds = $breakdown.waitingMilliseconds
+        stabilityObservationMilliseconds = $breakdown.stabilityObservationMilliseconds
+        coordinationWaitMilliseconds = $breakdown.coordinationWaitMilliseconds
         result = 'passed'
         artifactSha256 = $ArtifactSha256
     }
     $State.stageTimings[$name] = $timing
     $State.completedStages = @($State.completedStages | Where-Object { $_ -ne $name }) + $name
+    if ($script:activeStageContext -eq $Context) { $script:activeStageContext = $null }
     Save-State -State $State
     [ordered]@{
         result = 'passed'
@@ -1099,6 +1142,10 @@ function Get-CompletedStageResult {
         if ($Name -in @('build-commits', 'validate', 'publish', 'review-snapshot')) {
             $head = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('rev-parse', 'HEAD')).output.Trim()
             if ($head -ne $State.evidenceChain.fOid) { throw "Completed stage $Name no longer points at immutable F." }
+        }
+        if ($Name -ceq 'localization' -and [string]$State.status -ceq 'installed') {
+            $State.status = 'localized'
+            Save-State -State $State
         }
         return [ordered]@{
             result = 'passed'
@@ -2043,9 +2090,16 @@ function Invoke-AcquireSource {
 }
 
 function Complete-IncompleteClaim {
-    param([Collections.IDictionary] $State)
+    param(
+        [Collections.IDictionary] $State,
+        [Collections.IDictionary] $Context
+    )
     Assert-LockOwner -State $State
-    $stage = Start-Stage -Name 'claim'
+    $stage = if ($Context) {
+        $script:activeStageContext = $Context
+        $Context
+    }
+    else { Start-Stage -Name 'claim' }
     $isRecovery = -not [string]::IsNullOrWhiteSpace([string]$State.claimAttemptedAt)
     $State.claimAttemptedAt = Get-UtcTimestamp
     Save-State -State $State
@@ -2150,6 +2204,7 @@ function Invoke-Claim {
         throw 'claim requires -ArchivePath, -ModDirectory, and a complete -SourceRequestPath Nexus Main file tuple.'
     }
     $repository = [IO.Path]::GetFullPath($RepositoryRoot)
+    $claimStage = Start-Stage -Name 'claim'
     $actualRunId = if ($RunId) { [guid]::Parse($RunId).ToString() } else { [guid]::NewGuid().ToString() }
     $plan = Get-ModRunPlan -Repository $repository -CanonicalModDirectory $ModDirectory -ActualRunId $actualRunId
     $queueRoot = [string]$plan.queueRoot
@@ -2281,9 +2336,16 @@ function Invoke-Claim {
             throw 'Source archive must be a regular file, not a reparse point.'
         }
         $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
-        for ($second = 0; $second -lt 10; $second++) {
-            [Threading.Thread]::Sleep(1000)
-            Update-ActiveReservationHeartbeat
+        $stabilityStartedMilliseconds = [int64](& $claimStage.monotonicClock)
+        try {
+            for ($second = 0; $second -lt 10; $second++) {
+                [Threading.Thread]::Sleep(1000)
+                Update-ActiveReservationHeartbeat
+            }
+        }
+        finally {
+            $stabilityMilliseconds = [int64](& $claimStage.monotonicClock) - $stabilityStartedMilliseconds
+            $null = Add-StageWait -Context $claimStage -Reason 'stability-observation' -Milliseconds $stabilityMilliseconds
         }
         $null = Assert-NoReparsePath -Path $sourceFull -Root $repository -Label 'Source archive'
         $sampleTwo = Get-Item -LiteralPath $sourceFull
@@ -2298,7 +2360,7 @@ function Invoke-Claim {
         Ensure-RunWriterLock -State $existing
         $completed = Get-CompletedStageResult -State $existing -Name 'claim'
         if ($completed) { return $completed }
-        return Complete-IncompleteClaim -State $existing
+        return Complete-IncompleteClaim -State $existing -Context $claimStage
     }
 
     $null = Assert-NoReparsePath -Path $sourceFull -Root $repository -Label 'Source archive'
@@ -2550,7 +2612,7 @@ function Invoke-Claim {
     }
     $state.coordinationReceipts = @($sourceCoordinationReceipt)
     Save-State -State $state
-    Complete-IncompleteClaim -State $state
+    Complete-IncompleteClaim -State $state -Context $claimStage
 }
 
 function Get-ZipEntries {
@@ -3043,6 +3105,7 @@ function Invoke-Localization {
     $targetPathBytes = [Text.Encoding]::UTF8.GetBytes($targetPathJson)
     $State.evidenceTargetPathsSha256 = Get-Sha256Bytes -Bytes $targetPathBytes
     $State.localizationManifestPath = $manifestPath
+    $State.status = 'localized'
     Complete-Stage -State $State -Context $stage -ArtifactSha256 (Get-FileSha256 -Path $manifestPath) -Data ([ordered]@{ mode = $plan.mode; fileCount = $records.Count })
 }
 

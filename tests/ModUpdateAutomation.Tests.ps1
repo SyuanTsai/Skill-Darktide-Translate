@@ -52,6 +52,59 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'ConvertTo-Json'
     }
 
+    # Scenario: A stage spends controlled monotonic-clock intervals on source stability, coordination, and active work.
+    # Purpose: Keep audited wall time equal to active plus classified waits without mixing stability and lock contention.
+    It 'UnitT115_SeparatesActiveStabilityAndCoordinationTiming' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $allFunctions = $ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst]
+        }, $true)
+        $functionTexts = foreach ($name in @(
+            'Get-UtcTimestamp', 'Start-Stage', 'Add-StageWait', 'Get-StageTimingBreakdown', 'Enter-SharedCoordinationLock'
+        )) {
+            $functionAst = @($allFunctions | Where-Object Name -eq $name)[0]
+            $functionAst | Should -Not -BeNullOrEmpty
+            $functionAst.Extent.Text
+        }
+        $coordinationStub = @'
+function Update-ActiveReservationHeartbeat {}
+function Enter-SharedCoordinationLease {
+    param($RepositoryRoot, $ResourceKey, $RunId, $ReceiptRoot, $WaitHeartbeatAction, $TimeoutSeconds)
+    [ordered]@{ waitingMilliseconds = [int64]25 }
+}
+'@
+        $module = New-Module -ScriptBlock ([scriptblock]::Create((@($coordinationStub) + $functionTexts -join "`n")))
+        try {
+            $clockValue = [Runtime.CompilerServices.StrongBox[long]]::new(1000)
+            $clock = { [int64]$clockValue.Value }.GetNewClosure()
+            $context = & $module { param($clock) Start-Stage -Name 'claim' -MonotonicClock $clock } $clock
+            $clockValue.Value = [int64]1100
+            & $module { param($context) Add-StageWait -Context $context -Reason 'stability-observation' -Milliseconds 75 } $context
+            $clockValue.Value = [int64]1150
+            $lease = & $module {
+                Enter-SharedCoordinationLock -Repository 'C:\timing-test' -ResourceKey 'source-acquisition' -ActualRunId 'timing-test'
+            }
+            $lease.waitingMilliseconds | Should -Be 25
+            $clockValue.Value = [int64]1200
+            $timing = & $module { param($context) Get-StageTimingBreakdown -Context $context } $context
+
+            $timing.wallClockMilliseconds | Should -Be 200
+            $timing.activeMilliseconds | Should -Be 100
+            $timing.waitingMilliseconds | Should -Be 100
+            $timing.stabilityObservationMilliseconds | Should -Be 75
+            $timing.coordinationWaitMilliseconds | Should -Be 25
+            ([int64]$timing.activeMilliseconds + [int64]$timing.waitingMilliseconds) |
+                Should -Be ([int64]$timing.wallClockMilliseconds)
+        }
+        finally {
+            Remove-Module $module -Force
+        }
+    }
+
     # Scenario: A supplied ZIP contains line-ending variants, whitespace-sensitive Lua, or a hostile path.
     # Purpose: Require archive containment checks and byte-preserving extraction without trim, formatter, or cross-line replacement behavior.
     It 'UnitT120_ImplementsContainedBytePreservingArchiveExtraction' {
@@ -522,10 +575,21 @@ Describe 'Deterministic Darktide MOD update automation' {
         ) -join "`n") | Set-Content -LiteralPath (Join-Path $manualHashDirectory 'examplemod.hash') -NoNewline
         & git -C $fixtureRepo add README.md .hash/examplemod.hash
         & git -C $fixtureRepo commit --quiet -m 'fixture source metadata'
+        $claimWallClock = [Diagnostics.Stopwatch]::StartNew()
         $claim = & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $archivePath -ModDirectory 'ExampleMod' `
             -SourceRequestPath $manualSourceRequestPath -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD `
             -MetadataPath 'README.md', '.hash/examplemod.hash' -PassThru
+        $claimWallClock.Stop()
         $claim.result | Should -Be 'passed'
+        $claim.status | Should -Be 'worktree-ready'
+        $claim.stageTimings.stabilityObservationMilliseconds | Should -BeGreaterOrEqual 9000
+        $claim.stageTimings.coordinationWaitMilliseconds | Should -BeGreaterOrEqual 0
+        $claim.stageTimings.waitingMilliseconds | Should -Be `
+            ([int64]$claim.stageTimings.stabilityObservationMilliseconds + [int64]$claim.stageTimings.coordinationWaitMilliseconds)
+        ([int64]$claim.stageTimings.activeMilliseconds + [int64]$claim.stageTimings.waitingMilliseconds) |
+            Should -Be ([int64]$claim.stageTimings.wallClockMilliseconds)
+        [Math]::Abs([int64]$claimWallClock.ElapsedMilliseconds - [int64]$claim.stageTimings.wallClockMilliseconds) |
+            Should -BeLessThan 5000
         $statePath = $claim.statePath
         $claimStateAfterExit = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         $claimOwner = Get-Content -LiteralPath (Join-Path $claimStateAfterExit.modLockPath 'owner.json') -Raw | ConvertFrom-Json
@@ -662,7 +726,23 @@ Describe 'Deterministic Darktide MOD update automation' {
             removedPaths = @($relativeRemovedLocalization)
         }
         [IO.File]::WriteAllText($planPath, ($plan | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
-        (& $runnerPath localization -RepositoryRoot $fixtureRepo -StatePath $statePath -LocalizationPlanPath $planPath -PassThru).result | Should -Be 'passed'
+        $localization = & $runnerPath localization -RepositoryRoot $fixtureRepo -StatePath $statePath -LocalizationPlanPath $planPath -PassThru
+        $localization.result | Should -Be 'passed'
+        $localization.status | Should -Be 'localized'
+        $localizedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        [string]$localizedState.status | Should -Be 'localized'
+        @($localizedState.completedStages) | Should -Contain 'localization'
+        $localizationArtifactSha = [string]$localizedState.stageTimings.localization.artifactSha256
+        $localizedState.status = 'installed'
+        [IO.File]::WriteAllText($statePath, ($localizedState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        $localizationRecovery = & $runnerPath localization -RepositoryRoot $fixtureRepo -StatePath $statePath -LocalizationPlanPath $planPath -PassThru
+        $localizationRecovery.result | Should -Be 'passed'
+        $localizationRecovery.idempotent | Should -BeTrue
+        $localizationRecovery.status | Should -Be 'localized'
+        $recoveredLocalizationState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        [string]$recoveredLocalizationState.status | Should -Be 'localized'
+        [string]$recoveredLocalizationState.stageTimings.localization.artifactSha256 | Should -Be $localizationArtifactSha
+        @($recoveredLocalizationState.completedStages | Where-Object { $_ -ceq 'localization' }).Count | Should -Be 1
         (& $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
         $preGateState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         try {
@@ -719,7 +799,9 @@ Describe 'Deterministic Darktide MOD update automation' {
 
         foreach ($stageName in @('claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate')) {
             $state.stageTimings[$stageName].result | Should -Be 'passed'
-            $state.stageTimings[$stageName].waitingMilliseconds | Should -Be 0
+            $state.stageTimings[$stageName].waitingMilliseconds | Should -BeGreaterOrEqual 0
+            ([int64]$state.stageTimings[$stageName].activeMilliseconds + [int64]$state.stageTimings[$stageName].waitingMilliseconds) |
+                Should -Be ([int64]$state.stageTimings[$stageName].wallClockMilliseconds)
             $state.stageTimings[$stageName].artifactSha256 | Should -Match '^[0-9a-f]{64}$'
         }
         $headBeforeRerun = (& git -C $state.worktreePath rev-parse HEAD).Trim()

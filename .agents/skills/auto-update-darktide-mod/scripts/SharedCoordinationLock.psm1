@@ -245,7 +245,8 @@ function New-CoordinationLeaseRecord {
         [Parameter(Mandatory)][Collections.IDictionary] $Identity,
         [Parameter(Mandatory)][Collections.IDictionary] $Owner,
         [AllowNull()][string] $ReceiptRoot,
-        [AllowNull()][string] $StaleEvidencePath
+        [AllowNull()][string] $StaleEvidencePath,
+        [ValidateRange(0, [int64]::MaxValue)][int64] $WaitingMilliseconds = 0
     )
     [ordered]@{
         path = [IO.Path]::GetFullPath($LockPath)
@@ -259,6 +260,7 @@ function New-CoordinationLeaseRecord {
         receiptRoot = $ReceiptRoot
         receiptId = [guid]::NewGuid().ToString('N')
         staleEvidencePath = $StaleEvidencePath
+        waitingMilliseconds = $WaitingMilliseconds
         lastHeartbeatUtc = [DateTimeOffset]::UtcNow
     }
 }
@@ -287,6 +289,7 @@ function Enter-SharedCoordinationLease {
     $identity = Get-CoordinationProcessIdentity
     $token = [guid]::NewGuid().ToString('N')
     $staleEvidencePath = $null
+    [int64]$waitStartedMilliseconds = -1
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
         if ($WaitHeartbeatAction) { $null = & $WaitHeartbeatAction }
@@ -337,9 +340,15 @@ function Enter-SharedCoordinationLease {
                 Write-CoordinationAtomicJson -Path (Join-Path $prepared 'owner.json') -Value $owner
                 try {
                     [IO.Directory]::Move($prepared, $lockPath)
+                    $waitingMilliseconds = if ($waitStartedMilliseconds -lt 0) {
+                        [int64]0
+                    }
+                    else {
+                        [Math]::Max([int64]0, [Environment]::TickCount64 - $waitStartedMilliseconds)
+                    }
                     return New-CoordinationLeaseRecord -LockPath $lockPath -Token $token -RunId $RunId `
                         -ResourceKey $ResourceKey -Identity $identity -Owner $owner -ReceiptRoot $receiptRootFull `
-                        -StaleEvidencePath $staleEvidencePath
+                        -StaleEvidencePath $staleEvidencePath -WaitingMilliseconds $waitingMilliseconds
                 }
                 catch [IO.IOException] { $waitForOwner = $true }
             }
@@ -355,6 +364,7 @@ function Enter-SharedCoordinationLease {
             }
         }
         if ($waitForOwner) {
+            if ($waitStartedMilliseconds -lt 0) { $waitStartedMilliseconds = [Environment]::TickCount64 }
             [Threading.Thread]::Sleep(250)
             if ($WaitHeartbeatAction) { $null = & $WaitHeartbeatAction }
         }

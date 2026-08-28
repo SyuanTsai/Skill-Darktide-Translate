@@ -269,4 +269,101 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
             $null = Exit-SharedCoordinationLease -Lease $lease
         }
     }
+
+    # Scenario: A worker successfully acquires a shared lock after observing another live owner.
+    # Purpose: Prove the production lease reports real contention time instead of relying only on a stubbed timing value.
+    It 'InterT183_ReportsElapsedCoordinationWaitAfterContention' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-wait-timing-repository'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $heartbeatPath = Join-Path $TestDrive 'coordination-wait-heartbeat.txt'
+        $resultPath = Join-Path $TestDrive 'coordination-wait-result.json'
+        $workerPath = Join-Path $TestDrive 'coordination-wait-worker.ps1'
+        @'
+param(
+    [string] $ModulePath,
+    [string] $Repository,
+    [string] $HeartbeatPath,
+    [string] $ResultPath
+)
+Import-Module -Name $ModulePath -Force
+$callbackCount = [Runtime.CompilerServices.StrongBox[int]]::new(0)
+$waitHeartbeat = {
+    $callbackCount.Value++
+    [IO.File]::WriteAllText($HeartbeatPath, ([string]$callbackCount.Value), [Text.UTF8Encoding]::new($false))
+}.GetNewClosure()
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey 'git-coordination' `
+    -RunId '18318318-3183-4183-8183-183183183183' -TimeoutSeconds 10 `
+    -WaitHeartbeatAction $waitHeartbeat
+$clock.Stop()
+try {
+    $observation = [ordered]@{
+        observedMilliseconds = [int64]$clock.ElapsedMilliseconds
+        waitingMilliseconds = [int64]$lease.waitingMilliseconds
+    }
+    [IO.File]::WriteAllText($ResultPath, ($observation | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+}
+finally {
+    $null = Exit-SharedCoordinationLease -Lease $lease
+}
+'@ | Set-Content -LiteralPath $workerPath -NoNewline
+
+        $firstLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
+            -RunId '18318318-2183-4183-8183-183183183183'
+        $worker = $null
+        try {
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = (Get-Process -Id $PID).Path
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            foreach ($argument in @(
+                '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $workerPath,
+                '-ModulePath', $coordinationModule, '-Repository', $repository,
+                '-HeartbeatPath', $heartbeatPath, '-ResultPath', $resultPath
+            )) { $start.ArgumentList.Add($argument) }
+            $worker = [Diagnostics.Process]::new()
+            $worker.StartInfo = $start
+            $worker.Start() | Should -BeTrue
+            $stdout = $worker.StandardOutput.ReadToEndAsync()
+            $stderr = $worker.StandardError.ReadToEndAsync()
+
+            $deadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
+            $observedHeartbeatCount = 0
+            while ($observedHeartbeatCount -lt 2) {
+                if ($worker.HasExited) { break }
+                if ([DateTimeOffset]::UtcNow -gt $deadline) { break }
+                if (Test-Path -LiteralPath $heartbeatPath -PathType Leaf) {
+                    try {
+                        $heartbeatText = [IO.File]::ReadAllText($heartbeatPath)
+                        $parsedCount = 0
+                        if ([int]::TryParse($heartbeatText, [ref]$parsedCount)) { $observedHeartbeatCount = $parsedCount }
+                    }
+                    catch [IO.IOException] { }
+                }
+                Start-Sleep -Milliseconds 20
+            }
+            $observedHeartbeatCount | Should -BeGreaterOrEqual 2 -Because 'the worker must observe a live owner before release'
+            Start-Sleep -Milliseconds 300
+            $null = Exit-SharedCoordinationLease -Lease $firstLease
+            $firstLease = $null
+
+            $worker.WaitForExit(30000) | Should -BeTrue
+            $worker.ExitCode | Should -Be 0 -Because ($stderr.Result + $stdout.Result)
+            Test-Path -LiteralPath $resultPath -PathType Leaf | Should -BeTrue
+            $observation = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-TestJson -AsHashtable
+            [int64]$observation.waitingMilliseconds | Should -BeGreaterThan 0
+            [int64]$observation.waitingMilliseconds | Should -BeLessOrEqual ([int64]$observation.observedMilliseconds)
+            ([int64]$observation.observedMilliseconds - [int64]$observation.waitingMilliseconds) |
+                Should -BeLessThan 5000
+        }
+        finally {
+            if ($firstLease) { $null = Exit-SharedCoordinationLease -Lease $firstLease }
+            if ($worker) {
+                if (-not $worker.HasExited) { $worker.Kill($true) }
+                $worker.Dispose()
+            }
+        }
+    }
 }
