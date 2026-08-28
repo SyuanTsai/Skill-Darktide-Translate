@@ -4,8 +4,8 @@ Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive up
 
 - Stable source ID: `darktide-translate`
 - Catalog: `catalog/skills-catalog.json`
-- Current repository version: `0.3.0`
-- Jira delivery items: `SYP-91` automatic Nexus Main-file acquisition and localization worksets, `SYP-92` packaging, and `SYP-88` deterministic automation under `SYP-86`
+- Current repository version: `0.3.1`
+- Jira delivery items: `SYP-112` checkpoint reasons, `SYP-113` immutable source metadata, `SYP-114` shared coordination locks, `SYP-115` reservation heartbeat/lifecycle, and `SYP-116` runner observability/Windows byte preservation, building on `SYP-91`, `SYP-92`, and `SYP-88`
 
 ## Skill
 
@@ -28,6 +28,7 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
   scripts/Receive-NexusMainFile.ps1
   scripts/Test-SourceReceipt.ps1
   scripts/Invoke-ModUpdateQueue.ps1
+  scripts/SharedCoordinationLock.psm1
   scripts/LuaLocalizationScanner.psm1
   scripts/New-LocalizationWorkset.ps1
   scripts/Apply-LocalizationWorkset.ps1

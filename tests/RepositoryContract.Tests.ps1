@@ -52,6 +52,7 @@ Describe 'Darktide Translate repository contract' {
             '.agents/skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1',
+            '.agents/skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1',
             '.agents/skills/auto-update-darktide-mod/scripts/LuaLocalizationScanner.psm1',
             '.agents/skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1',
             '.agents/skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1',
@@ -71,13 +72,58 @@ Describe 'Darktide Translate repository contract' {
             Test-Path -LiteralPath (Join-Path $repoRoot $path) | Should -Be $true
         }
 
-        $skillRoot = Join-Path $repoRoot '.agents/skills'
         $actualSkillDirectories = @(
-            Get-ChildItem -LiteralPath $skillRoot -Directory |
-                Select-Object -ExpandProperty Name |
-                Sort-Object
+            & git -C $repoRoot ls-files -- '.agents/skills/*' |
+                ForEach-Object { (([string]$_).Replace('\', '/') -split '/')[2] } |
+                Sort-Object -Unique
         )
+        $LASTEXITCODE | Should -Be 0
         ($actualSkillDirectories -join "`n") | Should -Be 'auto-update-darktide-mod'
+    }
+
+    # Scenario: Windows Git checkout applies core.autocrlf while immutable Skill bytes are verified exactly.
+    # Purpose: Ensure PowerShell module sources use LF so git mode and archive/download mode produce identical package bytes.
+    It 'UnitT22_PreservesPowerShellModuleBytesAcrossWindowsCheckout' {
+        $attributesPath = Join-Path $repoRoot '.gitattributes'
+        Test-Path -LiteralPath $attributesPath | Should -Be $true
+        $attributes = Get-Content -LiteralPath $attributesPath -Raw
+        $attributes | Should -Match '(?m)^\*\.psm1 text eol=lf\r?$'
+
+        $modulePaths = @(& git -C $repoRoot ls-files -- '*.psm1')
+        $LASTEXITCODE | Should -Be 0
+        $modulePaths.Count | Should -BeGreaterThan 0
+        foreach ($modulePath in $modulePaths) {
+            $attribute = & git -C $repoRoot check-attr eol -- $modulePath
+            $LASTEXITCODE | Should -Be 0
+            $attribute | Should -Match ': eol: lf$'
+        }
+
+        $sourceRepository = Join-Path $TestDrive 'windows-git-source'
+        $freshCheckout = Join-Path $TestDrive 'windows-git-checkout'
+        New-Item -ItemType Directory -Path $sourceRepository -Force | Out-Null
+        Copy-Item -LiteralPath $attributesPath -Destination (Join-Path $sourceRepository '.gitattributes')
+        foreach ($modulePath in $modulePaths) {
+            $sourcePath = Join-Path $repoRoot $modulePath
+            $fixturePath = Join-Path $sourceRepository $modulePath
+            New-Item -ItemType Directory -Path (Split-Path -Parent $fixturePath) -Force | Out-Null
+            Copy-Item -LiteralPath $sourcePath -Destination $fixturePath
+        }
+        & git -C $sourceRepository init --quiet --initial-branch=main
+        & git -C $sourceRepository config user.name 'EOL Contract Test'
+        & git -C $sourceRepository config user.email 'eol-contract@example.invalid'
+        & git -C $sourceRepository config core.autocrlf true
+        & git -C $sourceRepository add --all
+        & git -C $sourceRepository commit --quiet -m 'fixture LF source'
+        $LASTEXITCODE | Should -Be 0
+        & git -c core.autocrlf=true clone --quiet $sourceRepository $freshCheckout
+        $LASTEXITCODE | Should -Be 0
+
+        foreach ($modulePath in $modulePaths) {
+            $sourceBlobOid = (& git -C $sourceRepository rev-parse "HEAD:$modulePath").Trim()
+            $checkoutRawOid = (& git -C $freshCheckout hash-object --no-filters -- $modulePath).Trim()
+            $LASTEXITCODE | Should -Be 0
+            $checkoutRawOid | Should -Be $sourceBlobOid -Because $modulePath
+        }
     }
 
     # Scenario: The independent source remains intentionally outside AI-Instructions fan-out.

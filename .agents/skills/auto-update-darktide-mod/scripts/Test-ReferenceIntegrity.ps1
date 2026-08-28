@@ -1,11 +1,53 @@
 [CmdletBinding()]
 param(
     [string] $SkillSourcePinPath,
+    [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
 
 $ErrorActionPreference = 'Stop'
 $skillRoot = Split-Path -Parent $PSScriptRoot
+
+function Invoke-Heartbeat {
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
+}
+
+function Copy-StreamWithHeartbeat {
+    param([Parameter(Mandatory)][IO.Stream] $Source, [Parameter(Mandatory)][IO.Stream] $Destination)
+    Invoke-Heartbeat
+    $buffer = [byte[]]::new(1MB)
+    while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $Destination.Write($buffer, 0, $readCount)
+        Invoke-Heartbeat
+    }
+}
+
+function Read-FileBytesWithHeartbeat {
+    param([Parameter(Mandatory)][string] $Path)
+    $source = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $memory = [IO.MemoryStream]::new()
+    try {
+        Copy-StreamWithHeartbeat -Source $source -Destination $memory
+        $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $source.Dispose() }
+}
+
+function Get-FileSha256 {
+    param([Parameter(Mandatory)][string] $Path)
+    Invoke-Heartbeat
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose(); $stream.Dispose() }
+}
 
 function Assert-NoReparsePath {
     param([string] $Path, [string] $Root, [string] $Name)
@@ -45,7 +87,16 @@ if ($provenance.sourceCommit -notmatch '^[0-9a-f]{40}$') {
 
 function Get-Sha256Bytes {
     param([byte[]] $Bytes)
-    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        for ($offset = 0; $offset -lt $Bytes.Length; $offset += 1MB) {
+            $count = [Math]::Min(1MB, $Bytes.Length - $offset)
+            $hasher.AppendData($Bytes, $offset, $count)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
 }
 
 function ConvertTo-NormalizedRepositoryPath {
@@ -71,14 +122,23 @@ function Get-GitBlobOid {
         [Parameter(Mandatory = $true)] [string] $Name
     )
 
-    $header = [Text.Encoding]::ASCII.GetBytes("blob $($Content.Length)`0")
-    $objectBytes = [byte[]] ($header + $Content)
-    $hash = switch ($ObjectFormat) {
-        'sha1' { [Security.Cryptography.SHA1]::HashData($objectBytes); break }
-        'sha256' { [Security.Cryptography.SHA256]::HashData($objectBytes); break }
+    $algorithm = switch ($ObjectFormat) {
+        'sha1' { [Security.Cryptography.HashAlgorithmName]::SHA1; break }
+        'sha256' { [Security.Cryptography.HashAlgorithmName]::SHA256; break }
         default { throw "$Name Git object format is unsupported." }
     }
-    [Convert]::ToHexString($hash).ToLowerInvariant()
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash($algorithm)
+    try {
+        $header = [Text.Encoding]::ASCII.GetBytes("blob $($Content.Length)`0")
+        $hasher.AppendData($header)
+        for ($offset = 0; $offset -lt $Content.Length; $offset += 1MB) {
+            $count = [Math]::Min(1MB, $Content.Length - $offset)
+            $hasher.AppendData($Content, $offset, $count)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
 }
 
 $skillRepositoryPath = ConvertTo-NormalizedRepositoryPath `
@@ -104,14 +164,14 @@ function Test-Document {
     $candidate = Assert-NoReparsePath -Path $candidate -Root $skillRoot -Name "$Name reference"
 
     $file = Get-Item -LiteralPath $candidate
-    $packageSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant()
+    $packageSha = Get-FileSha256 -Path $candidate
     if ($file.Length -ne [int64] $Document.packagedSizeBytes) {
         throw "$Name package size mismatch."
     }
     if ($packageSha -ne $Document.packagedSha256) {
         throw "$Name package SHA-256 mismatch."
     }
-    $packageBytes = [IO.File]::ReadAllBytes($candidate)
+    $packageBytes = Read-FileBytesWithHeartbeat -Path $candidate
     $packageGitBlobOid = Get-GitBlobOid `
         -Content $packageBytes `
         -ObjectFormat $Document.packagedGitObjectFormat `
@@ -129,7 +189,7 @@ function Test-Document {
         try {
             $expandedStream = [IO.MemoryStream]::new()
             try {
-                $gzipStream.CopyTo($expandedStream)
+                Copy-StreamWithHeartbeat -Source $gzipStream -Destination $expandedStream
                 $expandedBytes = $expandedStream.ToArray()
             }
             finally {
@@ -144,9 +204,7 @@ function Test-Document {
         $packageStream.Dispose()
     }
 
-    $contentSha = [Convert]::ToHexString(
-        [Security.Cryptography.SHA256]::HashData($expandedBytes)
-    ).ToLowerInvariant()
+    $contentSha = Get-Sha256Bytes -Bytes $expandedBytes
     if ($expandedBytes.Length -ne [int64] $Document.contentSizeBytes) {
         throw "$Name expanded content size mismatch."
     }
@@ -197,8 +255,8 @@ function Test-Schema15Extension {
     $expectedPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
     if (-not $candidate.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Schema 15 reference escaped the Skill root.' }
     $candidate = Assert-NoReparsePath -Path $candidate -Root $skillRoot -Name 'Schema 15 reference'
-    $bytes = [IO.File]::ReadAllBytes($candidate)
-    $sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    $bytes = Read-FileBytesWithHeartbeat -Path $candidate
+    $sha256 = Get-Sha256Bytes -Bytes $bytes
     if ($bytes.LongLength -ne [int64]$extensionProvenance.sizeBytes) { throw 'Schema 15 reference size mismatch.' }
     if ($sha256 -cne [string]$extensionProvenance.sha256) { throw 'Schema 15 reference SHA-256 mismatch.' }
     [ordered]@{
@@ -220,7 +278,7 @@ function Test-SkillSourcePin {
 
     $pinFull = [IO.Path]::GetFullPath($Path)
     $pinFull = Assert-NoReparsePath -Path $pinFull -Root ([IO.Path]::GetPathRoot($pinFull)) -Name 'Skill source pin'
-    $pinBytes = [IO.File]::ReadAllBytes($pinFull)
+    $pinBytes = Read-FileBytesWithHeartbeat -Path $pinFull
     $pin = [Text.UTF8Encoding]::new($false, $true).GetString($pinBytes) | ConvertFrom-Json -AsHashtable
     if ([int]$pin.schemaVersion -ne 1 -or [string]$pin.sourceId -cne 'darktide-translate' -or
         [string]$pin.repository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git' -or
@@ -258,7 +316,7 @@ function Test-SkillSourcePin {
         $repositoryPath = "$skillRepositoryPath/$relative"
         if (-not $expectedByPath.ContainsKey($repositoryPath)) { throw "Installed Skill file is absent from its source pin: $repositoryPath" }
         $entry = $expectedByPath[$repositoryPath]
-        $bytes = [IO.File]::ReadAllBytes($file.FullName)
+        $bytes = Read-FileBytesWithHeartbeat -Path $file.FullName
         if ($bytes.LongLength -ne [int64]$entry.size -or
             (Get-Sha256Bytes -Bytes $bytes) -cne [string]$entry.sha256 -or
             (Get-GitBlobOid -Content $bytes -ObjectFormat 'sha1' -Name 'Installed Skill file') -cne [string]$entry.blobOid) {

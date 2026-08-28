@@ -14,20 +14,91 @@ param(
 
     [switch] $AllowNonDelivered,
 
+    [scriptblock] $HeartbeatAction,
+
     [switch] $PassThru
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function ConvertFrom-JsonToken {
+    param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
+    if ($null -eq $Token -or $Token.Type -in @(
+        [Newtonsoft.Json.Linq.JTokenType]::Null,
+        [Newtonsoft.Json.Linq.JTokenType]::Undefined
+    )) { return $null }
+    if ($Token -is [Newtonsoft.Json.Linq.JObject]) {
+        $properties = [ordered]@{}
+        foreach ($property in $Token.Properties()) {
+            $properties[[string]$property.Name] = ConvertFrom-JsonToken -Token $property.Value -AsHashtable:$AsHashtable
+        }
+        if ($AsHashtable) { return $properties }
+        return [pscustomobject]$properties
+    }
+    if ($Token -is [Newtonsoft.Json.Linq.JArray]) {
+        $items = [object[]]::new($Token.Count)
+        for ($index = 0; $index -lt $Token.Count; $index++) {
+            $items[$index] = ConvertFrom-JsonToken -Token $Token[$index] -AsHashtable:$AsHashtable
+        }
+        Write-Output -NoEnumerate $items
+        return
+    }
+    ([Newtonsoft.Json.Linq.JValue]$Token).Value
+}
+
+function ConvertFrom-Json {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string] $InputObject,
+        [switch] $AsHashtable
+    )
+    process {
+        $parameters = @{ InputObject = $InputObject }
+        if ($AsHashtable) { $parameters.AsHashtable = $true }
+        $nativeCommand = Get-Command -Name 'Microsoft.PowerShell.Utility\ConvertFrom-Json'
+        if ($nativeCommand.Parameters.ContainsKey('DateKind')) {
+            $parameters.DateKind = 'String'
+            Microsoft.PowerShell.Utility\ConvertFrom-Json @parameters
+            return
+        }
+        $settings = [Newtonsoft.Json.JsonSerializerSettings]::new()
+        $settings.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+        $token = [Newtonsoft.Json.JsonConvert]::DeserializeObject($InputObject, $settings)
+        ConvertFrom-JsonToken -Token $token -AsHashtable:$AsHashtable
+    }
+}
+
+function Invoke-Heartbeat {
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
+}
+
 function Get-FileSha256 {
     param([string] $Path)
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    Invoke-Heartbeat
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
 }
 
 function ConvertTo-InvariantString {
     param($Value)
     if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) { return ([DateTimeOffset]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
     [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -43,14 +114,20 @@ function Get-SanitizedUrl {
 
 function Get-ArchiveEvidence {
     param([string] $Path)
+    Invoke-Heartbeat
     $bytes = [byte[]]::new(8)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $hasher = [Security.Cryptography.SHA256]::Create()
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
     try {
         $size = $stream.Length
         $read = $stream.Read($bytes, 0, $bytes.Length)
         $stream.Position = 0
-        $sha256 = [Convert]::ToHexString($hasher.ComputeHash($stream)).ToLowerInvariant()
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        $sha256 = [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
     }
     finally {
         $hasher.Dispose()
@@ -159,7 +236,7 @@ $receipt = Get-Content -LiteralPath $receiptFull -Raw | ConvertFrom-Json -AsHash
 $null = Assert-NoReparsePath -Path $requestFull -Root $sourceRunRoot -Label 'Source request'
 $request = Get-Content -LiteralPath $requestFull -Raw | ConvertFrom-Json -AsHashtable
 if ([int]$receipt.schemaVersion -ne 1) { throw 'Source receipt schemaVersion must be 1.' }
-if ([int]$request.schemaVersion -ne 1) { throw 'Source request schemaVersion must be 1.' }
+if ([int]$request.schemaVersion -notin @(1, 2)) { throw 'Source request schemaVersion must be 1 or 2.' }
 $receiptStatus = [string]$receipt.status
 $isRetainedNonDelivered = $receiptStatus -in @('unsupported', 'rejected')
 if ($receiptStatus -cne 'delivered' -and (-not $AllowNonDelivered -or -not $isRetainedNonDelivered)) {
@@ -168,6 +245,25 @@ if ($receiptStatus -cne 'delivered' -and (-not $AllowNonDelivered -or -not $isRe
 foreach ($field in @('gameDomain', 'modId', 'mainFileId', 'version', 'fileName')) {
     if ((ConvertTo-InvariantString $receipt.sourceRequest[$field]) -cne (ConvertTo-InvariantString $request[$field])) {
         throw "Source receipt $field does not match the immutable source request."
+    }
+}
+if ([int]$request.schemaVersion -eq 2) {
+    foreach ($field in @('pageUrl', 'pageVersion', 'pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+        if (-not $request.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request[$field])) -or
+            -not $receipt.sourceRequest.Contains($field) -or
+            (ConvertTo-InvariantString $receipt.sourceRequest[$field]) -cne (ConvertTo-InvariantString $request[$field])) {
+            throw "Source receipt $field does not match the complete immutable source request."
+        }
+    }
+    foreach ($timestampField in @('pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+        $timestamp = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParseExact(
+            (ConvertTo-InvariantString $request[$timestampField]),
+            'o',
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$timestamp
+        )) { throw "Source request $timestampField is not an ISO-8601 round-trip value." }
     }
 }
 $sourceUri = [Uri]$receipt.sourceUrl

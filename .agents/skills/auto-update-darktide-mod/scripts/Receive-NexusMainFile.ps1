@@ -27,19 +27,104 @@ param(
 
     [string] $ApiDownloadUriEnvironmentVariable = 'NEXUS_DOWNLOAD_URI',
     [string] $ApiKeyEnvironmentVariable = 'NEXUS_API_KEY',
+    [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function ConvertFrom-JsonToken {
+    param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
+    if ($null -eq $Token -or $Token.Type -in @(
+        [Newtonsoft.Json.Linq.JTokenType]::Null,
+        [Newtonsoft.Json.Linq.JTokenType]::Undefined
+    )) { return $null }
+    if ($Token -is [Newtonsoft.Json.Linq.JObject]) {
+        $properties = [ordered]@{}
+        foreach ($property in $Token.Properties()) {
+            $properties[[string]$property.Name] = ConvertFrom-JsonToken -Token $property.Value -AsHashtable:$AsHashtable
+        }
+        if ($AsHashtable) { return $properties }
+        return [pscustomobject]$properties
+    }
+    if ($Token -is [Newtonsoft.Json.Linq.JArray]) {
+        $items = [object[]]::new($Token.Count)
+        for ($index = 0; $index -lt $Token.Count; $index++) {
+            $items[$index] = ConvertFrom-JsonToken -Token $Token[$index] -AsHashtable:$AsHashtable
+        }
+        Write-Output -NoEnumerate $items
+        return
+    }
+    ([Newtonsoft.Json.Linq.JValue]$Token).Value
+}
+
+function ConvertFrom-Json {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string] $InputObject,
+        [switch] $AsHashtable
+    )
+    process {
+        $parameters = @{ InputObject = $InputObject }
+        if ($AsHashtable) { $parameters.AsHashtable = $true }
+        $nativeCommand = Get-Command -Name 'Microsoft.PowerShell.Utility\ConvertFrom-Json'
+        if ($nativeCommand.Parameters.ContainsKey('DateKind')) {
+            $parameters.DateKind = 'String'
+            Microsoft.PowerShell.Utility\ConvertFrom-Json @parameters
+            return
+        }
+        $settings = [Newtonsoft.Json.JsonSerializerSettings]::new()
+        $settings.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+        $token = [Newtonsoft.Json.JsonConvert]::DeserializeObject($InputObject, $settings)
+        ConvertFrom-JsonToken -Token $token -AsHashtable:$AsHashtable
+    }
+}
+
 function Get-UtcTimestamp {
     [DateTimeOffset]::UtcNow.ToString('o')
 }
 
+function Invoke-Heartbeat {
+    if ($HeartbeatAction) { $null = & $HeartbeatAction }
+}
+
 function Get-FileSha256 {
     param([Parameter(Mandatory)][string] $Path)
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    Invoke-Heartbeat
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hasher.Dispose(); $stream.Dispose() }
+}
+
+function Copy-StreamWithHeartbeat {
+    param([IO.Stream] $Source, [IO.Stream] $Destination)
+    Invoke-Heartbeat
+    $buffer = [byte[]]::new(1MB)
+    while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $Destination.Write($buffer, 0, $readCount)
+        Invoke-Heartbeat
+    }
+}
+
+function Wait-TaskWithHeartbeat {
+    param([Parameter(Mandatory)][Threading.Tasks.Task] $Task)
+    Invoke-Heartbeat
+    while (-not $Task.IsCompleted) {
+        [Threading.Thread]::Sleep(1000)
+        Invoke-Heartbeat
+    }
+    $Task.GetAwaiter().GetResult()
 }
 
 function Write-AtomicJson {
@@ -47,6 +132,7 @@ function Write-AtomicJson {
         [Parameter(Mandatory)][string] $Path,
         [Parameter(Mandatory)] $Value
     )
+    Invoke-Heartbeat
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
@@ -110,6 +196,8 @@ function Assert-RegularDirectoryRoot {
 function ConvertTo-InvariantString {
     param($Value)
     if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) { return ([DateTimeOffset]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
     [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -117,10 +205,24 @@ function Read-SourceRequest {
     param([string] $Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Source request does not exist.' }
     $request = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
-    if ([int]$request.schemaVersion -ne 1) { throw 'Source request schemaVersion must be 1.' }
+    if ([int]$request.schemaVersion -notin @(1, 2)) { throw 'Source request schemaVersion must be 1 or 2.' }
     foreach ($field in @('gameDomain', 'modId', 'mainFileId', 'version', 'fileName', 'pageUrl')) {
         if (-not $request.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request[$field]))) {
             throw "Source request requires a unique $field value."
+        }
+    }
+    if ([int]$request.schemaVersion -eq 2) {
+        foreach ($field in @('pageVersion', 'pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+            if (-not $request.Contains($field) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request[$field]))) {
+                throw "Schema 2 source request requires immutable Nexus metadata field $field."
+            }
+        }
+        foreach ($timestampField in @('pageUpdatedAt', 'mainFileUploadedAtUtc')) {
+            $timestamp = [DateTimeOffset]::MinValue
+            if (-not [DateTimeOffset]::TryParseExact(
+                (ConvertTo-InvariantString $request[$timestampField]), 'o', [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind, [ref]$timestamp
+            )) { throw "Schema 2 source request $timestampField must be an ISO-8601 round-trip timestamp." }
         }
     }
     $pageUri = [Uri](ConvertTo-InvariantString $request.pageUrl)
@@ -146,13 +248,16 @@ function Read-SourceRequest {
         throw 'Source request fileName uses a reserved Windows device name.'
     }
     [ordered]@{
-        schemaVersion = 1
+        schemaVersion = [int]$request.schemaVersion
         gameDomain = ConvertTo-InvariantString $request.gameDomain
         modId = ConvertTo-InvariantString $request.modId
         mainFileId = ConvertTo-InvariantString $request.mainFileId
         version = ConvertTo-InvariantString $request.version
         fileName = ConvertTo-InvariantString $request.fileName
         pageUrl = ConvertTo-InvariantString $request.pageUrl
+        pageVersion = if ($request.Contains('pageVersion')) { ConvertTo-InvariantString $request.pageVersion } else { $null }
+        pageUpdatedAt = if ($request.Contains('pageUpdatedAt')) { ConvertTo-InvariantString $request.pageUpdatedAt } else { $null }
+        mainFileUploadedAtUtc = if ($request.Contains('mainFileUploadedAtUtc')) { ConvertTo-InvariantString $request.mainFileUploadedAtUtc } else { $null }
         officialSha256 = if ($request.Contains('officialSha256') -and
             -not [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $request.officialSha256))) {
             (ConvertTo-InvariantString $request.officialSha256).ToLowerInvariant()
@@ -183,31 +288,39 @@ function Get-ArchiveEvidence {
     param([string] $Path)
     $bytes = [byte[]]::new(8)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $hasher = [Security.Cryptography.SHA256]::Create()
+    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
     try {
         $size = $stream.Length
         $read = $stream.Read($bytes, 0, $bytes.Length)
         $stream.Position = 0
-        $sha256 = [Convert]::ToHexString($hasher.ComputeHash($stream)).ToLowerInvariant()
+        $buffer = [byte[]]::new(1MB)
+        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $hasher.AppendData($buffer, 0, $readCount)
+            Invoke-Heartbeat
+        }
+        $sha256 = [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+        $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
+            (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
+            'zip'
+        }
+        elseif ($read -ge 7 -and $bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and
+            $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07 -and $bytes[6] -in @(0x00, 0x01)) {
+            'rar'
+        }
+        elseif ($read -ge 6 -and $bytes[0] -eq 0x37 -and $bytes[1] -eq 0x7A -and $bytes[2] -eq 0xBC -and
+            $bytes[3] -eq 0xAF -and $bytes[4] -eq 0x27 -and $bytes[5] -eq 0x1C) {
+            '7z'
+        }
+        else { 'unknown' }
+        [ordered]@{ size = [int64]$size; sha256 = $sha256; archiveFormat = $format; stream = $stream }
+    }
+    catch {
+        $stream.Dispose()
+        throw
     }
     finally {
         $hasher.Dispose()
-        $stream.Dispose()
     }
-    $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
-        (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
-        'zip'
-    }
-    elseif ($read -ge 7 -and $bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and
-        $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07 -and $bytes[6] -in @(0x00, 0x01)) {
-        'rar'
-    }
-    elseif ($read -ge 6 -and $bytes[0] -eq 0x37 -and $bytes[1] -eq 0x7A -and $bytes[2] -eq 0xBC -and
-        $bytes[3] -eq 0xAF -and $bytes[4] -eq 0x27 -and $bytes[5] -eq 0x1C) {
-        '7z'
-    }
-    else { 'unknown' }
-    [ordered]@{ size = [int64]$size; sha256 = $sha256; archiveFormat = $format }
 }
 
 function New-WaitingResult {
@@ -228,6 +341,7 @@ function Move-ApiPartialToRetainedEvidence {
     if (-not $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         $retainedName = '.retained-partial-' + [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') + '-' + [guid]::NewGuid().ToString('N') + '-' + $item.Name
         $retainedPath = Assert-ContainedFilePath -Candidate (Join-Path $IncomingRoot $retainedName) -Root $IncomingRoot
+        Invoke-Heartbeat
         [IO.File]::Move($item.FullName, $retainedPath)
         return $retainedPath
     }
@@ -251,14 +365,15 @@ function Invoke-ApiDownload {
     $handler.AllowAutoRedirect = $false
     $client = [Net.Http.HttpClient]::new($handler, $true)
     $response = $null
-    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.3.0')
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.3.1')
     $apiKey = [Environment]::GetEnvironmentVariable($ApiKeyEnvironmentVariable)
     if (-not [string]::IsNullOrWhiteSpace($apiKey)) { $client.DefaultRequestHeaders.Add('apikey', $apiKey) }
     try {
         $currentUri = $downloadUri
         for ($redirectCount = 0; $redirectCount -le 10; $redirectCount++) {
             if ($response) { $response.Dispose(); $response = $null }
-            $response = $client.GetAsync($currentUri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            $responseTask = $client.GetAsync($currentUri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+            $response = Wait-TaskWithHeartbeat -Task $responseTask
             if ([int]$response.StatusCode -notin @(301, 302, 303, 307, 308)) { break }
             if ($redirectCount -eq 10) { throw 'API download exceeded the ten-redirect safety limit.' }
             $location = $response.Headers.Location
@@ -273,9 +388,10 @@ function Invoke-ApiDownload {
             return New-WaitingResult -Status 'waiting-user' -Code 'nexus_permission_required' -Message 'Nexus login or download permission requires user action.' -Path $retainedPartialPath
         }
         $response.EnsureSuccessStatusCode()
-        $responseStream = $response.Content.ReadAsStream()
+        $responseStream = Wait-TaskWithHeartbeat -Task ($response.Content.ReadAsStreamAsync())
         $outputStream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $responseStream.CopyTo($outputStream) } finally { $outputStream.Dispose(); $responseStream.Dispose() }
+        try { Copy-StreamWithHeartbeat -Source $responseStream -Destination $outputStream } finally { $outputStream.Dispose(); $responseStream.Dispose() }
+        Invoke-Heartbeat
         [IO.File]::Move($temporaryPath, $finalPath)
         $finalPath
     }
@@ -347,7 +463,15 @@ $candidateItem = Get-Item -LiteralPath $candidateFull
 if ($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Downloaded file must be a regular file, not a reparse point.' }
 
 $sampleOne = [ordered]@{ size = [int64]$candidateItem.Length; lastWriteTimeUtc = $candidateItem.LastWriteTimeUtc.ToString('o'); observedAt = Get-UtcTimestamp }
-if ($ObservationIntervalMilliseconds -gt 0) { [Threading.Thread]::Sleep($ObservationIntervalMilliseconds) }
+if ($ObservationIntervalMilliseconds -gt 0) {
+    $remainingMilliseconds = $ObservationIntervalMilliseconds
+    while ($remainingMilliseconds -gt 0) {
+        $slice = [Math]::Min(1000, $remainingMilliseconds)
+        [Threading.Thread]::Sleep($slice)
+        $remainingMilliseconds -= $slice
+        Invoke-Heartbeat
+    }
+}
 Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
 $candidateItem = Get-Item -LiteralPath $candidateFull
 $sampleTwo = [ordered]@{ size = [int64]$candidateItem.Length; lastWriteTimeUtc = $candidateItem.LastWriteTimeUtc.ToString('o'); observedAt = Get-UtcTimestamp }
@@ -360,94 +484,123 @@ if ($sampleTwo.size -le 0) { throw 'Downloaded file is empty.' }
 $verifyStart = [Diagnostics.Stopwatch]::StartNew()
 Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
 $archiveEvidence = Get-ArchiveEvidence -Path $candidateFull
-if ([int64]$archiveEvidence.size -ne [int64]$sampleTwo.size) {
+$temporaryDelivery = $null
+$deleteCandidateAfterDelivery = $false
+try {
+    if ([int64]$archiveEvidence.size -ne [int64]$sampleTwo.size) {
+        $verifyStart.Stop()
+        Write-Result -Value (New-WaitingResult -Status 'waiting-system' -Code 'download_not_stable' -Message 'The provider output changed while its immutable evidence was computed.' -ArchiveFormat ([string]$archiveEvidence.archiveFormat) -Path $candidateFull)
+        return
+    }
+    $archiveFormat = [string]$archiveEvidence.archiveFormat
+    $sha256 = [string]$archiveEvidence.sha256
+    $officialHashPassed = $null
+    if (-not [string]::IsNullOrWhiteSpace([string]$request.officialSha256)) {
+        if ($request.officialSha256 -notmatch '^[0-9a-f]{64}$') { throw 'officialSha256 must contain 64 hexadecimal characters.' }
+        $officialHashPassed = $sha256 -ceq $request.officialSha256
+    }
     $verifyStart.Stop()
-    Write-Result -Value (New-WaitingResult -Status 'waiting-system' -Code 'download_not_stable' -Message 'The provider output changed while its immutable evidence was computed.' -ArchiveFormat ([string]$archiveEvidence.archiveFormat) -Path $candidateFull)
-    return
-}
-$archiveFormat = [string]$archiveEvidence.archiveFormat
-$sha256 = [string]$archiveEvidence.sha256
-$officialHashPassed = $null
-if (-not [string]::IsNullOrWhiteSpace([string]$request.officialSha256)) {
-    if ($request.officialSha256 -notmatch '^[0-9a-f]{64}$') { throw 'officialSha256 must contain 64 hexadecimal characters.' }
-    $officialHashPassed = $sha256 -ceq $request.officialSha256
-}
-$verifyStart.Stop()
-$receipt = [ordered]@{
-    schemaVersion = 1
-    sourceRequest = [ordered]@{
-        gameDomain = $request.gameDomain
-        modId = $request.modId
-        mainFileId = $request.mainFileId
-        version = $request.version
-        fileName = $request.fileName
+    $receipt = [ordered]@{
+        schemaVersion = 1
+        sourceRequest = [ordered]@{
+            gameDomain = $request.gameDomain
+            modId = $request.modId
+            mainFileId = $request.mainFileId
+            version = $request.version
+            fileName = $request.fileName
+            pageUrl = $request.pageUrl
+            pageVersion = $request.pageVersion
+            pageUpdatedAt = $request.pageUpdatedAt
+            mainFileUploadedAtUtc = $request.mainFileUploadedAtUtc
+        }
+        provider = $Provider
+        sourceUrl = Get-SanitizedUrl -Url $request.pageUrl
+        filename = [IO.Path]::GetFileName($candidateFull)
+        size = $archiveEvidence.size
+        sha256 = $sha256
+        archiveFormat = $archiveFormat
+        officialSha256 = $request.officialSha256
+        officialHashPassed = $officialHashPassed
+        stableObservations = @($sampleOne, $sampleTwo)
+        downloadedAt = Get-UtcTimestamp
+        deliveredAt = $null
+        deliveredPath = $null
+        status = 'verified'
+        timings = [ordered]@{
+            downloadMilliseconds = $providerStart.ElapsedMilliseconds
+            waitingMilliseconds = [int64]$ObservationIntervalMilliseconds
+            verifyMilliseconds = $verifyStart.ElapsedMilliseconds
+            deliverMilliseconds = 0
+        }
     }
-    provider = $Provider
-    sourceUrl = Get-SanitizedUrl -Url $request.pageUrl
-    filename = [IO.Path]::GetFileName($candidateFull)
-    size = $archiveEvidence.size
-    sha256 = $sha256
-    archiveFormat = $archiveFormat
-    officialSha256 = $request.officialSha256
-    officialHashPassed = $officialHashPassed
-    stableObservations = @($sampleOne, $sampleTwo)
-    downloadedAt = Get-UtcTimestamp
-    deliveredAt = $null
-    deliveredPath = $null
-    status = 'verified'
-    timings = [ordered]@{
-        downloadMilliseconds = $providerStart.ElapsedMilliseconds
-        waitingMilliseconds = [int64]$ObservationIntervalMilliseconds
-        verifyMilliseconds = $verifyStart.ElapsedMilliseconds
-        deliverMilliseconds = 0
+
+    if ($archiveFormat -ne 'zip') {
+        $receipt.status = 'unsupported'
+        Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
+        Write-AtomicJson -Path $ReceiptPath -Value $receipt
+        Write-Result -Value (New-WaitingResult -Status 'waiting-user' -Code 'unsupported_archive_format' -Message "Detected unsupported $archiveFormat archive bytes after download." -ArchiveFormat $archiveFormat -Path $candidateFull)
+        return
+    }
+    if ($false -eq $officialHashPassed) {
+        $receipt.status = 'rejected'
+        Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
+        Write-AtomicJson -Path $ReceiptPath -Value $receipt
+        Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; waitingReason = [ordered]@{ code = 'source_hash_mismatch'; message = 'Downloaded SHA-256 does not match the official hash.' }; retainedPath = $candidateFull })
+        return
+    }
+    if ([IO.Path]::GetFileName($candidateFull) -cne [string]$request.fileName) {
+        $receipt.status = 'rejected'
+        Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
+        Write-AtomicJson -Path $ReceiptPath -Value $receipt
+        Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; waitingReason = [ordered]@{ code = 'source_filename_mismatch'; message = 'Downloaded filename does not match the requested Main file.' }; retainedPath = $candidateFull })
+        return
+    }
+
+    $deliveryStart = [Diagnostics.Stopwatch]::StartNew()
+    $deliveryFull = [IO.Path]::GetFullPath($DeliveryDirectory)
+    $deliveryFull = Assert-RegularDirectoryRoot -Path $deliveryFull -Label 'Delivery directory' -RunRoot $sourceRunRoot
+    $deliveredPath = Assert-ContainedFilePath -Candidate (Join-Path $deliveryFull $request.fileName) -Root $deliveryFull
+    if (Test-Path -LiteralPath $deliveredPath) { throw 'Verified source delivery destination already exists.' }
+    Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
+    Write-AtomicJson -Path $ReceiptPath -Value $receipt
+    Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
+    Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source' -AllowMissingLeaf
+    Invoke-Heartbeat
+    $temporaryDelivery = Assert-ContainedFilePath -Candidate (Join-Path $deliveryFull ('.delivery-' + [guid]::NewGuid().ToString('N') + '.tmp')) -Root $deliveryFull
+    $destination = [IO.File]::Open($temporaryDelivery, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $archiveEvidence.stream.Position = 0
+        Copy-StreamWithHeartbeat -Source $archiveEvidence.stream -Destination $destination
+        $destination.Flush($true)
+    }
+    finally { $destination.Dispose() }
+    [IO.File]::Move($temporaryDelivery, $deliveredPath)
+    $temporaryDelivery = $null
+    $deleteCandidateAfterDelivery = $true
+    $deliveryStart.Stop()
+    $receipt.status = 'delivered'
+    $receipt.deliveredAt = Get-UtcTimestamp
+    $receipt.deliveredPath = $deliveredPath
+    $receipt.timings.deliverMilliseconds = $deliveryStart.ElapsedMilliseconds
+    Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt'
+    Write-AtomicJson -Path $ReceiptPath -Value $receipt
+
+    Write-Result -Value ([ordered]@{
+        result = 'passed'
+        status = 'delivered'
+        deliveredPath = $deliveredPath
+        receiptPath = [IO.Path]::GetFullPath($ReceiptPath)
+        receiptSha256 = Get-FileSha256 -Path $ReceiptPath
+        timings = $receipt.timings
+    })
+}
+finally {
+    if ($archiveEvidence.stream) { $archiveEvidence.stream.Dispose() }
+    if ($temporaryDelivery -and (Test-Path -LiteralPath $temporaryDelivery -PathType Leaf)) {
+        [IO.File]::Delete($temporaryDelivery)
+    }
+    if ($deleteCandidateAfterDelivery -and (Test-Path -LiteralPath $candidateFull -PathType Leaf)) {
+        Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Delivered source input cleanup'
+        [IO.File]::Delete($candidateFull)
     }
 }
-
-if ($archiveFormat -ne 'zip') {
-    $receipt.status = 'unsupported'
-    Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
-    Write-AtomicJson -Path $ReceiptPath -Value $receipt
-    Write-Result -Value (New-WaitingResult -Status 'waiting-user' -Code 'unsupported_archive_format' -Message "Detected unsupported $archiveFormat archive bytes after download." -ArchiveFormat $archiveFormat -Path $candidateFull)
-    return
-}
-if ($false -eq $officialHashPassed) {
-    $receipt.status = 'rejected'
-    Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
-    Write-AtomicJson -Path $ReceiptPath -Value $receipt
-    Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; waitingReason = [ordered]@{ code = 'source_hash_mismatch'; message = 'Downloaded SHA-256 does not match the official hash.' }; retainedPath = $candidateFull })
-    return
-}
-if ([IO.Path]::GetFileName($candidateFull) -cne [string]$request.fileName) {
-    $receipt.status = 'rejected'
-    Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
-    Write-AtomicJson -Path $ReceiptPath -Value $receipt
-    Write-Result -Value ([ordered]@{ result = 'blocked'; status = 'blocked'; waitingReason = [ordered]@{ code = 'source_filename_mismatch'; message = 'Downloaded filename does not match the requested Main file.' }; retainedPath = $candidateFull })
-    return
-}
-
-$deliveryStart = [Diagnostics.Stopwatch]::StartNew()
-$deliveryFull = [IO.Path]::GetFullPath($DeliveryDirectory)
-$deliveryFull = Assert-RegularDirectoryRoot -Path $deliveryFull -Label 'Delivery directory' -RunRoot $sourceRunRoot
-$deliveredPath = Assert-ContainedFilePath -Candidate (Join-Path $deliveryFull $request.fileName) -Root $deliveryFull
-if (Test-Path -LiteralPath $deliveredPath) { throw 'Verified source delivery destination already exists.' }
-Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
-Write-AtomicJson -Path $ReceiptPath -Value $receipt
-Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
-Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source' -AllowMissingLeaf
-[IO.File]::Move($candidateFull, $deliveredPath)
-$deliveryStart.Stop()
-$receipt.status = 'delivered'
-$receipt.deliveredAt = Get-UtcTimestamp
-$receipt.deliveredPath = $deliveredPath
-$receipt.timings.deliverMilliseconds = $deliveryStart.ElapsedMilliseconds
-Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt'
-Write-AtomicJson -Path $ReceiptPath -Value $receipt
-
-Write-Result -Value ([ordered]@{
-    result = 'passed'
-    status = 'delivered'
-    deliveredPath = $deliveredPath
-    receiptPath = [IO.Path]::GetFullPath($ReceiptPath)
-    receiptSha256 = Get-FileSha256 -Path $ReceiptPath
-    timings = $receipt.timings
-})
