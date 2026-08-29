@@ -146,6 +146,21 @@ Describe 'Darktide Translate repository contract' {
         $version | Should -Match '^\d+\.\d+\.\d+$'
     }
 
+    # Scenario: A release bumps VERSION while the Nexus API download client remains part of the packaged Skill.
+    # Purpose: Keep the outbound User-Agent aligned with the immutable repository version for traceable client identity.
+    It 'UnitT35_UsesTheRepositoryVersionInTheNexusClientUserAgent' {
+        $version = (Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION') -Raw).Trim()
+        $receiverPath = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1'
+        $receiver = Get-Content -LiteralPath $receiverPath -Raw
+
+        $userAgentMatches = @([regex]::Matches(
+            $receiver,
+            "UserAgent\.ParseAdd\('Skill-Darktide-Translate/(?<version>[^']+)'\)"
+        ))
+        $userAgentMatches.Count | Should -Be 1
+        $userAgentMatches[0].Groups['version'].Value | Should -Be $version
+    }
+
     # Scenario: GitHub validates a branch or pull request using the shared SYP-81 through SYP-84 tool policy.
     # Purpose: Prevent the repository from silently pinning stale quality tools or weakening the required gates.
     It 'UnitT40_PreservesTheSharedLatestAtRunTimeQualityGate' {
