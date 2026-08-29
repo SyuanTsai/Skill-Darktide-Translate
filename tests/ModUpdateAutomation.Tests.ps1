@@ -141,6 +141,57 @@ function Enter-SharedCoordinationLease {
         $validator | Should -Not -Match 'ModUpdate\.Automation\.psm1'
     }
 
+    # Scenario: A Schema 14 MOD has no active localization and the caller omits a localization plan.
+    # Purpose: Keep the default none-mode path array-shaped under StrictMode so an empty removed-path set can complete normally.
+    It 'UnitT135_CompletesSchema14LocalizationWithoutAPlan' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Localization'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $stubs = @'
+Set-StrictMode -Version Latest
+$script:LocalizationPlanPath = $null
+function Get-CompletedStageResult { param($State, $Name) $null }
+function Start-Stage { param($Name) [ordered]@{ name = $Name } }
+function Assert-LockOwner { param($State) }
+function Write-AtomicJson { param($Path, $Value) }
+function Get-FileSha256 { param($Path) 'a' * 64 }
+function Get-Sha256Bytes { param($Bytes) 'b' * 64 }
+function Complete-Stage {
+    param($State, $Context, $ArtifactSha256, $Data)
+    [pscustomobject]@{ result = 'passed'; status = $State.status; data = $Data }
+}
+'@
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($stubs + "`n" + $functionAst.Extent.Text))
+        try {
+            $state = [ordered]@{
+                schemaVersion = 14
+                metadataPaths = @('README.md', '.hash/example.hash')
+                artifactsRoot = Join-Path $TestDrive 'schema14-none-artifacts'
+                modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+                worktreePath = $TestDrive
+                evidenceChain = [ordered]@{ c0Oid = '1' * 40 }
+            }
+
+            $result = & $module { param($value) Invoke-Localization -State $value } $state
+
+            $result.result | Should -Be 'passed'
+            $result.data.mode | Should -Be 'none'
+            $result.data.fileCount | Should -Be 0
+            $state.status | Should -Be 'localized'
+            @($state.localizationRemovedPaths).Count | Should -Be 0
+            @($state.evidenceTargetPaths).Count | Should -Be 0
+        }
+        finally {
+            Remove-Module $module -Force
+        }
+    }
+
     # Scenario: Evidence is built for localization and non-localization runs, including a repair after publication.
     # Purpose: Preserve C0/C1/C2/C3/F identities, parent-tree invariants, normal Git index rules, and append-only history.
     It 'UnitT140_EnforcesLayeredGitEvidenceAndAppendOnlyPublication' {
@@ -319,8 +370,9 @@ function Enter-SharedCoordinationLease {
             $functionAst | Should -Not -BeNullOrEmpty
             $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
             $invokeMatch = {
-                param($relativePath, $textValue, $fieldName, $fieldValue)
-                Test-MetadataSourceFieldMatch -RelativePath $relativePath -Text $textValue -FieldName $fieldName -FieldValue $fieldValue
+                param($relativePath, $textValue, $fieldName, $fieldValue, $nexusPageUrl)
+                Test-MetadataSourceFieldMatch -RelativePath $relativePath -Text $textValue -FieldName $fieldName `
+                    -FieldValue $fieldValue -NexusPageUrl $nexusPageUrl
             }
 
             (& $module $invokeMatch 'README.md' '- Archive filename: ExampleMod.zip' 'archiveFileName' 'ExampleMod.zip') |
@@ -335,6 +387,18 @@ function Enter-SharedCoordinationLease {
                 Should -BeTrue
             (& $module $invokeMatch '.hash/examplemod.hash' 'filename=prefix-ExampleMod.zip.bak' 'archiveFileName' 'ExampleMod.zip') |
                 Should -BeFalse
+
+            $multiModReadme = @'
+### [First MOD](https://www.nexusmods.com/warhammer40kdarktide/mods/1)
+- Archive filename: FirstMod.zip
+
+### [Example MOD](https://www.nexusmods.com/warhammer40kdarktide/mods/2?tab=files)
+- Archive filename: ExampleMod.zip
+'@
+            (& $module $invokeMatch 'README.md' $multiModReadme 'archiveFileName' 'ExampleMod.zip' `
+                'https://www.nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeTrue
+            (& $module $invokeMatch 'README.md' $multiModReadme 'archiveFileName' 'FirstMod.zip' `
+                'https://www.nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeFalse
         }
     }
 

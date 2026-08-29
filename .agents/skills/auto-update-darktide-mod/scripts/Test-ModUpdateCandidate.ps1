@@ -161,7 +161,13 @@ function Get-ContractSha256 {
 }
 
 function Test-MetadataSourceFieldMatch {
-    param([string] $RelativePath, [string] $Text, [string] $FieldName, [string] $FieldValue)
+    param(
+        [string] $RelativePath,
+        [string] $Text,
+        [string] $FieldName,
+        [string] $FieldValue,
+        [string] $NexusPageUrl
+    )
     if ([string]::IsNullOrWhiteSpace($FieldValue)) { return $false }
     if ($RelativePath.StartsWith('.hash/', [StringComparison]::Ordinal)) {
         $hashKeys = [ordered]@{
@@ -176,6 +182,24 @@ function Test-MetadataSourceFieldMatch {
         return $matchesForKey.Count -eq 1 -and [string]$matchesForKey[0].Groups[1].Value -ceq $FieldValue
     }
     if ($RelativePath -cne 'README.md') { return $false }
+    $readmeText = $Text
+    if (-not [string]::IsNullOrWhiteSpace($NexusPageUrl)) {
+        $headingMatches = @([regex]::Matches(
+            $Text,
+            '(?m)^###\s+\[[^\]\r\n]+\]\((?<url>https://www\.nexusmods\.com/warhammer40kdarktide/mods/\d+)(?:\?[^)\r\n]*)?\)\s*\r?$'
+        ))
+        if ($headingMatches.Count -ne 0) {
+            $targetHeadings = @($headingMatches | Where-Object {
+                [string]$_.Groups['url'].Value -ceq $NexusPageUrl
+            })
+            if ($targetHeadings.Count -ne 1) { return $false }
+            $sectionStart = $targetHeadings[0].Index
+            $tailStart = $targetHeadings[0].Index + $targetHeadings[0].Length
+            $nextHeading = [regex]::Match($Text.Substring($tailStart), '(?m)^#{1,3}\s+')
+            $sectionEnd = if ($nextHeading.Success) { $tailStart + $nextHeading.Index } else { $Text.Length }
+            $readmeText = $Text.Substring($sectionStart, $sectionEnd - $sectionStart)
+        }
+    }
     $readmeLabels = [ordered]@{
         nexusModId = 'Nexus MOD ID'; nexusPageUrl = 'Nexus URL'; nexusPageVersion = 'Nexus page version'
         nexusPageUpdatedAt = 'Nexus last updated'; nexusMainFileId = 'Main file ID'; nexusMainFileVersion = 'Main file version'
@@ -184,7 +208,7 @@ function Test-MetadataSourceFieldMatch {
     }
     if (-not $readmeLabels.Contains($FieldName)) { return $false }
     $label = [regex]::Escape([string]$readmeLabels[$FieldName])
-    $matchesForLabel = @([regex]::Matches($Text, "(?m)^\s*-\s+$label\s*:\s*([^`r`n]*)`r?$") )
+    $matchesForLabel = @([regex]::Matches($readmeText, "(?m)^\s*-\s+$label\s*:\s*([^`r`n]*)`r?$") )
     if ($matchesForLabel.Count -ne 1) { return $false }
     $recorded = ([string]$matchesForLabel[0].Groups[1].Value).Trim()
     if ($recorded.Length -ge 2 -and $recorded.StartsWith('`', [StringComparison]::Ordinal) -and
@@ -577,7 +601,8 @@ function Assert-SourceTupleIntegrity {
         $textValue = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
         foreach ($fieldName in $expectedFields.Keys) {
             $expectedMatch = Test-MetadataSourceFieldMatch -RelativePath $relative -Text $textValue `
-                -FieldName $fieldName -FieldValue ([string]$expectedFields[$fieldName])
+                -FieldName $fieldName -FieldValue ([string]$expectedFields[$fieldName]) `
+                -NexusPageUrl ([string]$expectedFields.nexusPageUrl)
             if (-not $file.sourceFieldMatches.Contains($fieldName) -or [bool]$file.sourceFieldMatches[$fieldName] -ne $expectedMatch) {
                 throw "Metadata preview field evidence is inconsistent: $relative / $fieldName"
             }
