@@ -40,6 +40,14 @@ NoBrainer run `eb45d710-80da-479b-b7fa-ab9429c06096` installed Nexus Main file `
 - Preserved `UnitT135_CompletesSchema14LocalizationWithoutAPlan` for the genuine no-registration case.
 - The tests were added but intentionally not executed, following the trial instruction.
 
+### Post-trial PR validation and self-review
+
+- PR #10 initially ran 146 repository-contract tests at commit `8fe518839995fe4379d90c6eaab395f4a4cca299`: 145 passed and `UnitT35_UsesTheRepositoryVersionInTheNexusClientUserAgent` failed because `VERSION` was `0.3.6` while the packaged Nexus client User-Agent remained `0.3.5`.
+- The User-Agent was corrected to `Skill-Darktide-Translate/0.3.6`.
+- Self-review then found that the first guard recognized only line-leading `mod_localization` assignments. UnitT137 was tightened to use a valid inline table registration; it reproduced the silent `passed`/`none` result before the detector was made independent of line position.
+- Final targeted validation passed UnitT35 and UnitT137 (2 passed, 0 failed).
+- Final full validation passed all 146 tests with 0 failed and 0 skipped in 617.03 seconds; package reference integrity and PowerShell parser validation also passed.
+
 ## Successful BornReady candidate
 
 - Run ID: `a976fab0-ef65-4a7f-8587-36da419f8d12`

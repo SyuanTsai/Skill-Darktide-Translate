@@ -220,6 +220,13 @@ function Assert-LockOwner { param($State) }
 function Assert-NoReparseTree { param($Path, $Root, $Label) $Path }
 function Assert-NoReparsePath { param($Path, $Root, $Label) $Path }
 function Read-FileBytesWithHeartbeat { param($Path) [IO.File]::ReadAllBytes($Path) }
+function Write-AtomicJson { param($Path, $Value) }
+function Get-FileSha256 { param($Path) 'a' * 64 }
+function Get-Sha256Bytes { param($Bytes) 'b' * 64 }
+function Complete-Stage {
+    param($State, $Context, $ArtifactSha256, $Data)
+    [pscustomobject]@{ result = 'passed'; status = $State.status; stage = 'localization'; data = $Data }
+}
 function Suspend-Stage {
     param($State, $Context, $Result, $ArtifactSha256, $OutputStage, $Data)
     [pscustomobject]@{ result = $Result; status = $State.status; stage = $OutputStage; data = $Data }
@@ -231,7 +238,7 @@ function Suspend-Stage {
             New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
             [IO.File]::WriteAllText(
                 (Join-Path $installRoot 'ExampleMod.mod'),
-                "return {`n`tmod_localization = `"ExampleMod/ExampleMod_localization`",`n}`n",
+                'return { run = function() new_mod("ExampleMod", { mod_localization = "ExampleMod/ExampleMod_localization" }) end }',
                 [Text.UTF8Encoding]::new($false)
             )
             $state = [ordered]@{

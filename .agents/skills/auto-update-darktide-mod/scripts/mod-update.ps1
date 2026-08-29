@@ -3440,7 +3440,7 @@ function Invoke-Localization {
                 $descriptorText = [Text.UTF8Encoding]::new($false, $true).GetString(
                     (Read-FileBytesWithHeartbeat -Path $descriptorPath)
                 )
-                if ([regex]::IsMatch($descriptorText, '(?m)^[\t ]*mod_localization[\t ]*=')) {
+                if ([regex]::IsMatch($descriptorText, '(?<![A-Za-z0-9_])mod_localization[\t ]*=')) {
                     [IO.Path]::GetRelativePath($installRoot, $descriptorPath).Replace('\', '/')
                 }
             } | Sort-Object -Unique
