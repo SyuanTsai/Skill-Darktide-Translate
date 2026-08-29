@@ -831,7 +831,7 @@ return localization
         $runner | Should -Match 'Apply-LocalizationWorkset\.ps1'
         $runner | Should -Not -Match 'Write-ByteFile\s+-Path\s+\$worktreeFile\s+-Bytes\s+\$mergedRawBytes'
         $runner | Should -Match 'Write-ByteFile\s+-Path\s+\$destination\s+-Bytes\s+\(Read-FileBytesWithHeartbeat -Path \$mergedPath\)'
-        $runner | Should -Match "result = 'waiting-input'.*stage = 'localization-workset'"
+        $runner | Should -Match '(?s)Suspend-Stage -State \$State -Context \$stage -Result ''waiting-input''.*?-OutputStage ''localization-workset'''
         $validator | Should -Match "Add-ValidationCheck -Name 'localization-workset-boundary'"
         $validator | Should -Match 'replacementBase64'
         $validator | Should -Match 'immutableContractSha256'
