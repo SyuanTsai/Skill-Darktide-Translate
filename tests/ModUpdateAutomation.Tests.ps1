@@ -620,6 +620,160 @@ function Enter-SharedCoordinationLease {
                 (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
             }
         }
+
+        # Scenario: A pre-0.3 Schema 14 completed run has no run-local pin but retains its immutable authoring references.
+        # Purpose: Exercise the real resume path and preserve compatibility without creating or migrating pin evidence.
+        It 'InterT175_ResumesALegacySchema14RunWithoutMigratingItsPin' {
+            $integrity = & (Join-Path $script:syp118Fixture.SkillRoot 'scripts/Test-ReferenceIntegrity.ps1') -PassThru
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            foreach ($field in @(
+                'workflowSourcePinPath', 'workflowSourcePinSha256', 'workflowSourceRepository',
+                'workflowSourceVersion', 'workflowSourceContentSha256'
+            )) { $state.Remove($field) }
+            $state.schemaVersion = 14
+            $state.workflowSchemaVersion = 14
+            $state.workflowCommitOid = [string]$integrity.authoringSourceCommit
+            $state.workflowPath = [string]$integrity.workflow.originalPath
+            $state.workflowBlobOid = [string]$integrity.workflow.gitBlobOid
+            $state.workflowSha256 = [string]$integrity.workflow.sha256
+            $state.reviewBaselinePath = [string]$integrity.reviewBaseline.originalPath
+            $state.reviewBaselineBlobOid = [string]$integrity.reviewBaseline.gitBlobOid
+            $state.reviewBaselineSha256 = [string]$integrity.reviewBaseline.sha256
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            [IO.File]::Delete($script:syp118Fixture.PinPath)
+            $stateShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.StatePath -Algorithm SHA256).Hash
+
+            $result = & $script:syp118Fixture.RunnerPath verify-source `
+                -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                -StatePath $script:syp118Fixture.StatePath -PassThru
+
+            $result.result | Should -Be 'passed'
+            $result.idempotent | Should -BeTrue
+            (Get-FileHash -LiteralPath $script:syp118Fixture.StatePath -Algorithm SHA256).Hash | Should -Be $stateShaBefore
+            Test-Path -LiteralPath $script:syp118Fixture.PinPath | Should -BeFalse
+        }
+
+        # Scenario: A Schema 15 completed run loses both recorded run-local pin fields before resume.
+        # Purpose: Fail before reservation or state mutation instead of silently entering the Schema 14 compatibility path.
+        It 'InterT176_RejectsANonLegacyRunWhosePinRecordIsMissing' {
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $state.Remove('workflowSourcePinPath')
+            $state.Remove('workflowSourcePinSha256')
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*Run-local Skill source pin is missing*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: A Schema 15 completed run retains the pin path but loses the recorded pin SHA-256.
+        # Purpose: Reject a partial pin tuple before any writer or reservation mutation.
+        It 'InterT177_RejectsAnIncompleteRunLocalPinRecord' {
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $state.Remove('workflowSourcePinSha256')
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*pin record is incomplete*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: A Schema 15 state is edited to reference a pin outside its fixed run-local evidence path.
+        # Purpose: Reject pin relocation before reading alternate bytes or acquiring the reservation worker.
+        It 'InterT178_RejectsRunLocalPinPathRelocation' {
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $alternatePin = Join-Path $script:syp118Fixture.RunRoot 'alternate-pin.json'
+            [IO.File]::Copy($script:syp118Fixture.PinPath, $alternatePin)
+            $state.workflowSourcePinPath = [IO.Path]::GetFullPath($alternatePin)
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath,
+                $alternatePin
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*pin path changed*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: The fixed run-local pin remains valid JSON but its bytes change after the state records its SHA-256.
+        # Purpose: Reject any pin rewrite even when its semantic fields still describe the same package.
+        It 'InterT179_RejectsChangedRunLocalPinBytes' {
+            [IO.File]::AppendAllText($script:syp118Fixture.PinPath, "`n", [Text.UTF8Encoding]::new($false))
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*pin bytes*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
     }
 
     # Scenario: A maintainer installs the Skill, recovers a failed run, rolls back, or adds a MOD exception.
@@ -1119,6 +1273,115 @@ function Invoke-Git {
         $reviewFunction | Should -Match 'reviewThreads\(first:100\)'
         $reviewFunction | Should -Match '\$snapshot\[''reviewThreads''\]\s*='
         $reviewFunction | Should -Match 'Review feedback snapshot exceeds the bounded thread capacity'
+    }
+
+    # Scenario: An untrusted ZIP reaches the documented high-entry boundary without any file/ancestor collision.
+    # Purpose: Keep collision validation proportional to path depth instead of comparing every entry with every other entry.
+    It 'UnitT206_IndexesArchiveAncestorPrefixesInLinearSpace' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Assert-NoArchiveFileAncestorCollisions'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $seen = [Collections.Generic.Dictionary[string, bool]]::new([StringComparer]::OrdinalIgnoreCase)
+        for ($index = 0; $index -lt 5000; $index++) {
+            $seen.Add("ExampleMod/dir-$index/file.lua", $false)
+        }
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+
+        & $module { param($paths) Assert-NoArchiveFileAncestorCollisions -Seen $paths } $seen
+
+        $stopwatch.Stop()
+        $stopwatch.Elapsed.TotalSeconds | Should -BeLessThan 3
+        $functionAst.Extent.Text | Should -Match '\$filePaths\s*=\s*\[Collections\.Generic\.HashSet\[string\]\]::new'
+        $functionAst.Extent.Text | Should -Not -Match '\$ancestorPrefixes\s*='
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $runner | Should -Not -Match '\$entries\s*\+='
+        $runner | Should -Not -Match '(?s)\$seen\.Keys\s*\|\s*Where-Object.*?StartsWith'
+    }
+
+    # Scenario: Evidence generation has been consolidated into the bounded batch implementation.
+    # Purpose: Prevent a second unused Git evidence implementation from drifting away from the audited path.
+    It 'UnitT207_UsesOnlyTheBoundedGitEvidenceImplementation' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+
+        $runner | Should -Not -Match 'function New-GitEvidenceFile'
+        ([regex]::Matches($runner, 'New-GitEvidenceBatch')).Count | Should -Be 2
+    }
+
+    # Scenario: Archive and candidate manifests may each contain up to the documented 100,000 payload files.
+    # Purpose: Prevent repeated PowerShell array copies from reintroducing quadratic work after ZIP validation.
+    It 'UnitT208_UsesLinearCollectionsForHighCardinalityManifestEnumeration' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+        $tokens = $null
+        $parseErrors = $null
+        $runnerAst = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        foreach ($functionName in @('New-Manifest', 'Import-SecurityOverrides', 'New-GitNormalizationManifest', 'New-GitTreeManifest', 'Invoke-Localization')) {
+            $functionAst = $runnerAst.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
+            }, $true)
+            $functionAst | Should -Not -BeNullOrEmpty
+            $functionAst.Extent.Text | Should -Not -Match '\$[A-Za-z][A-Za-z0-9_]*\s*\+=\s*\[ordered\]'
+            if ($functionName -ne 'New-Manifest') {
+                $functionAst.Extent.Text | Should -Match 'Collections\.Generic\.List\[object\]'
+            }
+        }
+        $validator | Should -Not -Match '\$actual\s*\+=\s*\[ordered\]'
+        $validator | Should -Match '\$actual\s*=\s*\[Collections\.Generic\.List\[object\]\]::new\(\)'
+    }
+
+    # Scenario: Any immutable source-tuple field differs between state and the run-local package pin.
+    # Purpose: Keep every authorization field fail-closed rather than protecting only pin bytes and commit identity.
+    It 'UnitT209_RejectsEveryRunLocalSkillSourceTupleMismatch' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Assert-RunLocalSkillPinRecord'
+        }, $true)
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $pin = [ordered]@{
+            repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+            requestedRef = 'v0.3.2'
+            resolvedCommit = '1' * 40
+            resolvedVersion = '0.3.2'
+            contentSha256 = 'a' * 64
+            pinSha256 = 'b' * 64
+        }
+        $state = [ordered]@{
+            workflowSourceRepository = $pin.repository
+            workflowRef = $pin.requestedRef
+            workflowCommitOid = $pin.resolvedCommit
+            workflowSourceVersion = $pin.resolvedVersion
+            workflowSourceContentSha256 = $pin.contentSha256
+            workflowSourcePinSha256 = $pin.pinSha256
+        }
+        $mismatches = [ordered]@{
+            workflowSourceRepository = 'https://example.invalid/other.git'
+            workflowRef = 'other-ref'
+            workflowCommitOid = '2' * 40
+            workflowSourceVersion = '9.9.9'
+            workflowSourceContentSha256 = 'c' * 64
+            workflowSourcePinSha256 = 'd' * 64
+        }
+
+        foreach ($field in $mismatches.Keys) {
+            $changed = $state | ConvertTo-Json -Depth 10 | ConvertFrom-TestJson -AsHashtable
+            $changed[$field] = $mismatches[$field]
+            { & $module { param($value, $record) Assert-RunLocalSkillPinRecord -State $value -PinRecord $record -ActualPinSha256 $record.pinSha256 } `
+                    $changed $pin } | Should -Throw '*Skill package drift*'
+        }
     }
 
     # Scenario: A real ZIP changes an active localization file, including metadata preflight failures and resumable evidence failures.

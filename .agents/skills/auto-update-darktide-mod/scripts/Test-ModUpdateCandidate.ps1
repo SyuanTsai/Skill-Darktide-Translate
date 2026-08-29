@@ -1645,12 +1645,12 @@ Add-ValidationCheck -Name 'candidate-manifest' -Action {
     $manifest = Get-Content -LiteralPath $state.candidateTreeManifest.path -Raw | ConvertFrom-Json -AsHashtable
     if ($manifest.commitOid -ne $chain.fOid -or $manifest.treeOid -ne $chain.fTreeOid) { throw 'Candidate manifest is not bound to F and F tree.' }
     $listing = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('-c', 'core.quotePath=false', 'ls-tree', '-r', '-l', '--full-tree', $chain.fOid, '--', $state.modRelativePath)).output
-    $actual = @()
+    $actual = [Collections.Generic.List[object]]::new()
     foreach ($line in @($listing -split "`r?`n" | Where-Object { $_ })) {
         if ($line -notmatch '^[0-7]{6} blob ([0-9a-f]{40})\s+(\d+)\t(.+)$') { throw "Unable to independently parse candidate Git tree entry: $line" }
         $repositoryPath = $Matches[3]
         $bytes = Get-GitBlobBytes -WorkingDirectory $worktree -Object $Matches[1]
-        $actual += [ordered]@{ path = $repositoryPath.Substring(([string]$state.modRelativePath).Length).TrimStart('/'); blobOid = $Matches[1]; size = [int64]$Matches[2]; sha256 = Get-Sha256Bytes -Bytes $bytes }
+        $actual.Add([ordered]@{ path = $repositoryPath.Substring(([string]$state.modRelativePath).Length).TrimStart('/'); blobOid = $Matches[1]; size = [int64]$Matches[2]; sha256 = Get-Sha256Bytes -Bytes $bytes })
     }
     $expected = @($manifest.files | Sort-Object { $_.path })
     $actual = @($actual | Sort-Object { $_.path })

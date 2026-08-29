@@ -991,7 +991,7 @@ function Import-SecurityOverrides {
         throw 'Security override input does not bind this exact run and archive SHA-256.'
     }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $approvals = @()
+    $approvals = [Collections.Generic.List[object]]::new()
     foreach ($approval in @($overrideDocument.approvals)) {
         if ($approval -isnot [Collections.IDictionary]) { throw 'Security override approval must be an object.' }
         $relative = [string]$approval.relativePath
@@ -1004,7 +1004,7 @@ function Import-SecurityOverrides {
         if ($fileSha256 -notmatch '^[0-9a-f]{64}$') { throw 'Security override fileSha256 must be 64 lowercase hexadecimal characters.' }
         $key = "$relative`n$fileSha256"
         if (-not $seen.Add($key)) { throw 'Security override contains a duplicate approval tuple.' }
-        $approvals += [ordered]@{ archiveSha256 = [string]$State.archive.sha256; relativePath = $relative; fileSha256 = $fileSha256 }
+        $approvals.Add([ordered]@{ archiveSha256 = [string]$State.archive.sha256; relativePath = $relative; fileSha256 = $fileSha256 })
     }
     if ($approvals.Count -eq 0) { throw 'Security override input contains no exact approvals.' }
     $artifactPath = Join-Path ([string]$State.artifactsRoot) 'security-overrides.json'
@@ -1117,7 +1117,7 @@ function Get-StageArtifactPath {
 
 function New-GitNormalizationManifest {
     param([Collections.IDictionary] $State)
-    $records = @()
+    $records = [Collections.Generic.List[object]]::new()
     foreach ($file in Get-ChildItem -LiteralPath $State.installRoot -File -Recurse | Sort-Object FullName) {
         $relativeToRepository = [IO.Path]::GetRelativePath($State.worktreePath, $file.FullName).Replace('\', '/')
         $relativeToMod = [IO.Path]::GetRelativePath($State.installRoot, $file.FullName).Replace('\', '/')
@@ -1127,7 +1127,7 @@ function New-GitNormalizationManifest {
         $transform = if ((Get-Sha256Bytes -Bytes $rawBytes) -eq (Get-Sha256Bytes -Bytes $indexedBytes)) { 'none' }
             elseif (Test-CrlfNormalizationOnly -RawBytes $rawBytes -IndexedBytes $indexedBytes) { 'crlf-to-lf' }
             else { throw "Git clean processing changed bytes beyond CRLF-to-LF for $relativeToRepository." }
-        $records += [ordered]@{
+        $records.Add([ordered]@{
             path = $relativeToMod
             repositoryPath = $relativeToRepository
             rawSize = $rawBytes.LongLength
@@ -1137,7 +1137,7 @@ function New-GitNormalizationManifest {
             blobOid = $blobOid
             transform = $transform
             whitespacePreserved = $true
-        }
+        })
     }
     $path = Join-Path $State.artifactsRoot 'git-index-normalization.json'
     Write-AtomicJson -Path $path -Value ([ordered]@{
@@ -1153,20 +1153,20 @@ function New-GitNormalizationManifest {
 function New-GitTreeManifest {
     param([Collections.IDictionary] $State, [string] $CommitOid)
     $listing = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.quotePath=false', 'ls-tree', '-r', '-l', '--full-tree', $CommitOid, '--', $State.modRelativePath)).output
-    $files = @()
+    $files = [Collections.Generic.List[object]]::new()
     foreach ($line in @($listing -split "`r?`n" | Where-Object { $_ })) {
         if ($line -notmatch '^[0-7]{6} blob ([0-9a-f]{40})\s+(\d+)\t(.+)$') { throw "Unable to parse candidate Git tree entry: $line" }
         $repositoryPath = $Matches[3]
         $relative = $repositoryPath.Substring(([string]$State.modRelativePath).Length).TrimStart('/')
         $bytes = Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $Matches[1]
         if ($bytes.LongLength -ne [int64]$Matches[2]) { throw "Candidate Git blob size mismatch: $repositoryPath" }
-        $files += [ordered]@{
+        $files.Add([ordered]@{
             path = $relative
             repositoryPath = $repositoryPath
             blobOid = $Matches[1]
             size = $bytes.LongLength
             sha256 = Get-Sha256Bytes -Bytes $bytes
-        }
+        })
     }
     $path = Join-Path $State.artifactsRoot 'candidate-tree-manifest.json'
     Write-AtomicJson -Path $path -Value ([ordered]@{
@@ -1421,7 +1421,8 @@ function Assert-RunLocalSkillPackage {
                 else { 0 }
             if ($schemaVersion -eq 14) {
                 $legacyIntegrity = & $integrityScript -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
-                return (Assert-LegacySchema14SkillPackageRecord -State $State -Integrity $legacyIntegrity)
+                $legacyIntegrityRecord = $legacyIntegrity | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+                return (Assert-LegacySchema14SkillPackageRecord -State $State -Integrity $legacyIntegrityRecord)
             }
             throw 'Run-local Skill source pin is missing.'
         }
@@ -2940,6 +2941,29 @@ function Invoke-Claim {
     Complete-IncompleteClaim -State $state -Context $claimStage
 }
 
+function Assert-NoArchiveFileAncestorCollisions {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.Generic.Dictionary[string, bool]] $Seen
+    )
+    $filePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($pair in $Seen.GetEnumerator()) {
+        if (-not $pair.Value) { $null = $filePaths.Add($pair.Key) }
+    }
+    foreach ($path in $Seen.Keys) {
+        $separatorIndex = $path.IndexOf([char]'/')
+        while ($separatorIndex -ge 0) {
+            if ($separatorIndex -gt 0) {
+                $ancestor = $path.Substring(0, $separatorIndex)
+                if ($filePaths.Contains($ancestor)) {
+                    throw "Archive file/ancestor archive path collision rejected: $ancestor"
+                }
+            }
+            $separatorIndex = $path.IndexOf([char]'/', $separatorIndex + 1)
+        }
+    }
+}
+
 function Get-ZipEntries {
     param(
         [Parameter(Mandatory)][string] $Path,
@@ -2954,7 +2978,7 @@ function Get-ZipEntries {
     try {
         $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Read, $false)
         $seen = [Collections.Generic.Dictionary[string, bool]]::new([StringComparer]::OrdinalIgnoreCase)
-        $entries = @()
+        $entries = [Collections.Generic.List[object]]::new()
         $totalLength = [int64]0
         if ($archive.Entries.Count -gt 100000) { throw 'Archive entry count exceeds the 100,000 entry limit.' }
         foreach ($entry in $archive.Entries) {
@@ -2995,21 +3019,15 @@ function Get-ZipEntries {
                 }
                 catch { throw "Encrypted or unreadable archive entry rejected: $entryPath. $($_.Exception.Message)" }
             }
-            $entries += [ordered]@{
+            $entries.Add([ordered]@{
                 path = $entryPath
                 size = $entry.Length
                 compressedSize = $entry.CompressedLength
                 externalAttributes = $entry.ExternalAttributes
                 directory = $isDirectory
-            }
+            })
         }
-        foreach ($pair in $seen.GetEnumerator()) {
-            if ($pair.Value) { continue }
-            $filePrefix = $pair.Key + '/'
-            if (@($seen.Keys | Where-Object { $_.StartsWith($filePrefix, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) {
-                throw "Archive file/ancestor archive path collision rejected: $($pair.Key)"
-            }
-        }
+        Assert-NoArchiveFileAncestorCollisions -Seen $seen
         [ordered]@{ archive = $archive; stream = $stream; entries = $entries }
     }
     catch {
@@ -3393,7 +3411,7 @@ function Invoke-Localization {
     }
     $localizationRoot = Join-Path $State.artifactsRoot 'localization'
     New-Item -ItemType Directory -Path $localizationRoot -Force | Out-Null
-    $records = @()
+    $records = [Collections.Generic.List[object]]::new()
     foreach ($file in @($plan.files)) {
         $relative = ([string]$file.relativePath).Replace('\', '/')
         if (-not $relative.StartsWith($State.modRelativePath + '/', [StringComparison]::OrdinalIgnoreCase)) {
@@ -3419,7 +3437,7 @@ function Invoke-Localization {
         Write-ByteFile -Path (Join-Path $artifactDirectory 'merged.lua') -Bytes $mergedBytes
         $decisionsPath = Join-Path $artifactDirectory 'decisions.json'
         Write-AtomicJson -Path $decisionsPath -Value $file
-        $records += [ordered]@{
+        $records.Add([ordered]@{
             relativePath = $relative
             safeId = $safeId
             rawSha256 = Get-Sha256Bytes -Bytes $rawBytes
@@ -3428,7 +3446,7 @@ function Invoke-Localization {
             approvedSpans = @($file.approvedSpans)
             artifactDirectory = $artifactDirectory
             decisionsSha256 = Get-FileSha256 -Path $decisionsPath
-        }
+        })
     }
     $manifestPath = Join-Path $State.artifactsRoot 'localization-manifest.json'
     Write-AtomicJson -Path $manifestPath -Value ([ordered]@{ schemaVersion = 1; mode = $plan.mode; files = $records; removedPaths = $removedPaths })
@@ -3447,42 +3465,6 @@ function Invoke-Localization {
     $State.localizationManifestPath = $manifestPath
     $State.status = 'localized'
     Complete-Stage -State $State -Context $stage -ArtifactSha256 (Get-FileSha256 -Path $manifestPath) -Data ([ordered]@{ mode = $plan.mode; fileCount = $records.Count })
-}
-
-function New-GitEvidenceFile {
-    param([Collections.IDictionary] $State, [string] $Name, [string[]] $Arguments)
-    $path = Join-Path (Join-Path $State.artifactsRoot 'git-evidence') $Name
-    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
-    $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = 'git'
-    $start.UseShellExecute = $false
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    foreach ($argument in @('-C', [string]$State.worktreePath) + $Arguments) { $start.ArgumentList.Add($argument) }
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $start
-    $memory = [IO.MemoryStream]::new()
-    try {
-        if (-not $process.Start()) { throw 'Unable to start Git evidence generation.' }
-        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
-        $errorTask = $process.StandardError.ReadToEndAsync()
-        while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
-            if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
-            else { [Threading.Tasks.Task]::Delay(50).Wait() }
-            Update-ActiveReservationHeartbeat
-            Update-ActiveSharedCoordinationHeartbeat
-        }
-        $null = $copyTask.GetAwaiter().GetResult()
-        $errorText = $errorTask.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw "Git evidence generation failed ($($process.ExitCode)): $errorText" }
-        $evidenceBytes = $memory.ToArray()
-    }
-    finally {
-        $memory.Dispose()
-        $process.Dispose()
-    }
-    Write-AtomicBytes -Path $path -Bytes $evidenceBytes
-    [ordered]@{ path = $path; size = $evidenceBytes.LongLength; sha256 = Get-FileSha256 -Path $path }
 }
 
 function New-GitEvidenceBatch {
