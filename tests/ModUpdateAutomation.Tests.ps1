@@ -468,6 +468,8 @@ function Enter-SharedCoordinationLease {
         $runner | Should -Match 'LocalReviewPath'
         $runner | Should -Match 'review-completion-validation\.json'
         $runner | Should -Match 'function Ensure-RunWriterLock'
+        $runner | Should -Match '(?s)function Ensure-RunWriterLock.*?Assert-RunSkillPackageBinding -State \$State.*?Enter-ModReservationWorker -State \$State'
+        $runner | Should -Match '(?s)function Get-CompletedStageResult.*?Assert-RunSkillPackageBinding -State \$State.*?Assert-LockOwner -State \$State'
         $runner | Should -Match '(?s)function Ensure-RunWriterLock.*?Enter-ModReservationWorker -State \$State.*?\$script:writerLease = Enter-RunWriterLock -State \$State'
         $runner | Should -Match '(?s)Ensure-RunWriterLock -State \$state\s+Write-AtomicJson -Path \$state\.statePath'
         $runner | Should -Match 'if \(-not \$script:writerLease\)'
@@ -482,6 +484,130 @@ function Enter-SharedCoordinationLease {
         $identityLockIndex = $runner.IndexOf('Enter-ModReservation -Plan $plan', $baseResolutionIndex)
         $baseResolutionIndex | Should -BeGreaterOrEqual 0
         $identityLockIndex | Should -BeGreaterThan $baseResolutionIndex
+    }
+
+    Context 'SYP-118 completed-stage run-local Skill pin validation' {
+        BeforeEach {
+            $script:syp118Fixture = New-TestPinnedCompletedStageRun -SkillRoot $skillRoot `
+                -FixtureRoot (Join-Path $TestDrive ("syp118-" + [guid]::NewGuid().ToString('N')))
+        }
+
+        # Scenario: The installed package still exactly matches the immutable pin archived by the completed run.
+        # Purpose: Preserve same-pin idempotency while re-proving the package before receipt reuse.
+        It 'InterT171_ReusesACompletedStageWithTheSameRunLocalPin' {
+            $stateShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.StatePath -Algorithm SHA256).Hash
+            $pinShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.PinPath -Algorithm SHA256).Hash
+            $artifactShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.ArtifactPath -Algorithm SHA256).Hash
+            $sourceShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.SourcePath -Algorithm SHA256).Hash
+
+            $result = & $script:syp118Fixture.RunnerPath verify-source `
+                -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                -StatePath $script:syp118Fixture.StatePath -PassThru
+
+            $result.result | Should -Be 'passed'
+            $result.idempotent | Should -BeTrue
+            $result.stage | Should -Be 'verify-source'
+            (Get-FileHash -LiteralPath $script:syp118Fixture.StatePath -Algorithm SHA256).Hash | Should -Be $stateShaBefore
+            (Get-FileHash -LiteralPath $script:syp118Fixture.PinPath -Algorithm SHA256).Hash | Should -Be $pinShaBefore
+            (Get-FileHash -LiteralPath $script:syp118Fixture.ArtifactPath -Algorithm SHA256).Hash | Should -Be $artifactShaBefore
+            (Get-FileHash -LiteralPath $script:syp118Fixture.SourcePath -Algorithm SHA256).Hash | Should -Be $sourceShaBefore
+        }
+
+        # Scenario: A non-runner installed package file differs from the content recorded by the run-local pin.
+        # Purpose: Reject a completed receipt before state, reservation, source evidence, or pin mutation.
+        It 'InterT172_RejectsDifferentPinnedPackageContentBeforeReceiptReuse' {
+            [IO.File]::AppendAllText(
+                (Join-Path $script:syp118Fixture.SkillRoot 'references/automation.md'),
+                "`nSYP-118 package drift`n",
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*Installed Skill file differs from its source pin*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: A replacement pin keeps the same version and package manifest but names a different commit.
+        # Purpose: Make commit identity part of resume authorization instead of trusting SemVer alone.
+        It 'InterT173_RejectsTheSameVersionFromADifferentPinnedCommit' {
+            $pin = Get-Content -LiteralPath $script:syp118Fixture.PinPath -Raw | ConvertFrom-TestJson -AsHashtable
+            $originalVersion = [string]$pin.resolvedVersion
+            $pin.resolvedCommit = '2222222222222222222222222222222222222222'
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.PinPath,
+                ($pin | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $state.workflowSourcePinSha256 = (Get-FileHash -LiteralPath $script:syp118Fixture.PinPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $state.workflowSourceVersion | Should -Be $originalVersion
+            $state.workflowCommitOid | Should -Not -Be $pin.resolvedCommit
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*resolvedCommit*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: The executing mod-update.ps1 bytes drift after the run archives its immutable package pin.
+        # Purpose: Prove the runner cannot authorize reuse of its own completed-stage receipt after self drift.
+        It 'InterT174_RejectsRunnerFileDriftBeforeStateOrLockMutation' {
+            [IO.File]::AppendAllText(
+                $script:syp118Fixture.RunnerPath,
+                "`n# SYP-118 runner drift`n",
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*mod-update.ps1*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
     }
 
     # Scenario: A maintainer installs the Skill, recovers a failed run, rolls back, or adds a MOD exception.
@@ -994,6 +1120,7 @@ function Enter-SharedCoordinationLease {
             archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
             completedStages = @(); stageTimings = [ordered]@{}
         }
+        $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         $owner = [ordered]@{
             schemaVersion = 2
@@ -1045,6 +1172,7 @@ function Enter-SharedCoordinationLease {
             archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
             completedStages = @(); stageTimings = [ordered]@{}
         }
+        $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         [ordered]@{
             schemaVersion = 2

@@ -587,6 +587,90 @@ function Get-SkillSourceFileEntry {
     $matchingEntries[0]
 }
 
+function Assert-RunSkillPackageBinding {
+    param([Parameter(Mandatory)][Collections.IDictionary] $State)
+
+    $pinFields = @(
+        'workflowSourcePinPath',
+        'workflowSourcePinSha256',
+        'workflowSourceRepository',
+        'workflowRef',
+        'workflowCommitOid',
+        'workflowSourceVersion',
+        'workflowSourceContentSha256'
+    )
+    $hasPinPath = $State.Contains('workflowSourcePinPath') -and
+        -not [string]::IsNullOrWhiteSpace([string]$State.workflowSourcePinPath)
+    $hasPinSha256 = $State.Contains('workflowSourcePinSha256') -and
+        -not [string]::IsNullOrWhiteSpace([string]$State.workflowSourcePinSha256)
+    if (-not $hasPinPath -and -not $hasPinSha256) {
+        $schemaVersion = if ($State.Contains('workflowSchemaVersion')) { [int]$State.workflowSchemaVersion }
+            elseif ($State.Contains('schemaVersion')) { [int]$State.schemaVersion }
+            else { 14 }
+        if ($schemaVersion -ne 14) {
+            throw 'Skill package drift: the run-local skill-source-pin.json is missing from a non-legacy run.'
+        }
+        try {
+            $legacyIntegrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') `
+                -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+        }
+        catch {
+            throw "Skill package drift: the legacy Schema 14 reference package failed integrity validation. $($_.Exception.Message)"
+        }
+        if ($legacyIntegrity.result -cne 'passed') {
+            throw 'Skill package drift: the legacy Schema 14 reference package did not pass integrity validation.'
+        }
+        return $legacyIntegrity
+    }
+    foreach ($field in $pinFields) {
+        if (-not $State.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$State[$field])) {
+            throw "Skill package drift: recorded run-local Skill source pin field is missing: $field"
+        }
+    }
+
+    $expectedPinPath = [IO.Path]::GetFullPath((Join-Path ([string]$State.runRoot) 'review-artifacts/skill-source-pin.json'))
+    $recordedPinPath = [IO.Path]::GetFullPath([string]$State.workflowSourcePinPath)
+    if ($recordedPinPath -cne $expectedPinPath) {
+        throw 'Skill package drift: the immutable Skill source pin is not at the fixed run-local skill-source-pin.json path.'
+    }
+    if (-not (Test-Path -LiteralPath $recordedPinPath -PathType Leaf)) {
+        throw 'Skill package drift: the run-local skill-source-pin.json is missing.'
+    }
+    try {
+        $null = Assert-NoReparsePath -Path $recordedPinPath -Root ([string]$State.repositoryRoot) -Label 'Run-local Skill source pin'
+    }
+    catch {
+        throw "Skill package drift: the run-local Skill source pin path is unsafe. $($_.Exception.Message)"
+    }
+    if ((Get-FileSha256 -Path $recordedPinPath) -cne [string]$State.workflowSourcePinSha256) {
+        throw 'Skill package drift: the run-local skill-source-pin.json bytes changed.'
+    }
+
+    try {
+        $integrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') `
+            -SkillSourcePinPath $recordedPinPath -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+    }
+    catch {
+        throw "Skill package drift: the installed Skill package does not match the run-local source pin. $($_.Exception.Message)"
+    }
+    if ($integrity.result -cne 'passed' -or -not $integrity.skillSourcePin) {
+        throw 'Skill package drift: the installed Skill package did not pass run-local source pin validation.'
+    }
+
+    $pin = $integrity.skillSourcePin
+    $tupleMismatches = @()
+    if ([string]$pin.pinSha256 -cne [string]$State.workflowSourcePinSha256) { $tupleMismatches += 'pinSha256' }
+    if ([string]$pin.repository -cne [string]$State.workflowSourceRepository) { $tupleMismatches += 'repository' }
+    if ([string]$pin.requestedRef -cne [string]$State.workflowRef) { $tupleMismatches += 'requestedRef' }
+    if ([string]$pin.resolvedCommit -cne [string]$State.workflowCommitOid) { $tupleMismatches += 'resolvedCommit' }
+    if ([string]$pin.resolvedVersion -cne [string]$State.workflowSourceVersion) { $tupleMismatches += 'resolvedVersion' }
+    if ([string]$pin.contentSha256 -cne [string]$State.workflowSourceContentSha256) { $tupleMismatches += 'contentSha256' }
+    if ($tupleMismatches.Count -ne 0) {
+        throw "Skill package drift: the run state source tuple differs from its immutable run-local pin: $($tupleMismatches -join ', ')"
+    }
+    $integrity
+}
+
 function Get-ModReservationOwnerPath {
     param(
         [Parameter(Mandatory)][string] $ModLockPath,
@@ -1130,6 +1214,7 @@ function Complete-Stage {
 function Get-CompletedStageResult {
     param([Collections.IDictionary] $State, [string] $Name)
     if (@($State.completedStages) -contains $Name) {
+        $null = Assert-RunSkillPackageBinding -State $State
         Assert-LockOwner -State $State
         $artifactPath = Get-StageArtifactPath -State $State -Name $Name
         if ([string]::IsNullOrWhiteSpace($artifactPath) -or -not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
@@ -1445,6 +1530,7 @@ function Ensure-RunWriterLock {
     param([Collections.IDictionary] $State)
     $script:activeStatePath = [string]$State.statePath
     if (-not $script:writerLease) {
+        $null = Assert-RunSkillPackageBinding -State $State
         Enter-ModReservationWorker -State $State
         try {
             $script:writerLease = Enter-RunWriterLock -State $State
@@ -3693,14 +3779,16 @@ try {
     if ($PassThru) { $result } else { $result | ConvertTo-Json -Depth 40 -Compress }
 }
 catch {
+    $isPackageDrift = $_.Exception.Message.StartsWith('Skill package drift:', [StringComparison]::Ordinal)
     $errorResult = [ordered]@{
         result = 'failed'
+        failureKind = if ($isPackageDrift) { 'package-drift' } else { 'stage-failure' }
         stage = $Command
         statePath = if ($activeStatePath) { $activeStatePath } else { $StatePath }
         error = $_.Exception.Message
         at = Get-UtcTimestamp
     }
-    if ($writerLease -and $activeStatePath -and (Test-Path -LiteralPath $activeStatePath -PathType Leaf)) {
+    if (-not $isPackageDrift -and $writerLease -and $activeStatePath -and (Test-Path -LiteralPath $activeStatePath -PathType Leaf)) {
         try {
             $failedState = Read-State -Path $activeStatePath
             $failedState.lastError = $errorResult

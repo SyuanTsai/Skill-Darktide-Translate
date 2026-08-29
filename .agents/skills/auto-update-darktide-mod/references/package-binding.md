@@ -9,7 +9,7 @@ Read this file before the packaged Schema 14 Workflow. It changes only how the W
 - Skill ID: `auto-update-darktide-mod`
 - Skill path: `.agents/skills/auto-update-darktide-mod`
 
-A new run requires the consumer's immutable source-pin JSON from `scripts/Get-SourcePin.ps1`: requested tag or ref, resolved 40-character source commit, deterministic repository content SHA-256, and the per-file blob/SHA-256 manifest for the installed Skill. Pass that external evidence as `-SkillSourcePinPath`. If `Test-ReferenceIntegrity.ps1 -SkillSourcePinPath ...` cannot tie every installed Skill file to that tuple, do not acquire or claim; stop as `waiting-user`. The runner copies the verified pin to `review-artifacts/skill-source-pin.json`. Resuming a run uses only that run-owned copy and rejects a different supplied pin.
+A new run requires the consumer's immutable source-pin JSON from `scripts/Get-SourcePin.ps1`: requested tag or ref, resolved 40-character source commit, deterministic repository content SHA-256, and the per-file blob/SHA-256 manifest for the installed Skill. Pass that external evidence as `-SkillSourcePinPath`. If `Test-ReferenceIntegrity.ps1 -SkillSourcePinPath ...` cannot tie every installed Skill file to that tuple, do not acquire or claim; stop as `waiting-user`. The runner copies the verified pin to `review-artifacts/skill-source-pin.json`. Resuming a run uses only that run-owned copy and rejects a different supplied pin. It validates the complete installed package before acquiring the state writer lease and again before any completed-stage receipt reuse; drift never migrates or rewrites the recorded pin.
 
 ## Original-to-package path mapping
 
