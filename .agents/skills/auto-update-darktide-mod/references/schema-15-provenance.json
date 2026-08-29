@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "issue": "SYP-91",
   "path": "references/schema-15.md",
-  "sizeBytes": 12742,
-  "sha256": "7ee96a5bed1d49e8244512b1bf4d58fdc8f9d21362b091db2f970df5dcafe0a0",
+  "sizeBytes": 12898,
+  "sha256": "82ce5c4fe1603e87ae669a6dcaeb18a9069f2d1592cd27d032a9b6d14f44892d",
   "derivedFrom": {
     "workflowSchemaVersion": 14,
     "workflowSha256": "931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549",

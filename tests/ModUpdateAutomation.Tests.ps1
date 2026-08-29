@@ -1165,6 +1165,8 @@ function Invoke-Git {
             Should -BeLessThan $extractFunction.IndexOf('[IO.Directory]::Move', [StringComparison]::Ordinal)
     }
 
+    # Scenario: Risk classification receives known risky content plus Windows ZIP external attributes whose upper word overlaps Unix execute bits.
+    # Purpose: Preserve executable/script/archive blocking without treating DOS metadata as Unix executable permissions in either security implementation.
     It 'UnitT196_ClassifiesRiskyPayloadContentAndExtensions' {
         $tokens = $null
         $parseErrors = $null
@@ -1182,6 +1184,23 @@ function Invoke-Git {
         (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/install.ps1' -Bytes ([byte[]](1, 2)) }) | Should -Be 'install-or-system-script'
         (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/unknown.bin' -Bytes ([byte[]](0x7F, 0x45, 0x4C, 0x46)) }) | Should -Be 'native-executable'
         (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/localization.lua' -Bytes ([byte[]](1, 2)) }) | Should -BeNullOrEmpty
+        (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/ExampleMod.mod' -Bytes ([byte[]](1, 2)) -ExternalAttributes 0x00080020 }) | Should -BeNullOrEmpty
+        (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/tool' -Bytes ([byte[]](1, 2)) -ExternalAttributes 0x81ED0000 }) | Should -Be 'native-executable'
+        (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/tool' -Bytes ([byte[]](1, 2)) -ExternalAttributes 0x01ED0000 }) | Should -Be 'native-executable'
+
+        $validatorTokens = $null
+        $validatorParseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($validatorPath, [ref]$validatorTokens, [ref]$validatorParseErrors)
+        @($validatorParseErrors).Count | Should -Be 0
+        $validatorRiskFunction = $validatorAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ArchivePayloadRisk'
+        }, $true)
+        $validatorRiskFunction | Should -Not -BeNullOrEmpty
+        $validatorModule = New-Module -ScriptBlock ([scriptblock]::Create($validatorRiskFunction.Extent.Text))
+        (& $validatorModule { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/ExampleMod.mod' -Bytes ([byte[]](1, 2)) -ExternalAttributes 0x00080020 }) | Should -BeNullOrEmpty
+        (& $validatorModule { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/tool' -Bytes ([byte[]](1, 2)) -ExternalAttributes 0x81ED0000 }) | Should -Be 'native-executable'
+        (& $validatorModule { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/tool' -Bytes ([byte[]](1, 2)) -ExternalAttributes 0x01ED0000 }) | Should -Be 'native-executable'
     }
 
     It 'UnitT197_ImportsSecurityApprovalAsAnAuditedRunArtifact' {
