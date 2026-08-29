@@ -864,9 +864,9 @@ function Complete-Stage {
         $automation | Should -Match 'state\.json'
     }
 
-    # Scenario: README or the formal hash metadata is absent when build-commits starts.
-    # Purpose: Fail before C1 so a metadata preparation error cannot leave partial evidence commits.
-    It 'UnitT181_PreflightsEveryMetadataPathBeforeCreatingC1' {
+    # Scenario: README or the first-time formal hash metadata is absent when build-commits starts.
+    # Purpose: Pause for explicit Agent preparation before C1 without recording a failed run or partial evidence commits.
+    It 'UnitT181_SuspendsForFirstTimeMetadataPreparationBeforeCreatingC1' {
         $tokens = $null
         $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
@@ -895,10 +895,18 @@ function Assert-NoReparsePath { param($Path, $Root, $Label, [switch]$AllowMissin
 
         { & $module { param($value) Assert-BuildMetadataPaths -State $value } $state } |
             Should -Throw '*Metadata path is missing: .hash/examplemod.hash*'
+        $preparation = @(& $module { param($value) Assert-BuildMetadataPaths -State $value -AllowMissing } $state)
+        $preparation.Count | Should -Be 2
+        @($preparation | Where-Object { -not $_.exists }).relativePath | Should -Be @('.hash/examplemod.hash')
         $buildText = $buildFunction.Extent.Text
+        $readinessIndex = $buildText.IndexOf('Assert-BuildMetadataPaths -State $State -AllowMissing', [StringComparison]::Ordinal)
+        $suspendIndex = $buildText.IndexOf("-OutputStage 'metadata-preparation'", [StringComparison]::Ordinal)
         $preflightIndex = $buildText.IndexOf('New-BuildMetadataPreview -State $State', [StringComparison]::Ordinal)
         $c1CommitIndex = $buildText.IndexOf('sync upstream non-localization [C1]', [StringComparison]::Ordinal)
+        $readinessIndex | Should -BeGreaterOrEqual 0
+        $suspendIndex | Should -BeGreaterThan $readinessIndex
         $preflightIndex | Should -BeGreaterOrEqual 0
+        $preflightIndex | Should -BeGreaterThan $suspendIndex
         $c1CommitIndex | Should -BeGreaterThan $preflightIndex
     }
 
@@ -962,6 +970,54 @@ function Invoke-Git {
             $buildText | Should -Match ("Assert-StagedCheckpointBoundary[^`r`n]+-Checkpoint '$checkpoint'")
         }
         ([regex]::Matches($buildText, 'Assert-StagedCheckpointBoundary')).Count | Should -Be 4
+    }
+
+    # Scenario: Localization is not applicable, so C2 and C3 have no parent or checkpoint tree OID.
+    # Purpose: Keep the producer's structured KEEP contract byte-identical to the independent Gate's null-valued reconstruction.
+    It 'UnitT201_PreservesNullTreesInNotApplicableCheckpointReasons' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $reasonFunction = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-CheckpointReason'
+        }, $true))[0]
+        $reasonFunction | Should -Not -BeNullOrEmpty
+        $moduleSource = @'
+function Get-Sha256Bytes {
+    param([byte[]] $Bytes)
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+}
+function Get-FileSha256 { param([string] $Path) 'a' * 64 }
+function Get-SourceTupleContractSha256 {
+    param([Collections.IDictionary] $Contract)
+    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes(($Contract | ConvertTo-Json -Depth 20 -Compress)))
+}
+'@ + "`n" + $reasonFunction.Extent.Text
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $manifestPath = Join-Path $TestDrive 'localization-manifest.json'
+        [IO.File]::WriteAllText($manifestPath, '{"mode":"none"}', [Text.UTF8Encoding]::new($false))
+        $targetSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+            [Text.UTF8Encoding]::new($false).GetBytes('[]'))).ToLowerInvariant()
+        $state = [ordered]@{
+            schemaVersion = 14
+            localizationMode = 'none'
+            evidenceTargetPaths = @()
+            evidenceTargetPathsSha256 = $targetSha
+            localizationManifestPath = $manifestPath
+        }
+
+        $reason = & $module { param($value) New-CheckpointReason -State $value -Checkpoint C2 -ParentTreeOid $null -TreeOid $null } $state
+        ($null -eq $reason.parentTreeOid) | Should -BeTrue
+        ($null -eq $reason.treeOid) | Should -BeTrue
+        $expectedContract = [ordered]@{
+            checkpoint = 'C2'; code = 'localization-not-applicable'; disposition = 'KEEP'; localizationMode = 'none'
+            parentTreeOid = $null; treeOid = $null; targetPathsSha256 = $targetSha; targetPathCount = 0
+            localizationManifestSha256 = 'a' * 64
+        }
+        $expectedSha = & $module { param($contract) Get-SourceTupleContractSha256 -Contract $contract } $expectedContract
+        $reason.contractSha256 | Should -Be $expectedSha
     }
 
     # Scenario: build-commits failed after C1 and state retained the exact C1 OID and tree.
@@ -1764,13 +1820,17 @@ function Invoke-Git {
         $metadataHashPath = Join-Path ([string]$recoveredLocalizationState.worktreePath) '.hash/examplemod.hash'
         $metadataHashBytes = [IO.File]::ReadAllBytes($metadataHashPath)
         [IO.File]::Delete($metadataHashPath)
-        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
-            Should -Throw '*Metadata path is missing: .hash/examplemod.hash*'
+        $metadataWaiting = & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru
+        $metadataWaiting.result | Should -Be 'waiting-input'
+        $metadataWaiting.stage | Should -Be 'metadata-preparation'
+        @($metadataWaiting.data.missingPaths) | Should -Be @('.hash/examplemod.hash')
+        [string]$metadataWaiting.data.sourceTupleSha256 | Should -Be ([string]$recoveredLocalizationState.sourceTuple.sha256)
         $metadataFailureState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         (& git -C $metadataFailureState.worktreePath rev-parse HEAD).Trim() | Should -Be $metadataFailureState.evidenceChain.c0Oid
         $metadataFailureState.evidenceChain.c1Oid | Should -BeNullOrEmpty
-        $metadataFailureState.stageTimings.'build-commits'.result | Should -Be 'failed'
-        $metadataFailureState.stageTimings.'build-commits'.recoveryDisposition | Should -Be 'restart-before-c1'
+        $metadataFailureState.status | Should -Be 'waiting-input'
+        $metadataFailureState.stageTimings.'build-commits'.result | Should -Be 'waiting-input'
+        $metadataFailureState.waitingReason.code | Should -Be 'metadata_preparation_required'
         [IO.File]::WriteAllBytes($metadataHashPath, $metadataHashBytes)
 
         $c1FailureState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
@@ -1809,7 +1869,8 @@ function Invoke-Git {
         $resumedBuild = & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru
         $resumedBuild.result | Should -Be 'passed'
         $resumedBuild.stageTimings.attempts.Count | Should -Be 8
-        @($resumedBuild.stageTimings.attempts | Where-Object result -eq 'failed').Count | Should -Be 7
+        @($resumedBuild.stageTimings.attempts | Where-Object result -eq 'failed').Count | Should -Be 6
+        @($resumedBuild.stageTimings.attempts | Where-Object result -eq 'waiting-input').Count | Should -Be 1
         $resumedBuild.stageTimings.attempts[-1].result | Should -Be 'passed'
         $preGateState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         $rawEvidenceStart = [Diagnostics.ProcessStartInfo]::new()

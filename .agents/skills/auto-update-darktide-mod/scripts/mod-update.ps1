@@ -375,8 +375,10 @@ function New-CheckpointReason {
     if ([string]$manifest.mode -cne $expectedManifestMode) {
         throw "$Checkpoint reason localization mode contradicts its immutable manifest."
     }
+    $contractParentTreeOid = if ([string]::IsNullOrWhiteSpace($ParentTreeOid)) { $null } else { $ParentTreeOid }
+    $contractTreeOid = if ([string]::IsNullOrWhiteSpace($TreeOid)) { $null } else { $TreeOid }
     $isNotApplicable = [string]$State.localizationMode -ceq 'none'
-    $isKeep = $isNotApplicable -or $ParentTreeOid -ceq $TreeOid
+    $isKeep = $isNotApplicable -or $contractParentTreeOid -ceq $contractTreeOid
     $code = if ($isNotApplicable) { 'localization-not-applicable' }
         elseif ($Checkpoint -ceq 'C2' -and $isKeep) { 'upstream-localization-unchanged' }
         elseif ($Checkpoint -ceq 'C2') { 'upstream-localization-changed' }
@@ -387,8 +389,8 @@ function New-CheckpointReason {
         code = $code
         disposition = if ($isKeep) { 'KEEP' } else { 'APPLY' }
         localizationMode = [string]$State.localizationMode
-        parentTreeOid = $ParentTreeOid
-        treeOid = $TreeOid
+        parentTreeOid = $contractParentTreeOid
+        treeOid = $contractTreeOid
         targetPathsSha256 = $targetPathsSha256
         targetPathCount = $targetPaths.Count
         localizationManifestSha256 = $manifestSha256
@@ -398,8 +400,8 @@ function New-CheckpointReason {
         code = $code
         disposition = $contract.disposition
         localizationMode = $contract.localizationMode
-        parentTreeOid = $ParentTreeOid
-        treeOid = $TreeOid
+        parentTreeOid = $contractParentTreeOid
+        treeOid = $contractTreeOid
         targetPathsSha256 = $targetPathsSha256
         targetPathCount = $targetPaths.Count
         localizationManifestSha256 = $manifestSha256
@@ -3671,7 +3673,10 @@ function Assert-EvidenceChangedPathAllowlists {
 }
 
 function Assert-BuildMetadataPaths {
-    param([Parameter(Mandatory)][Collections.IDictionary] $State)
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [switch] $AllowMissing
+    )
     $worktree = [IO.Path]::GetFullPath([string]$State.worktreePath)
     $required = @('README.md', ".hash/$($State.modSlug).hash")
     $actual = @($State.metadataPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
@@ -3682,8 +3687,9 @@ function Assert-BuildMetadataPaths {
     foreach ($metadataRelative in $actual) {
         $metadataFull = Assert-ContainedPath -Candidate (Join-Path $worktree $metadataRelative) -Root $worktree -Label 'Metadata path'
         $null = Assert-NoReparsePath -Path $metadataFull -Root $worktree -Label 'Metadata path' -AllowMissing
-        if (-not (Test-Path -LiteralPath $metadataFull -PathType Leaf)) { throw "Metadata path is missing: $metadataRelative" }
-        $records += [ordered]@{ relativePath = $metadataRelative; fullPath = $metadataFull }
+        $exists = Test-Path -LiteralPath $metadataFull -PathType Leaf
+        if (-not $exists -and -not $AllowMissing) { throw "Metadata path is missing: $metadataRelative" }
+        $records += [ordered]@{ relativePath = $metadataRelative; fullPath = $metadataFull; exists = $exists }
     }
     @($records)
 }
@@ -4032,6 +4038,25 @@ function Invoke-BuildCommits {
         $worktree = Assert-NoReparsePath -Path ([string]$State.worktreePath) `
             -Root ([IO.Path]::GetPathRoot([string]$State.worktreePath)) -Label 'Evidence worktree'
         $null = Assert-NoReparseTree -Path ([string]$State.installRoot) -Root $worktree -Label 'Installed MOD tree before evidence commits'
+
+        $metadataPreparation = @(Assert-BuildMetadataPaths -State $State -AllowMissing)
+        $missingMetadataPaths = @($metadataPreparation | Where-Object { -not $_.exists } | ForEach-Object { [string]$_.relativePath })
+        if ($missingMetadataPaths.Count -gt 0) {
+            $State.status = 'waiting-input'
+            $State.waitingReason = [ordered]@{
+                code = 'metadata_preparation_required'
+                message = 'Prepare the missing README/formal-hash metadata from the immutable source tuple, then resume build-commits.'
+                missingPaths = $missingMetadataPaths
+            }
+            return Suspend-Stage -State $State -Context $stage -Result 'waiting-input' `
+                -ArtifactSha256 ([string]$State.sourceTuple.sha256) -OutputStage 'metadata-preparation' `
+                -Data ([ordered]@{
+                    required = $State.waitingReason.message
+                    missingPaths = $missingMetadataPaths
+                    sourceTuplePath = [string]$State.sourceTuple.path
+                    sourceTupleSha256 = [string]$State.sourceTuple.sha256
+                })
+        }
 
         $validator = Join-Path $PSScriptRoot 'Test-ModUpdateCandidate.ps1'
         $securityValidation = & $validator -StatePath $State.statePath -SecurityPayloadOnly `
