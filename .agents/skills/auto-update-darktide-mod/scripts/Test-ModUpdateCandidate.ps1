@@ -184,13 +184,25 @@ function Test-MetadataSourceFieldMatch {
     if ($RelativePath -cne 'README.md') { return $false }
     $readmeText = $Text
     if (-not [string]::IsNullOrWhiteSpace($NexusPageUrl)) {
+        $targetUri = $null
+        if (-not [Uri]::TryCreate($NexusPageUrl, [UriKind]::Absolute, [ref]$targetUri) -or
+            $targetUri.Scheme -cne 'https' -or $targetUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+            -not [string]::IsNullOrEmpty($targetUri.UserInfo) -or -not [string]::IsNullOrEmpty($targetUri.Query) -or
+            -not [string]::IsNullOrEmpty($targetUri.Fragment) -or -not $targetUri.IsDefaultPort) {
+            return $false
+        }
+        $targetPathMatch = [regex]::Match(
+            $targetUri.AbsolutePath.TrimEnd('/'),
+            '^/warhammer40kdarktide/mods/(?<modId>\d+)$'
+        )
+        if (-not $targetPathMatch.Success) { return $false }
         $headingMatches = @([regex]::Matches(
             $Text,
-            '(?m)^###\s+\[[^\]\r\n]+\]\((?<url>https://www\.nexusmods\.com/warhammer40kdarktide/mods/\d+)(?:\?[^)\r\n]*)?\)\s*\r?$'
+            '(?m)^###\s+\[[^\]\r\n]+\]\((?i:https://(?:www\.)?nexusmods\.com)/warhammer40kdarktide/mods/(?<modId>\d+)/?(?:\?[^#)\r\n]*)?(?:#[^)\r\n]*)?\)\s*\r?$'
         ))
         if ($headingMatches.Count -ne 0) {
             $targetHeadings = @($headingMatches | Where-Object {
-                [string]$_.Groups['url'].Value -ceq $NexusPageUrl
+                [string]$_.Groups['modId'].Value -ceq [string]$targetPathMatch.Groups['modId'].Value
             })
             if ($targetHeadings.Count -ne 1) { return $false }
             $sectionStart = $targetHeadings[0].Index

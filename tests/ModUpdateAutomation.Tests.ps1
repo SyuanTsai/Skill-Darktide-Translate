@@ -399,6 +399,18 @@ function Complete-Stage {
                 'https://www.nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeTrue
             (& $module $invokeMatch 'README.md' $multiModReadme 'archiveFileName' 'FirstMod.zip' `
                 'https://www.nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeFalse
+
+            $nonWwwMultiModReadme = @'
+### [First MOD](https://nexusmods.com/warhammer40kdarktide/mods/1/)
+- Archive filename: Wrong-Section.zip
+
+### [Example MOD](https://nexusmods.com/warhammer40kdarktide/mods/2/?tab=files)
+- Archive filename: ExampleMod.zip
+'@
+            (& $module $invokeMatch 'README.md' $nonWwwMultiModReadme 'archiveFileName' 'ExampleMod.zip' `
+                'https://nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeTrue
+            (& $module $invokeMatch 'README.md' $nonWwwMultiModReadme 'archiveFileName' 'Wrong-Section.zip' `
+                'https://nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeFalse
         }
     }
 
