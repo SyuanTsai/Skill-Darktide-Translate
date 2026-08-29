@@ -29,7 +29,7 @@ param(
     [string] $WorktreeParent,
     [string] $Remote = 'origin',
     [string] $PullRequestBase = 'main',
-    [ValidateSet('source-verified', 'awaiting-user-merge')]
+    [ValidateSet('source-verified', 'localized', 'awaiting-user-merge')]
     [string] $Until = 'awaiting-user-merge',
     [switch] $PassThru
 )
@@ -1000,7 +1000,8 @@ function Get-ArchivePayloadRisk {
         return 'install-or-system-script'
     }
     $unixMode = ($ExternalAttributes -shr 16) -band 0xFFFF
-    if (($unixMode -band 73) -ne 0) { return 'native-executable' }
+    $hasUnixMode = ($unixMode -band 0xF000) -ne 0 -or ($ExternalAttributes -band 0xFFFF) -eq 0
+    if ($hasUnixMode -and ($unixMode -band 73) -ne 0) { return 'native-executable' }
     if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0x4D -and $Bytes[1] -eq 0x5A) { return 'native-executable' }
     if ($Bytes.Length -ge 4 -and $Bytes[0] -eq 0x7F -and $Bytes[1] -eq 0x45 -and $Bytes[2] -eq 0x4C -and $Bytes[3] -eq 0x46) {
         return 'native-executable'
@@ -4784,7 +4785,7 @@ try {
             foreach ($stageName in @('verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot')) {
                 $last = Invoke-StageCommand -StageName $stageName -State $state
                 $state = Read-State -Path $state.statePath
-                if ($last.result -eq 'waiting-input' -or $state.status -in @('waiting-input', 'waiting-user', 'waiting-system', 'automation-excluded')) { break }
+                if ($last.result -in @('waiting-input', 'waiting-user', 'waiting-system', 'automation-excluded')) { break }
                 if (($Until -eq 'source-verified' -and $stageName -eq 'verify-source') -or $state.status -eq $Until) { break }
             }
             $last

@@ -27,7 +27,7 @@ The fixed ordering is:
 
 1. validate the source request and known archive extension;
 2. reserve the canonical MOD identity for one run ID;
-3. create the run-local `.incoming-<run-id>` directory;
+3. create the run-local `AI Auto Update/In Progress/<normalized-mod-slug>-<first-eight-run-id-characters>/.incoming-<run-id>` directory; an `.incoming-*` sibling directly below `AI Auto Update` is not run-local;
 4. acquire through the API provider or an existing signed-in browser session;
 5. ignore partial files and observe size and mtime twice;
 6. identify the archive from magic bytes;

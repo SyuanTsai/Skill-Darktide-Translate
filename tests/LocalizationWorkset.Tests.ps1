@@ -863,6 +863,7 @@ return localization
         [ordered]@{
             schemaVersion = 15
             runId = 'finalization-run'
+            repositoryRoot = $TestDrive
             statePath = $statePath
             runRoot = $runRoot
             artifactsRoot = $artifacts

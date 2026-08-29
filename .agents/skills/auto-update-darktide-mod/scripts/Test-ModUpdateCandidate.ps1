@@ -308,7 +308,8 @@ function Get-ArchivePayloadRisk {
     if ($extension -in @('.dll', '.exe', '.com', '.scr', '.msi', '.msp', '.cpl', '.ocx', '.sys', '.drv', '.efi', '.so', '.dylib')) { return 'native-executable' }
     if ($extension -in @('.bat', '.cmd', '.ps1', '.psm1', '.psd1', '.sh', '.bash', '.zsh', '.fish', '.vbs', '.vbe', '.wsf', '.wsh', '.hta', '.reg')) { return 'install-or-system-script' }
     $unixMode = ($ExternalAttributes -shr 16) -band 0xFFFF
-    if (($unixMode -band 73) -ne 0) { return 'native-executable' }
+    $hasUnixMode = ($unixMode -band 0xF000) -ne 0 -or ($ExternalAttributes -band 0xFFFF) -eq 0
+    if ($hasUnixMode -and ($unixMode -band 73) -ne 0) { return 'native-executable' }
     if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0x4D -and $Bytes[1] -eq 0x5A) { return 'native-executable' }
     if ($Bytes.Length -ge 4 -and $Bytes[0] -eq 0x7F -and $Bytes[1] -eq 0x45 -and $Bytes[2] -eq 0x4C -and $Bytes[3] -eq 0x46) { return 'native-executable' }
     if ($Bytes.Length -ge 4 -and [Convert]::ToHexString($Bytes[0..3]) -in @('FEEDFACE', 'CEFAEDFE', 'FEEDFACF', 'CFFAEDFE', 'CAFEBABE')) { return 'native-executable' }

@@ -37,7 +37,7 @@ Start a run:
 
 Read `references/schema-15.md` completely before a new automatic-source run. Supply the normalized Schema 15 source request and a fixed run ID. The request contains identity metadata, never credentials or a signed download URL.
 
-For an existing signed-in browser session, download only into the fixed run's exact `.incoming-<run-id>` directory. A single `run` invocation acquires, independently verifies, receipt-binds, claims, and continues the ordered stages:
+For an existing signed-in browser session, download only into the fixed aggregate run path `AI Auto Update/In Progress/<normalized-mod-slug>-<first-eight-run-id-characters>/.incoming-<run-id>`. The runner normalizes the MOD directory to a lowercase safe slug, so compute the path before starting the browser download; a sibling `.incoming-*` directly under `AI Auto Update` is outside the run boundary and is rejected. A single `run` invocation acquires, independently verifies, receipt-binds, claims, and continues the ordered stages:
 
 ```powershell
 ./scripts/mod-update.ps1 run `
@@ -47,10 +47,14 @@ For an existing signed-in browser session, download only into the fixed run's ex
   -SourceRequestPath 'D:\...\source-request.json' `
   -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.1.json' `
   -Provider browser `
-  -DownloadedFilePath 'D:\...\.incoming-11111111-2222-4333-8444-555555555555\ExampleMod.zip'
+  -DownloadedFilePath 'D:\Games\Warhammer-40-000-DARKTIDE-Mods\AI Auto Update\In Progress\examplemod-11111111\.incoming-11111111-2222-4333-8444-555555555555\ExampleMod.zip'
 ```
 
 `acquire-source` and receipt-bound `claim` remain separately callable for coordinators and diagnosis. New automatic runs preflight immutable base localization before branch creation; a loader-only entry returns `AUTOMATION_EXCLUDED: localization_entry_is_loader` while retaining acquisition evidence and the per-MOD reservation.
+
+For a bounded diagnostic or coordinator handoff, `run -Until source-verified` and `run -Until localized` stop after those completed boundaries; the default remains `awaiting-user-merge`.
+
+After localization passes and before `build-commits`, prepare both metadata inputs from the archived `review-artifacts/source-tuple.json`: add or replace the complete 11-field provenance block inside the current MOD's Nexus-linked README section, leaving other MOD sections intact, and create or replace `.hash/<normalized-slug>.hash` with the same exact values. Preserve timestamp strings byte-for-byte from the tuple; do not let a native JSON parser convert them to local `DateTime` values. The runner validates and commits these Agent-prepared files but does not synthesize them. A missing first-time formal hash is therefore a preparation step, while a missing or changed file after metadata preview remains a fail-closed recovery error.
 
 Acquisition atomically archives the supplied request as run-local `review-artifacts/source-request.json` and the verified Skill pin as `review-artifacts/skill-source-pin.json`; receipt-bound claim accepts only that exact tuple and verifies its hashes against `source-acquisition.json` and the MOD reservation owner. Claim then creates `source-tuple.json`, whose contract SHA binds run, acquisition method, complete Nexus facts, request/receipt, and archive filename/size/SHA. Every resume proves that the supplied state file is physically below the requested repository, that its `repositoryRoot`, `statePath`, and `runRoot` self-bind to that file, and that its MOD lock key and path equal the canonical reservation derived from the MOD identity. Every reservation-owner read or write, source read, receipt write, delivery move, workset apply, and workset deletion rechecks all existing path components for reparse points. The API provider reads an ephemeral HTTPS Nexus download URL from `NEXUS_DOWNLOAD_URI` and an optional API key from `NEXUS_API_KEY`. Automatic redirects are disabled; at most ten redirect hops are followed manually, and every hop must remain HTTPS on `nexusmods.com` or one of its subdomains before any credential-bearing request is sent. These environment values are never written to state or receipts. Missing URLs, partial files, instability, and rate limits are `waiting-system`; login, OTP, CAPTCHA, terms, permissions, unsupported archives, and a missing or invalid Skill pin are `waiting-user`. Identity or hash mismatches are blocked.
 
