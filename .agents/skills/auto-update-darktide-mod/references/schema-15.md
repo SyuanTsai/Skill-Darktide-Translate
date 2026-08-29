@@ -137,6 +137,10 @@ README and formal-hash source facts both preserve the complete 11-field tuple: N
 
 The PR body contains a deterministic classification-count table and receipt/workset hashes. Delete `localization-workset.json` after a passed Candidate Gate and before publication. Preserve its SHA-256, counts, edit count, validation result, and deletion evidence in state and the Gate report. The workset must never be added to Git.
 
+Before any C1/C2/C3/F checkpoint is created or resumed, `build-commits` invokes the independent payload-security-only validation mode. It reopens the claimed archive, verifies the extraction manifest and any exact approval receipt, reconstructs risky payload dispositions against C0, and persists `precommit-security-validation.json`; this keeps the security boundary ahead of commits as well as ahead of publication.
+
+Archive listing accepts only ordinary files/directories. Windows reparse attributes, Unix symlinks or other special entry types, directory/file duplicates, and file/ancestor collisions stop before extraction.
+
 ## Publication and rollback
 
 Schema 15 does not authorize push, PR mutation, merge, destructive cleanup, credential entry, or security overrides. Existing authorization boundaries remain unchanged.

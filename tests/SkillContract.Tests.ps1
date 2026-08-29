@@ -32,7 +32,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $result.result | Should -Be 'passed'
         $result.workflow.sha256 | Should -Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
         $result.reviewBaseline.sha256 | Should -Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
-        $result.schema15.sha256 | Should -Be '7467c3420712f4d11dd1935c30232ab3ec59ecb8c0fdb14192b2aafa0160fc64'
+        $result.schema15.sha256 | Should -Be '7ee96a5bed1d49e8244512b1bf4d58fdc8f9d21362b091db2f970df5dcafe0a0'
         $result.schema15.path | Should -Be '.agents/skills/auto-update-darktide-mod/references/schema-15.md'
         $result.workflow.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz'
         $result.reviewBaseline.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz'
@@ -156,6 +156,19 @@ Describe 'Auto Update Darktide MOD Skill contract' {
 
         { & $fixtureExpander -Document Workflow -OutputDirectory $fixtureRoot -PassThru } |
             Should -Throw '*outside the Skill source*'
+    }
+
+    # Scenario: A completed run is resumed with a runner file whose bytes no longer match its immutable source pin.
+    # Purpose: Reject runtime package drift even when the changed file is the stage runner itself.
+    It 'UnitT29_RejectsRunnerFileDriftFromTheImmutableSourcePin' {
+        $fixtureRoot = Join-Path $TestDrive 'runner-drift-skill'
+        Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
+        $fixturePinPath = New-TestSkillSourcePin -SkillRoot $fixtureRoot -OutputPath (Join-Path $TestDrive 'runner-drift-pin.json')
+        Add-Content -LiteralPath (Join-Path $fixtureRoot 'scripts/mod-update.ps1') -Value "`n# runtime drift"
+
+        { & (Join-Path $fixtureRoot 'scripts/Test-ReferenceIntegrity.ps1') `
+                -SkillSourcePinPath $fixturePinPath -PassThru } |
+            Should -Throw '*Installed Skill file differs from its source pin*mod-update.ps1*'
     }
 
     # Scenario: The Skill runs outside the original MOD repository prompt location.

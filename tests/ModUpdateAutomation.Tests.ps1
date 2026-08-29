@@ -468,6 +468,8 @@ function Enter-SharedCoordinationLease {
         $runner | Should -Match 'LocalReviewPath'
         $runner | Should -Match 'review-completion-validation\.json'
         $runner | Should -Match 'function Ensure-RunWriterLock'
+        $runner | Should -Match '(?s)function Ensure-RunWriterLock.*?Assert-RunLocalSkillPackage -State \$State.*?Enter-ModReservationWorker -State \$State'
+        $runner | Should -Match '(?s)function Get-CompletedStageResult.*?Assert-RunLocalSkillPackage -State \$State.*?Assert-LockOwner -State \$State'
         $runner | Should -Match '(?s)function Ensure-RunWriterLock.*?Enter-ModReservationWorker -State \$State.*?\$script:writerLease = Enter-RunWriterLock -State \$State'
         $runner | Should -Match '(?s)Ensure-RunWriterLock -State \$state\s+Write-AtomicJson -Path \$state\.statePath'
         $runner | Should -Match 'if \(-not \$script:writerLease\)'
@@ -475,13 +477,303 @@ function Enter-SharedCoordinationLease {
         $runner | Should -Match '\$pendingWriterRecovery\s*=\s*\$null'
         $runner | Should -Match '(?s)\$script:writerLease = Enter-RunWriterLock -State \$State.*?\$State\.lastRecovery = \$script:writerLease\.recovery.*?Save-State -State \$State'
         $runner | Should -Match 'function Assert-PublishedPrAtF'
-        ([regex]::Matches($runner, 'Assert-PublishedPrAtF -State \$State')).Count | Should -Be 2
-        $runner | Should -Match "(?s)\$stageName -eq 'review-snapshot'.*?completedStages.*?-notcontains 'review-snapshot'"
+        ([regex]::Matches($runner, 'Assert-PublishedPrAtF -State \$State')).Count | Should -Be 3
+        $runner | Should -Not -Match '(?s)\$stageName -eq ''review-snapshot''.*?completedStages.*?-notcontains ''review-snapshot'''
+        $runner | Should -Match '(?s)foreach \(\$stageName in @\(.*?''review-snapshot''.*?\)\).*?Invoke-StageCommand -StageName \$stageName'
+        $runner | Should -Match '(?s)function Invoke-ReviewSnapshot.*?Suspend-Stage.*?-OutputStage ''local-review'''
         $runner | Should -Match '(?s)if \(\$completed\).*?Assert-PublishedPrAtF -State \$State.*?\$State\.status = ''awaiting-user-merge''.*?Save-State -State \$State'
         $baseResolutionIndex = $runner.IndexOf('$baseOid = (Invoke-Git -WorkingDirectory $repository')
         $identityLockIndex = $runner.IndexOf('Enter-ModReservation -Plan $plan', $baseResolutionIndex)
         $baseResolutionIndex | Should -BeGreaterOrEqual 0
         $identityLockIndex | Should -BeGreaterThan $baseResolutionIndex
+    }
+
+    Context 'SYP-118 completed-stage run-local Skill pin validation' {
+        BeforeEach {
+            $script:syp118Fixture = New-TestPinnedCompletedStageRun -SkillRoot $skillRoot `
+                -FixtureRoot (Join-Path $TestDrive ("syp118-" + [guid]::NewGuid().ToString('N')))
+        }
+
+        AfterEach {
+            $fixtureSkillRoot = [IO.Path]::GetFullPath([string]$script:syp118Fixture.SkillRoot)
+            Get-Module -Name 'SharedCoordinationLock' | Where-Object {
+                $_.Path -and [IO.Path]::GetFullPath([string]$_.Path).StartsWith(
+                    $fixtureSkillRoot,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            } | Remove-Module -Force
+        }
+
+        # Scenario: The installed package still exactly matches the immutable pin archived by the completed run.
+        # Purpose: Preserve same-pin idempotency while re-proving the package before receipt reuse.
+        It 'InterT171_ReusesACompletedStageWithTheSameRunLocalPin' {
+            $stateShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.StatePath -Algorithm SHA256).Hash
+            $pinShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.PinPath -Algorithm SHA256).Hash
+            $artifactShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.ArtifactPath -Algorithm SHA256).Hash
+            $sourceShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.SourcePath -Algorithm SHA256).Hash
+
+            $result = & $script:syp118Fixture.RunnerPath verify-source `
+                -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                -StatePath $script:syp118Fixture.StatePath -PassThru
+
+            $result.result | Should -Be 'passed'
+            $result.idempotent | Should -BeTrue
+            $result.stage | Should -Be 'verify-source'
+            (Get-FileHash -LiteralPath $script:syp118Fixture.StatePath -Algorithm SHA256).Hash | Should -Be $stateShaBefore
+            (Get-FileHash -LiteralPath $script:syp118Fixture.PinPath -Algorithm SHA256).Hash | Should -Be $pinShaBefore
+            (Get-FileHash -LiteralPath $script:syp118Fixture.ArtifactPath -Algorithm SHA256).Hash | Should -Be $artifactShaBefore
+            (Get-FileHash -LiteralPath $script:syp118Fixture.SourcePath -Algorithm SHA256).Hash | Should -Be $sourceShaBefore
+        }
+
+        # Scenario: A non-runner installed package file differs from the content recorded by the run-local pin.
+        # Purpose: Reject a completed receipt before state, reservation, source evidence, or pin mutation.
+        It 'InterT172_RejectsDifferentPinnedPackageContentBeforeReceiptReuse' {
+            [IO.File]::AppendAllText(
+                (Join-Path $script:syp118Fixture.SkillRoot 'references/automation.md'),
+                "`nSYP-118 package drift`n",
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*Installed Skill file differs from its source pin*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: A replacement pin keeps the same version and package manifest but names a different commit.
+        # Purpose: Make commit identity part of resume authorization instead of trusting SemVer alone.
+        It 'InterT173_RejectsTheSameVersionFromADifferentPinnedCommit' {
+            $pin = Get-Content -LiteralPath $script:syp118Fixture.PinPath -Raw | ConvertFrom-TestJson -AsHashtable
+            $originalVersion = [string]$pin.resolvedVersion
+            $pin.resolvedCommit = '2222222222222222222222222222222222222222'
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.PinPath,
+                ($pin | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $state.workflowSourcePinSha256 = (Get-FileHash -LiteralPath $script:syp118Fixture.PinPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $state.workflowSourceVersion | Should -Be $originalVersion
+            $state.workflowCommitOid | Should -Not -Be $pin.resolvedCommit
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*resolvedCommit*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: The executing mod-update.ps1 bytes drift after the run archives its immutable package pin.
+        # Purpose: Prove the runner cannot authorize reuse of its own completed-stage receipt after self drift.
+        It 'InterT174_RejectsRunnerFileDriftBeforeStateOrLockMutation' {
+            [IO.File]::AppendAllText(
+                $script:syp118Fixture.RunnerPath,
+                "`n# SYP-118 runner drift`n",
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*mod-update.ps1*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: A pre-0.3 Schema 14 completed run has no run-local pin but retains its immutable authoring references.
+        # Purpose: Exercise the real resume path and preserve compatibility without creating or migrating pin evidence.
+        It 'InterT175_ResumesALegacySchema14RunWithoutMigratingItsPin' {
+            $integrity = & (Join-Path $script:syp118Fixture.SkillRoot 'scripts/Test-ReferenceIntegrity.ps1') -PassThru
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            foreach ($field in @(
+                'workflowSourcePinPath', 'workflowSourcePinSha256', 'workflowSourceRepository',
+                'workflowSourceVersion', 'workflowSourceContentSha256'
+            )) { $state.Remove($field) }
+            $state.schemaVersion = 14
+            $state.workflowSchemaVersion = 14
+            $state.workflowCommitOid = [string]$integrity.authoringSourceCommit
+            $state.workflowPath = [string]$integrity.workflow.originalPath
+            $state.workflowBlobOid = [string]$integrity.workflow.gitBlobOid
+            $state.workflowSha256 = [string]$integrity.workflow.sha256
+            $state.reviewBaselinePath = [string]$integrity.reviewBaseline.originalPath
+            $state.reviewBaselineBlobOid = [string]$integrity.reviewBaseline.gitBlobOid
+            $state.reviewBaselineSha256 = [string]$integrity.reviewBaseline.sha256
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            [IO.File]::Delete($script:syp118Fixture.PinPath)
+            $stateShaBefore = (Get-FileHash -LiteralPath $script:syp118Fixture.StatePath -Algorithm SHA256).Hash
+
+            $result = & $script:syp118Fixture.RunnerPath verify-source `
+                -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                -StatePath $script:syp118Fixture.StatePath -PassThru
+
+            $result.result | Should -Be 'passed'
+            $result.idempotent | Should -BeTrue
+            (Get-FileHash -LiteralPath $script:syp118Fixture.StatePath -Algorithm SHA256).Hash | Should -Be $stateShaBefore
+            Test-Path -LiteralPath $script:syp118Fixture.PinPath | Should -BeFalse
+        }
+
+        # Scenario: A Schema 15 completed run loses both recorded run-local pin fields before resume.
+        # Purpose: Fail before reservation or state mutation instead of silently entering the Schema 14 compatibility path.
+        It 'InterT176_RejectsANonLegacyRunWhosePinRecordIsMissing' {
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $state.Remove('workflowSourcePinPath')
+            $state.Remove('workflowSourcePinSha256')
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*Run-local Skill source pin is missing*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: A Schema 15 completed run retains the pin path but loses the recorded pin SHA-256.
+        # Purpose: Reject a partial pin tuple before any writer or reservation mutation.
+        It 'InterT177_RejectsAnIncompleteRunLocalPinRecord' {
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $state.Remove('workflowSourcePinSha256')
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*pin record is incomplete*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: A Schema 15 state is edited to reference a pin outside its fixed run-local evidence path.
+        # Purpose: Reject pin relocation before reading alternate bytes or acquiring the reservation worker.
+        It 'InterT178_RejectsRunLocalPinPathRelocation' {
+            $state = Get-Content -LiteralPath $script:syp118Fixture.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $alternatePin = Join-Path $script:syp118Fixture.RunRoot 'alternate-pin.json'
+            [IO.File]::Copy($script:syp118Fixture.PinPath, $alternatePin)
+            $state.workflowSourcePinPath = [IO.Path]::GetFullPath($alternatePin)
+            [IO.File]::WriteAllText(
+                $script:syp118Fixture.StatePath,
+                ($state | ConvertTo-Json -Depth 20),
+                [Text.UTF8Encoding]::new($false)
+            )
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath,
+                $alternatePin
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*pin path changed*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
+
+        # Scenario: The fixed run-local pin remains valid JSON but its bytes change after the state records its SHA-256.
+        # Purpose: Reject any pin rewrite even when its semantic fields still describe the same package.
+        It 'InterT179_RejectsChangedRunLocalPinBytes' {
+            [IO.File]::AppendAllText($script:syp118Fixture.PinPath, "`n", [Text.UTF8Encoding]::new($false))
+            $protectedPaths = @(
+                $script:syp118Fixture.StatePath,
+                $script:syp118Fixture.PinPath,
+                $script:syp118Fixture.OwnerPath,
+                $script:syp118Fixture.ArtifactPath,
+                $script:syp118Fixture.SourcePath
+            )
+            $before = @{}
+            foreach ($path in $protectedPaths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+
+            { & $script:syp118Fixture.RunnerPath verify-source `
+                    -RepositoryRoot $script:syp118Fixture.RepositoryRoot `
+                    -StatePath $script:syp118Fixture.StatePath -PassThru } |
+                Should -Throw '*Skill package drift*pin bytes*'
+
+            foreach ($path in $protectedPaths) {
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash | Should -Be $before[$path] -Because $path
+            }
+        }
     }
 
     # Scenario: A maintainer installs the Skill, recovers a failed run, rolls back, or adds a MOD exception.
@@ -496,8 +788,604 @@ function Enter-SharedCoordinationLease {
         $automation | Should -Match 'state\.json'
     }
 
-    # Scenario: A real ZIP changes an active localization file while preserving CRLF-sensitive whitespace and adds a non-target file.
-    # Purpose: Execute claim through the independent Gate and prove C0/C1/C2/C3/F, approved byte spans, manifests, timings, and rerun idempotency.
+    # Scenario: README or the formal hash metadata is absent when build-commits starts.
+    # Purpose: Fail before C1 so a metadata preparation error cannot leave partial evidence commits.
+    It 'UnitT181_PreflightsEveryMetadataPathBeforeCreatingC1' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functions = $ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst]
+        }, $true)
+        $metadataFunction = @($functions | Where-Object Name -eq 'Assert-BuildMetadataPaths')[0]
+        $buildFunction = @($functions | Where-Object Name -eq 'Invoke-BuildCommits')[0]
+        $metadataFunction | Should -Not -BeNullOrEmpty
+        $buildFunction | Should -Not -BeNullOrEmpty
+        $moduleSource = @'
+function Assert-ContainedPath { param($Candidate, $Root, $Label) [IO.Path]::GetFullPath($Candidate) }
+function Assert-NoReparsePath { param($Path, $Root, $Label, [switch]$AllowMissing) [IO.Path]::GetFullPath($Path) }
+'@ + "`n" + $metadataFunction.Extent.Text
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $worktree = Join-Path $TestDrive 'metadata-preflight-worktree'
+        New-Item -ItemType Directory -Path $worktree -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $worktree 'README.md'), 'ready', [Text.UTF8Encoding]::new($false))
+        $state = [ordered]@{
+            worktreePath = $worktree
+            modSlug = 'examplemod'
+            metadataPaths = @('README.md', '.hash/examplemod.hash')
+        }
+
+        { & $module { param($value) Assert-BuildMetadataPaths -State $value } $state } |
+            Should -Throw '*Metadata path is missing: .hash/examplemod.hash*'
+        $buildText = $buildFunction.Extent.Text
+        $preflightIndex = $buildText.IndexOf('New-BuildMetadataPreview -State $State', [StringComparison]::Ordinal)
+        $c1CommitIndex = $buildText.IndexOf('sync upstream non-localization [C1]', [StringComparison]::Ordinal)
+        $preflightIndex | Should -BeGreaterOrEqual 0
+        $c1CommitIndex | Should -BeGreaterThan $preflightIndex
+    }
+
+    # Scenario: a crash recovery or external Git operation leaves an unrelated path staged before a checkpoint commit.
+    # Purpose: Fail before C1/C2/C3/F can absorb out-of-scope index entries, and run Git's whitespace/error check on every staged checkpoint.
+    It 'UnitT181A_EnforcesTheStagedIndexBoundaryBeforeEveryCheckpointCommit' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functions = $ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst]
+        }, $true)
+        $guardFunction = @($functions | Where-Object Name -eq 'Assert-StagedCheckpointBoundary')[0]
+        $buildFunction = @($functions | Where-Object Name -eq 'Invoke-BuildCommits')[0]
+        $guardFunction | Should -Not -BeNullOrEmpty
+        $buildFunction | Should -Not -BeNullOrEmpty
+
+        $moduleSource = @'
+function Invoke-Git {
+    param([string] $WorkingDirectory, [string[]] $Arguments, [switch] $AllowFailure)
+    $output = & git -C $WorkingDirectory @Arguments 2>&1 | Out-String
+    $result = [pscustomobject]@{ exitCode = $LASTEXITCODE; output = $output.TrimEnd(); warning = '' }
+    if ($result.exitCode -ne 0 -and -not $AllowFailure) { throw $result.output }
+    $result
+}
+'@ + "`n" + $guardFunction.Extent.Text
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $repository = Join-Path $TestDrive 'checkpoint-index-boundary'
+        New-Item -ItemType Directory -Path (Join-Path $repository 'mods/ExampleMod') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $repository 'mods/ExampleMod/upstream.txt'), "old`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $repository 'outside.txt'), "old`n", [Text.UTF8Encoding]::new($false))
+        & git -C $repository init --quiet --initial-branch=main
+        & git -C $repository config user.name 'Fixture User'
+        & git -C $repository config user.email 'fixture@example.invalid'
+        & git -C $repository add --all
+        & git -C $repository commit --quiet -m baseline
+        try {
+            [IO.File]::WriteAllText((Join-Path $repository 'mods/ExampleMod/upstream.txt'), "new`n", [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText((Join-Path $repository 'outside.txt'), "changed`n", [Text.UTF8Encoding]::new($false))
+            & git -C $repository add --all
+
+            { & $module {
+                    param($worktree)
+                    Assert-StagedCheckpointBoundary -WorkingDirectory $worktree -Checkpoint 'C1' -AllowedRoot 'mods/ExampleMod'
+                } $repository } | Should -Throw '*C1 staged path is outside its allowlist: outside.txt*'
+
+            & git -C $repository reset --quiet HEAD -- outside.txt
+            { & $module {
+                    param($worktree)
+                    Assert-StagedCheckpointBoundary -WorkingDirectory $worktree -Checkpoint 'C1' -AllowedRoot 'mods/ExampleMod'
+                } $repository } | Should -Not -Throw
+        }
+        finally {
+            Remove-Module $module -Force
+        }
+
+        $buildText = $buildFunction.Extent.Text
+        foreach ($checkpoint in @('C1', 'C2', 'C3', 'F')) {
+            $buildText | Should -Match ("Assert-StagedCheckpointBoundary[^`r`n]+-Checkpoint '$checkpoint'")
+        }
+        ([regex]::Matches($buildText, 'Assert-StagedCheckpointBoundary')).Count | Should -Be 4
+    }
+
+    # Scenario: build-commits failed after C1 and state retained the exact C1 OID and tree.
+    # Purpose: Resume the same generation from C1 only when HEAD still matches the recorded checkpoint tuple.
+    It 'UnitT182_ResumesTheRecordedC1PartialCheckpoint' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BuildCommitsResumeCheckpoint'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $c0 = '0' * 40
+        $c1 = '1' * 40
+        $c0Tree = 'a' * 40
+        $c1Tree = 'b' * 40
+        $state = [ordered]@{ evidenceChain = [ordered]@{
+            c0Oid = $c0; c0TreeOid = $c0Tree; c1Oid = $c1; c1TreeOid = $c1Tree
+            c2Oid = $null; c2TreeOid = $null; c3Oid = $null; c3TreeOid = $null; fOid = $null; fTreeOid = $null
+        } }
+
+        (& $module { param($value, $head, $tree) Get-BuildCommitsResumeCheckpoint -State $value -HeadOid $head -HeadTreeOid $tree } `
+            $state $c1 $c1Tree) | Should -Be 'c1'
+        { & $module { param($value, $head, $tree) Get-BuildCommitsResumeCheckpoint -State $value -HeadOid $head -HeadTreeOid $tree } `
+                $state $c1 ('c' * 40) } | Should -Throw '*partial checkpoint tree*'
+    }
+
+    # Scenario: build-commits failed after C3 and state retained the exact C1/C2/C3 chain.
+    # Purpose: Continue with metadata and evidence generation without creating duplicate C1/C2/C3 commits.
+    It 'UnitT183_ResumesTheRecordedC3PartialCheckpoint' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BuildCommitsResumeCheckpoint'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $state = [ordered]@{ evidenceChain = [ordered]@{
+            c0Oid = '0' * 40; c0TreeOid = 'a' * 40; c1Oid = '1' * 40; c1TreeOid = 'b' * 40
+            c2Oid = '2' * 40; c2TreeOid = 'c' * 40; c3Oid = '3' * 40; c3TreeOid = 'd' * 40
+            fOid = $null; fTreeOid = $null
+        } }
+
+        (& $module { param($value) Get-BuildCommitsResumeCheckpoint -State $value -HeadOid ('3' * 40) -HeadTreeOid ('d' * 40) } $state) |
+            Should -Be 'c3'
+    }
+
+    # Scenario: a failed partial attempt is followed by a deterministic same-run success.
+    # Purpose: Preserve the failed timing record instead of overwriting it when the resumed attempt passes.
+    It 'UnitT184_PreservesFailedAttemptHistoryAfterSuccessfulResume' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-StageAttemptHistory'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $failed = [ordered]@{ attempt = 1; result = 'failed'; partialCheckpoint = 'c1' }
+        $timing = [ordered]@{ attempt = 1; result = 'failed'; attempts = @($failed) }
+        $history = @(& $module { param($value) Get-StageAttemptHistory -Timing $value } $timing)
+
+        $history.Count | Should -Be 1
+        $history[0].result | Should -Be 'failed'
+        $history[0].partialCheckpoint | Should -Be 'c1'
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $runner | Should -Match 'recoveryDisposition'
+        $runner | Should -Match 'same-run-checkpoint-resume'
+    }
+
+    # Scenario: a state-mutating resume presents a pin whose bytes no longer equal the run-local pin receipt.
+    # Purpose: Reject package drift before any completed-stage receipt can be reused.
+    It 'UnitT185_RejectsRunLocalPinContentDrift' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RunLocalSkillPinRecord'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $pin = [ordered]@{
+            repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+            requestedRef = 'test-fixture'
+            resolvedCommit = '1' * 40; resolvedVersion = '0.3.1'; contentSha256 = 'a' * 64; pinSha256 = 'b' * 64
+        }
+        $state = [ordered]@{
+            workflowSourceRepository = $pin.repository; workflowRef = $pin.requestedRef; workflowCommitOid = $pin.resolvedCommit
+            workflowSourceVersion = $pin.resolvedVersion; workflowSourceContentSha256 = $pin.contentSha256
+            workflowSourcePinSha256 = $pin.pinSha256
+        }
+
+        { & $module { param($value, $record) Assert-RunLocalSkillPinRecord -State $value -PinRecord $record -ActualPinSha256 ('c' * 64) } `
+                $state $pin } | Should -Throw '*Skill package drift*pin bytes*'
+    }
+
+    # Scenario: installed package metadata reports the same version but a different immutable commit from the run.
+    # Purpose: Treat commit identity as authoritative and never migrate the old run pin to the current package.
+    It 'UnitT186_RejectsTheSameVersionFromADifferentCommit' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RunLocalSkillPinRecord'
+        }, $true)
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $pin = [ordered]@{
+            repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+            requestedRef = 'test-fixture'
+            resolvedCommit = '2' * 40; resolvedVersion = '0.3.1'; contentSha256 = 'a' * 64; pinSha256 = 'b' * 64
+        }
+        $state = [ordered]@{
+            workflowSourceRepository = $pin.repository; workflowRef = $pin.requestedRef; workflowCommitOid = '1' * 40
+            workflowSourceVersion = $pin.resolvedVersion; workflowSourceContentSha256 = $pin.contentSha256
+            workflowSourcePinSha256 = $pin.pinSha256
+        }
+
+        { & $module { param($value, $record) Assert-RunLocalSkillPinRecord -State $value -PinRecord $record -ActualPinSha256 $record.pinSha256 } `
+                $state $pin } | Should -Throw '*Skill package drift*commit*'
+    }
+
+    # Scenario: a caller resumes a completed stage under the identical immutable package pin.
+    # Purpose: Verify the pin before writer acquisition and again inside the completed-stage fast path while retaining idempotency.
+    It 'UnitT187_PreflightsTheIdenticalPinBeforeWriterAndCompletedReceiptReuse' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $completedFunctionStart = $runner.IndexOf('function Get-CompletedStageResult', [StringComparison]::Ordinal)
+        $completedFunctionEnd = $runner.IndexOf('function Assert-LockOwner', $completedFunctionStart, [StringComparison]::Ordinal)
+        $completedFunction = $runner.Substring($completedFunctionStart, $completedFunctionEnd - $completedFunctionStart)
+        $completedFunction | Should -Match 'Assert-RunLocalSkillPackage -State \$State'
+        $resumePreflightIndex = $runner.IndexOf('Assert-RunLocalSkillPackage -State $state', $runner.IndexOf("elseif (`$Command -eq 'run')", [StringComparison]::Ordinal), [StringComparison]::Ordinal)
+        $writerIndex = $runner.IndexOf('Ensure-RunWriterLock -State $state', $runner.IndexOf("elseif (`$Command -eq 'run')", [StringComparison]::Ordinal), [StringComparison]::Ordinal)
+        $resumePreflightIndex | Should -BeGreaterOrEqual 0
+        $writerIndex | Should -BeGreaterThan $resumePreflightIndex
+    }
+
+    # Scenario: package drift is detected after a writer was acquired but before a completed receipt is reused.
+    # Purpose: Report the drift while preserving the old run state, source, lock identity, and immutable pin evidence.
+    It 'UnitT188_DoesNotWritePackageDriftIntoThePinnedRunState' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $runner | Should -Match '(?s)catch \{.*?\$isPackageDrift.*?if \(-not \$isPackageDrift -and \$writerLease'
+    }
+
+    # Scenario: a pre-0.3 Schema 14 run has no run-local pin and presents its recorded authoring-reference tuple.
+    # Purpose: Preserve legacy compatibility only when the installed Workflow and Review Baseline still match that tuple.
+    It 'UnitT189_ValidatesTheLegacySchema14AuthoringTupleWithoutMigratingIt' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-LegacySchema14SkillPackageRecord'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $integrity = [ordered]@{
+            result = 'passed'
+            authoringSourceCommit = '1' * 40
+            workflow = [ordered]@{ originalPath = 'AI Prompt/workflow.md'; gitBlobOid = '2' * 40; sha256 = 'a' * 64 }
+            reviewBaseline = [ordered]@{ originalPath = 'AI Prompt/review.md'; gitBlobOid = '3' * 40; sha256 = 'b' * 64 }
+        }
+        $state = [ordered]@{
+            schemaVersion = 14
+            workflowCommitOid = $integrity.authoringSourceCommit
+            workflowPath = $integrity.workflow.originalPath
+            workflowBlobOid = $integrity.workflow.gitBlobOid
+            workflowSha256 = $integrity.workflow.sha256
+            reviewBaselinePath = $integrity.reviewBaseline.originalPath
+            reviewBaselineBlobOid = $integrity.reviewBaseline.gitBlobOid
+            reviewBaselineSha256 = $integrity.reviewBaseline.sha256
+        }
+
+        (& $module { param($value, $record) Assert-LegacySchema14SkillPackageRecord -State $value -Integrity $record } `
+            $state $integrity).result | Should -Be 'legacy-schema-14'
+        $state.workflowCommitOid = '4' * 40
+        { & $module { param($value, $record) Assert-LegacySchema14SkillPackageRecord -State $value -Integrity $record } `
+                $state $integrity } | Should -Throw '*legacy Schema 14 authoring reference tuple*'
+    }
+
+    # Scenario: Schema 15 pauses after it has started localization because AI decisions are still required.
+    # Purpose: Preserve that waiting attempt and clear the active stage context so same-run resume has complete timing evidence.
+    It 'UnitT190_RecordsWaitingInputAsAResumableStageAttempt' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $runner | Should -Match 'function Suspend-Stage'
+        $localizationStart = $runner.IndexOf('function Invoke-LocalizationWorkset', [StringComparison]::Ordinal)
+        $localizationEnd = $runner.IndexOf('function Invoke-Localization', $localizationStart + 1, [StringComparison]::Ordinal)
+        $localizationFunction = $runner.Substring($localizationStart, $localizationEnd - $localizationStart)
+        ([regex]::Matches($localizationFunction, 'Suspend-Stage -State \$State -Context \$stage')).Count | Should -Be 2
+        $localizationFunction | Should -Match "-Result 'waiting-input'"
+    }
+
+    # Scenario: A PR keeps the immutable F head but its evidence summary body is stale or externally edited.
+    # Purpose: Reject Review completion unless the remote PR body still carries the current Gate/evidence tuple.
+    It 'UnitT191_RevalidatesTheRemotePrEvidenceSummary' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+        $assertStart = $runner.IndexOf('function Assert-PublishedPrAtF', [StringComparison]::Ordinal)
+        $assertEnd = $runner.IndexOf('function Invoke-Publish', $assertStart, [StringComparison]::Ordinal)
+        $assertFunction = $runner.Substring($assertStart, $assertEnd - $assertStart)
+        $assertFunction | Should -Match "headRefOid,body"
+        $assertFunction | Should -Match 'Get-PrBody -State \$State'
+        $assertFunction | Should -Match 'Published PR evidence summary body changed'
+        $runner | Should -Match '(?s)pr'', ''edit''.*?--body'', \$updatedBody.*?Assert-PublishedPrAtF -State \$State'
+        $validator | Should -Match 'function Assert-PrBodyEvidenceSummary'
+        $validator | Should -Match "Add-ReviewCheck -Name 'pr-evidence-summary'"
+    }
+
+    # Scenario: The evidence receipt claims that the coordinator checked every changed-path boundary.
+    # Purpose: Require reconstructible range/allowlist evidence instead of accepting a self-asserted passed string.
+    It 'UnitT192_ReconstructsCoordinatorChangedPathAllowlists' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+
+        $runner | Should -Match 'function Assert-EvidenceChangedPathAllowlists'
+        $runner | Should -Match '\$changedPathVerification\s*=\s*Assert-EvidenceChangedPathAllowlists -State \$State'
+        $runner | Should -Match 'changedPathAllowlists\s*=\s*\$changedPathVerification'
+        $validator | Should -Match '\$verification\.changedPathAllowlists\.result\s*-cne\s*''passed'''
+        $validator | Should -Match 'changedPathAllowlists\.contractSha256'
+        $validator | Should -Match 'evidence-generation-receipt coordinator changed-path allowlists changed'
+    }
+
+    # Scenario: Review completion is resumed or independently rechecked after Gate artifacts or review content drift.
+    # Purpose: Bind the completion decision to the immutable evidence receipt, Candidate Gate SHA, and actionable finding schema.
+    It 'UnitT193_RevalidatesImmutableEvidenceAndLocalReviewAtCompletion' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+        $reviewStart = $runner.IndexOf('function Invoke-ReviewSnapshot', [StringComparison]::Ordinal)
+        $reviewEnd = $runner.IndexOf('function Resolve-InitialState', $reviewStart, [StringComparison]::Ordinal)
+        $reviewFunction = $runner.Substring($reviewStart, $reviewEnd - $reviewStart)
+        $completionStart = $validator.IndexOf('if ($ReviewCompletion)', [StringComparison]::Ordinal)
+        $completionEnd = $validator.IndexOf('$checks = [ordered]@{}', $completionStart, [StringComparison]::Ordinal)
+        $completionBlock = $validator.Substring($completionStart, $completionEnd - $completionStart)
+
+        $reviewFunction | Should -Match '(?s)if \(\$completed\).*?Test-ModUpdateCandidate\.ps1.*?-ReviewCompletion'
+        $completionBlock | Should -Match "Add-ReviewCheck -Name 'evidence-generation-receipt'"
+        $completionBlock | Should -Match 'Assert-EvidenceGenerationReceiptIntegrity -State \$state'
+        $completionBlock | Should -Match '\$review\.candidateGateSha256\s*-ne\s*\$state\.candidateGate\.validationReportSha256'
+        foreach ($field in @('priority', 'location', 'violatedBaseline', 'evidence', 'consequence', 'disposition')) {
+            $completionBlock | Should -Match ([regex]::Escape("'$field'"))
+        }
+    }
+
+    # Scenario: GitHub accepts no Copilot review request for the current F.
+    # Purpose: Record unavailable with failure evidence instead of falsely claiming a request is pending.
+    It 'UnitT194_DoesNotCallAFailedExternalReviewRequestPending' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $reviewStart = $runner.IndexOf('function Invoke-ReviewSnapshot', [StringComparison]::Ordinal)
+        $reviewEnd = $runner.IndexOf('function Resolve-InitialState', $reviewStart, [StringComparison]::Ordinal)
+        $reviewFunction = $runner.Substring($reviewStart, $reviewEnd - $reviewStart)
+
+        $reviewFunction | Should -Match '(?s)\$request\s*=\s*Invoke-Gh.*?if \(\$request\.exitCode -ne 0\).*?status\s*=\s*''unavailable'''
+        $reviewFunction | Should -Match 'External Review request failed'
+    }
+
+    # Scenario: A source archive adds or changes executable, script, or nested-archive payload bytes.
+    # Purpose: Stop before publishing extracted bytes unless an exact archive/path/file-SHA approval exists.
+    It 'UnitT195_GatesChangedRiskyArchivePayloads' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $extractStart = $runner.IndexOf('function Invoke-Extract', [StringComparison]::Ordinal)
+        $extractEnd = $runner.IndexOf('function Copy-DirectoryBytes', $extractStart, [StringComparison]::Ordinal)
+        $extractFunction = $runner.Substring($extractStart, $extractEnd - $extractStart)
+
+        $runner | Should -Match 'function Get-ArchivePayloadRisk'
+        $runner | Should -Match 'function Assert-ArchivePayloadSecurity'
+        $runner | Should -Match '(?i)\.dll'
+        $runner | Should -Match '(?i)nested-archive'
+        $runner | Should -Match 'archiveSha256'
+        $runner | Should -Match 'fileSha256'
+        $extractFunction | Should -Match 'Assert-ArchivePayloadSecurity -State \$State -ExtractedRoot \$temporaryRoot'
+        $extractFunction.IndexOf('Assert-ArchivePayloadSecurity', [StringComparison]::Ordinal) |
+            Should -BeLessThan $extractFunction.IndexOf('[IO.Directory]::Move', [StringComparison]::Ordinal)
+    }
+
+    It 'UnitT196_ClassifiesRiskyPayloadContentAndExtensions' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $riskFunction = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ArchivePayloadRisk'
+        }, $true)
+        $riskFunction | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($riskFunction.Extent.Text))
+
+        (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/payload.dll' -Bytes ([byte[]](1, 2)) }) | Should -Be 'native-executable'
+        (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/nested.zip' -Bytes ([byte[]](1, 2)) }) | Should -Be 'nested-archive'
+        (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/install.ps1' -Bytes ([byte[]](1, 2)) }) | Should -Be 'install-or-system-script'
+        (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/unknown.bin' -Bytes ([byte[]](0x7F, 0x45, 0x4C, 0x46)) }) | Should -Be 'native-executable'
+        (& $module { Get-ArchivePayloadRisk -RelativePath 'ExampleMod/localization.lua' -Bytes ([byte[]](1, 2)) }) | Should -BeNullOrEmpty
+    }
+
+    It 'UnitT197_ImportsSecurityApprovalAsAnAuditedRunArtifact' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $runner | Should -Match '\[string\]\s*\$SecurityOverridePath'
+        $runner | Should -Match 'function Import-SecurityOverrides'
+        $runner | Should -Match 'security-overrides\.json'
+        $runner | Should -Match 'runId'
+        $runner | Should -Match 'archiveSha256'
+        $runner | Should -Match '(?s)function Invoke-Extract.*?Import-SecurityOverrides -State \$State -Path \$SecurityOverridePath.*?Assert-ArchivePayloadSecurity'
+    }
+
+    It 'UnitT198_IndependentlyReconstructsRiskyPayloadApprovalAtTheCandidateGate' {
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+        $validator | Should -Match 'function Get-ArchivePayloadRisk'
+        $validator | Should -Match 'function Assert-ArchivePayloadSecurityIntegrity'
+        $validator | Should -Match "Add-ValidationCheck -Name 'security-payload'"
+        $validator | Should -Match 'securityOverrideReceipt'
+        $validator | Should -Match 'approved-exact-tuple'
+        $validator | Should -Match 'unchanged-from-c0'
+    }
+
+    It 'UnitT199_ReconstructsEveryExternalReviewTerminalObservation' {
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+        $completionStart = $validator.IndexOf('if ($ReviewCompletion)', [StringComparison]::Ordinal)
+        $completionEnd = $validator.IndexOf('$checks = [ordered]@{}', $completionStart, [StringComparison]::Ordinal)
+        $completionBlock = $validator.Substring($completionStart, $completionEnd - $completionStart)
+        $completionBlock | Should -Match 'switch \(\[string\]\$state\.externalReview\.status\)'
+        foreach ($field in @('requestEvidence', 'reviewId', 'reviewerLogin', 'submittedAt', 'reviewCommitOid', 'snapshotAt', 'verifiedAt', 'reason')) {
+            $completionBlock | Should -Match ([regex]::Escape($field))
+        }
+        $completionBlock | Should -Match 'External Review head does not equal F'
+    }
+
+    It 'UnitT202_RendersAndValidatesExactSecurityApprovalEvidenceInThePrBody' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+        $runner | Should -Match '\$securityOverrideSummary'
+        $runner | Should -Match 'archiveSha256=.*relativePath=.*fileSha256='
+        $runner | Should -Match 'Security override receipt SHA-256'
+        $validator | Should -Match 'Security override receipt SHA-256'
+    }
+
+    # Scenario: A build resumes after extraction while its exact risky-payload approval evidence may have drifted.
+    # Purpose: Re-run the independent payload-security verifier before any checkpoint commit can be created or resumed.
+    It 'UnitT203_RevalidatesPayloadSecurityBeforeCheckpointCommits' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+        $buildStart = $runner.IndexOf('function Invoke-BuildCommits', [StringComparison]::Ordinal)
+        $buildEnd = $runner.IndexOf('function Invoke-Validate', $buildStart, [StringComparison]::Ordinal)
+        $buildFunction = $runner.Substring($buildStart, $buildEnd - $buildStart)
+
+        $validator | Should -Match '\[switch\]\s*\$SecurityPayloadOnly'
+        $validator | Should -Match 'precommit-security-validation\.json'
+        $validator | Should -Match "Add-ValidationCheck -Name 'precommit-security-validation'"
+        $validator | Should -Match 'securityPrecommitValidationSha256'
+        $buildFunction | Should -Match '(?s)Test-ModUpdateCandidate\.ps1.*?-SecurityPayloadOnly'
+        $buildFunction.IndexOf('-SecurityPayloadOnly', [StringComparison]::Ordinal) |
+            Should -BeLessThan $buildFunction.IndexOf("@('commit'", [StringComparison]::Ordinal)
+    }
+
+    # Scenario: Review completion or its completed-stage fast path is resumed after feedback evidence changes.
+    # Purpose: Bind the local Review and independent completion decision to one immutable PR feedback snapshot artifact.
+    It 'UnitT204_BindsReviewCompletionToTheImmutableFeedbackSnapshot' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+
+        $runner | Should -Match 'reviewSnapshot\s*=\s*\[ordered\]'
+        $runner | Should -Match 'feedbackSnapshotSha256'
+        $validator | Should -Match "Add-ReviewCheck -Name 'feedback-snapshot'"
+        $validator | Should -Match 'review-snapshot\.json'
+        $validator | Should -Match '\$review\.feedbackSnapshotSha256'
+        $validator | Should -Match 'Feedback snapshot SHA-256 changed'
+        $validator | Should -Match 'Local review predates the immutable feedback snapshot'
+    }
+
+    # Scenario: A non-localization run can still have security, metadata, or evidence feedback on its PR.
+    # Purpose: Capture PR feedback for local Review even when optional external localization Review is not applicable.
+    It 'UnitT205_CapturesPrFeedbackWhenLocalizationModeIsNone' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $reviewStart = $runner.IndexOf('function Invoke-ReviewSnapshot', [StringComparison]::Ordinal)
+        $reviewEnd = $runner.IndexOf('function Resolve-InitialState', $reviewStart, [StringComparison]::Ordinal)
+        $reviewFunction = $runner.Substring($reviewStart, $reviewEnd - $reviewStart)
+
+        $viewIndex = $reviewFunction.IndexOf("'headRefOid,reviews,reviewRequests,comments'", [StringComparison]::Ordinal)
+        $noneIndex = $reviewFunction.IndexOf('$State.localizationMode -eq ''none''', [StringComparison]::Ordinal)
+        $viewIndex | Should -BeGreaterOrEqual 0
+        $noneIndex | Should -BeGreaterThan $viewIndex
+        $reviewFunction | Should -Match 'reviewThreads\(first:100\)'
+        $reviewFunction | Should -Match '\$snapshot\[''reviewThreads''\]\s*='
+        $reviewFunction | Should -Match 'Review feedback snapshot exceeds the bounded thread capacity'
+    }
+
+    # Scenario: An untrusted ZIP reaches the documented high-entry boundary without any file/ancestor collision.
+    # Purpose: Keep collision validation proportional to path depth instead of comparing every entry with every other entry.
+    It 'UnitT206_IndexesArchiveAncestorPrefixesInLinearSpace' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Assert-NoArchiveFileAncestorCollisions'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $seen = [Collections.Generic.Dictionary[string, bool]]::new([StringComparer]::OrdinalIgnoreCase)
+        for ($index = 0; $index -lt 5000; $index++) {
+            $seen.Add("ExampleMod/dir-$index/file.lua", $false)
+        }
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+
+        & $module { param($paths) Assert-NoArchiveFileAncestorCollisions -Seen $paths } $seen
+
+        $stopwatch.Stop()
+        $stopwatch.Elapsed.TotalSeconds | Should -BeLessThan 3
+        $functionAst.Extent.Text | Should -Match '\$filePaths\s*=\s*\[Collections\.Generic\.HashSet\[string\]\]::new'
+        $functionAst.Extent.Text | Should -Not -Match '\$ancestorPrefixes\s*='
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $runner | Should -Not -Match '\$entries\s*\+='
+        $runner | Should -Not -Match '(?s)\$seen\.Keys\s*\|\s*Where-Object.*?StartsWith'
+    }
+
+    # Scenario: Evidence generation has been consolidated into the bounded batch implementation.
+    # Purpose: Prevent a second unused Git evidence implementation from drifting away from the audited path.
+    It 'UnitT207_UsesOnlyTheBoundedGitEvidenceImplementation' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+
+        $runner | Should -Not -Match 'function New-GitEvidenceFile'
+        ([regex]::Matches($runner, 'New-GitEvidenceBatch')).Count | Should -Be 2
+    }
+
+    # Scenario: Archive and candidate manifests may each contain up to the documented 100,000 payload files.
+    # Purpose: Prevent repeated PowerShell array copies from reintroducing quadratic work after ZIP validation.
+    It 'UnitT208_UsesLinearCollectionsForHighCardinalityManifestEnumeration' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+        $tokens = $null
+        $parseErrors = $null
+        $runnerAst = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        foreach ($functionName in @('New-Manifest', 'Import-SecurityOverrides', 'New-GitNormalizationManifest', 'New-GitTreeManifest', 'Invoke-Localization')) {
+            $functionAst = $runnerAst.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
+            }, $true)
+            $functionAst | Should -Not -BeNullOrEmpty
+            $functionAst.Extent.Text | Should -Not -Match '\$[A-Za-z][A-Za-z0-9_]*\s*\+=\s*\[ordered\]'
+            if ($functionName -ne 'New-Manifest') {
+                $functionAst.Extent.Text | Should -Match 'Collections\.Generic\.List\[object\]'
+            }
+        }
+        $validator | Should -Not -Match '\$actual\s*\+=\s*\[ordered\]'
+        $validator | Should -Match '\$actual\s*=\s*\[Collections\.Generic\.List\[object\]\]::new\(\)'
+    }
+
+    # Scenario: Any immutable source-tuple field differs between state and the run-local package pin.
+    # Purpose: Keep every authorization field fail-closed rather than protecting only pin bytes and commit identity.
+    It 'UnitT209_RejectsEveryRunLocalSkillSourceTupleMismatch' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Assert-RunLocalSkillPinRecord'
+        }, $true)
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $pin = [ordered]@{
+            repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+            requestedRef = 'v0.3.2'
+            resolvedCommit = '1' * 40
+            resolvedVersion = '0.3.2'
+            contentSha256 = 'a' * 64
+            pinSha256 = 'b' * 64
+        }
+        $state = [ordered]@{
+            workflowSourceRepository = $pin.repository
+            workflowRef = $pin.requestedRef
+            workflowCommitOid = $pin.resolvedCommit
+            workflowSourceVersion = $pin.resolvedVersion
+            workflowSourceContentSha256 = $pin.contentSha256
+            workflowSourcePinSha256 = $pin.pinSha256
+        }
+        $mismatches = [ordered]@{
+            workflowSourceRepository = 'https://example.invalid/other.git'
+            workflowRef = 'other-ref'
+            workflowCommitOid = '2' * 40
+            workflowSourceVersion = '9.9.9'
+            workflowSourceContentSha256 = 'c' * 64
+            workflowSourcePinSha256 = 'd' * 64
+        }
+
+        foreach ($field in $mismatches.Keys) {
+            $changed = $state | ConvertTo-Json -Depth 10 | ConvertFrom-TestJson -AsHashtable
+            $changed[$field] = $mismatches[$field]
+            { & $module { param($value, $record) Assert-RunLocalSkillPinRecord -State $value -PinRecord $record -ActualPinSha256 $record.pinSha256 } `
+                    $changed $pin } | Should -Throw '*Skill package drift*'
+        }
+    }
+
+    # Scenario: A real ZIP changes an active localization file, including metadata preflight failures and resumable evidence failures.
+    # Purpose: Prove fail-closed metadata validation, C0/C1/C2/C3/F recovery, byte preservation, manifests, timings, and rerun idempotency.
     It 'InterT200_ExecutesABytePreservingLocalizedCandidateEndToEnd' {
         $fixtureRepo = Join-Path $TestDrive 'fixture-repository'
         $modRoot = Join-Path $fixtureRepo 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
@@ -743,8 +1631,119 @@ function Enter-SharedCoordinationLease {
         [string]$recoveredLocalizationState.status | Should -Be 'localized'
         [string]$recoveredLocalizationState.stageTimings.localization.artifactSha256 | Should -Be $localizationArtifactSha
         @($recoveredLocalizationState.completedStages | Where-Object { $_ -ceq 'localization' }).Count | Should -Be 1
-        (& $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
+
+        $unexpectedInstallPath = Join-Path ([string]$recoveredLocalizationState.installRoot) 'unexpected-after-install.txt'
+        [IO.File]::WriteAllText($unexpectedInstallPath, 'not from the verified archive', [Text.UTF8Encoding]::new($false))
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*Pre-C1 raw install tree file count differs from its immutable manifest*'
+        $installDriftState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        (& git -C $installDriftState.worktreePath rev-parse HEAD).Trim() | Should -Be $installDriftState.evidenceChain.c0Oid
+        $installDriftState.evidenceChain.c1Oid | Should -BeNullOrEmpty
+        [IO.File]::Delete($unexpectedInstallPath)
+
+        $attributesPath = Join-Path ([string]$recoveredLocalizationState.worktreePath) '.gitattributes'
+        $attributesBytes = [IO.File]::ReadAllBytes($attributesPath)
+        [IO.File]::AppendAllText($attributesPath, "upstream.txt -text`n", [Text.UTF8Encoding]::new($false))
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*C1 index blob differs from its immutable expected SHA-256*'
+        $attributeDriftState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        (& git -C $attributeDriftState.worktreePath rev-parse HEAD).Trim() | Should -Be $attributeDriftState.evidenceChain.c0Oid
+        $attributeDriftState.evidenceChain.c1Oid | Should -BeNullOrEmpty
+        [IO.File]::WriteAllBytes($attributesPath, $attributesBytes)
+
+        $metadataReadmePath = Join-Path ([string]$recoveredLocalizationState.worktreePath) 'README.md'
+        $metadataReadmeBytes = [IO.File]::ReadAllBytes($metadataReadmePath)
+        $metadataReadmeText = [Text.Encoding]::UTF8.GetString($metadataReadmeBytes)
+        $metadataReadmeText = $metadataReadmeText.Replace(
+            '- Nexus page version: 2.0.0',
+            '- Nexus page version: incorrect-version'
+        )
+        [IO.File]::WriteAllText($metadataReadmePath, $metadataReadmeText, [Text.UTF8Encoding]::new($false))
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*Metadata preflight field mismatch: README.md nexusPageVersion*'
+        $metadataMismatchState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        (& git -C $metadataMismatchState.worktreePath rev-parse HEAD).Trim() | Should -Be $metadataMismatchState.evidenceChain.c0Oid
+        $metadataMismatchState.evidenceChain.c1Oid | Should -BeNullOrEmpty
+        [IO.File]::WriteAllBytes($metadataReadmePath, $metadataReadmeBytes)
+
+        $metadataHashPath = Join-Path ([string]$recoveredLocalizationState.worktreePath) '.hash/examplemod.hash'
+        $metadataHashBytes = [IO.File]::ReadAllBytes($metadataHashPath)
+        [IO.File]::Delete($metadataHashPath)
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*Metadata path is missing: .hash/examplemod.hash*'
+        $metadataFailureState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        (& git -C $metadataFailureState.worktreePath rev-parse HEAD).Trim() | Should -Be $metadataFailureState.evidenceChain.c0Oid
+        $metadataFailureState.evidenceChain.c1Oid | Should -BeNullOrEmpty
+        $metadataFailureState.stageTimings.'build-commits'.result | Should -Be 'failed'
+        $metadataFailureState.stageTimings.'build-commits'.recoveryDisposition | Should -Be 'restart-before-c1'
+        [IO.File]::WriteAllBytes($metadataHashPath, $metadataHashBytes)
+
+        $c1FailureState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $expectedIndexedSha = [string]$c1FailureState.localizationFiles[0].indexedSha256
+        $c1FailureState.localizationFiles[0].indexedSha256 = '0' * 64
+        [IO.File]::WriteAllText($statePath, ($c1FailureState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*C2 index bytes do not match*'
+        $recordedC1State = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $recordedC1State.evidenceChain.c1Oid | Should -Match '^[0-9a-f]{40}$'
+        $recordedC1State.evidenceChain.c2Oid | Should -BeNullOrEmpty
+        $recordedC1State.buildCommitsRecovery.partialCheckpoint | Should -Be 'c1'
+        $recordedC1State.buildCommitsRecovery.recoveryDisposition | Should -Be 'same-run-checkpoint-resume'
+
+        $partialReadmeBytes = [IO.File]::ReadAllBytes($metadataReadmePath)
+        [IO.File]::AppendAllText($metadataReadmePath, "`nUnrelated metadata drift", [Text.UTF8Encoding]::new($false))
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*Metadata preview inputs changed after build-commits preflight*'
+        $metadataDriftState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        (& git -C $metadataDriftState.worktreePath rev-parse HEAD).Trim() | Should -Be $recordedC1State.evidenceChain.c1Oid
+        [IO.File]::WriteAllBytes($metadataReadmePath, $partialReadmeBytes)
+
+        $metadataDriftState.localizationFiles[0].indexedSha256 = $expectedIndexedSha
+        [IO.File]::WriteAllText($statePath, ($metadataDriftState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+
+        $gitEvidenceBlocker = Join-Path ([string]$recordedC1State.artifactsRoot) 'git-evidence'
+        [IO.File]::WriteAllText($gitEvidenceBlocker, 'block evidence directory creation', [Text.UTF8Encoding]::new($false))
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } | Should -Throw
+        $recordedC3State = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $recordedC3State.evidenceChain.c3Oid | Should -Match '^[0-9a-f]{40}$' -Because ([string]$recordedC3State.lastError.error)
+        $recordedC3State.evidenceChain.fOid | Should -Match '^[0-9a-f]{40}$' -Because ([string]$recordedC3State.lastError.error)
+        $recordedC3State.buildCommitsRecovery.partialCheckpoint | Should -Be 'f'
+        $recordedC3State.buildCommitsRecovery.recoveryDisposition | Should -Be 'same-run-checkpoint-resume'
+        [IO.File]::Delete($gitEvidenceBlocker)
+
+        $resumedBuild = & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru
+        $resumedBuild.result | Should -Be 'passed'
+        $resumedBuild.stageTimings.attempts.Count | Should -Be 8
+        @($resumedBuild.stageTimings.attempts | Where-Object result -eq 'failed').Count | Should -Be 7
+        $resumedBuild.stageTimings.attempts[-1].result | Should -Be 'passed'
         $preGateState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $rawEvidenceStart = [Diagnostics.ProcessStartInfo]::new()
+        $rawEvidenceStart.FileName = 'git'
+        $rawEvidenceStart.UseShellExecute = $false
+        $rawEvidenceStart.RedirectStandardOutput = $true
+        $rawEvidenceStart.RedirectStandardError = $true
+        foreach ($argument in @(
+            '-C', [string]$preGateState.worktreePath, 'diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames',
+            "$($preGateState.evidenceChain.c0Oid)..$($preGateState.evidenceChain.c1Oid)"
+        )) { $rawEvidenceStart.ArgumentList.Add($argument) }
+        $rawEvidenceProcess = [Diagnostics.Process]::new()
+        $rawEvidenceProcess.StartInfo = $rawEvidenceStart
+        $rawEvidenceMemory = [IO.MemoryStream]::new()
+        try {
+            $rawEvidenceProcess.Start() | Should -BeTrue
+            $rawEvidenceCopy = $rawEvidenceProcess.StandardOutput.BaseStream.CopyToAsync($rawEvidenceMemory)
+            $rawEvidenceError = $rawEvidenceProcess.StandardError.ReadToEndAsync()
+            $rawEvidenceProcess.WaitForExit()
+            $rawEvidenceCopy.GetAwaiter().GetResult()
+            $rawEvidenceError.GetAwaiter().GetResult() | Should -BeNullOrEmpty
+            $rawEvidenceProcess.ExitCode | Should -Be 0
+            [IO.File]::ReadAllBytes([string]$preGateState.evidenceDiffs.c0C1Diff.path) |
+                Should -Be $rawEvidenceMemory.ToArray()
+        }
+        finally {
+            $rawEvidenceMemory.Dispose()
+            $rawEvidenceProcess.Dispose()
+        }
         try {
             $appendStream = [IO.File]::Open([string]$preGateState.archive.path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
             try { $appendStream.WriteByte(0) } finally { $appendStream.Dispose() }
@@ -762,8 +1761,53 @@ function Enter-SharedCoordinationLease {
         $state.sourceTuple.contract.acquisitionMethod | Should -Be 'manual-queue'
         $state.sourceTuple.contract.archive.fileName | Should -Be 'ExampleMod.zip'
         $state.metadataPreview.sourceTupleContractSha256 | Should -Be $state.sourceTuple.contractSha256
+        $evidenceReceipt = Get-Content -LiteralPath $state.evidenceReceipt.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $evidenceReceipt.schemaVersion | Should -Be 2
+        $evidenceReceipt.executionMode | Should -Be 'bounded-parallel'
+        $evidenceReceipt.maxConcurrency | Should -Be 4
+        @($evidenceReceipt.tasks).Count | Should -BeGreaterThan 4
+        $evidenceReceipt.coordinatorVerification.result | Should -Be 'passed'
+        foreach ($task in @($evidenceReceipt.tasks)) {
+            foreach ($field in @('name', 'baseOid', 'headOid', 'treeOid', 'artifact', 'startedAt', 'completedAt')) {
+                $task.Contains($field) | Should -BeTrue
+            }
+            $task.artifact.size | Should -BeGreaterOrEqual 0
+            $task.artifact.sha256 | Should -Match '^[0-9a-f]{64}$'
+        }
         foreach ($field in @('c0Oid', 'c1Oid', 'c2Oid', 'c3Oid', 'fOid', 'c0TreeOid', 'c1TreeOid', 'c2TreeOid', 'c3TreeOid', 'fTreeOid')) {
             $state.evidenceChain[$field] | Should -Match '^[0-9a-f]{40}$'
+        }
+
+        $metadataPreviewBytes = [IO.File]::ReadAllBytes([string]$state.metadataPreview.path)
+        $metadataPreviewStateBytes = [IO.File]::ReadAllBytes($statePath)
+        try {
+            $metadataPreview = Get-Content -LiteralPath $state.metadataPreview.path -Raw | ConvertFrom-TestJson -AsHashtable
+            $metadataPreview.files[0].indexedSha256 = '0' * 64
+            [IO.File]::WriteAllText([string]$state.metadataPreview.path, ($metadataPreview | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+            $metadataTamperState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $metadataTamperState.metadataPreview.sha256 = (Get-FileHash -LiteralPath $metadataTamperState.metadataPreview.path -Algorithm SHA256).Hash.ToLowerInvariant()
+            [IO.File]::WriteAllText($statePath, ($metadataTamperState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+            { & $validatorPath -StatePath $statePath -PassThru } | Should -Throw '*metadata-preview-index*'
+        }
+        finally {
+            [IO.File]::WriteAllBytes([string]$state.metadataPreview.path, $metadataPreviewBytes)
+            [IO.File]::WriteAllBytes($statePath, $metadataPreviewStateBytes)
+        }
+
+        $evidenceReceiptBytes = [IO.File]::ReadAllBytes([string]$state.evidenceReceipt.path)
+        $evidenceReceiptStateBytes = [IO.File]::ReadAllBytes($statePath)
+        try {
+            $tamperedReceipt = Get-Content -LiteralPath $state.evidenceReceipt.path -Raw | ConvertFrom-TestJson -AsHashtable
+            $tamperedReceipt.inputTupleSha256 = '0' * 64
+            [IO.File]::WriteAllText([string]$state.evidenceReceipt.path, ($tamperedReceipt | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+            $receiptTamperState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $receiptTamperState.evidenceReceipt.sha256 = (Get-FileHash -LiteralPath $receiptTamperState.evidenceReceipt.path -Algorithm SHA256).Hash.ToLowerInvariant()
+            [IO.File]::WriteAllText($statePath, ($receiptTamperState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+            { & $validatorPath -StatePath $statePath -PassThru } | Should -Throw '*evidence-generation-receipt*'
+        }
+        finally {
+            [IO.File]::WriteAllBytes([string]$state.evidenceReceipt.path, $evidenceReceiptBytes)
+            [IO.File]::WriteAllBytes($statePath, $evidenceReceiptStateBytes)
         }
         $expectedMerged = $indexedText.Replace('Hello', '你好').Replace('Dynamic', '動態')
         $finalLocalizationPath = Join-Path $state.worktreePath $relativeLocalization
@@ -811,6 +1855,23 @@ function Enter-SharedCoordinationLease {
         $rerun.idempotent | Should -Be $true
         (& git -C $state.worktreePath rev-parse HEAD).Trim() | Should -Be $headBeforeRerun
 
+        $stateBytesBeforePinDrift = [IO.File]::ReadAllBytes($statePath)
+        $ownerPath = Join-Path ([string]$state.modLockPath) 'owner.json'
+        $ownerBytesBeforePinDrift = [IO.File]::ReadAllBytes($ownerPath)
+        $sourceBytesBeforePinDrift = [IO.File]::ReadAllBytes([string]$state.archive.path)
+        $runPinBytes = [IO.File]::ReadAllBytes([string]$state.workflowSourcePinPath)
+        try {
+            [IO.File]::AppendAllText([string]$state.workflowSourcePinPath, ' ', [Text.UTF8Encoding]::new($false))
+            { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+                Should -Throw '*Skill package drift*'
+            [IO.File]::ReadAllBytes($statePath) | Should -Be $stateBytesBeforePinDrift
+            [IO.File]::ReadAllBytes($ownerPath) | Should -Be $ownerBytesBeforePinDrift
+            [IO.File]::ReadAllBytes([string]$state.archive.path) | Should -Be $sourceBytesBeforePinDrift
+        }
+        finally {
+            [IO.File]::WriteAllBytes([string]$state.workflowSourcePinPath, $runPinBytes)
+        }
+
         $receiptBytes = [IO.File]::ReadAllBytes($state.evidenceReceipt.path)
         Remove-Item -LiteralPath $state.evidenceReceipt.path
         { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
@@ -820,9 +1881,10 @@ function Enter-SharedCoordinationLease {
         $incompleteBuildState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
         $incompleteBuildState.published = $false
         $incompleteBuildState.completedStages = @($incompleteBuildState.completedStages | Where-Object { $_ -ne 'build-commits' })
+        $incompleteBuildState.Remove('buildCommitsRecovery')
         [IO.File]::WriteAllText($statePath, ($incompleteBuildState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
         { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
-            Should -Throw '*Incomplete build-commits recovery requires HEAD to equal C0*'
+            Should -Throw '*Recorded partial HEAD is not bound to the saved build-commits recovery evidence*'
         (& git -C $state.worktreePath rev-parse HEAD).Trim() | Should -Be $headBeforeRerun
 
         $recoveryState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
@@ -868,6 +1930,7 @@ function Enter-SharedCoordinationLease {
         finally { $archive.Dispose(); $archiveStream.Dispose() }
         $statePath = Join-Path $runRoot 'state.json'
         $state = [ordered]@{
+            schemaVersion = 14
             runId = $runId
             statePath = $statePath
             repositoryRoot = $TestDrive
@@ -886,6 +1949,7 @@ function Enter-SharedCoordinationLease {
             completedStages = @()
             stageTimings = [ordered]@{}
         }
+        $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         $owner = [ordered]@{
             schemaVersion = 2
@@ -899,14 +1963,22 @@ function Enter-SharedCoordinationLease {
 
         { & $runnerPath verify-source -RepositoryRoot $TestDrive -StatePath $statePath -PassThru } |
             Should -Throw '*path traversal*'
-        (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).status | Should -Be 'waiting-user'
+        $failedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $failedState.status | Should -Be 'waiting-user'
+        $failedState.lastError.stage | Should -Be 'verify-source'
+        $failedState.stageTimings.'verify-source'.result | Should -Be 'failed'
+        $failedState.stageTimings.'verify-source'.attempt | Should -Be 1
+        $failedState.stageTimings.'verify-source'.attempts.Count | Should -Be 1
+        ([int64]$failedState.stageTimings.'verify-source'.activeMilliseconds +
+            [int64]$failedState.stageTimings.'verify-source'.waitingMilliseconds) |
+            Should -Be ([int64]$failedState.stageTimings.'verify-source'.wallClockMilliseconds)
         Test-Path -LiteralPath (Join-Path $runRoot 'staging/extracted') | Should -Be $false
     }
 
-    # Scenario: A ZIP has the wrong canonical root, declares a Unix symlink entry, or uses a Windows device name.
-    # Purpose: Execute identity, link-type, and device-path security blocks before any filesystem extraction.
+    # Scenario: A ZIP has the wrong canonical root, unsafe entry types, reserved names, or file/ancestor collisions.
+    # Purpose: Execute identity, link/reparse/special-type, device-path, and normalized collision blocks before extraction.
     It 'InterT220_RejectsInvalidRootSymlinkAndDeviceNameArchives' {
-        foreach ($case in @('invalid-root', 'symlink', 'reserved-device')) {
+        foreach ($case in @('invalid-root', 'symlink', 'reparse-point', 'unix-special', 'reserved-device', 'file-ancestor-collision')) {
             $runId = [guid]::NewGuid().ToString()
             $short = $runId.Replace('-', '').Substring(0, 8)
             $runRoot = Join-Path $TestDrive "AI Auto Update/In Progress/examplemod-$short"
@@ -923,23 +1995,35 @@ function Enter-SharedCoordinationLease {
                 $entryName = switch ($case) {
                     'invalid-root' { 'OtherMod/file.lua' }
                     'symlink' { 'ExampleMod/link.lua' }
+                    'reparse-point' { 'ExampleMod/reparse.lua' }
+                    'unix-special' { 'ExampleMod/fifo.lua' }
                     'reserved-device' { 'ExampleMod/NUL' }
+                    'file-ancestor-collision' { 'ExampleMod/node' }
                 }
                 $entry = $archive.CreateEntry($entryName)
                 if ($case -eq 'symlink') { $entry.ExternalAttributes = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]2684354560), 0) }
+                if ($case -eq 'reparse-point') { $entry.ExternalAttributes = [int][IO.FileAttributes]::ReparsePoint }
+                if ($case -eq 'unix-special') { $entry.ExternalAttributes = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]268435456), 0) }
                 $entryStream = $entry.Open()
                 try { $entryStream.WriteByte(65) } finally { $entryStream.Dispose() }
+                if ($case -eq 'file-ancestor-collision') {
+                    $child = $archive.CreateEntry('ExampleMod/node/child.lua')
+                    $childStream = $child.Open()
+                    try { $childStream.WriteByte(66) } finally { $childStream.Dispose() }
+                }
             }
             finally { $archive.Dispose(); $archiveStream.Dispose() }
 
             $statePath = Join-Path $runRoot 'state.json'
             $state = [ordered]@{
+                schemaVersion = 14
                 runId = $runId; statePath = $statePath; repositoryRoot = $TestDrive; status = 'worktree-ready'; runRoot = $runRoot
                 artifactsRoot = $artifactsRoot; mod = 'ExampleMod'; modLockPath = $lockPath; modLockKey = $lockKey
                 repoModDirectory = 'ExampleMod'; modRelativePath = $modRelativePath
                 archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
                 completedStages = @(); stageTimings = [ordered]@{}
             }
+            $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
             [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
             $owner = [ordered]@{
                 schemaVersion = 2
@@ -953,11 +2037,92 @@ function Enter-SharedCoordinationLease {
             $expected = switch ($case) {
                 'invalid-root' { '*Invalid archive root*' }
                 'symlink' { '*symlink rejected*' }
+                'reparse-point' { '*reparse point rejected*' }
+                'unix-special' { '*special entry type rejected*' }
                 'reserved-device' { '*reserved Windows device name*' }
+                'file-ancestor-collision' { '*file/ancestor archive path collision rejected*' }
             }
             { & $runnerPath verify-source -RepositoryRoot $TestDrive -StatePath $statePath -PassThru } | Should -Throw $expected
             Test-Path -LiteralPath (Join-Path $runRoot 'staging/extracted') | Should -Be $false
         }
+    }
+
+    # Scenario: A valid ZIP introduces a DLL that did not exist at C0.
+    # Purpose: Require one exact archive/path/file-SHA approval and record that disposition in extraction evidence.
+    It 'InterT221_RequiresAnExactApprovalForAChangedRiskyPayload' {
+        $repository = Join-Path $TestDrive 'payload-security-repository'
+        $runId = '56565656-6666-4777-8888-999999999999'
+        $modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $lockKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))).ToLowerInvariant()
+        $runRoot = Join-Path $repository 'AI Auto Update/In Progress/examplemod-56565656'
+        $artifactsRoot = Join-Path $runRoot 'artifacts'
+        $lockPath = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
+        New-Item -ItemType Directory -Path $artifactsRoot, $lockPath, (Join-Path $runRoot 'source'), (Join-Path $repository $modRelativePath) -Force | Out-Null
+        & git -C $repository init --quiet --initial-branch=main
+        & git -C $repository config user.name 'Fixture User'
+        & git -C $repository config user.email 'fixture@example.invalid'
+        [IO.File]::WriteAllText((Join-Path $repository $modRelativePath 'existing.lua'), "return {}`n", [Text.UTF8Encoding]::new($false))
+        & git -C $repository add -- $modRelativePath
+        & git -C $repository commit --quiet -m 'base'
+        $c0 = (& git -C $repository rev-parse HEAD).Trim()
+
+        $archivePath = Join-Path $runRoot 'source/payload.zip'
+        $archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew)
+        $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        $payloadBytes = [byte[]](0x4D, 0x5A, 0x01, 0x02)
+        try {
+            $entry = $archive.CreateEntry('ExampleMod/payload.dll')
+            $entryStream = $entry.Open()
+            try { $entryStream.Write($payloadBytes, 0, $payloadBytes.Length) } finally { $entryStream.Dispose() }
+        }
+        finally { $archive.Dispose(); $archiveStream.Dispose() }
+        $archiveSha = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $payloadSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadBytes)).ToLowerInvariant()
+        $statePath = Join-Path $runRoot 'state.json'
+        $state = [ordered]@{
+            schemaVersion = 15; workflowSchemaVersion = 15; runId = $runId; statePath = $statePath
+            repositoryRoot = $repository; status = 'worktree-ready'; runRoot = $runRoot; artifactsRoot = $artifactsRoot
+            worktreePath = $repository; mod = 'ExampleMod'; repoModDirectory = 'ExampleMod'; modRelativePath = $modRelativePath
+            modLockPath = $lockPath; modLockKey = $lockKey; baseOid = $c0
+            evidenceChain = [ordered]@{ c0Oid = $c0 }
+            archive = [ordered]@{ path = $archivePath; filename = 'payload.zip'; size = (Get-Item -LiteralPath $archivePath).Length; sha256 = $archiveSha }
+            securityOverrides = @(); completedStages = @(); stageTimings = [ordered]@{}
+        }
+        $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
+        [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        [ordered]@{
+            schemaVersion = 2; runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
+            plannedStatePath = $statePath; statePath = $statePath; reservationToken = [guid]::NewGuid().ToString('N')
+            workerToken = $null; machineName = $null; workerId = $null; workerProcessStartTicks = $null
+            leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $lockPath 'owner.json') -NoNewline
+
+        (& $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru).result | Should -Be 'passed'
+        { & $runnerPath extract -RepositoryRoot $repository -StatePath $statePath -PassThru } |
+            Should -Throw '*Security approval required for changed risky archive payload*'
+        (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable).status | Should -Be 'waiting-user'
+
+        $approvalPath = Join-Path $TestDrive 'payload-approval.json'
+        [IO.File]::WriteAllText($approvalPath, ([ordered]@{
+            schemaVersion = 1; runId = $runId; archiveSha256 = $archiveSha
+            approvals = @([ordered]@{ relativePath = 'ExampleMod/payload.dll'; fileSha256 = $payloadSha })
+        } | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+        (& $runnerPath extract -RepositoryRoot $repository -StatePath $statePath -SecurityOverridePath $approvalPath -PassThru).result | Should -Be 'passed'
+        $finalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        (Get-FileHash -LiteralPath $finalState.securityOverrideReceipt.path -Algorithm SHA256).Hash.ToLowerInvariant() |
+            Should -Be $finalState.securityOverrideReceipt.sha256
+        $manifest = Get-Content -LiteralPath $finalState.extractionManifest.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $payload = @($manifest.files | Where-Object path -eq 'ExampleMod/payload.dll')[0]
+        $payload.securityDisposition.result | Should -Be 'approved-exact-tuple'
+        $payload.securityDisposition.archiveSha256 | Should -Be $archiveSha
+        $payload.securityDisposition.fileSha256 | Should -Be $payloadSha
+        (& $validatorPath -StatePath $statePath -SecurityPayloadOnly -PassThru).result | Should -Be 'passed'
+
+        $approvalArtifact = Get-Content -LiteralPath $finalState.securityOverrideReceipt.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $approvalArtifact.approvals[0].fileSha256 = ('0' * 64)
+        [IO.File]::WriteAllText($finalState.securityOverrideReceipt.path, ($approvalArtifact | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+        { & $validatorPath -StatePath $statePath -SecurityPayloadOnly -PassThru } |
+            Should -Throw '*Security override receipt SHA-256 changed*'
     }
 
     # Scenario: A valid-looking state keeps the canonical reservation path string, but that directory is replaced by a junction.
@@ -994,6 +2159,7 @@ function Enter-SharedCoordinationLease {
             archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
             completedStages = @(); stageTimings = [ordered]@{}
         }
+        $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         $owner = [ordered]@{
             schemaVersion = 2
@@ -1045,6 +2211,7 @@ function Enter-SharedCoordinationLease {
             archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
             completedStages = @(); stageTimings = [ordered]@{}
         }
+        $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         [ordered]@{
             schemaVersion = 2

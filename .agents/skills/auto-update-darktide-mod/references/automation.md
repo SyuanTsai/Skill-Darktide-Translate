@@ -69,9 +69,29 @@ The JSON result returns the generated `statePath`. Resume individual stages with
 ./scripts/mod-update.ps1 review-snapshot -RepositoryRoot $repository -StatePath $statePath -LocalReviewPath $localReview
 ```
 
-`run` executes the same ordered stages. After publication it returns `waiting-input` instead of pretending to perform semantic Review. Expand and read the packaged Review Baseline, review the immutable F, write the local Review artifact below, then resume the same `run` with `-StatePath` and `-LocalReviewPath`. The second invocation completes the zero-wait external snapshot and stops at `awaiting-user-merge`. It does not merge a PR or release the MOD identity reservation.
+If `extract` reports a changed risky payload, do not edit `state.json`. After the user approves the exact file, provide a separate JSON artifact and resume the same stage with `-SecurityOverridePath`:
 
-Every completed-stage result contains the run ID, stage, state, primary artifact SHA-256, and `wallClockMilliseconds`, `activeMilliseconds`, `waitingMilliseconds`, `stabilityObservationMilliseconds`, and `coordinationWaitMilliseconds`. Active plus waiting equals wall-clock; Schema 14 claim classifies its required archive stability observation as waiting, while contended shared-lock acquisition is recorded separately as coordination wait. Completed stages are idempotent: rerunning them reuses the matching same-run receipt instead of creating duplicate commits or PRs. A completed localization receipt repairs a stale top-level `installed` state to `localized` without reapplying localization.
+```json
+{
+  "schemaVersion": 1,
+  "runId": "<same run ID>",
+  "archiveSha256": "<same archive SHA-256>",
+  "approvals": [
+    {
+      "relativePath": "ExampleMod/bin/payload.dll",
+      "fileSha256": "<exact extracted file SHA-256>"
+    }
+  ]
+}
+```
+
+The runner accepts no wildcard, directory, or reusable approval. It copies the canonical approval to `artifacts/security-overrides.json`, binds it to the current run/archive, and records `approved-exact-tuple` in the extraction manifest. Added or changed native executables, DLLs, install/system scripts, executable-mode or executable-magic files, and nested archives remain `waiting-user` without that exact tuple; unchanged risky bytes already present at C0 are recorded as `unchanged-from-c0`. Before `build-commits` creates or resumes any C1/C2/C3/F commit, the independent validator reopens the claimed archive, re-hashes the extraction manifest and exact approval receipt, reconstructs every risky-payload disposition against C0, and writes `artifacts/precommit-security-validation.json`. A changed or missing receipt therefore stops before another checkpoint commit, not only at the later Candidate Gate.
+
+ZIP listing rejects Windows reparse attributes, Unix symlinks and other non-regular special entry types, exact/case/Unicode collisions, directory/file collisions, and a file entry that is also an ancestor of another entry before extraction begins.
+
+`run` executes the same ordered stages. After publication it captures one zero-wait PR feedback/external-review snapshot and returns `waiting-input` instead of pretending to perform semantic Review. Expand and read the packaged Review Baseline, review the immutable F plus the returned feedback snapshot, write the local Review artifact below, then resume the same `run` with `-StatePath` and `-LocalReviewPath`. The second invocation revalidates that same snapshot and stops at `awaiting-user-merge`. It does not merge a PR or release the MOD identity reservation.
+
+Every completed-stage result contains the run ID, stage, state, primary artifact SHA-256, and `wallClockMilliseconds`, `activeMilliseconds`, `waitingMilliseconds`, `stabilityObservationMilliseconds`, and `coordinationWaitMilliseconds`. Active plus waiting equals wall-clock; Schema 14 claim classifies its required archive stability observation as waiting, while contended shared-lock acquisition is recorded separately as coordination wait. Completed stages are idempotent: rerunning them reuses the matching same-run receipt instead of creating duplicate commits or PRs. Before any state-mutating resume takes its writer lock, and again before a completed-stage fast path reuses a receipt, the runner verifies the complete installed Skill package against the run-local `review-artifacts/skill-source-pin.json` and matches its pin SHA, repository, version, immutable commit, and repository content hash to state. Package drift fails closed without replacing or updating the old run pin. A completed localization receipt repairs a stale top-level `installed` state to `localized` without reapplying localization.
 
 New Schema 14 and Schema 15 states record the runtime Skill pin. A pre-0.3 Schema 14 state that lacks `workflowSourcePinPath` remains on its legacy authoring-reference tuple and is validated through the legacy Schema 14 compatibility path; it is never rewritten or upgraded in place. Schema 15 has no implicit downgrade or pin migration.
 
@@ -117,7 +137,7 @@ If the workset contains pending `AI_REQUIRED` units, including active `missing_z
 
 ### Local Review artifact
 
-Local Review is an Agent decision over the packaged Review Baseline, not a result the deterministic script can invent. Bind it to the current PR F and Candidate Gate:
+Local Review is an Agent decision over the packaged Review Baseline, not a result the deterministic script can invent. The first `review-snapshot` or aggregate `run` call after publication captures one immutable `artifacts/review-snapshot.json` and returns `waiting-input`. The bounded capture includes review bodies, issue comments, and up to 100 review threads with up to 100 comments per thread; pagination beyond that fixed capacity fails closed instead of silently omitting feedback. This capture happens even when `localizationMode=none` makes optional external localization Review not applicable. Review that fixed artifact together with F and the Candidate Gate, then bind the supplied Review to all three:
 
 ```json
 {
@@ -125,30 +145,38 @@ Local Review is an Agent decision over the packaged Review Baseline, not a resul
   "result": "passed",
   "headOid": "<F commit OID>",
   "candidateGateSha256": "<validation-report SHA-256>",
+  "feedbackSnapshotSha256": "<review-snapshot.json SHA-256>",
   "reviewedAt": "<ISO-8601>",
   "findings": [],
   "securityBlocking": []
 }
 ```
 
-Every finding must have a completed `keep`, `resolved`, or `out-of-scope` disposition. The runner copies this input into run-local `artifacts/review.json`; the independent validator then verifies local HEAD, remote branch, non-draft PR head, F, reviewed OID, Gate SHA, and the zero-wait external observation before state can become `awaiting-user-merge`.
+Every actionable finding must contain priority, location, violated baseline, evidence, consequence, and a completed `keep` or `resolved` disposition. Out-of-scope observations are not findings. The runner copies this input into run-local `artifacts/review.json`; the independent validator then re-hashes the immutable feedback snapshot, checks its run/F/external-observation tuple against state, verifies the local Review's snapshot SHA and timestamp/finding schema, and verifies local HEAD, remote branch, non-draft PR head, F, reviewed OID, Gate SHA, and immutable evidence receipt/artifacts before state can become `awaiting-user-merge`. A completed-stage resume reruns that independent completion check instead of trusting only the old completion artifact.
 
 ## Recovery
 
 Keep `state.json`, the claimed archive, MOD identity lock, worktree, branch, and artifacts together. A retry must use the exact returned `statePath`; never create a replacement generation to bypass a failed run.
 
-- A completed stage returns its existing receipt only after re-hashing its primary artifact, rechecking the lock-owner tuple, and—after evidence exists—confirming HEAD still equals F.
+- Every pinned resume validates the complete installed Skill package against the fixed run-local `review-artifacts/skill-source-pin.json` before acquiring the reservation worker or state writer lease. A package file, content hash, commit, compressed reference, or expanded reference mismatch fails as package drift without changing state, lock evidence, source, or the immutable pin. The completed-stage fast path repeats this binding check immediately before receipt reuse.
+- A completed stage returns its existing receipt only after the package binding passes, re-hashing its primary artifact, rechecking the lock-owner tuple, and—after evidence exists—confirming HEAD still equals F.
 - Claim resolves the immutable base and worktree plan before taking the MOD identity lock, records the fixed Workflow/Baseline source tuple, and writes writer-protected `state.json` before moving the stable source into `.claims/<run-id>/source` or creating the worktree. Retrying that state can recover the ZIP from its original queue path, reattach a partially created worktree or branch, and move the same claimed archive into the run; it never starts a replacement generation. `claim.json` and `owner.json` retain the planned state path so the narrower pre-state crash window remains attributable to the same run.
 - Every state-mutating resume uses an atomic run-local writer lock bound to machine, PID, process start time, state path, and an unguessable token. A live owner blocks the second writer; a stale lock is retained as evidence before the original run resumes.
 - The MOD reservation separately binds reservation/worker tokens plus machine, PID, and process-start time. Active workers refresh heartbeat during long file, Git, download, and Gate operations; every owner write is token-guarded. Normal process exit and waiting states atomically clear the active worker tuple and retain the same run as `reserved`.
 - `source-acquisition.lock` protects only queue inventory/claim/destination moves; `git-coordination.lock` protects only shared fetch/branch/worktree metadata and remote-ref publication by `git push`. Both are short-lived and owner-checked, stale lock directories are retained instead of overwritten, and neither lock wraps commits, Candidate Gate, GitHub PR/Review calls, or the run lifecycle.
 - An interrupted extraction preserves the previous directory under a recovery name before atomically installing the new extraction.
-- An incomplete `build-commits` may resume only while HEAD still equals C0. A partial C1/C2/C3 history is retained and stops for explicit user-directed recovery instead of appending duplicate evidence commits.
+- `build-commits` re-hashes the complete raw install tree against its immutable manifest before C1/C2 recovery, validates the immutable source tuple plus both required metadata paths (`README.md` and the current `.hash/<slug>.hash`), and writes `metadata-preview.json` before C1. Every required metadata field must match that tuple. Metadata bytes remain unstaged until after C3, and a partial-checkpoint resume rejects any change from the recorded preview inputs.
+- Before every C1/C2/C3/F commit, the runner reads the complete staged path set, rejects entries outside that checkpoint's deterministic allowlist, and re-hashes index blobs against the immutable normalization, indexed-localization, merged-localization, or metadata-preview representation. It resets only the MOD index before a C1 retry so a rejected clean-filter result cannot survive recovery, then executes `git diff --cached --check`. Only exact warnings on staged immutable-upstream paths in C1/C2 are retained as upstream-whitespace exceptions; C3/F warnings are blocking.
+- The independent Candidate Gate reconstructs the metadata-preview input contract and re-reads both metadata blobs from immutable F. Their blob OID, indexed size/SHA, and `none|crlf-to-lf` transform must match the preview; matching only the raw worktree file is insufficient.
+- After every C1/C2/C3/F checkpoint, `build-commits` immediately persists its OID/tree; C1/C2/C3 additionally retain their parent OID/tree tuple. A later error records the failed timing attempt, partial HEAD/tree, checkpoint, generation, and `same-run-checkpoint-resume` disposition. Resume accepts only the latest recorded checkpoint whose HEAD/tree and applicable parent-tree invariants still match; it continues the same generation without duplicate commits. Missing or contradictory partial evidence fails closed. Failed attempts remain in `stageTimings.build-commits.attempts` after a later successful resume.
+- Failures and Schema 15 localization `waiting-input` exits in every started stage preserve the actual attempt result plus wall/active/wait timing and append-only attempt history, including attempts reached through the aggregate `run` command.
+- Git diff and name-status evidence captures Git stdout as exact bytes; it is never trimmed, decoded/re-encoded, or rewritten with platform-specific line endings.
+- One evidence generation launches the fixed Git diff/name-status tasks with a maximum concurrency of four, then records every task's base/head/tree, exact artifact path/size/SHA, start/completion time, the candidate-tree enumeration, the manifest-bound batch input tuple, Git/parameter versions, and coordinator verification in receipt schema 2. The coordinator independently rereads every C1/C2/C3/F range, records the deterministic paths plus their SHA and allowlist class, and hashes that contract. The independent Gate reconstructs the receipt, changed-path contract, every artifact, and every Git tree instead of trusting only the receipt file SHA or a self-asserted `passed` value.
 - Recorded C0/C1/C2/C3/F OIDs and trees are revalidated by the independent Gate before publication.
 - Empty C2/C3 trees require structured `KEEP` reasons bound to target paths, localization mode/manifest, parent/current trees, and a reconstructible contract hash. The Gate rejects missing, fake, unknown, or contradictory reasons and independently binds README/formal-hash metadata preview fields to the same complete source tuple. Both files must preserve all 11 tuple fields. README uses unique labeled list entries with exact values; substring, prefix/suffix, missing, duplicate, and contradictory matches fail.
-- GitHub CLI operations run from the recorded worktree and publication uses the remote stored in state. An existing open PR is updated; a second PR is not created. A closed, retargeted, or head-mismatched PR stops for user recovery.
+- GitHub CLI operations run from the recorded worktree and publication uses the remote stored in state. An existing open PR is updated; a second PR is not created. A closed, retargeted, head-mismatched, or stale/electronically edited evidence-summary body stops publication or Review completion. The runner compares the normalized remote body with its canonical rendering, and the independent completion Gate confirms the body still carries the current F/Gate/evidence tuple.
 - After publication, history is append-only. Never reset, rebase, squash, force-push, or replace rejected evidence.
-- External review takes one zero-wait snapshot. `requested-pending` is non-blocking and schedules no watcher.
+- External review takes one zero-wait snapshot. `requested-pending` is non-blocking and schedules no watcher, but is emitted only when an existing request is observed or the new request call succeeds; a failed request is recorded as `unavailable` with failure evidence.
 
 When identity, archive provenance, path containment, or security evidence is ambiguous, the run becomes `waiting-user` and retains its reservation and artifacts.
 

@@ -4,7 +4,9 @@
 param(
     [Parameter(Mandatory)]
     [string] $StatePath,
+    [switch] $SecurityPayloadOnly,
     [switch] $ReviewCompletion,
+    [switch] $CheckOnly,
     [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
@@ -263,6 +265,103 @@ function Assert-ClaimedArchiveIntegrity {
     }
 }
 
+function Get-ArchivePayloadRisk {
+    param([string] $RelativePath, [byte[]] $Bytes, [int64] $ExternalAttributes = 0)
+    $extension = [IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    if ($extension -in @('.zip', '.7z', '.rar', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.cab', '.iso', '.jar')) { return 'nested-archive' }
+    if ($extension -in @('.dll', '.exe', '.com', '.scr', '.msi', '.msp', '.cpl', '.ocx', '.sys', '.drv', '.efi', '.so', '.dylib')) { return 'native-executable' }
+    if ($extension -in @('.bat', '.cmd', '.ps1', '.psm1', '.psd1', '.sh', '.bash', '.zsh', '.fish', '.vbs', '.vbe', '.wsf', '.wsh', '.hta', '.reg')) { return 'install-or-system-script' }
+    $unixMode = ($ExternalAttributes -shr 16) -band 0xFFFF
+    if (($unixMode -band 73) -ne 0) { return 'native-executable' }
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0x4D -and $Bytes[1] -eq 0x5A) { return 'native-executable' }
+    if ($Bytes.Length -ge 4 -and $Bytes[0] -eq 0x7F -and $Bytes[1] -eq 0x45 -and $Bytes[2] -eq 0x4C -and $Bytes[3] -eq 0x46) { return 'native-executable' }
+    if ($Bytes.Length -ge 4 -and [Convert]::ToHexString($Bytes[0..3]) -in @('FEEDFACE', 'CEFAEDFE', 'FEEDFACF', 'CFFAEDFE', 'CAFEBABE')) { return 'native-executable' }
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0x23 -and $Bytes[1] -eq 0x21) { return 'install-or-system-script' }
+    $null
+}
+
+function Assert-ArchivePayloadSecurityIntegrity {
+    param([Collections.IDictionary] $State, [Collections.IDictionary] $Chain, [string] $Worktree)
+    if (-not $State.extractionManifest -or [string]::IsNullOrWhiteSpace([string]$State.extractionManifest.path) -or
+        [string]::IsNullOrWhiteSpace([string]$State.extractionManifest.sha256)) {
+        throw 'Extraction manifest receipt is missing before payload security validation.'
+    }
+    $manifestPath = Assert-NoReparsePath -Path ([string]$State.extractionManifest.path) -Root ([string]$State.repositoryRoot) -Label 'Extraction manifest'
+    $expectedManifestPath = [IO.Path]::GetFullPath((Join-Path ([string]$State.artifactsRoot) 'extraction-manifest.json'))
+    if ($manifestPath -cne $expectedManifestPath) { throw 'Extraction manifest path changed.' }
+    if ((Get-FileSha256 -Path $manifestPath) -cne [string]$State.extractionManifest.sha256) { throw 'Extraction manifest SHA-256 changed.' }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([IO.Path]::GetFullPath([string]$manifest.root) -cne [IO.Path]::GetFullPath([string]$State.extractionRoot)) {
+        throw 'Extraction manifest root changed before payload security validation.'
+    }
+    $archiveAttributes = [ordered]@{}
+    Add-Type -AssemblyName System.IO.Compression
+    $archiveStream = [IO.File]::Open([string]$State.archive.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Read, $false)
+        try {
+            foreach ($entry in $archive.Entries) { $archiveAttributes[$entry.FullName.Replace('\', '/')] = [int64]$entry.ExternalAttributes }
+        }
+        finally { $archive.Dispose() }
+    }
+    finally { $archiveStream.Dispose() }
+    $approvalArtifact = $null
+    if ($State.Contains('securityOverrideReceipt') -and $State.securityOverrideReceipt) {
+        $approvalPath = Assert-NoReparsePath -Path ([string]$State.securityOverrideReceipt.path) -Root ([string]$State.repositoryRoot) -Label 'Security override receipt'
+        if ($approvalPath -cne [IO.Path]::GetFullPath((Join-Path ([string]$State.artifactsRoot) 'security-overrides.json'))) {
+            throw 'Security override receipt path changed.'
+        }
+        if ((Get-FileSha256 -Path $approvalPath) -cne [string]$State.securityOverrideReceipt.sha256) {
+            throw 'Security override receipt SHA-256 changed.'
+        }
+        $approvalArtifact = Get-Content -LiteralPath $approvalPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([string]$approvalArtifact.runId -cne [string]$State.runId -or [string]$approvalArtifact.archiveSha256 -cne [string]$State.archive.sha256) {
+            throw 'Security override receipt does not bind this run/archive.'
+        }
+    }
+    $usedApprovals = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($record in @($manifest.files)) {
+        $relative = [string]$record.path
+        $physical = Assert-NoReparsePath -Path (Join-Path ([string]$manifest.root) $relative) -Root ([string]$State.repositoryRoot) -Label 'Extraction security payload'
+        $bytes = Read-FileBytesWithHeartbeat -Path $physical
+        $risk = Get-ArchivePayloadRisk -RelativePath $relative -Bytes $bytes -ExternalAttributes ([int64]$archiveAttributes[$relative])
+        if (-not $record.Contains('securityDisposition')) { throw "Extraction security disposition is missing: $relative" }
+        $disposition = $record.securityDisposition
+        if ([string]::IsNullOrWhiteSpace($risk)) {
+            if ([string]$disposition.result -cne 'not-risky') { throw "Safe payload has a contradictory security disposition: $relative" }
+            continue
+        }
+        $fileSha256 = Get-Sha256Bytes -Bytes $bytes
+        $modRelative = $relative.Substring(([string]$State.repoModDirectory).Length).TrimStart('/')
+        $repositoryPath = "$($State.modRelativePath)/$modRelative"
+        $oldSha256 = $null
+        $oldExists = Invoke-GitCheck -WorkingDirectory $Worktree -Arguments @('cat-file', '-e', "$($Chain.c0Oid):$repositoryPath") -AllowFailure
+        if ($oldExists.exitCode -eq 0) {
+            $oldSha256 = Get-Sha256Bytes -Bytes (Get-GitBlobBytes -WorkingDirectory $Worktree -Object "$($Chain.c0Oid):$repositoryPath")
+        }
+        elseif ($oldExists.exitCode -notin @(1, 128)) { throw "Unable to compare risky payload with C0: $repositoryPath" }
+        if ($oldSha256 -ceq $fileSha256) {
+            if ([string]$disposition.result -cne 'unchanged-from-c0' -or [string]$disposition.risk -cne $risk -or
+                [string]$disposition.fileSha256 -cne $fileSha256 -or [string]$disposition.c0Sha256 -cne $oldSha256) {
+                throw "Unchanged risky payload disposition changed: $relative"
+            }
+            continue
+        }
+        if (-not $approvalArtifact -or [string]$disposition.result -cne 'approved-exact-tuple' -or
+            [string]$disposition.risk -cne $risk -or [string]$disposition.fileSha256 -cne $fileSha256 -or
+            [string]$disposition.archiveSha256 -cne [string]$State.archive.sha256) {
+            throw "Changed risky payload lacks an exact approval: $relative"
+        }
+        $matchingApprovals = @($approvalArtifact.approvals | Where-Object {
+            [string]$_.archiveSha256 -ceq [string]$State.archive.sha256 -and [string]$_.relativePath -ceq $relative -and [string]$_.fileSha256 -ceq $fileSha256
+        })
+        if ($matchingApprovals.Count -ne 1) { throw "Changed risky payload approval is missing or ambiguous: $relative" }
+        $null = $usedApprovals.Add("$relative`n$fileSha256")
+    }
+    if ($approvalArtifact -and $usedApprovals.Count -ne @($approvalArtifact.approvals).Count) { throw 'Security override receipt contains an unused or stale approval.' }
+    "archive payload security passed; approvals=$($usedApprovals.Count)"
+}
+
 function Assert-SourceReceiptIntegrity {
     param([Collections.IDictionary] $State)
     if ([int]$State.schemaVersion -lt 15) { return 'not-applicable: Schema 14 manual source' }
@@ -439,12 +538,42 @@ function Assert-SourceTupleIntegrity {
     if (($actualMetadataPaths -join "`n") -cne ($expectedMetadataPaths -join "`n")) {
         throw 'Metadata preview requires exactly README.md and this MOD formal hash file.'
     }
+    $previewInput = [ordered]@{
+        schemaVersion = $preview.schemaVersion
+        runId = $preview.runId
+        sourceTuplePath = $preview.sourceTuplePath
+        sourceTupleSha256 = $preview.sourceTupleSha256
+        sourceTupleContractSha256 = $preview.sourceTupleContractSha256
+        sourceFields = $preview.sourceFields
+        files = $preview.files
+    }
+    $previewInputSha256 = Get-ContractSha256 -Contract $previewInput
+    if ([string]$preview.inputContractSha256 -cne $previewInputSha256 -or
+        [string]$State.metadataPreview.inputContractSha256 -cne $previewInputSha256) {
+        throw 'metadata-preview-index input contract cannot be reconstructed.'
+    }
     foreach ($file in $previewFiles) {
         $relative = ([string]$file.path).Replace('\', '/')
         if ($relative -cnotin @($State.metadataPaths | ForEach-Object { ([string]$_).Replace('\', '/') })) { throw 'Metadata preview contains a path outside metadataPaths.' }
         $full = Assert-NoReparsePath -Path (Join-Path ([string]$State.worktreePath) $relative) -Root ([string]$State.worktreePath) -Label 'Metadata preview source file'
         $bytes = Read-FileBytesWithHeartbeat -Path $full
         if ((Get-Sha256Bytes -Bytes $bytes) -cne [string]$file.sha256 -or $bytes.Length -ne [int64]$file.size) { throw 'Metadata preview source file bytes changed.' }
+        foreach ($indexedField in @('indexedSha256', 'indexedSize', 'blobOid', 'transform')) {
+            if (-not $file.Contains($indexedField) -or [string]::IsNullOrWhiteSpace((ConvertTo-InvariantString $file[$indexedField]))) {
+                throw "metadata-preview-index field is missing: $relative / $indexedField"
+            }
+        }
+        $fObject = "$([string]$State.evidenceChain.fOid):$relative"
+        $fBlobOid = (Invoke-GitCheck -WorkingDirectory ([string]$State.worktreePath) -Arguments @('rev-parse', $fObject)).output.Trim()
+        $fBytes = Get-GitBlobBytes -WorkingDirectory ([string]$State.worktreePath) -Object $fObject
+        $fSha256 = Get-Sha256Bytes -Bytes $fBytes
+        $expectedTransform = if ((Get-Sha256Bytes -Bytes $bytes) -ceq $fSha256) { 'none' }
+            elseif (Test-CrlfNormalizationOnly -RawBytes $bytes -IndexedBytes $fBytes) { 'crlf-to-lf' }
+            else { throw "metadata-preview-index F blob differs beyond CRLF-to-LF: $relative" }
+        if ([string]$file.indexedSha256 -cne $fSha256 -or [int64]$file.indexedSize -ne $fBytes.LongLength -or
+            [string]$file.blobOid -cne $fBlobOid -or [string]$file.transform -cne $expectedTransform) {
+            throw "metadata-preview-index does not match the immutable F blob: $relative"
+        }
         $textValue = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
         foreach ($fieldName in $expectedFields.Keys) {
             $expectedMatch = Test-MetadataSourceFieldMatch -RelativePath $relative -Text $textValue `
@@ -519,6 +648,138 @@ function Assert-CheckpointReasonIntegrity {
         }
     }
     'C2/C3 structured reasons independently reconstructed'
+}
+
+function Assert-EvidenceGenerationReceiptIntegrity {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][Collections.IDictionary] $Chain,
+        [Parameter(Mandatory)][string] $Worktree
+    )
+    $receiptPath = Assert-NoReparsePath -Path ([string]$State.evidenceReceipt.path) -Root ([string]$State.repositoryRoot) -Label 'Evidence generation receipt'
+    if ((Get-FileSha256 -Path $receiptPath) -cne [string]$State.evidenceReceipt.sha256) {
+        throw 'evidence-generation-receipt SHA-256 changed.'
+    }
+    $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
+    $parameterVersion = 'full-index-binary-no-renames-v2'
+    if ([int]$receipt.schemaVersion -ne 2 -or [string]$receipt.runId -cne [string]$State.runId -or
+        [int]$receipt.generation -ne [int]$State.evidenceGeneration -or [string]$receipt.executionMode -cne 'bounded-parallel' -or
+        [int]$receipt.maxConcurrency -ne 4 -or [string]$receipt.parameterVersion -cne $parameterVersion) {
+        throw 'evidence-generation-receipt batch identity or parameter contract changed.'
+    }
+    $tuple = [ordered]@{
+        generation = $State.evidenceGeneration
+        chain = $Chain
+        targetPathsSha256 = $State.evidenceTargetPathsSha256
+        archiveSha256 = $State.archive.sha256
+        artifactSha256 = [ordered]@{
+            extraction = $State.extractionManifest.sha256
+            rawInstall = $State.rawInstallManifest.sha256
+            install = $State.installManifest.sha256
+            candidateTree = $State.candidateTreeManifest.sha256
+            gitIndexNormalization = $State.gitIndexNormalization.sha256
+            metadataPreview = $State.metadataPreview.sha256
+            securityOverride = if ($State.Contains('securityOverrideReceipt') -and $State.securityOverrideReceipt) { $State.securityOverrideReceipt.sha256 } else { $null }
+            precommitSecurity = $State.securityPrecommitValidation.sha256
+        }
+        parameterVersion = $parameterVersion
+    }
+    if ([string]$receipt.inputTupleSha256 -cne (Get-ContractSha256 -Contract $tuple) -or
+        (Get-ContractSha256 -Contract $receipt.evidenceChain) -cne (Get-ContractSha256 -Contract $Chain)) {
+        throw 'evidence-generation-receipt fixed input tuple cannot be independently reconstructed.'
+    }
+    $gitVersion = (Invoke-GitCheck -WorkingDirectory $Worktree -Arguments @('--version')).output
+    if ([string]$receipt.gitVersion -cne $gitVersion) { throw 'evidence-generation-receipt Git version changed.' }
+    $batchStarted = [DateTimeOffset]::MinValue
+    $batchCompleted = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$receipt.batchStartedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$batchStarted) -or
+        -not [DateTimeOffset]::TryParse([string]$receipt.batchCompletedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$batchCompleted) -or
+        $batchCompleted -lt $batchStarted) {
+        throw 'evidence-generation-receipt batch timing is invalid.'
+    }
+
+    if ($receipt.artifacts.Count -ne $State.evidenceDiffs.Count) { throw 'evidence-generation-receipt artifact map differs from state.' }
+    foreach ($name in $State.evidenceDiffs.Keys) {
+        if (-not $receipt.artifacts.Contains($name)) { throw "evidence-generation-receipt artifact is missing: $name" }
+        $expectedArtifact = $State.evidenceDiffs[$name]
+        $actualArtifact = $receipt.artifacts[$name]
+        if ($expectedArtifact.Contains('status') -and [string]$expectedArtifact.status -ceq 'not-applicable') {
+            if ([string]$actualArtifact.status -cne 'not-applicable') { throw "evidence-generation-receipt not-applicable artifact changed: $name" }
+            continue
+        }
+        if ([string]$actualArtifact.path -cne [string]$expectedArtifact.path -or
+            [int64]$actualArtifact.size -ne [int64]$expectedArtifact.size -or
+            [string]$actualArtifact.sha256 -cne [string]$expectedArtifact.sha256) {
+            throw "evidence-generation-receipt artifact tuple changed: $name"
+        }
+    }
+
+    $expectedTasks = [ordered]@{
+        c0C1Diff = [ordered]@{ baseOid = $Chain.c0Oid; headOid = $Chain.c1Oid; treeOid = $Chain.c1TreeOid; artifact = $State.evidenceDiffs.c0C1Diff }
+        c0C1NameStatus = [ordered]@{ baseOid = $Chain.c0Oid; headOid = $Chain.c1Oid; treeOid = $Chain.c1TreeOid; artifact = $State.evidenceDiffs.c0C1NameStatus }
+        c1ParentNameStatus = [ordered]@{ baseOid = $Chain.c1ParentOid; headOid = $Chain.c1Oid; treeOid = $Chain.c1TreeOid; artifact = $State.evidenceDiffs.c1ParentNameStatus }
+    }
+    if ([string]$State.localizationMode -ceq 'zh-tw') {
+        $expectedTasks.c1C2Diff = [ordered]@{ baseOid = $Chain.c1Oid; headOid = $Chain.c2Oid; treeOid = $Chain.c2TreeOid; artifact = $State.evidenceDiffs.c1C2Diff }
+        $expectedTasks.c1C2NameStatus = [ordered]@{ baseOid = $Chain.c1Oid; headOid = $Chain.c2Oid; treeOid = $Chain.c2TreeOid; artifact = $State.evidenceDiffs.c1C2NameStatus }
+        $expectedTasks.c2C3Diff = [ordered]@{ baseOid = $Chain.c2Oid; headOid = $Chain.c3Oid; treeOid = $Chain.c3TreeOid; artifact = $State.evidenceDiffs.c2C3Diff }
+        $expectedTasks.c2C3NameStatus = [ordered]@{ baseOid = $Chain.c2Oid; headOid = $Chain.c3Oid; treeOid = $Chain.c3TreeOid; artifact = $State.evidenceDiffs.c2C3NameStatus }
+        $expectedTasks.c2ParentNameStatus = [ordered]@{ baseOid = $Chain.c2ParentOid; headOid = $Chain.c2Oid; treeOid = $Chain.c2TreeOid; artifact = $State.evidenceDiffs.c2ParentNameStatus }
+        $expectedTasks.c3ParentNameStatus = [ordered]@{ baseOid = $Chain.c3ParentOid; headOid = $Chain.c3Oid; treeOid = $Chain.c3TreeOid; artifact = $State.evidenceDiffs.c3ParentNameStatus }
+        if ([string]$Chain.fOid -cne [string]$Chain.c3Oid) {
+            $expectedTasks.c3FDiff = [ordered]@{ baseOid = $Chain.c3Oid; headOid = $Chain.fOid; treeOid = $Chain.fTreeOid; artifact = $State.evidenceDiffs.c3FDiff }
+            $expectedTasks.c3FNameStatus = [ordered]@{ baseOid = $Chain.c3Oid; headOid = $Chain.fOid; treeOid = $Chain.fTreeOid; artifact = $State.evidenceDiffs.c3FNameStatus }
+        }
+    }
+    $expectedTasks.c0FDiff = [ordered]@{ baseOid = $Chain.c0Oid; headOid = $Chain.fOid; treeOid = $Chain.fTreeOid; artifact = $State.evidenceDiffs.c0FDiff }
+    $expectedTasks.c0FNameStatus = [ordered]@{ baseOid = $Chain.c0Oid; headOid = $Chain.fOid; treeOid = $Chain.fTreeOid; artifact = $State.evidenceDiffs.c0FNameStatus }
+    $expectedTasks.candidateTreeManifest = [ordered]@{ baseOid = $Chain.fOid; headOid = $Chain.fOid; treeOid = $Chain.fTreeOid; artifact = $State.candidateTreeManifest }
+    if (@($receipt.tasks).Count -ne $expectedTasks.Count) { throw 'evidence-generation-receipt task count differs from the fixed generation.' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($task in @($receipt.tasks)) {
+        $name = [string]$task.name
+        if (-not $seen.Add($name) -or -not $expectedTasks.Contains($name)) { throw "evidence-generation-receipt task is duplicate or unknown: $name" }
+        $expected = $expectedTasks[$name]
+        if ([string]$task.baseOid -cne [string]$expected.baseOid -or [string]$task.headOid -cne [string]$expected.headOid -or
+            [string]$task.treeOid -cne [string]$expected.treeOid -or [string]$task.artifact.path -cne [string]$expected.artifact.path -or
+            [int64]$task.artifact.size -ne [int64]$expected.artifact.size -or [string]$task.artifact.sha256 -cne [string]$expected.artifact.sha256) {
+            throw "evidence-generation-receipt task tuple changed: $name"
+        }
+        $taskStarted = [DateTimeOffset]::MinValue
+        $taskCompleted = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse([string]$task.startedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$taskStarted) -or
+            -not [DateTimeOffset]::TryParse([string]$task.completedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$taskCompleted) -or
+            $taskStarted -lt $batchStarted -or $taskCompleted -gt $batchCompleted -or $taskCompleted -lt $taskStarted) {
+            throw "evidence-generation-receipt task timing is invalid: $name"
+        }
+        $artifactPath = Assert-NoReparsePath -Path ([string]$task.artifact.path) -Root ([string]$State.artifactsRoot) -Label "Evidence task $name"
+        if ((Get-Item -LiteralPath $artifactPath).Length -ne [int64]$task.artifact.size -or
+            (Get-FileSha256 -Path $artifactPath) -cne [string]$task.artifact.sha256) {
+            throw "evidence-generation-receipt task artifact changed: $name"
+        }
+        $actualTree = (Invoke-GitCheck -WorkingDirectory $Worktree -Arguments @('rev-parse', "$([string]$task.headOid)^{tree}")).output.Trim()
+        if ($actualTree -cne [string]$task.treeOid) { throw "evidence-generation-receipt task Git tree changed: $name" }
+    }
+    $verification = $receipt.coordinatorVerification
+    if (-not $verification -or [string]$verification.result -cne 'passed' -or
+        [int]$verification.artifactCount -ne $expectedTasks.Count -or
+        -not $verification.changedPathAllowlists -or [string]$verification.changedPathAllowlists.result -cne 'passed' -or
+        -not $expectedTasks.Contains([string]$verification.spotCheckTask)) {
+        throw 'evidence-generation-receipt coordinator verification is incomplete.'
+    }
+    $changedPathVerification = Get-EvidenceChangedPathAllowlistVerification -State $State -Chain $Chain -Worktree $Worktree
+    if ([string]$verification.changedPathAllowlists.contractSha256 -cne [string]$changedPathVerification.contractSha256 -or
+        (Get-ContractSha256 -Contract ([ordered]@{ records = @($verification.changedPathAllowlists.records) })) -cne
+        (Get-ContractSha256 -Contract ([ordered]@{ records = @($changedPathVerification.records) }))) {
+        throw 'evidence-generation-receipt coordinator changed-path allowlists changed.'
+    }
+    $spotExpected = $expectedTasks[[string]$verification.spotCheckTask]
+    $spotActualTree = (Invoke-GitCheck -WorkingDirectory $Worktree -Arguments @('rev-parse', "$([string]$verification.spotCheckHeadOid)^{tree}")).output.Trim()
+    if ([string]$verification.spotCheckHeadOid -cne [string]$spotExpected.headOid -or
+        [string]$verification.spotCheckTreeOid -cne [string]$spotExpected.treeOid -or $spotActualTree -cne [string]$spotExpected.treeOid) {
+        throw 'evidence-generation-receipt coordinator Git object spot-check changed.'
+    }
+    [string]$receipt.inputTupleSha256
 }
 
 function Assert-ReferenceIntegrity {
@@ -709,6 +970,55 @@ function Get-ChangedPaths {
     )
 }
 
+function Get-EvidenceChangedPathAllowlistVerification {
+    param([Collections.IDictionary] $State, [Collections.IDictionary] $Chain, [string] $Worktree)
+    $targets = @($State.evidenceTargetPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
+    $metadata = @($State.metadataPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
+    $ranges = @(
+        [ordered]@{ name = 'c1-parent'; baseOid = $Chain.c1ParentOid; headOid = $Chain.c1Oid; allowlist = 'mod-non-target' },
+        [ordered]@{ name = 'c0-c1'; baseOid = $Chain.c0Oid; headOid = $Chain.c1Oid; allowlist = 'mod-non-target' }
+    )
+    if ([string]$State.localizationMode -ceq 'zh-tw') {
+        $ranges += @(
+            [ordered]@{ name = 'c2-parent'; baseOid = $Chain.c2ParentOid; headOid = $Chain.c2Oid; allowlist = 'target-only' },
+            [ordered]@{ name = 'c1-c2'; baseOid = $Chain.c1Oid; headOid = $Chain.c2Oid; allowlist = 'target-only' },
+            [ordered]@{ name = 'c3-parent'; baseOid = $Chain.c3ParentOid; headOid = $Chain.c3Oid; allowlist = 'target-only' },
+            [ordered]@{ name = 'c2-c3'; baseOid = $Chain.c2Oid; headOid = $Chain.c3Oid; allowlist = 'target-only' }
+        )
+        if ([string]$Chain.fOid -cne [string]$Chain.c3Oid) {
+            $ranges += [ordered]@{ name = 'c3-f'; baseOid = $Chain.c3Oid; headOid = $Chain.fOid; allowlist = 'metadata-only' }
+        }
+    }
+    $ranges += [ordered]@{ name = 'c0-f'; baseOid = $Chain.c0Oid; headOid = $Chain.fOid; allowlist = 'mod-or-metadata' }
+    $records = @()
+    foreach ($range in $ranges) {
+        $paths = @(Get-ChangedPaths -WorkingDirectory $Worktree -BaseOid ([string]$range.baseOid) -HeadOid ([string]$range.headOid) | Sort-Object -Unique)
+        foreach ($path in $paths) {
+            $inMod = $path.StartsWith(([string]$State.modRelativePath + '/'), [StringComparison]::Ordinal)
+            $allowed = switch ([string]$range.allowlist) {
+                'mod-non-target' { $inMod -and $path -cnotin $targets }
+                'target-only' { $path -cin $targets }
+                'metadata-only' { $path -cin $metadata }
+                'mod-or-metadata' { $inMod -or $path -cin $metadata }
+                default { $false }
+            }
+            if (-not $allowed) { throw "Independent coordinator allowlist reconstruction rejected $($range.name): $path" }
+        }
+        $pathsSha256 = Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject @($paths) -Compress)))
+        $records += [ordered]@{
+            name = [string]$range.name; baseOid = [string]$range.baseOid; headOid = [string]$range.headOid
+            allowlist = [string]$range.allowlist; paths = $paths; pathCount = $paths.Count; pathsSha256 = $pathsSha256
+        }
+    }
+    $contract = [ordered]@{
+        generation = [int]$State.evidenceGeneration
+        targetPathsSha256 = [string]$State.evidenceTargetPathsSha256
+        metadataPaths = $metadata
+        records = $records
+    }
+    [ordered]@{ records = $records; contractSha256 = Get-ContractSha256 -Contract $contract }
+}
+
 function Test-ApprovedSpanCandidate {
     param([byte[]] $Indexed, [byte[]] $Merged, [object[]] $ApprovedSpans)
     $ordered = @($ApprovedSpans | Sort-Object { [int64]$_.startByte })
@@ -793,6 +1103,56 @@ function Get-ImmutableWorksetContractSha256 {
     Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress)))
 }
 
+function Assert-PrBodyEvidenceSummary {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Body
+    )
+    $normalized = $Body.Replace("`r`n", "`n")
+    $chain = $State.evidenceChain
+    $requiredFragments = [Collections.Generic.List[string]]::new()
+    foreach ($fragment in @(
+        "- Run: $($State.runId)",
+        "- HEAD/F: $($chain.fOid)",
+        "- C0: $($chain.c0Oid)",
+        "- C1: $($chain.c1Oid)",
+        "- C2: $($chain.c2Oid) ($($chain.c2Status): $($chain.c2Reason.code), $($chain.c2Reason.disposition))",
+        "- C3: $($chain.c3Oid) ($($chain.c3Status): $($chain.c3Reason.code), $($chain.c3Reason.disposition))",
+        "- Trees C0/C1/C2/C3/F: $($chain.c0TreeOid) / $($chain.c1TreeOid) / $($chain.c2TreeOid) / $($chain.c3TreeOid) / $($chain.fTreeOid)",
+        "- Parent-tree Gate: C1^=$($chain.c1ParentTreeOid); C2^=$($chain.c2ParentTreeOid); C3^=$($chain.c3ParentTreeOid)",
+        "- C0..C1 diff/name-status SHA-256: $($State.evidenceDiffs.c0C1Diff.sha256) / $($State.evidenceDiffs.c0C1NameStatus.sha256)",
+        "- C1..C2 diff/name-status SHA-256: $($State.evidenceDiffs.c1C2Diff.sha256) / $($State.evidenceDiffs.c1C2NameStatus.sha256)",
+        "- C2..C3 diff/name-status SHA-256: $($State.evidenceDiffs.c2C3Diff.sha256) / $($State.evidenceDiffs.c2C3NameStatus.sha256)",
+        "- C0..F diff/name-status SHA-256: $($State.evidenceDiffs.c0FDiff.sha256) / $($State.evidenceDiffs.c0FNameStatus.sha256)",
+        "- Evidence target paths SHA-256: $($State.evidenceTargetPathsSha256)",
+        "- Extraction/raw-install/install/candidate-tree manifest SHA-256: $($State.extractionManifest.sha256) / $($State.rawInstallManifest.sha256) / $($State.installManifest.sha256) / $($State.candidateTreeManifest.sha256)",
+        "- Git normalization/metadata/evidence receipt SHA-256: $($State.gitIndexNormalization.sha256) / $($State.metadataPreview.sha256) / $($State.evidenceReceipt.sha256)",
+        "- Candidate Gate: passed",
+        "- Validation SHA-256: $($State.candidateGate.validationReportSha256)",
+        "- Review Baseline path/blob/SHA-256: $($State.reviewBaselinePath) / $($State.reviewBaselineBlobOid) / $($State.reviewBaselineSha256)",
+        "- Archive filename/SHA-256: $($State.archive.filename) / $($State.archive.sha256)",
+        "- Source tuple contract SHA-256: $($State.sourceTuple.contractSha256)",
+        "- Security override receipt SHA-256: $(if ($State.Contains('securityOverrideReceipt') -and $State.securityOverrideReceipt) { $State.securityOverrideReceipt.sha256 } else { 'not-applicable' })",
+        "- Pre-commit security validation SHA-256: $($State.securityPrecommitValidation.sha256)",
+        "- External review: $($State.externalReview.status)"
+    )) { $requiredFragments.Add($fragment) }
+    foreach ($approval in @($State.securityOverrides)) {
+        $requiredFragments.Add("archiveSha256=$($approval.archiveSha256);relativePath=$($approval.relativePath);fileSha256=$($approval.fileSha256)")
+    }
+    foreach ($path in @($State.evidenceTargetPaths)) { $requiredFragments.Add([string]$path) }
+    foreach ($record in @($State.localizationFiles)) {
+        foreach ($value in @($record.safeId, $record.rawSha256, $record.indexedSha256, $record.mergedSha256)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$value)) { $requiredFragments.Add([string]$value) }
+        }
+    }
+    foreach ($fragment in $requiredFragments) {
+        if ($normalized.IndexOf($fragment, [StringComparison]::Ordinal) -lt 0) {
+            throw "PR evidence summary is missing the current immutable tuple fragment: $fragment"
+        }
+    }
+    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($normalized))
+}
+
 $stateFull = [IO.Path]::GetFullPath($StatePath)
 $stateRunRoot = Split-Path -Parent $stateFull
 $null = Assert-NoReparsePath -Path $stateFull -Root ([IO.Path]::GetPathRoot($stateFull)) -Label 'Candidate state'
@@ -801,6 +1161,44 @@ if ([IO.Path]::GetFullPath([string]$state.runRoot) -cne $stateRunRoot -or [IO.Pa
     throw 'Candidate state path differs from its fixed run root tuple.'
 }
 $null = Assert-NoReparsePath -Path $stateFull -Root ([string]$state.repositoryRoot) -Label 'Candidate state'
+
+if ($SecurityPayloadOnly) {
+    $securityChecks = [ordered]@{}
+    $securityErrors = [Collections.Generic.List[string]]::new()
+    foreach ($check in @(
+        [ordered]@{ name = 'claimed-archive'; action = { Assert-ClaimedArchiveIntegrity -State $state } },
+        [ordered]@{ name = 'security-payload'; action = { Assert-ArchivePayloadSecurityIntegrity -State $state -Chain $state.evidenceChain -Worktree ([string]$state.worktreePath) } }
+    )) {
+        try { $securityChecks[$check.name] = [ordered]@{ result = 'passed'; evidence = (& $check.action) } }
+        catch {
+            $securityChecks[$check.name] = [ordered]@{ result = 'rejected'; evidence = $_.Exception.Message }
+            $securityErrors.Add("$($check.name): $($_.Exception.Message)")
+        }
+    }
+    $securityResult = if ($securityErrors.Count -eq 0) { 'passed' } else { 'rejected' }
+    $securityPath = Join-Path ([string]$state.artifactsRoot) 'precommit-security-validation.json'
+    $securityReport = [ordered]@{
+        schemaVersion = 1; result = $securityResult; runId = $state.runId; archiveSha256 = $state.archive.sha256
+        c0Oid = $state.evidenceChain.c0Oid; extractionManifestSha256 = $state.extractionManifest.sha256
+        securityOverrideReceiptSha256 = if ($state.Contains('securityOverrideReceipt') -and $state.securityOverrideReceipt) { $state.securityOverrideReceipt.sha256 } else { $null }
+        checks = $securityChecks; errors = @($securityErrors); validatedAt = Get-UtcTimestamp
+    }
+    if (-not $CheckOnly) { Write-AtomicJson -Path $securityPath -Value $securityReport }
+    $securityOutput = [ordered]@{
+        result = $securityResult; path = $securityPath
+        sha256 = if ($CheckOnly) { Get-ContractSha256 -Contract $securityReport } else { Get-FileSha256 -Path $securityPath }
+        errors = @($securityErrors)
+    }
+    if ($PassThru) {
+        $securityOutput
+        if ($securityResult -ne 'passed') { throw "Pre-commit payload security validation rejected the run: $($securityErrors -join '; ')" }
+    }
+    else {
+        $securityOutput | ConvertTo-Json -Depth 20 -Compress
+        if ($securityResult -ne 'passed') { exit 1 }
+    }
+    return
+}
 
 if ($ReviewCompletion) {
     $reviewChecks = [ordered]@{}
@@ -828,8 +1226,34 @@ if ($ReviewCompletion) {
     Add-ReviewCheck -Name 'candidate-gate' -Action {
         if ($state.candidateGate.status -ne 'passed') { throw 'Candidate Gate is not passed.' }
         if ((Get-FileSha256 -Path $state.candidateGate.validationReportPath) -ne $state.candidateGate.validationReportSha256) { throw 'Candidate Gate report SHA-256 changed.' }
+        $report = Get-Content -LiteralPath $state.candidateGate.validationReportPath -Raw | ConvertFrom-Json -AsHashtable
+        if ($report.result -ne 'passed' -or $report.runId -ne $state.runId -or
+            (Get-ContractSha256 -Contract $report.evidenceChain) -ne (Get-ContractSha256 -Contract $state.evidenceChain)) {
+            throw 'Candidate Gate report no longer binds the current run/evidence chain.'
+        }
+        $gateBindings = [ordered]@{
+            evidenceGeneration = $state.evidenceGeneration; evidenceTargetPathsSha256 = $state.evidenceTargetPathsSha256
+            extractionManifestSha256 = $state.extractionManifest.sha256; rawInstallManifestSha256 = $state.rawInstallManifest.sha256
+            installManifestSha256 = $state.installManifest.sha256; candidateTreeManifestSha256 = $state.candidateTreeManifest.sha256
+            gitIndexNormalizationSha256 = $state.gitIndexNormalization.sha256; metadataPreviewSha256 = $state.metadataPreview.sha256
+            evidenceGenerationReceiptSha256 = $state.evidenceReceipt.sha256; diffReadabilitySha256 = $state.diffReadability.sha256
+            securityOverrideReceiptSha256 = if ($state.Contains('securityOverrideReceipt') -and $state.securityOverrideReceipt) { $state.securityOverrideReceipt.sha256 } else { $null }
+            securityPrecommitValidationSha256 = $state.securityPrecommitValidation.sha256
+        }
+        foreach ($field in $gateBindings.Keys) {
+            if ([string]$state.candidateGate[$field] -cne [string]$gateBindings[$field]) { throw "Candidate Gate binding changed: $field" }
+        }
+        foreach ($artifact in @($state.extractionManifest, $state.rawInstallManifest, $state.installManifest, $state.candidateTreeManifest, $state.gitIndexNormalization, $state.metadataPreview, $state.securityPrecommitValidation)) {
+            if (-not (Test-Path -LiteralPath ([string]$artifact.path) -PathType Leaf) -or
+                (Get-FileSha256 -Path ([string]$artifact.path)) -cne [string]$artifact.sha256) {
+                throw "Candidate Gate artifact changed: $($artifact.path)"
+            }
+        }
         if (-not $state.diffReadability -or (Get-FileSha256 -Path $state.diffReadability.path) -ne $state.candidateGate.diffReadabilitySha256 -or $state.diffReadability.result -ne 'passed') { throw 'Diff readability evidence is missing, changed, or rejected.' }
         $state.candidateGate.validationReportSha256
+    }
+    Add-ReviewCheck -Name 'evidence-generation-receipt' -Action {
+        Assert-EvidenceGenerationReceiptIntegrity -State $state -Chain $state.evidenceChain -Worktree ([string]$state.worktreePath)
     }
     Add-ReviewCheck -Name 'localization-workset-deletion' -Action {
         if ([int]$state.schemaVersion -lt 15) { return 'not-applicable: Schema 14 approved spans' }
@@ -862,14 +1286,57 @@ if ($ReviewCompletion) {
         }
         $receiptSha
     }
+    Add-ReviewCheck -Name 'feedback-snapshot' -Action {
+        if (-not $state.reviewSnapshot -or [string]::IsNullOrWhiteSpace([string]$state.reviewSnapshot.path) -or
+            [string]::IsNullOrWhiteSpace([string]$state.reviewSnapshot.sha256)) {
+            throw 'Review feedback snapshot receipt is missing.'
+        }
+        $snapshotPath = Assert-NoReparsePath -Path ([string]$state.reviewSnapshot.path) -Root ([string]$state.repositoryRoot) -Label 'Review feedback snapshot'
+        $expectedSnapshotPath = [IO.Path]::GetFullPath((Join-Path ([string]$state.artifactsRoot) 'review-snapshot.json'))
+        if ($snapshotPath -cne $expectedSnapshotPath) { throw 'Review feedback snapshot path changed.' }
+        if ((Get-FileSha256 -Path $snapshotPath) -cne [string]$state.reviewSnapshot.sha256) { throw 'Feedback snapshot SHA-256 changed.' }
+        $snapshotDocument = Get-Content -LiteralPath $snapshotPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([int]$snapshotDocument.schemaVersion -ne 1 -or [string]$snapshotDocument.runId -cne [string]$state.runId -or
+            [string]$snapshotDocument.headOid -cne [string]$state.evidenceChain.fOid -or
+            [string]$state.reviewSnapshot.headOid -cne [string]$state.evidenceChain.fOid) {
+            throw 'Review feedback snapshot does not bind this run and immutable F.'
+        }
+        $capturedAt = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParseExact([string]$state.reviewSnapshot.capturedAt, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$capturedAt) -or
+            [string]$snapshotDocument.capturedAt -cne [string]$state.reviewSnapshot.capturedAt) {
+            throw 'Review feedback snapshot capturedAt evidence is invalid.'
+        }
+        if (($snapshotDocument.externalReview | ConvertTo-Json -Depth 20 -Compress) -cne
+            ($state.externalReview | ConvertTo-Json -Depth 20 -Compress)) {
+            throw 'Review feedback snapshot external observation differs from state.'
+        }
+        [string]$state.reviewSnapshot.sha256
+    }
     Add-ReviewCheck -Name 'local-review' -Action {
         if (-not $state.localReview -or -not (Test-Path -LiteralPath $state.localReview.path -PathType Leaf)) { throw 'Local review artifact is missing.' }
         if ((Get-FileSha256 -Path $state.localReview.path) -ne $state.localReview.sha256) { throw 'Local review artifact SHA-256 changed.' }
         $review = Get-Content -LiteralPath $state.localReview.path -Raw | ConvertFrom-Json -AsHashtable
-        if ($review.result -ne 'passed' -or $review.headOid -ne $state.evidenceChain.fOid) { throw 'Local review is not passed for F.' }
+        if ($review.result -ne 'passed' -or $review.headOid -ne $state.evidenceChain.fOid -or
+            $review.candidateGateSha256 -ne $state.candidateGate.validationReportSha256 -or
+            $review.feedbackSnapshotSha256 -ne $state.reviewSnapshot.sha256) { throw 'Local review is not passed for the current F/Candidate Gate/feedback snapshot.' }
+        $reviewedAt = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParseExact([string]$review.reviewedAt, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$reviewedAt)) {
+            throw 'Local review reviewedAt is not an ISO-8601 round-trip timestamp.'
+        }
+        $capturedAt = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParseExact([string]$state.reviewSnapshot.capturedAt, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$capturedAt) -or
+            $reviewedAt -lt $capturedAt) { throw 'Local review predates the immutable feedback snapshot.' }
         if (@($review.securityBlocking).Count -ne 0) { throw 'Local review contains a security-blocking finding.' }
-        $unresolved = @($review.findings | Where-Object { $_.disposition -notin @('keep', 'resolved', 'out-of-scope') })
+        foreach ($finding in @($review.findings)) {
+            if ($finding -isnot [Collections.IDictionary]) { throw 'Local review finding is not an object.' }
+            foreach ($field in @('priority', 'location', 'violatedBaseline', 'evidence', 'consequence', 'disposition')) {
+                if (-not $finding.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$finding[$field])) { throw "Local review finding is missing $field." }
+            }
+        }
+        $unresolved = @($review.findings | Where-Object { $_.disposition -notin @('keep', 'resolved') })
         if ($unresolved.Count -ne 0) { throw 'Local review contains findings without a completed disposition.' }
+        if ($state.localReview.reviewedAt -ne $review.reviewedAt) { throw 'Local review state timestamp differs from its artifact.' }
+        if ($state.localReview.feedbackSnapshotSha256 -ne $review.feedbackSnapshotSha256) { throw 'Local review state feedback snapshot differs from its artifact.' }
         $state.localReview.sha256
     }
     Add-ReviewCheck -Name 'local-remote-pr-head' -Action {
@@ -880,17 +1347,58 @@ if ($ReviewCompletion) {
         if ($pr.state -ne 'OPEN' -or $pr.isDraft -or $pr.baseRefName -ne $state.pullRequestBase -or $pr.headRefName -ne $state.branch) { throw 'PR state, draft flag, base, or head is invalid.' }
         $local
     }
+    Add-ReviewCheck -Name 'pr-evidence-summary' -Action {
+        $pr = (Invoke-GhCheck -WorkingDirectory $state.worktreePath -Arguments @('pr', 'view', [string]$state.prNumber, '--json', 'body')).output | ConvertFrom-Json -AsHashtable
+        Assert-PrBodyEvidenceSummary -State $state -Body ([string]$pr.body)
+    }
     Add-ReviewCheck -Name 'reviewed-oid' -Action {
         if ($state.reviewedOid -ne $state.evidenceChain.fOid) { throw 'reviewedOid does not equal F.' }
         if ($state.externalReview.status -notin @('completed', 'requested-pending', 'not-applicable', 'unavailable')) { throw 'External Review has no allowed zero-wait observation.' }
         if (-not $state.externalReview.Contains('pollingWaitSeconds') -or [int64]$state.externalReview.pollingWaitSeconds -ne 0) { throw 'External Review polling wait is missing or not zero.' }
+        if ([string]$state.externalReview.headOid -cne [string]$state.evidenceChain.fOid) { throw 'External Review head does not equal F.' }
+        $snapshotAt = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParseExact([string]$state.externalReview.snapshotAt, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$snapshotAt)) {
+            throw 'External Review snapshotAt is not an ISO-8601 round-trip timestamp.'
+        }
+        switch ([string]$state.externalReview.status) {
+            'completed' {
+                foreach ($field in @('reviewId', 'reviewerLogin', 'submittedAt', 'reviewCommitOid')) {
+                    if ([string]::IsNullOrWhiteSpace([string]$state.externalReview[$field])) { throw "Completed External Review is missing $field." }
+                }
+                if ([string]$state.externalReview.reviewCommitOid -cne [string]$state.evidenceChain.fOid) { throw 'Completed External Review commit does not equal F.' }
+                $submittedAt = [DateTimeOffset]::MinValue
+                if (-not [DateTimeOffset]::TryParse([string]$state.externalReview.submittedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$submittedAt)) {
+                    throw 'Completed External Review submittedAt is invalid.'
+                }
+            }
+            'requested-pending' {
+                if (-not $state.externalReview.requestEvidence) { throw 'Pending External Review is missing requestEvidence.' }
+                if ($state.externalReview.requestEvidence.Contains('exitCode') -and [int]$state.externalReview.requestEvidence.exitCode -ne 0) {
+                    throw 'Pending External Review request evidence records a failed request.'
+                }
+            }
+            'not-applicable' {
+                if ([string]::IsNullOrWhiteSpace([string]$state.externalReview.reason)) { throw 'Not-applicable External Review is missing its reason.' }
+            }
+            'unavailable' {
+                if ([string]::IsNullOrWhiteSpace([string]$state.externalReview.reason)) { throw 'Unavailable External Review is missing its reason.' }
+                $verifiedAt = [DateTimeOffset]::MinValue
+                if (-not [DateTimeOffset]::TryParseExact([string]$state.externalReview.verifiedAt, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$verifiedAt)) {
+                    throw 'Unavailable External Review verifiedAt is invalid.'
+                }
+            }
+        }
         $state.reviewedOid
     }
     $reviewResultName = if ($reviewErrors.Count -eq 0) { 'passed' } else { 'rejected' }
     $reviewValidationPath = Join-Path $state.artifactsRoot 'review-completion-validation.json'
     $reviewReport = [ordered]@{ schemaVersion = 1; result = $reviewResultName; runId = $state.runId; headOid = $state.evidenceChain.fOid; checks = $reviewChecks; errors = @($reviewErrors); validatedAt = Get-UtcTimestamp }
-    Write-AtomicJson -Path $reviewValidationPath -Value $reviewReport
-    $reviewOutput = [ordered]@{ result = $reviewResultName; path = $reviewValidationPath; sha256 = Get-FileSha256 -Path $reviewValidationPath; errors = @($reviewErrors) }
+    if (-not $CheckOnly) { Write-AtomicJson -Path $reviewValidationPath -Value $reviewReport }
+    $reviewOutput = [ordered]@{
+        result = $reviewResultName; path = $reviewValidationPath
+        sha256 = if ($CheckOnly) { Get-ContractSha256 -Contract $reviewReport } else { Get-FileSha256 -Path $reviewValidationPath }
+        errors = @($reviewErrors)
+    }
     if ($PassThru) { $reviewOutput; if ($reviewResultName -ne 'passed') { throw "Review completion validation rejected the run: $($reviewErrors -join '; ')" } }
     else { $reviewOutput | ConvertTo-Json -Depth 20 -Compress; if ($reviewResultName -ne 'passed') { exit 1 } }
     return
@@ -917,6 +1425,37 @@ $worktree = [string]$state.worktreePath
 
 Add-ValidationCheck -Name 'claimed-archive' -Action {
     Assert-ClaimedArchiveIntegrity -State $state
+}
+
+Add-ValidationCheck -Name 'security-payload' -Action {
+    Assert-ArchivePayloadSecurityIntegrity -State $state -Chain $chain -Worktree $worktree
+}
+
+Add-ValidationCheck -Name 'precommit-security-validation' -Action {
+    if (-not $state.securityPrecommitValidation -or [string]::IsNullOrWhiteSpace([string]$state.securityPrecommitValidation.path) -or
+        [string]::IsNullOrWhiteSpace([string]$state.securityPrecommitValidation.sha256)) {
+        throw 'Pre-commit security validation receipt is missing.'
+    }
+    $path = Assert-NoReparsePath -Path ([string]$state.securityPrecommitValidation.path) -Root ([string]$state.repositoryRoot) -Label 'Pre-commit security validation'
+    if ($path -cne [IO.Path]::GetFullPath((Join-Path ([string]$state.artifactsRoot) 'precommit-security-validation.json'))) {
+        throw 'Pre-commit security validation path changed.'
+    }
+    if ((Get-FileSha256 -Path $path) -cne [string]$state.securityPrecommitValidation.sha256) {
+        throw 'Pre-commit security validation SHA-256 changed.'
+    }
+    $receipt = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+    $expectedOverrideSha = if ($state.Contains('securityOverrideReceipt') -and $state.securityOverrideReceipt) { [string]$state.securityOverrideReceipt.sha256 } else { '' }
+    if ([string]$receipt.result -cne 'passed' -or [string]$receipt.runId -cne [string]$state.runId -or
+        [string]$receipt.archiveSha256 -cne [string]$state.archive.sha256 -or
+        [string]$receipt.c0Oid -cne [string]$chain.c0Oid -or
+        [string]$receipt.extractionManifestSha256 -cne [string]$state.extractionManifest.sha256 -or
+        [string]$receipt.securityOverrideReceiptSha256 -cne $expectedOverrideSha -or
+        [string]$state.securityPrecommitValidation.archiveSha256 -cne [string]$state.archive.sha256 -or
+        [string]$state.securityPrecommitValidation.extractionManifestSha256 -cne [string]$state.extractionManifest.sha256 -or
+        [string]$state.securityPrecommitValidation.securityOverrideReceiptSha256 -cne $expectedOverrideSha) {
+        throw 'Pre-commit security validation tuple changed.'
+    }
+    [string]$state.securityPrecommitValidation.sha256
 }
 
 Add-ValidationCheck -Name 'physical-install-tree' -Action {
@@ -1061,6 +1600,10 @@ Add-ValidationCheck -Name 'diff-readability' -Action {
     $state.diffReadability.sha256
 }
 
+Add-ValidationCheck -Name 'evidence-generation-receipt' -Action {
+    Assert-EvidenceGenerationReceiptIntegrity -State $state -Chain $chain -Worktree $worktree
+}
+
 Add-ValidationCheck -Name 'artifact-sha256' -Action {
     foreach ($artifact in @($state.sourceTuple, $state.extractionManifest, $state.rawInstallManifest, $state.installManifest, $state.gitIndexNormalization, $state.metadataPreview, $state.candidateTreeManifest, $state.evidenceReceipt)) {
         if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf)) { throw "Missing manifest or evidence artifact: $($artifact.path)" }
@@ -1102,12 +1645,12 @@ Add-ValidationCheck -Name 'candidate-manifest' -Action {
     $manifest = Get-Content -LiteralPath $state.candidateTreeManifest.path -Raw | ConvertFrom-Json -AsHashtable
     if ($manifest.commitOid -ne $chain.fOid -or $manifest.treeOid -ne $chain.fTreeOid) { throw 'Candidate manifest is not bound to F and F tree.' }
     $listing = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('-c', 'core.quotePath=false', 'ls-tree', '-r', '-l', '--full-tree', $chain.fOid, '--', $state.modRelativePath)).output
-    $actual = @()
+    $actual = [Collections.Generic.List[object]]::new()
     foreach ($line in @($listing -split "`r?`n" | Where-Object { $_ })) {
         if ($line -notmatch '^[0-7]{6} blob ([0-9a-f]{40})\s+(\d+)\t(.+)$') { throw "Unable to independently parse candidate Git tree entry: $line" }
         $repositoryPath = $Matches[3]
         $bytes = Get-GitBlobBytes -WorkingDirectory $worktree -Object $Matches[1]
-        $actual += [ordered]@{ path = $repositoryPath.Substring(([string]$state.modRelativePath).Length).TrimStart('/'); blobOid = $Matches[1]; size = [int64]$Matches[2]; sha256 = Get-Sha256Bytes -Bytes $bytes }
+        $actual.Add([ordered]@{ path = $repositoryPath.Substring(([string]$state.modRelativePath).Length).TrimStart('/'); blobOid = $Matches[1]; size = [int64]$Matches[2]; sha256 = Get-Sha256Bytes -Bytes $bytes })
     }
     $expected = @($manifest.files | Sort-Object { $_.path })
     $actual = @($actual | Sort-Object { $_.path })
@@ -1321,6 +1864,8 @@ $report = [ordered]@{
         gitIndexNormalization = $state.gitIndexNormalization
         metadataPreview = $state.metadataPreview
         evidenceReceipt = $state.evidenceReceipt
+        securityOverride = if ($state.Contains('securityOverrideReceipt')) { $state.securityOverrideReceipt } else { $null }
+        precommitSecurity = $state.securityPrecommitValidation
     }
     checks = $checks
     errors = @($errors)
@@ -1354,6 +1899,8 @@ $state.candidateGate = [ordered]@{
     sourceTupleSha256 = $state.sourceTuple.sha256
     sourceTupleContractSha256 = $state.sourceTuple.contractSha256
     evidenceGenerationReceiptSha256 = $state.evidenceReceipt.sha256
+    securityOverrideReceiptSha256 = if ($state.Contains('securityOverrideReceipt') -and $state.securityOverrideReceipt) { $state.securityOverrideReceipt.sha256 } else { $null }
+    securityPrecommitValidationSha256 = $state.securityPrecommitValidation.sha256
     diffReadabilitySha256 = $state.diffReadability.sha256
     localizationWorksetSha256 = if ([int]$state.schemaVersion -ge 15) { $state.localizationWorkset.sha256 } else { $null }
     sourceReceiptSha256 = if ([int]$state.schemaVersion -ge 15) { $state.sourceReceipt.sha256 } else { $null }
