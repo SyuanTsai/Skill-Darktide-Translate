@@ -159,6 +159,9 @@ $script:LocalizationPlanPath = $null
 function Get-CompletedStageResult { param($State, $Name) $null }
 function Start-Stage { param($Name) [ordered]@{ name = $Name } }
 function Assert-LockOwner { param($State) }
+function Assert-NoReparseTree { param($Path, $Root, $Label) $Path }
+function Assert-NoReparsePath { param($Path, $Root, $Label) $Path }
+function Read-FileBytesWithHeartbeat { param($Path) [IO.File]::ReadAllBytes($Path) }
 function Write-AtomicJson { param($Path, $Value) }
 function Get-FileSha256 { param($Path) 'a' * 64 }
 function Get-Sha256Bytes { param($Bytes) 'b' * 64 }
@@ -169,8 +172,12 @@ function Complete-Stage {
 '@
         $module = New-Module -ScriptBlock ([scriptblock]::Create($stubs + "`n" + $functionAst.Extent.Text))
         try {
+            $installRoot = Join-Path $TestDrive 'schema14-none-install'
+            New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
             $state = [ordered]@{
                 schemaVersion = 14
+                installRoot = $installRoot
+                rawInstallManifest = [ordered]@{ sha256 = 'c' * 64 }
                 metadataPaths = @('README.md', '.hash/example.hash')
                 artifactsRoot = Join-Path $TestDrive 'schema14-none-artifacts'
                 modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
@@ -186,6 +193,67 @@ function Complete-Stage {
             $state.status | Should -Be 'localized'
             @($state.localizationRemovedPaths).Count | Should -Be 0
             @($state.evidenceTargetPaths).Count | Should -Be 0
+        }
+        finally {
+            Remove-Module $module -Force
+        }
+    }
+
+    # Scenario: A Schema 14 MOD descriptor registers mod_localization and the caller omits a localization plan.
+    # Purpose: Prevent an active localization source from being silently classified as none and bypassing zh-tw maintenance.
+    It 'UnitT137_SuspendsSchema14LocalizationWhenARegisteredSourceHasNoPlan' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Localization'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $stubs = @'
+Set-StrictMode -Version Latest
+$script:LocalizationPlanPath = $null
+function Get-CompletedStageResult { param($State, $Name) $null }
+function Start-Stage { param($Name) [ordered]@{ name = $Name } }
+function Assert-LockOwner { param($State) }
+function Assert-NoReparseTree { param($Path, $Root, $Label) $Path }
+function Assert-NoReparsePath { param($Path, $Root, $Label) $Path }
+function Read-FileBytesWithHeartbeat { param($Path) [IO.File]::ReadAllBytes($Path) }
+function Suspend-Stage {
+    param($State, $Context, $Result, $ArtifactSha256, $OutputStage, $Data)
+    [pscustomobject]@{ result = $Result; status = $State.status; stage = $OutputStage; data = $Data }
+}
+'@
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($stubs + "`n" + $functionAst.Extent.Text))
+        try {
+            $installRoot = Join-Path $TestDrive 'schema14-registered-localization'
+            New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+            [IO.File]::WriteAllText(
+                (Join-Path $installRoot 'ExampleMod.mod'),
+                "return {`n`tmod_localization = `"ExampleMod/ExampleMod_localization`",`n}`n",
+                [Text.UTF8Encoding]::new($false)
+            )
+            $state = [ordered]@{
+                schemaVersion = 14
+                installRoot = $installRoot
+                worktreePath = $TestDrive
+                rawInstallManifest = [ordered]@{ sha256 = 'c' * 64 }
+                metadataPaths = @('README.md', '.hash/example.hash')
+                artifactsRoot = Join-Path $TestDrive 'schema14-registered-artifacts'
+                modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+                evidenceChain = [ordered]@{ c0Oid = '1' * 40 }
+            }
+
+            $result = & $module { param($value) Invoke-Localization -State $value } $state
+
+            $result.result | Should -Be 'waiting-input'
+            $result.stage | Should -Be 'localization-plan'
+            $result.data.code | Should -Be 'localization_plan_required'
+            @($result.data.registeredModFiles) | Should -Be @('ExampleMod.mod')
+            $state.status | Should -Be 'waiting-input'
+            $state.waitingReason.code | Should -Be 'localization_plan_required'
+            $state.Contains('localizationMode') | Should -BeFalse
         }
         finally {
             Remove-Module $module -Force

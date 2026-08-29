@@ -3431,6 +3431,35 @@ function Invoke-Localization {
     $stage = Start-Stage -Name 'localization'
     Assert-LockOwner -State $State
     $plan = if ([string]::IsNullOrWhiteSpace($LocalizationPlanPath)) {
+        $installRoot = Assert-NoReparseTree -Path ([string]$State.installRoot) `
+            -Root ([string]$State.worktreePath) -Label 'Installed MOD tree before Schema 14 localization plan detection'
+        $registeredModFiles = @(
+            Get-ChildItem -LiteralPath $installRoot -File -Filter '*.mod' | ForEach-Object {
+                $descriptorPath = Assert-NoReparsePath -Path $_.FullName -Root ([string]$State.worktreePath) `
+                    -Label 'Schema 14 MOD descriptor'
+                $descriptorText = [Text.UTF8Encoding]::new($false, $true).GetString(
+                    (Read-FileBytesWithHeartbeat -Path $descriptorPath)
+                )
+                if ([regex]::IsMatch($descriptorText, '(?m)^[\t ]*mod_localization[\t ]*=')) {
+                    [IO.Path]::GetRelativePath($installRoot, $descriptorPath).Replace('\', '/')
+                }
+            } | Sort-Object -Unique
+        )
+        if ($registeredModFiles.Count -ne 0) {
+            $State.status = 'waiting-input'
+            $State.waitingReason = [ordered]@{
+                code = 'localization_plan_required'
+                message = 'The installed Schema 14 MOD registers mod_localization. Review its active localization and resume with an explicit localization plan.'
+                registeredModFiles = $registeredModFiles
+            }
+            return (Suspend-Stage -State $State -Context $stage -Result 'waiting-input' `
+                -ArtifactSha256 ([string]$State.rawInstallManifest.sha256) -OutputStage 'localization-plan' `
+                -Data ([ordered]@{
+                    code = $State.waitingReason.code
+                    required = $State.waitingReason.message
+                    registeredModFiles = $registeredModFiles
+                }))
+        }
         [ordered]@{ schemaVersion = 1; mode = 'none'; files = @(); metadataPaths = @($State.metadataPaths) }
     }
     else {

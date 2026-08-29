@@ -129,6 +129,8 @@ The Agent first determines active `zh-tw` targets, wording, placeholders, markup
 }
 ```
 
+Omitting `-LocalizationPlanPath` is accepted only when no installed root `.mod` descriptor registers `mod_localization`; that compatibility path records `mode=none`. If a descriptor registers `mod_localization`, omission returns a resumable `waiting-input` handoff with `code=localization_plan_required` and the matching descriptor path instead of silently treating the MOD as unlocalized. Resume the same state with an explicit plan. After semantic review, an intentionally unmaintained registration must still be expressed explicitly as `{"schemaVersion":1,"mode":"none","files":[],"removedPaths":[]}`.
+
 Spans must not overlap. `oldSha256` binds each decision to the immutable indexed bytes. The generator applies only those replacements; the independent validator separately proves that every byte outside the approved spans is unchanged. Direct fields and dynamic lookups use the same byte contract because semantic selection stays outside the script. Put an upstream-deleted active target in `removedPaths`; the runner requires it to be absent after raw installation and checkpoints that deletion in C2. A newly added target is a normal `files` entry and may have an empty `approvedSpans` array when upstream bytes are intentionally unchanged.
 
 ### Schema 15 localization workset
