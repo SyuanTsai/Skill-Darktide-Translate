@@ -408,7 +408,13 @@ function New-CheckpointReason {
 }
 
 function Test-MetadataSourceFieldMatch {
-    param([string] $RelativePath, [string] $Text, [string] $FieldName, [string] $FieldValue)
+    param(
+        [string] $RelativePath,
+        [string] $Text,
+        [string] $FieldName,
+        [string] $FieldValue,
+        [string] $NexusPageUrl
+    )
     if ([string]::IsNullOrWhiteSpace($FieldValue)) { return $false }
     if ($RelativePath.StartsWith('.hash/', [StringComparison]::Ordinal)) {
         $hashKeys = [ordered]@{
@@ -423,6 +429,36 @@ function Test-MetadataSourceFieldMatch {
         return $matchesForKey.Count -eq 1 -and [string]$matchesForKey[0].Groups[1].Value -ceq $FieldValue
     }
     if ($RelativePath -cne 'README.md') { return $false }
+    $readmeText = $Text
+    if (-not [string]::IsNullOrWhiteSpace($NexusPageUrl)) {
+        $targetUri = $null
+        if (-not [Uri]::TryCreate($NexusPageUrl, [UriKind]::Absolute, [ref]$targetUri) -or
+            $targetUri.Scheme -cne 'https' -or $targetUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+            -not [string]::IsNullOrEmpty($targetUri.UserInfo) -or -not [string]::IsNullOrEmpty($targetUri.Query) -or
+            -not [string]::IsNullOrEmpty($targetUri.Fragment) -or -not $targetUri.IsDefaultPort) {
+            return $false
+        }
+        $targetPathMatch = [regex]::Match(
+            $targetUri.AbsolutePath.TrimEnd('/'),
+            '^/warhammer40kdarktide/mods/(?<modId>\d+)$'
+        )
+        if (-not $targetPathMatch.Success) { return $false }
+        $headingMatches = @([regex]::Matches(
+            $Text,
+            '(?m)^###\s+\[[^\]\r\n]+\]\((?i:https://(?:www\.)?nexusmods\.com)/warhammer40kdarktide/mods/(?<modId>\d+)/?(?:\?[^#)\r\n]*)?(?:#[^)\r\n]*)?\)\s*\r?$'
+        ))
+        if ($headingMatches.Count -ne 0) {
+            $targetHeadings = @($headingMatches | Where-Object {
+                [string]$_.Groups['modId'].Value -ceq [string]$targetPathMatch.Groups['modId'].Value
+            })
+            if ($targetHeadings.Count -ne 1) { return $false }
+            $sectionStart = $targetHeadings[0].Index
+            $tailStart = $targetHeadings[0].Index + $targetHeadings[0].Length
+            $nextHeading = [regex]::Match($Text.Substring($tailStart), '(?m)^#{1,3}\s+')
+            $sectionEnd = if ($nextHeading.Success) { $tailStart + $nextHeading.Index } else { $Text.Length }
+            $readmeText = $Text.Substring($sectionStart, $sectionEnd - $sectionStart)
+        }
+    }
     $readmeLabels = [ordered]@{
         nexusModId = 'Nexus MOD ID'; nexusPageUrl = 'Nexus URL'; nexusPageVersion = 'Nexus page version'
         nexusPageUpdatedAt = 'Nexus last updated'; nexusMainFileId = 'Main file ID'; nexusMainFileVersion = 'Main file version'
@@ -431,7 +467,7 @@ function Test-MetadataSourceFieldMatch {
     }
     if (-not $readmeLabels.Contains($FieldName)) { return $false }
     $label = [regex]::Escape([string]$readmeLabels[$FieldName])
-    $matchesForLabel = @([regex]::Matches($Text, "(?m)^\s*-\s+$label\s*:\s*([^`r`n]*)`r?$") )
+    $matchesForLabel = @([regex]::Matches($readmeText, "(?m)^\s*-\s+$label\s*:\s*([^`r`n]*)`r?$") )
     if ($matchesForLabel.Count -ne 1) { return $false }
     $recorded = ([string]$matchesForLabel[0].Groups[1].Value).Trim()
     if ($recorded.Length -ge 2 -and $recorded.StartsWith('`', [StringComparison]::Ordinal) -and
@@ -3400,7 +3436,8 @@ function Invoke-Localization {
     }
     if ($plan.mode -notin @('none', 'zh-tw')) { throw 'Localization plan mode must be none or zh-tw.' }
     if ($plan.mode -eq 'none' -and @($plan.files).Count -ne 0) { throw 'Localization mode none cannot contain files.' }
-    $removedPaths = if ($plan.Contains('removedPaths')) { @($plan.removedPaths) } else { @() }
+    $removedPaths = @()
+    if ($plan.Contains('removedPaths')) { $removedPaths = @($plan.removedPaths) }
     if ($plan.mode -eq 'none' -and $removedPaths.Count -ne 0) { throw 'Localization mode none cannot contain removed paths.' }
     foreach ($removedPath in $removedPaths) {
         $removedRelative = ([string]$removedPath).Replace('\', '/')
@@ -3690,7 +3727,8 @@ function New-BuildMetadataPreview {
         foreach ($fieldName in $sourceFields.Keys) {
             $fieldValue = [string]$sourceFields[$fieldName]
             $fieldMatches[$fieldName] = Test-MetadataSourceFieldMatch -RelativePath ([string]$metadataPath.relativePath) `
-                -Text $metadataText -FieldName $fieldName -FieldValue $fieldValue
+                -Text $metadataText -FieldName $fieldName -FieldValue $fieldValue `
+                -NexusPageUrl ([string]$sourceFields.nexusPageUrl)
         }
         $mismatchedFields = @($fieldMatches.Keys | Where-Object { -not [bool]$fieldMatches[$_] })
         if ($mismatchedFields.Count -ne 0) {
