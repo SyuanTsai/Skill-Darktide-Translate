@@ -1372,10 +1372,10 @@ function Assert-RunLocalSkillPinRecord {
     $checks = [ordered]@{
         'pin bytes' = @([string]$State.workflowSourcePinSha256, $ActualPinSha256)
         'repository' = @([string]$State.workflowSourceRepository, [string]$PinRecord.repository)
-        'requested ref' = @([string]$State.workflowRef, [string]$PinRecord.requestedRef)
-        'commit' = @([string]$State.workflowCommitOid, [string]$PinRecord.resolvedCommit)
-        'version' = @([string]$State.workflowSourceVersion, [string]$PinRecord.resolvedVersion)
-        'content hash' = @([string]$State.workflowSourceContentSha256, [string]$PinRecord.contentSha256)
+        'requestedRef' = @([string]$State.workflowRef, [string]$PinRecord.requestedRef)
+        'resolvedCommit' = @([string]$State.workflowCommitOid, [string]$PinRecord.resolvedCommit)
+        'resolvedVersion' = @([string]$State.workflowSourceVersion, [string]$PinRecord.resolvedVersion)
+        'contentSha256' = @([string]$State.workflowSourceContentSha256, [string]$PinRecord.contentSha256)
         'pin receipt' = @([string]$State.workflowSourcePinSha256, [string]$PinRecord.pinSha256)
     }
     foreach ($name in $checks.Keys) {

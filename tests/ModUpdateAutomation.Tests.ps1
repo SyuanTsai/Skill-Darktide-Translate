@@ -468,8 +468,8 @@ function Enter-SharedCoordinationLease {
         $runner | Should -Match 'LocalReviewPath'
         $runner | Should -Match 'review-completion-validation\.json'
         $runner | Should -Match 'function Ensure-RunWriterLock'
-        $runner | Should -Match '(?s)function Ensure-RunWriterLock.*?Assert-RunSkillPackageBinding -State \$State.*?Enter-ModReservationWorker -State \$State'
-        $runner | Should -Match '(?s)function Get-CompletedStageResult.*?Assert-RunSkillPackageBinding -State \$State.*?Assert-LockOwner -State \$State'
+        $runner | Should -Match '(?s)function Ensure-RunWriterLock.*?Assert-RunLocalSkillPackage -State \$State.*?Enter-ModReservationWorker -State \$State'
+        $runner | Should -Match '(?s)function Get-CompletedStageResult.*?Assert-RunLocalSkillPackage -State \$State.*?Assert-LockOwner -State \$State'
         $runner | Should -Match '(?s)function Ensure-RunWriterLock.*?Enter-ModReservationWorker -State \$State.*?\$script:writerLease = Enter-RunWriterLock -State \$State'
         $runner | Should -Match '(?s)Ensure-RunWriterLock -State \$state\s+Write-AtomicJson -Path \$state\.statePath'
         $runner | Should -Match 'if \(-not \$script:writerLease\)'
@@ -821,10 +821,11 @@ function Invoke-Git {
         $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
         $pin = [ordered]@{
             repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+            requestedRef = 'test-fixture'
             resolvedCommit = '1' * 40; resolvedVersion = '0.3.1'; contentSha256 = 'a' * 64; pinSha256 = 'b' * 64
         }
         $state = [ordered]@{
-            workflowSourceRepository = $pin.repository; workflowCommitOid = $pin.resolvedCommit
+            workflowSourceRepository = $pin.repository; workflowRef = $pin.requestedRef; workflowCommitOid = $pin.resolvedCommit
             workflowSourceVersion = $pin.resolvedVersion; workflowSourceContentSha256 = $pin.contentSha256
             workflowSourcePinSha256 = $pin.pinSha256
         }
@@ -846,10 +847,11 @@ function Invoke-Git {
         $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
         $pin = [ordered]@{
             repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+            requestedRef = 'test-fixture'
             resolvedCommit = '2' * 40; resolvedVersion = '0.3.1'; contentSha256 = 'a' * 64; pinSha256 = 'b' * 64
         }
         $state = [ordered]@{
-            workflowSourceRepository = $pin.repository; workflowCommitOid = '1' * 40
+            workflowSourceRepository = $pin.repository; workflowRef = $pin.requestedRef; workflowCommitOid = '1' * 40
             workflowSourceVersion = $pin.resolvedVersion; workflowSourceContentSha256 = $pin.contentSha256
             workflowSourcePinSha256 = $pin.pinSha256
         }
@@ -1684,7 +1686,7 @@ function Invoke-Git {
             completedStages = @()
             stageTimings = [ordered]@{}
         }
-        $null = Add-TestRunLocalSkillPin -State $state -SkillSourcePinPath $script:skillSourcePinPath
+        $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         $owner = [ordered]@{
             schemaVersion = 2
@@ -1758,7 +1760,7 @@ function Invoke-Git {
                 archive = [ordered]@{ path = $archivePath; sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
                 completedStages = @(); stageTimings = [ordered]@{}
             }
-            $null = Add-TestRunLocalSkillPin -State $state -SkillSourcePinPath $script:skillSourcePinPath
+            $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
             [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
             $owner = [ordered]@{
                 schemaVersion = 2
@@ -1823,7 +1825,7 @@ function Invoke-Git {
             archive = [ordered]@{ path = $archivePath; filename = 'payload.zip'; size = (Get-Item -LiteralPath $archivePath).Length; sha256 = $archiveSha }
             securityOverrides = @(); completedStages = @(); stageTimings = [ordered]@{}
         }
-        $null = Add-TestRunLocalSkillPin -State $state -SkillSourcePinPath $script:skillSourcePinPath
+        $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
         [ordered]@{
             schemaVersion = 2; runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
