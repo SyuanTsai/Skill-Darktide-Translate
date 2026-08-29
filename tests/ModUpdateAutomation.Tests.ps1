@@ -492,6 +492,16 @@ function Enter-SharedCoordinationLease {
                 -FixtureRoot (Join-Path $TestDrive ("syp118-" + [guid]::NewGuid().ToString('N')))
         }
 
+        AfterEach {
+            $fixtureSkillRoot = [IO.Path]::GetFullPath([string]$script:syp118Fixture.SkillRoot)
+            Get-Module -Name 'SharedCoordinationLock' | Where-Object {
+                $_.Path -and [IO.Path]::GetFullPath([string]$_.Path).StartsWith(
+                    $fixtureSkillRoot,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            } | Remove-Module -Force
+        }
+
         # Scenario: The installed package still exactly matches the immutable pin archived by the completed run.
         # Purpose: Preserve same-pin idempotency while re-proving the package before receipt reuse.
         It 'InterT171_ReusesACompletedStageWithTheSameRunLocalPin' {
