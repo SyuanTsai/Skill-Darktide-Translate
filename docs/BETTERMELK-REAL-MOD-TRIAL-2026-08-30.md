@@ -100,6 +100,9 @@ After the resumed build created C1 and F, the independent Candidate Gate rejecte
 - Targeted UnitT181/UnitT201 regression tests: 2 passed, 0 failed
 - Updated InterT200 end-to-end integration test: passed
 - Full post-change suite: 145 passed, 0 failed, 0 skipped in 665.19 seconds
+- Reference-integrity validation: passed
+
+During final review, the new checkpoint test was found to reuse an existing numeric test ID. It was renamed to the unique `UnitT201` ID. The first filtered rerun was blocked before test execution because the sandbox denied Pester access to its temporary `HKCU\Software\Pester` registry key; the identical filtered command was rerun in the approved local Pester environment and passed (1 passed, 0 failed). This was an execution-environment permission failure, not a product or test assertion failure.
 
 ## Process observations
 
