@@ -29,7 +29,7 @@ param(
     [string] $WorktreeParent,
     [string] $Remote = 'origin',
     [string] $PullRequestBase = 'main',
-    [ValidateSet('source-verified', 'awaiting-user-merge')]
+    [ValidateSet('source-verified', 'localized', 'awaiting-user-merge')]
     [string] $Until = 'awaiting-user-merge',
     [switch] $PassThru
 )
@@ -4747,7 +4747,7 @@ try {
             foreach ($stageName in @('verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot')) {
                 $last = Invoke-StageCommand -StageName $stageName -State $state
                 $state = Read-State -Path $state.statePath
-                if ($last.result -eq 'waiting-input' -or $state.status -in @('waiting-input', 'waiting-user', 'waiting-system', 'automation-excluded')) { break }
+                if ($last.result -in @('waiting-input', 'waiting-user', 'waiting-system', 'automation-excluded')) { break }
                 if (($Until -eq 'source-verified' -and $stageName -eq 'verify-source') -or $state.status -eq $Until) { break }
             }
             $last

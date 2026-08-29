@@ -101,7 +101,7 @@ if (-not $state.Contains('runRoot') -or [string]::IsNullOrWhiteSpace([string]$st
 }
 $runRoot = $stateRunRoot
 $securityRoot = if ($state.Contains('repositoryRoot') -and -not [string]::IsNullOrWhiteSpace([string]$state.repositoryRoot)) {
-    Assert-ContainedPath -Candidate $runRoot -Root ([string]$state.repositoryRoot) -Label 'Run root'
+    $null = Assert-ContainedPath -Candidate $runRoot -Root ([string]$state.repositoryRoot) -Label 'Run root'
     [string]$state.repositoryRoot
 }
 else { $runRoot }

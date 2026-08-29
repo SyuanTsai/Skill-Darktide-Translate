@@ -693,6 +693,65 @@ Describe 'Schema 15 source acquisition contract' {
         @($state.completedStages) | Should -Contain 'verify-source'
     }
 
+    # Scenario: An aggregate Schema 15 run pauses for one AI_REQUIRED localization unit after its source stages completed, then receives the approved expression.
+    # Purpose: Resume through verified idempotent stages to the waiting localization stage instead of returning the first completed-stage receipt.
+    It 'InterT76_ResumesAggregateRunPastIdempotentStagesAfterLocalizationInput' {
+        $repository = Join-Path $TestDrive 'aggregate-localization-resume'
+        $modRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/AutoMod'
+        New-Item -ItemType Directory -Path $modRoot -Force | Out-Null
+        & git -C $repository init --quiet
+        & git -C $repository config user.name 'Aggregate Resume Test'
+        & git -C $repository config user.email 'aggregate-resume@example.invalid'
+        $oldLocalization = 'return { existing = { en = "Existing", ["zh-tw"] = "既有" } }'
+        [IO.File]::WriteAllText((Join-Path $modRoot 'AutoMod_localization.lua'), $oldLocalization, [Text.UTF8Encoding]::new($false))
+        & git -C $repository add .
+        & git -C $repository commit --quiet -m 'base localization'
+
+        $runId = '36363636-4747-4888-8999-101010101010'
+        $runRoot = Join-Path $repository 'AI Auto Update/In Progress/automod-36363636'
+        $incoming = Join-Path $runRoot ".incoming-$runId"
+        New-Item -ItemType Directory -Path $incoming -Force | Out-Null
+        $downloadPath = Join-Path $incoming 'AutoMod-2.1.0.zip'
+        $newLocalization = 'return { existing = { en = "Existing", ["zh-tw"] = "既有" }, added = { en = "Added" } }'
+        $stream = [IO.File]::Open($downloadPath, [IO.FileMode]::CreateNew)
+        $zip = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $entry = $zip.CreateEntry('AutoMod/AutoMod_localization.lua')
+            $writer = [IO.StreamWriter]::new($entry.Open(), [Text.UTF8Encoding]::new($false))
+            try { $writer.Write($newLocalization) } finally { $writer.Dispose() }
+        }
+        finally { $zip.Dispose(); $stream.Dispose() }
+
+        $requestPath = Join-Path $TestDrive 'aggregate-localization-source-request.json'
+        [ordered]@{
+            schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 778; mainFileId = 889
+            version = '2.1.0'; fileName = 'AutoMod-2.1.0.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/778'
+            pageVersion = '2.1.0'; pageUpdatedAt = '2026-01-03T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-03T00:00:00.0000000+00:00'
+        } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
+
+        $runner = Join-Path $scriptRoot 'mod-update.ps1'
+        $waiting = & $runner run -RepositoryRoot $repository -ModDirectory 'AutoMod' -RunId $runId `
+            -SourceRequestPath $requestPath -Provider browser -DownloadedFilePath $downloadPath `
+            -SkillSourcePinPath $script:skillSourcePinPath -ObservationIntervalMilliseconds 0 -BaseRef HEAD `
+            -Until localized -PassThru
+
+        $waiting.result | Should -Be 'waiting-input'
+        $waiting.stage | Should -Be 'localization-workset'
+        $workset = Get-Content -LiteralPath $waiting.data.worksetPath -Raw | ConvertFrom-Json -AsHashtable
+        $pending = @($workset.units | Where-Object { [string]$_.action -ceq 'AI_REQUIRED' })
+        $pending.Count | Should -Be 1
+        $pending[0].reviewStatus = 'approved'
+        $pending[0].suggestedZhTwExpression = '"新增"'
+        [IO.File]::WriteAllText($waiting.data.worksetPath, ($workset | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+
+        $resumed = & $runner run -RepositoryRoot $repository -StatePath $waiting.statePath -Until localized -PassThru
+
+        $resumed.result | Should -Be 'passed'
+        $resumed.stage | Should -Be 'localization'
+        $resumed.status | Should -Be 'localized'
+        $resumed.idempotent | Should -BeNullOrEmpty
+    }
+
     # Scenario: A complete Schema 15 candidate has one unchanged localization file, but mutable state is edited to omit its localization record.
     # Purpose: Make the independent Gate cross-bind the unique localization file to the persisted manifest instead of skipping its byte checks.
     It 'InterT77_RejectsMutableStateThatOmitsTheUniqueLocalizationRecord' {
