@@ -3726,9 +3726,12 @@ function Assert-BuildMetadataPaths {
         throw "Metadata preflight requires README.md and .hash/$($State.modSlug).hash before C1."
     }
     $records = @()
+    $trackedMetadata = Invoke-Git -WorkingDirectory $worktree -Arguments @('ls-files', '--full-name', '--', 'README.md', '.hash')
+    $trackedMetadataPaths = @($trackedMetadata.output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     foreach ($metadataRelative in $actual) {
-        $tracked = Invoke-Git -WorkingDirectory $worktree -Arguments @('ls-files', '--full-name', '--', $metadataRelative)
-        $trackedPaths = @($tracked.output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $trackedPaths = @($trackedMetadataPaths | Where-Object {
+            $_.Equals($metadataRelative, [StringComparison]::OrdinalIgnoreCase)
+        })
         if ($trackedPaths.Count -gt 1 -or
             ($trackedPaths.Count -eq 1 -and -not $trackedPaths[0].Equals($metadataRelative, [StringComparison]::OrdinalIgnoreCase))) {
             throw "Metadata path has ambiguous tracked casing: $metadataRelative"
