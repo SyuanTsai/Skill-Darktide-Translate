@@ -4110,10 +4110,11 @@ function Invoke-BuildCommits {
         $null = Assert-NoReparseTree -Path ([string]$State.installRoot) -Root $worktree -Label 'Installed MOD tree before evidence commits'
 
         $remoteTrackingRef = "refs/remotes/$($State.remote)/$($State.branch)"
-        $remoteTracking = Invoke-Git -WorkingDirectory $worktree -Arguments @('show-ref', '--verify', $remoteTrackingRef) -AllowFailure
+        $remoteTracking = Invoke-Git -WorkingDirectory $worktree -Arguments @('show-ref', '--verify', '--quiet', $remoteTrackingRef) -AllowFailure
         if (-not $State.published -and $remoteTracking.exitCode -eq 0) {
+            $remoteTrackingOid = Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', '--verify', "$remoteTrackingRef^{commit}")
             $State.published = $true
-            $State.headOid = @($remoteTracking.output -split '\s+')[0]
+            $State.headOid = $remoteTrackingOid.output.Trim()
             Save-State -State $State
             throw 'The run state said unpublished, but its remote-tracking branch already exists. State was repaired to published; prepare an append-only same-run refresh before rebuilding checkpoints.'
         }

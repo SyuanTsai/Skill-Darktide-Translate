@@ -813,6 +813,8 @@ Describe 'Schema 15 source acquisition contract' {
             -MetadataPath 'README.md', '.hash/m.hash' -Until source-verified -PassThru
         $sourceVerified.result | Should -Be 'passed'
         $statePath = $sourceVerified.statePath
+        $explicitMetadataState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        @($explicitMetadataState.metadataPaths) | Should -Be @('README.md', '.hash/m.hash')
         foreach ($stage in @('extract', 'install', 'localization', 'build-commits')) {
             $stageResult = & $runner $stage -RepositoryRoot $repository -StatePath $statePath -PassThru
             $stageResult.result | Should -Be 'passed'
