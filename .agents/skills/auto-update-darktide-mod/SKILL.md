@@ -56,6 +56,7 @@ When `run` returns `waiting-input` after publication, perform the required local
 - When active localization targets exist, C0, C1, C2, C3, and F are evidence boundaries, not history preferences. Do not squash or replace them with a final manifest.
 - The Final Candidate Gate must pass for the current immutable tuple before any push or PR mutation.
 - A published evidence branch is append-only: no reset, rebase, squash, or force-push to conceal rejected evidence.
+- Before checkpoint rebuilding, treat an existing run-specific remote-tracking branch as published evidence even if mutable state says otherwise. The runner repairs that flag and stops; use only the Workflow's append-only same-run refresh procedure.
 - External Review is optional and non-blocking. Make at most one request for a fixed F, take one bounded snapshot, and never poll in the background.
 - Credentials, login steps, security overrides, destructive cleanup, pushes, PR mutations, and merge actions retain their normal user-authorization boundaries.
 

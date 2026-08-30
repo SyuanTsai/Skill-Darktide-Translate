@@ -4105,10 +4105,23 @@ function Invoke-BuildCommits {
     $stage = Start-Stage -Name 'build-commits'
     try {
         Assert-LockOwner -State $State
-        if ($State.published) { throw 'A published evidence branch is append-only; completed checkpoints are never reset or rebuilt in place.' }
         $worktree = Assert-NoReparsePath -Path ([string]$State.worktreePath) `
             -Root ([IO.Path]::GetPathRoot([string]$State.worktreePath)) -Label 'Evidence worktree'
         $null = Assert-NoReparseTree -Path ([string]$State.installRoot) -Root $worktree -Label 'Installed MOD tree before evidence commits'
+
+        $remoteTrackingRef = "refs/remotes/$($State.remote)/$($State.branch)"
+        $remoteTracking = Invoke-Git -WorkingDirectory $worktree -Arguments @('show-ref', '--verify', $remoteTrackingRef) -AllowFailure
+        if (-not $State.published -and $remoteTracking.exitCode -eq 0) {
+            $State.published = $true
+            $State.headOid = @($remoteTracking.output -split '\s+')[0]
+            Save-State -State $State
+            throw 'The run state said unpublished, but its remote-tracking branch already exists. State was repaired to published; prepare an append-only same-run refresh before rebuilding checkpoints.'
+        }
+        if ($remoteTracking.exitCode -notin @(0, 1)) { throw 'Unable to inspect the run remote-tracking branch before build-commits.' }
+
+        if ($State.published) {
+            throw 'A published evidence branch is append-only; completed checkpoints are never reset or rebuilt in place. Use the Workflow append-only same-run refresh procedure.'
+        }
 
         $metadataPreparation = @(Assert-BuildMetadataPaths -State $State -AllowMissing)
         $missingMetadataPaths = @($metadataPreparation | Where-Object { -not $_.exists } | ForEach-Object { [string]$_.relativePath })
