@@ -870,9 +870,9 @@ return localization
         Test-Path -LiteralPath $outputPath | Should -Be $false
     }
 
-    # Scenario: The sole active localization file moves between OLD and NEW during a complete Schema 15 run.
-    # Purpose: Keep both paths in the target allowlist so C1 cannot absorb the old target deletion and corrupt layered Git evidence.
-    It 'InterT45_PreservesOldAndNewEvidenceTargetPathsForALocalizationMove' {
+    # Scenario: The sole active localization file moves between OLD and NEW while a Schema 15 run resumes from a stale waiting reason.
+    # Purpose: Keep both paths in the target allowlist and clear the resolved waiting reason after successful workset localization.
+    It 'InterT45_PreservesMovedTargetsAndClearsTheResolvedWaitingReason' {
         $repository = Join-Path $TestDrive 'rename-runner-repository'
         $oldRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/RenameMod/old'
         New-Item -ItemType Directory -Path $oldRoot -Force | Out-Null
@@ -910,9 +910,19 @@ return localization
             -SkillSourcePinPath $script:skillSourcePinPath -ObservationIntervalMilliseconds 0 -BaseRef HEAD -Until source-verified -PassThru
         $null = & $runner extract -RepositoryRoot $repository -StatePath $verified.statePath -PassThru
         $null = & $runner install -RepositoryRoot $repository -StatePath $verified.statePath -PassThru
-        $null = & $runner localization -RepositoryRoot $repository -StatePath $verified.statePath -PassThru
+        $waitingState = Get-Content -LiteralPath $verified.statePath -Raw | ConvertFrom-Json -AsHashtable
+        $waitingState.status = 'waiting-input'
+        $waitingState.waitingReason = [ordered]@{
+            code = 'localization_workset_review_required'
+            message = 'Resume localization after the workset review is complete.'
+        }
+        $waitingState | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $verified.statePath -NoNewline
+
+        $localized = & $runner localization -RepositoryRoot $repository -StatePath $verified.statePath -PassThru
         $state = Get-Content -LiteralPath $verified.statePath -Raw | ConvertFrom-Json
 
+        $localized.result | Should -Be 'passed'
+        $state.waitingReason | Should -BeNullOrEmpty
         @($state.evidenceTargetPaths) | Should -Be @(
             'Warhammer 40,000 DARKTIDE/mods/RenameMod/new/RenameMod_localization.lua',
             'Warhammer 40,000 DARKTIDE/mods/RenameMod/old/RenameMod_localization.lua'
