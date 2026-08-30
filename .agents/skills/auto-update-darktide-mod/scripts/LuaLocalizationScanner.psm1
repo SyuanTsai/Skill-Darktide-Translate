@@ -380,6 +380,18 @@ function ConvertTo-Utf8ByteOffset {
     $BomLength + (Get-LuaUtf8ByteCount -Text $Text -StartIndex 0 -CharacterCount $CharacterIndex)
 }
 
+function Test-LuaIdentifierIsOnlyCalled {
+    param([object[]] $Tokens, [string] $Name)
+    for ($index = 0; $index -lt $Tokens.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        if ($Tokens[$index].type -cne 'identifier' -or $Tokens[$index].text -cne $Name) { continue }
+        $previous = if ($index -gt 0) { [string]$Tokens[$index - 1].text } else { $null }
+        $next = if (($index + 1) -lt $Tokens.Count) { [string]$Tokens[$index + 1].text } else { $null }
+        if ($next -cne '(' -or $previous -in @('function', '.', ':')) { return $false }
+    }
+    $true
+}
+
 function Test-DirectLocalizeCall {
     param([object[]] $Tokens, [int] $StartIndex, [int] $EndIndex)
     if (($EndIndex - $StartIndex) -lt 2 -or
@@ -387,7 +399,50 @@ function Test-DirectLocalizeCall {
         $Tokens[$StartIndex + 1].text -cne '(' -or $Tokens[$EndIndex].text -cne ')') {
         return $false
     }
+    if (-not (Test-LuaIdentifierIsOnlyCalled -Tokens $Tokens -Name 'Localize')) { return $false }
     (Get-MatchingTokenIndex -Tokens $Tokens -StartIndex ($StartIndex + 1) -Open '(' -Close ')') -eq $EndIndex
+}
+
+function Test-LuaTableFieldAssignment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Text,
+        [Parameter(Mandatory)][string] $Key,
+        [scriptblock] $HeartbeatAction
+    )
+    if ([string]::IsNullOrWhiteSpace($Key)) { throw 'Lua table field key cannot be empty.' }
+    $previousHeartbeatAction = $script:luaScannerHeartbeatAction
+    $previousHeartbeatProgress = $script:luaScannerHeartbeatProgress
+    $script:luaScannerHeartbeatAction = $HeartbeatAction
+    $script:luaScannerHeartbeatProgress = [int64]0
+    try {
+        $tokens = @(Get-LuaTokens -Text $Text)
+        $braceDepth = 0
+        for ($index = 0; $index -lt $tokens.Count; $index++) {
+            Invoke-LuaScannerProgressHeartbeat
+            $token = [string]$tokens[$index].text
+            if ($token -ceq '{') { $braceDepth++; continue }
+            if ($token -ceq '}') { if ($braceDepth -gt 0) { $braceDepth-- }; continue }
+            if ($braceDepth -eq 0) { continue }
+            $previous = if ($index -gt 0) { [string]$tokens[$index - 1].text } else { $null }
+            if ($previous -notin @('{', ',', ';')) { continue }
+            if ($tokens[$index].type -ceq 'identifier' -and $token -ceq $Key -and
+                ($index + 1) -lt $tokens.Count -and $tokens[$index + 1].text -ceq '=') {
+                return $true
+            }
+            if ($token -ceq '[' -and ($index + 3) -lt $tokens.Count -and
+                $tokens[$index + 1].type -ceq 'string' -and $tokens[$index + 2].text -ceq ']' -and
+                $tokens[$index + 3].text -ceq '=' -and
+                (ConvertFrom-LuaKeyString -Literal ([string]$tokens[$index + 1].text)) -ceq $Key) {
+                return $true
+            }
+        }
+        $false
+    }
+    finally {
+        $script:luaScannerHeartbeatAction = $previousHeartbeatAction
+        $script:luaScannerHeartbeatProgress = $previousHeartbeatProgress
+    }
 }
 
 function New-ExpressionRecord {
@@ -635,4 +690,4 @@ function Get-LuaLocalizationDocument {
     }
 }
 
-Export-ModuleMember -Function Get-LuaLocalizationDocument
+Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment

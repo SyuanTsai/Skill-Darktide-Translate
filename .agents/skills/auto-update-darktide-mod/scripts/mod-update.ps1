@@ -721,6 +721,8 @@ function Test-ProcessIdentityActive {
 
 $sharedCoordinationModulePath = Join-Path $PSScriptRoot 'SharedCoordinationLock.psm1'
 Import-Module -Name $sharedCoordinationModulePath -Force -ErrorAction Stop
+$luaLocalizationScannerModulePath = Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1'
+Import-Module -Name $luaLocalizationScannerModulePath -Force -ErrorAction Stop
 
 function Enter-SharedCoordinationLock {
     param(
@@ -2015,7 +2017,6 @@ function Assert-Schema15BaseLocalizationEligibility {
     if ($localizationPaths.Count -eq 0) { return }
     if ($localizationPaths.Count -ne 1) { throw 'AUTOMATION_BLOCKED: localization_entry_not_unique' }
 
-    Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force -ErrorAction Stop
     foreach ($path in $localizationPaths) {
         $blobOid = (Invoke-Git -WorkingDirectory $Repository -Arguments @('rev-parse', "$BaseOid`:$path")).output.Trim()
         $bytes = Get-GitBlobBytes -WorkingDirectory $Repository -Object $blobOid
@@ -3440,7 +3441,7 @@ function Invoke-Localization {
                 $descriptorText = [Text.UTF8Encoding]::new($false, $true).GetString(
                     (Read-FileBytesWithHeartbeat -Path $descriptorPath)
                 )
-                if ([regex]::IsMatch($descriptorText, '(?<![A-Za-z0-9_])mod_localization[\t ]*=')) {
+                if (Test-LuaTableFieldAssignment -Text $descriptorText -Key 'mod_localization') {
                     [IO.Path]::GetRelativePath($installRoot, $descriptorPath).Replace('\', '/')
                 }
             } | Sort-Object -Unique
