@@ -12,6 +12,13 @@ param(
     [string] $StatePath,
     [string] $ArchivePath,
     [string] $ModDirectory,
+    [ValidateScript({
+        $parsedRunId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$_, [ref]$parsedRunId)) {
+            throw 'RunId must be a GUID, for example 7a923183-8edc-4a62-9af3-3bfe77023d02.'
+        }
+        $true
+    })]
     [string] $RunId,
     [string] $SourceRequestPath,
     [string] $SourceReceiptPath,
@@ -3710,7 +3717,12 @@ function Assert-BuildMetadataPaths {
     $worktree = [IO.Path]::GetFullPath([string]$State.worktreePath)
     $required = @('README.md', ".hash/$($State.modSlug).hash")
     $actual = @($State.metadataPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
-    if (($actual -join "`n") -cne (($required | Sort-Object) -join "`n")) {
+    $matchesRequiredContract = $actual.Count -eq $required.Count
+    foreach ($requiredPath in $required) {
+        $pathMatches = @($actual | Where-Object { $_.Equals($requiredPath, [StringComparison]::OrdinalIgnoreCase) })
+        if ($pathMatches.Count -ne 1) { $matchesRequiredContract = $false }
+    }
+    if (-not $matchesRequiredContract) {
         throw "Metadata preflight requires README.md and .hash/$($State.modSlug).hash before C1."
     }
     $records = @()
@@ -3721,6 +3733,29 @@ function Assert-BuildMetadataPaths {
         if (-not $exists -and -not $AllowMissing) { throw "Metadata path is missing: $metadataRelative" }
         $records += [ordered]@{ relativePath = $metadataRelative; fullPath = $metadataFull; exists = $exists }
     }
+    if (@($records | Where-Object { -not $_.exists }).Count -gt 0) {
+        return @($records)
+    }
+
+    $records = @()
+    $trackedMetadata = Invoke-Git -WorkingDirectory $worktree -Arguments @('ls-files', '--full-name', '--', 'README.md', '.hash')
+    $trackedMetadataPaths = @($trackedMetadata.output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    foreach ($metadataRelative in $actual) {
+        $trackedPaths = @($trackedMetadataPaths | Where-Object {
+            $_.Equals($metadataRelative, [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($trackedPaths.Count -gt 1 -or
+            ($trackedPaths.Count -eq 1 -and -not $trackedPaths[0].Equals($metadataRelative, [StringComparison]::OrdinalIgnoreCase))) {
+            throw "Metadata path has ambiguous tracked casing: $metadataRelative"
+        }
+        $canonicalRelative = if ($trackedPaths.Count -eq 1) { [string]$trackedPaths[0] } else { $metadataRelative }
+        $metadataFull = Assert-ContainedPath -Candidate (Join-Path $worktree $canonicalRelative) -Root $worktree -Label 'Metadata path'
+        $null = Assert-NoReparsePath -Path $metadataFull -Root $worktree -Label 'Metadata path' -AllowMissing
+        $exists = Test-Path -LiteralPath $metadataFull -PathType Leaf
+        if (-not $exists -and -not $AllowMissing) { throw "Metadata path is missing: $canonicalRelative" }
+        $records += [ordered]@{ relativePath = $canonicalRelative; fullPath = $metadataFull; exists = $exists }
+    }
+    $State.metadataPaths = @($records | ForEach-Object { [string]$_.relativePath })
     @($records)
 }
 
