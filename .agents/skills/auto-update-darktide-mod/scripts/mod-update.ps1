@@ -3719,12 +3719,24 @@ function Assert-BuildMetadataPaths {
     $actual = @($State.metadataPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
     $matchesRequiredContract = $actual.Count -eq $required.Count
     foreach ($requiredPath in $required) {
-        $matches = @($actual | Where-Object { $_.Equals($requiredPath, [StringComparison]::OrdinalIgnoreCase) })
-        if ($matches.Count -ne 1) { $matchesRequiredContract = $false }
+        $pathMatches = @($actual | Where-Object { $_.Equals($requiredPath, [StringComparison]::OrdinalIgnoreCase) })
+        if ($pathMatches.Count -ne 1) { $matchesRequiredContract = $false }
     }
     if (-not $matchesRequiredContract) {
         throw "Metadata preflight requires README.md and .hash/$($State.modSlug).hash before C1."
     }
+    $records = @()
+    foreach ($metadataRelative in $actual) {
+        $metadataFull = Assert-ContainedPath -Candidate (Join-Path $worktree $metadataRelative) -Root $worktree -Label 'Metadata path'
+        $null = Assert-NoReparsePath -Path $metadataFull -Root $worktree -Label 'Metadata path' -AllowMissing
+        $exists = Test-Path -LiteralPath $metadataFull -PathType Leaf
+        if (-not $exists -and -not $AllowMissing) { throw "Metadata path is missing: $metadataRelative" }
+        $records += [ordered]@{ relativePath = $metadataRelative; fullPath = $metadataFull; exists = $exists }
+    }
+    if (@($records | Where-Object { -not $_.exists }).Count -gt 0) {
+        return @($records)
+    }
+
     $records = @()
     $trackedMetadata = Invoke-Git -WorkingDirectory $worktree -Arguments @('ls-files', '--full-name', '--', 'README.md', '.hash')
     $trackedMetadataPaths = @($trackedMetadata.output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
