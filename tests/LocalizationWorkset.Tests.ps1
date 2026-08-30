@@ -43,6 +43,8 @@ Describe 'Schema 15 localization workset' {
         Test-Path -LiteralPath (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') -PathType Leaf | Should -Be $true
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        Get-Command Test-LuaTableFieldAssignment -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
     }
 
     # Scenario: A localization file uses duplicate keys, bracketed language names, dynamic keys, comments, and multiline expressions.
@@ -76,6 +78,24 @@ return {
         $document.units[2].sourceExpression.isDirectLocalizeCall | Should -BeTrue
         $document.units[2].sourceExpression.startByte | Should -BeGreaterThan 0
         $document.units[2].zhTwExpression.lengthByte | Should -BeGreaterThan 0
+    }
+
+    # Scenario: A localization file shadows the game-global Localize name before using the same call syntax in a source expression.
+    # Purpose: Reserve localized_source for proven game-global calls so local helpers cannot hide untranslated English text.
+    It 'UnitT22_RejectsShadowedLocalizeCallsFromTheLocalizedSourceException' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $globalLua = 'return { key = { en = Localize("loc_social_menu_leave_party") } }'
+        $shadowedLua = 'local Localize = function(value) return value end; return { key = { en = Localize("plain English") } }'
+
+        $globalDocument = Get-LuaLocalizationDocument `
+            -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($globalLua)) `
+            -DisplayPath '<global-localize>' -SourceId 'global-localize'
+        $shadowedDocument = Get-LuaLocalizationDocument `
+            -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($shadowedLua)) `
+            -DisplayPath '<shadowed-localize>' -SourceId 'shadowed-localize'
+
+        $globalDocument.units[0].sourceExpression.isDirectLocalizeCall | Should -BeTrue
+        $shadowedDocument.units[0].sourceExpression.isDirectLocalizeCall | Should -BeFalse
     }
 
     # Scenario: A bracketed zh-tw language key uses a valid Lua hexadecimal escape for the hyphen.
@@ -662,6 +682,7 @@ return {
         @'
 return {
     existing_localized = { en = Localize("loc_social_menu_leave_party") },
+    existing_translated = { en = Localize("loc_social_menu_leave_party"), ["zh-tw"] = "保留既有翻譯" },
     composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
 }
 '@ | Set-Content -LiteralPath $oldPath -NoNewline
@@ -676,6 +697,7 @@ return {
         @'
 return {
     existing_localized = { en = Localize("loc_social_menu_leave_party") },
+    existing_translated = { en = Localize("loc_social_menu_leave_party") },
     new_localized = { en = Localize("loc_item_type_end_of_round") },
     composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
 }
@@ -696,6 +718,10 @@ return {
             $unit.action | Should -Be 'NONE'
             $unit.reviewStatus | Should -Be 'not-required'
         }
+        $existingTranslated = @($workset.units | Where-Object key -eq 'existing_translated')[0]
+        $existingTranslated.changeType | Should -Be 'zh_tw_only_changed'
+        $existingTranslated.action | Should -Be 'RESTORE_OLD_ZH_TW'
+        $existingTranslated.reviewStatus | Should -Be 'not-required'
         $composed = @($workset.units | Where-Object key -eq 'composed')[0]
         $composed.changeType | Should -Be 'missing_zh_tw'
         $composed.action | Should -Be 'AI_REQUIRED'
@@ -709,6 +735,8 @@ return {
         foreach ($key in @('existing_localized', 'new_localized')) {
             (@($applied.units | Where-Object key -eq $key)[0]).zhTwExpression | Should -BeNullOrEmpty
         }
+        (@($applied.units | Where-Object key -eq 'existing_translated')[0]).zhTwExpression.raw |
+            Should -Be '"保留既有翻譯"'
         (@($applied.units | Where-Object key -eq 'composed')[0]).zhTwExpression.raw |
             Should -Be 'Localize("loc_social_menu_leave_party") .. " 現在"'
         (& (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') `

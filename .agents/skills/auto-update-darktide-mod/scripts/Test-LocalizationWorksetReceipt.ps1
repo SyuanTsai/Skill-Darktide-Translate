@@ -214,7 +214,7 @@ function Get-ExpectedClassification {
     $newZhTw = if ($null -ne $NewUnit) { Get-CanonicalExpression -Expression $NewUnit.zhTwExpression } else { $null }
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { return [ordered]@{ changeType = 'blocked'; action = 'BLOCKED'; blockedReason = $blockedReason } }
     if ($null -eq $NewUnit) { return [ordered]@{ changeType = 'deleted_key'; action = 'ACCEPT_REMOVAL'; blockedReason = $null } }
-    if ([bool]$NewUnit.sourceExpression.isDirectLocalizeCall -and $null -eq $newZhTw) { return [ordered]@{ changeType = 'localized_source'; action = 'NONE'; blockedReason = $null } }
+    if ([bool]$NewUnit.sourceExpression.isDirectLocalizeCall -and $null -eq $oldZhTw -and $null -eq $newZhTw) { return [ordered]@{ changeType = 'localized_source'; action = 'NONE'; blockedReason = $null } }
     if ($null -eq $OldUnit) { return [ordered]@{ changeType = 'new_key'; action = 'AI_REQUIRED'; blockedReason = $null } }
     if ($null -eq $oldZhTw -and $null -eq $newZhTw) { return [ordered]@{ changeType = 'missing_zh_tw'; action = 'AI_REQUIRED'; blockedReason = $null } }
     if ($oldSource -ceq $newSource -and $oldZhTw -ceq $newZhTw) { return [ordered]@{ changeType = 'unchanged'; action = 'NONE'; blockedReason = $null } }
