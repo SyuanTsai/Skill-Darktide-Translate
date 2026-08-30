@@ -215,8 +215,9 @@ function New-UnitRecord {
 
     $changeType = $null; $action = $null
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { $changeType = 'blocked'; $action = 'BLOCKED' }
-    elseif ($null -eq $OldUnit) { $changeType = 'new_key'; $action = 'AI_REQUIRED' }
     elseif ($null -eq $NewUnit) { $changeType = 'deleted_key'; $action = 'ACCEPT_REMOVAL' }
+    elseif ([bool]$NewUnit.sourceExpression.isDirectLocalizeCall -and $null -eq $newZhTw) { $changeType = 'localized_source'; $action = 'NONE' }
+    elseif ($null -eq $OldUnit) { $changeType = 'new_key'; $action = 'AI_REQUIRED' }
     elseif ($null -eq $oldZhTw -and $null -eq $newZhTw) { $changeType = 'missing_zh_tw'; $action = 'AI_REQUIRED' }
     elseif ($oldSource -ceq $newSource -and $oldZhTw -ceq $newZhTw) { $changeType = 'unchanged'; $action = 'NONE' }
     elseif ($oldSource -ceq $newSource) { $changeType = 'zh_tw_only_changed'; $action = 'RESTORE_OLD_ZH_TW' }
@@ -357,7 +358,7 @@ foreach ($oldUnit in @($oldDocument.units)) {
     if (-not $newById.ContainsKey([string]$oldUnit.unitId)) { $records.Add((New-UnitRecord -OldUnit $oldUnit -NewUnit $null)) }
 }
 $counts = [ordered]@{}
-foreach ($name in @('unchanged', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
+foreach ($name in @('unchanged', 'localized_source', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
     $counts[$name] = @($records | Where-Object { $_.changeType -ceq $name }).Count
 }
 $workset = [ordered]@{

@@ -3431,6 +3431,35 @@ function Invoke-Localization {
     $stage = Start-Stage -Name 'localization'
     Assert-LockOwner -State $State
     $plan = if ([string]::IsNullOrWhiteSpace($LocalizationPlanPath)) {
+        $installRoot = Assert-NoReparseTree -Path ([string]$State.installRoot) `
+            -Root ([string]$State.worktreePath) -Label 'Installed MOD tree before Schema 14 localization plan detection'
+        $registeredModFiles = @(
+            Get-ChildItem -LiteralPath $installRoot -File -Filter '*.mod' | ForEach-Object {
+                $descriptorPath = Assert-NoReparsePath -Path $_.FullName -Root ([string]$State.worktreePath) `
+                    -Label 'Schema 14 MOD descriptor'
+                $descriptorText = [Text.UTF8Encoding]::new($false, $true).GetString(
+                    (Read-FileBytesWithHeartbeat -Path $descriptorPath)
+                )
+                if ([regex]::IsMatch($descriptorText, '(?<![A-Za-z0-9_])mod_localization[\t ]*=')) {
+                    [IO.Path]::GetRelativePath($installRoot, $descriptorPath).Replace('\', '/')
+                }
+            } | Sort-Object -Unique
+        )
+        if ($registeredModFiles.Count -ne 0) {
+            $State.status = 'waiting-input'
+            $State.waitingReason = [ordered]@{
+                code = 'localization_plan_required'
+                message = 'The installed Schema 14 MOD registers mod_localization. Review its active localization and resume with an explicit localization plan.'
+                registeredModFiles = $registeredModFiles
+            }
+            return (Suspend-Stage -State $State -Context $stage -Result 'waiting-input' `
+                -ArtifactSha256 ([string]$State.rawInstallManifest.sha256) -OutputStage 'localization-plan' `
+                -Data ([ordered]@{
+                    code = $State.waitingReason.code
+                    required = $State.waitingReason.message
+                    registeredModFiles = $registeredModFiles
+                }))
+        }
         [ordered]@{ schemaVersion = 1; mode = 'none'; files = @(); metadataPaths = @($State.metadataPaths) }
     }
     else {
@@ -4404,7 +4433,7 @@ function Get-PrBody {
         $approvedSpanCount = [int]$State.localizationWorkset.editCount
         $unchangedTargetCount = [int]$State.localizationWorkset.counts.unchanged
         $localizationScope = 'only program-selected zh-tw workset edits; BLOCKED=0'
-        $rows = foreach ($changeType in @('unchanged', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
+        $rows = foreach ($changeType in @('unchanged', 'localized_source', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
             "| $changeType | $($State.localizationWorkset.counts[$changeType]) |"
         }
         $localizationTable = "`n| Localization change type | Count |`n| --- | ---: |`n" + ($rows -join "`n")
