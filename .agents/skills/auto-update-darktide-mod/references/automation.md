@@ -33,6 +33,8 @@ Start a run:
   -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.1.json'
 ```
 
+`-MetadataPath` is optional. When omitted, the runner records the canonical `README.md` and `.hash/<normalized-mod-slug>.hash` paths in run state. Supplying the parameter remains supported when a caller needs to preserve an existing tracked path spelling; pre-C1 validation still resolves that spelling case-insensitively against the bounded tracked metadata set.
+
 ### Schema 15 automatic source
 
 Read `references/schema-15.md` completely before a new automatic-source run. Supply the normalized Schema 15 source request and a fixed run ID. The request contains identity metadata, never credentials or a signed download URL.

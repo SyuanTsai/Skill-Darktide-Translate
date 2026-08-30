@@ -4,7 +4,7 @@ Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive up
 
 - Stable source ID: `darktide-translate`
 - Catalog: `catalog/skills-catalog.json`
-- Current repository version: `0.3.7`
+- Current repository version: `0.3.8`
 - Jira delivery items: `SYP-112` checkpoint reasons, `SYP-113` immutable source metadata, `SYP-114` shared coordination locks, `SYP-115` reservation heartbeat/lifecycle, `SYP-116` runner observability/Windows byte preservation, `SYP-117` deterministic partial commit recovery, and `SYP-118` resume-time Skill pin validation, building on `SYP-91`, `SYP-92`, and `SYP-88`
 
 ## Skill

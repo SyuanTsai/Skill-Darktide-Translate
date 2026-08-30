@@ -2828,6 +2828,12 @@ function Invoke-Claim {
     New-Item -ItemType Directory -Path (Join-Path $runRoot 'artifacts') -Force | Out-Null
     $claimedArchive = Join-Path (Join-Path $runRoot 'source') ([IO.Path]::GetFileName($sourceFull))
 
+    $resolvedMetadataPaths = if (@($MetadataPath).Count -eq 0) {
+        @('README.md', ".hash/$slug.hash")
+    }
+    else {
+        @($MetadataPath)
+    }
     $state = [ordered]@{
         schemaVersion = if ($sourceReceipt) { 15 } else { 14 }
         workflowSchemaVersion = if ($sourceReceipt) { 15 } else { 14 }
@@ -2852,7 +2858,7 @@ function Invoke-Claim {
         pullRequestBase = $PullRequestBase
         baseOid = $baseOid
         checkedMainOid = $baseOid
-        metadataPaths = @($MetadataPath)
+        metadataPaths = @($resolvedMetadataPaths)
         sourceReceipt = $sourceReceipt
         sourceTuple = $sourceTuple
         sourceAcquisition = if ($sourceReceipt) {
