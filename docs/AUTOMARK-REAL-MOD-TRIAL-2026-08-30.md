@@ -21,6 +21,9 @@
 8. The first PR validation found that the new path-matching locals used `$matches`, which collides case-insensitively with PowerShell's automatic `$Matches` variable. They were renamed to `$pathMatches` in both the runner and independent Candidate Gate.
 9. The first canonical-casing implementation called `Invoke-Git` before reporting a first-time missing metadata file. That broke the isolated preflight contract and added an unnecessary dependency to the resumable `metadata-preparation` handoff. The runner now performs the bounded filesystem missing-file check first and consults the Git index only after both metadata files exist.
 10. Bumping the repository to 0.3.7 left the Nexus API client's traceable User-Agent at 0.3.6. The literal was synchronized to `Skill-Darktide-Translate/0.3.7`.
+11. The target repository still had a version-1 managed-instructions manifest that the current bootstrap could not consume directly. A one-time safe migration preserved all customized bytes and kept runtime instruction artifacts ignored; this was a repository bootstrap compatibility issue, not a MOD-run state mutation.
+12. The optional system `quick_validate.py` helper could not start because neither available Python environment included `PyYAML` (`ModuleNotFoundError: yaml`). No package was installed and no test suite was substituted; the PowerShell parser, packaged reference-integrity validation, and workflow Candidate Gate supplied the recorded non-test validation evidence.
+13. The first Review Baseline expansion attempt used `-OutputPath`, but the packaged expander accepts `-OutputDirectory`. The failed invocation wrote no artifact; rerunning with the declared parameter produced the hash-bound Review Baseline used for Local Review.
 
 ## Fix in 0.3.7
 
