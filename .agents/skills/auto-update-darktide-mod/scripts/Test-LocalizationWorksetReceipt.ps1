@@ -177,6 +177,7 @@ function Get-ExpressionSnapshot {
     if ($null -eq $Expression) { return $null }
     [ordered]@{
         raw = $Expression.raw; canonical = $Expression.canonical
+        isDirectLocalizeCall = $Expression.isDirectLocalizeCall
         startByte = $Expression.startByte; lengthByte = $Expression.lengthByte
         fieldStartByte = $Expression.fieldStartByte; fieldLengthByte = $Expression.fieldLengthByte
         separatorStartByte = $Expression.separatorStartByte; separatorLengthByte = $Expression.separatorLengthByte
@@ -212,8 +213,9 @@ function Get-ExpectedClassification {
     $oldZhTw = if ($null -ne $OldUnit) { Get-CanonicalExpression -Expression $OldUnit.zhTwExpression } else { $null }
     $newZhTw = if ($null -ne $NewUnit) { Get-CanonicalExpression -Expression $NewUnit.zhTwExpression } else { $null }
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { return [ordered]@{ changeType = 'blocked'; action = 'BLOCKED'; blockedReason = $blockedReason } }
-    if ($null -eq $OldUnit) { return [ordered]@{ changeType = 'new_key'; action = 'AI_REQUIRED'; blockedReason = $null } }
     if ($null -eq $NewUnit) { return [ordered]@{ changeType = 'deleted_key'; action = 'ACCEPT_REMOVAL'; blockedReason = $null } }
+    if ([bool]$NewUnit.sourceExpression.isDirectLocalizeCall -and $null -eq $newZhTw) { return [ordered]@{ changeType = 'localized_source'; action = 'NONE'; blockedReason = $null } }
+    if ($null -eq $OldUnit) { return [ordered]@{ changeType = 'new_key'; action = 'AI_REQUIRED'; blockedReason = $null } }
     if ($null -eq $oldZhTw -and $null -eq $newZhTw) { return [ordered]@{ changeType = 'missing_zh_tw'; action = 'AI_REQUIRED'; blockedReason = $null } }
     if ($oldSource -ceq $newSource -and $oldZhTw -ceq $newZhTw) { return [ordered]@{ changeType = 'unchanged'; action = 'NONE'; blockedReason = $null } }
     if ($oldSource -ceq $newSource) { return [ordered]@{ changeType = 'zh_tw_only_changed'; action = 'RESTORE_OLD_ZH_TW'; blockedReason = $null } }
@@ -430,7 +432,7 @@ if ($bindingValueCount -eq 3 -and
     throw 'Localization workset unit inventory differs from independently parsed OLD and NEW bytes.'
 }
 $classificationCounts = [ordered]@{}
-foreach ($name in @('unchanged', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
+foreach ($name in @('unchanged', 'localized_source', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
     $classificationCounts[$name] = 0
 }
 foreach ($unit in @($workset.units)) {
@@ -455,7 +457,7 @@ foreach ($unit in @($workset.units)) {
     $classificationCounts[[string]$classification.changeType]++
 }
 $countKeys = @($workset.counts.Keys | Sort-Object)
-if (($countKeys -join ',') -cne 'blocked,deleted_key,missing_zh_tw,new_key,source_and_translation_changed,source_changed_translation_unchanged,unchanged,zh_tw_only_changed') {
+if (($countKeys -join ',') -cne 'blocked,deleted_key,localized_source,missing_zh_tw,new_key,source_and_translation_changed,source_changed_translation_unchanged,unchanged,zh_tw_only_changed') {
     throw 'Localization workset classification counts are malformed.'
 }
 foreach ($name in $classificationCounts.Keys) {

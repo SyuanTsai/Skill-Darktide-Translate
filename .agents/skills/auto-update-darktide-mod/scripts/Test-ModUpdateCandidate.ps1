@@ -1758,7 +1758,7 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
         [string]$localizationManifest.immutableContractSha256 -cne [string]$workset.immutableContractSha256) {
         throw 'Schema 15 localization manifest tuple differs from Candidate state or workset evidence.'
     }
-    $classificationNames = @('unchanged', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')
+    $classificationNames = @('unchanged', 'localized_source', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')
     if (@($localizationManifest.counts.Keys).Count -ne $classificationNames.Count -or @($state.localizationWorkset.counts.Keys).Count -ne $classificationNames.Count) {
         throw 'Schema 15 localization classification counts are malformed.'
     }

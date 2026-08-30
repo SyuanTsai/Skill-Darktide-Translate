@@ -380,6 +380,16 @@ function ConvertTo-Utf8ByteOffset {
     $BomLength + (Get-LuaUtf8ByteCount -Text $Text -StartIndex 0 -CharacterCount $CharacterIndex)
 }
 
+function Test-DirectLocalizeCall {
+    param([object[]] $Tokens, [int] $StartIndex, [int] $EndIndex)
+    if (($EndIndex - $StartIndex) -lt 2 -or
+        $Tokens[$StartIndex].type -cne 'identifier' -or $Tokens[$StartIndex].text -cne 'Localize' -or
+        $Tokens[$StartIndex + 1].text -cne '(' -or $Tokens[$EndIndex].text -cne ')') {
+        return $false
+    }
+    (Get-MatchingTokenIndex -Tokens $Tokens -StartIndex ($StartIndex + 1) -Open '(' -Close ')') -eq $EndIndex
+}
+
 function New-ExpressionRecord {
     param(
         [string] $Text,
@@ -403,6 +413,7 @@ function New-ExpressionRecord {
     [ordered]@{
         raw = $Text.Substring($valueStart, $valueEnd - $valueStart)
         canonical = Get-CanonicalTokenText -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
+        isDirectLocalizeCall = Test-DirectLocalizeCall -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
         startByte = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex $valueStart -BomLength $BomLength
         lengthByte = Get-LuaUtf8ByteCount -Text $Text -StartIndex $valueStart -CharacterCount ($valueEnd - $valueStart)
         fieldStartByte = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex $fieldStart -BomLength $BomLength

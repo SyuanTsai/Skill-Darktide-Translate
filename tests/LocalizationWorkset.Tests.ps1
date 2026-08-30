@@ -72,6 +72,8 @@ return {
         $document.units[2].key | Should -Be '[SettingNames.Enable]'
         $document.units[1].sourceExpression.raw | Should -Be 'string.format("Two %s", value)'
         $document.units[1].zhTwExpression.raw | Should -Be 'cf("貳")'
+        $document.units[1].sourceExpression.isDirectLocalizeCall | Should -BeFalse
+        $document.units[2].sourceExpression.isDirectLocalizeCall | Should -BeTrue
         $document.units[2].sourceExpression.startByte | Should -BeGreaterThan 0
         $document.units[2].zhTwExpression.lengthByte | Should -BeGreaterThan 0
     }
@@ -645,6 +647,74 @@ return {
 
         { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru } |
             Should -Throw '*reparse*'
+    }
+
+    # Scenario: Existing and newly added entries use a direct game Localize call while a neighboring entry appends custom text.
+    # Purpose: Skip redundant zh-tw authoring only for complete Localize(...) source expressions, without hiding composed text that still needs translation.
+    It 'InterT35_SkipsDirectLocalizeSourcesButStillTranslatesComposedExpressions' {
+        $repository = Join-Path $TestDrive 'direct-localize-workset-repository'
+        $oldModRoot = Join-Path $repository 'mods/ExampleMod'
+        New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
+        & git -C $repository init --quiet
+        & git -C $repository config user.name 'Direct Localize Workset Test'
+        & git -C $repository config user.email 'direct-localize-workset@example.invalid'
+        $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
+        @'
+return {
+    existing_localized = { en = Localize("loc_social_menu_leave_party") },
+    composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
+}
+'@ | Set-Content -LiteralPath $oldPath -NoNewline
+        & git -C $repository add mods/ExampleMod/ExampleMod_localization.lua
+        & git -C $repository commit --quiet -m 'base localization'
+        $baseOid = (& git -C $repository rev-parse HEAD).Trim()
+
+        $runRoot = Join-Path $repository 'AI Auto Update/In Progress/direct-localize'
+        $staging = Join-Path $runRoot 'staging/localization-workset-input/ExampleMod'
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        $newPath = Join-Path $staging 'ExampleMod_localization.lua'
+        @'
+return {
+    existing_localized = { en = Localize("loc_social_menu_leave_party") },
+    new_localized = { en = Localize("loc_item_type_end_of_round") },
+    composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
+}
+'@ | Set-Content -LiteralPath $newPath -NoNewline
+        $rawNewPath = Join-Path $runRoot 'review-artifacts/new.lua'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $rawNewPath) -Force | Out-Null
+        [IO.File]::WriteAllBytes($rawNewPath, [IO.File]::ReadAllBytes($newPath))
+        $outputPath = Join-Path $runRoot 'review-artifacts/localization-workset.json'
+
+        (& (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') `
+                -RepositoryRoot $repository -BaseOid $baseOid -ModRelativePath 'mods/ExampleMod' `
+                -StagingModPath $staging -OutputPath $outputPath -SourceId 'example' -PassThru).result |
+            Should -Be 'passed'
+        $workset = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+        foreach ($key in @('existing_localized', 'new_localized')) {
+            $unit = @($workset.units | Where-Object key -eq $key)[0]
+            $unit.changeType | Should -Be 'localized_source'
+            $unit.action | Should -Be 'NONE'
+            $unit.reviewStatus | Should -Be 'not-required'
+        }
+        $composed = @($workset.units | Where-Object key -eq 'composed')[0]
+        $composed.changeType | Should -Be 'missing_zh_tw'
+        $composed.action | Should -Be 'AI_REQUIRED'
+        $composed.reviewStatus = 'approved'
+        $composed.suggestedZhTwExpression = 'Localize("loc_social_menu_leave_party") .. " 現在"'
+        $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $outputPath -NoNewline
+
+        (& (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru).result | Should -Be 'passed'
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $applied = Get-LuaLocalizationDocument -Path $newPath -SourceId 'example'
+        foreach ($key in @('existing_localized', 'new_localized')) {
+            (@($applied.units | Where-Object key -eq $key)[0]).zhTwExpression | Should -BeNullOrEmpty
+        }
+        (@($applied.units | Where-Object key -eq 'composed')[0]).zhTwExpression.raw |
+            Should -Be 'Localize("loc_social_menu_leave_party") .. " 現在"'
+        (& (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') `
+                -WorksetPath $outputPath -NewPath $rawNewPath -MergedPath $newPath `
+                -RepositoryRoot $repository -ExpectedBaseOid $baseOid -ExpectedModRelativePath 'mods/ExampleMod' -PassThru).result |
+            Should -Be 'passed'
     }
 
     # Scenario: Apply has persisted its deterministic edit plan, then the process stops either before or after replacing NEW bytes.

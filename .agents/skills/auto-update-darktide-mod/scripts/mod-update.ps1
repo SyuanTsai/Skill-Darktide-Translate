@@ -4433,7 +4433,7 @@ function Get-PrBody {
         $approvedSpanCount = [int]$State.localizationWorkset.editCount
         $unchangedTargetCount = [int]$State.localizationWorkset.counts.unchanged
         $localizationScope = 'only program-selected zh-tw workset edits; BLOCKED=0'
-        $rows = foreach ($changeType in @('unchanged', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
+        $rows = foreach ($changeType in @('unchanged', 'localized_source', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
             "| $changeType | $($State.localizationWorkset.counts[$changeType]) |"
         }
         $localizationTable = "`n| Localization change type | Count |`n| --- | ---: |`n" + ($rows -join "`n")

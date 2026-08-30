@@ -47,6 +47,8 @@ NoBrainer run `eb45d710-80da-479b-b7fa-ab9429c06096` installed Nexus Main file `
 - Self-review then found that the first guard recognized only line-leading `mod_localization` assignments. UnitT137 was tightened to use a valid inline table registration; it reproduced the silent `passed`/`none` result before the detector was made independent of line position.
 - Final targeted validation passed UnitT35 and UnitT137 (2 passed, 0 failed).
 - Final full validation passed all 146 tests with 0 failed and 0 skipped in 617.03 seconds; package reference integrity and PowerShell parser validation also passed.
+- Follow-up review evidence showed C3 had inserted `leave_party["zh-tw"] = "離開小隊"` even though its complete source was `Localize("loc_social_menu_leave_party")`; review commit `40062a4c` removed that redundant field. The Skill now classifies an exact direct `Localize(...)` source with no zh-tw as deterministic `localized_source/NONE`, while composed expressions such as `Localize(...) .. "text"` remain translation targets.
+- The direct-Localize change followed Red/Green validation: InterT35 first failed as `missing_zh_tw`, then UnitT20 plus InterT35 passed, the complete localization-workset suite passed 24/24, and the final repository suite passed 147/147 in 646.62 seconds. Reference integrity, PowerShell parser validation, and `git diff --check` passed. The optional Skill Creator `quick_validate.py` could not start because both available Python environments lacked PyYAML; no dependency was installed, and the repository/GitHub Skill contract validators remain the release gates.
 
 ## Successful BornReady candidate
 

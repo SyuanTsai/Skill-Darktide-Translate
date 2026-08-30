@@ -103,7 +103,7 @@ New Schema 14 and Schema 15 states record the runtime Skill pin. A pre-0.3 Schem
 
 This subsection is Schema 14 only.
 
-The Agent first determines active `zh-tw` targets, wording, placeholders, markup, and lookup structure under Schema 14. It then supplies deterministic byte-span approvals over the Git-normalized indexed base:
+The Agent first determines active `zh-tw` targets, wording, placeholders, markup, and lookup structure under Schema 14. When the complete `en` expression is exactly a direct `Localize(...)` call and the unit has no zh-tw field, the game already resolves the active locale: exclude that unit from translation and do not add zh-tw. This exclusion does not apply to concatenation, formatting, fallback logic, or any other expression that merely contains a `Localize(...)` call, and it does not delete an existing zh-tw field. The Agent then supplies deterministic byte-span approvals over the Git-normalized indexed base:
 
 ```json
 {
@@ -137,7 +137,7 @@ Spans must not overlap. `oldSha256` binds each decision to the immutable indexed
 
 After raw installation, `localization` creates the fixed run-local `review-artifacts/localization-workset.json` with `New-LocalizationWorkset.ps1`. OLD comes from `baseOid`; NEW is a byte-identical physical staging copy. The scanner never executes Lua.
 
-If the workset contains pending `AI_REQUIRED` units, including active `missing_zh_tw` units, the runner returns `waiting-input`. Review only those unit IDs, set `reviewStatus` to `approved`, and provide `suggestedZhTwExpression`. Do not edit classification, action, paths, source spans, or non-AI units; non-AI review fields remain `not-required` and null. `immutableContractSha256` binds every other field and is independently recomputed. Resume the same `localization` stage.
+If the workset contains pending `AI_REQUIRED` units, including active `missing_zh_tw` units, the runner returns `waiting-input`. A no-zh-tw unit whose complete source expression is exactly a direct `Localize(...)` call is instead deterministic `localized_source/NONE`; composed expressions remain eligible for `AI_REQUIRED`. Review only those unit IDs, set `reviewStatus` to `approved`, and provide `suggestedZhTwExpression`. Do not edit classification, action, paths, source spans, or non-AI units; non-AI review fields remain `not-required` and null. `immutableContractSha256` binds every other field and is independently recomputed. Resume the same `localization` stage.
 
 `Apply-LocalizationWorkset.ps1` selects INSERT, REPLACE, or REMOVE, preserves BOM/newlines, and records byte edits. It persists a `pending` deterministic apply receipt before replacing NEW bytes; a resume accepts only the recorded input or output hash, then completes the same receipt. C2 checkpoints raw upstream localization and C3 applies the merged workset artifact. `Test-LocalizationWorksetReceipt.ps1` independently recomputes the exact authorized edits from immutable units plus raw NEW bytes and rejects any self-authorizing receipt mutation before the Gate proves the merged and Git bytes. A passing Gate records the workset hash and counts, then deletes the JSON through a separate pending/deleted receipt before publication; it is never added to Git.
 
