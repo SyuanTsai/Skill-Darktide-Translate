@@ -232,7 +232,7 @@ function Suspend-Stage {
     [pscustomobject]@{ result = $Result; status = $State.status; stage = $OutputStage; data = $Data }
 }
 '@
-        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        Import-Module (Join-Path (Join-Path $skillRoot 'scripts') 'LuaLocalizationScanner.psm1') -Force
         $module = New-Module -ScriptBlock ([scriptblock]::Create($stubs + "`n" + $functionAst.Extent.Text))
         try {
             $installRoot = Join-Path $TestDrive 'schema14-non-code-localization'
@@ -297,7 +297,7 @@ function Suspend-Stage {
     [pscustomobject]@{ result = $Result; status = $State.status; stage = $OutputStage; data = $Data }
 }
 '@
-        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        Import-Module (Join-Path (Join-Path $skillRoot 'scripts') 'LuaLocalizationScanner.psm1') -Force
         $module = New-Module -ScriptBlock ([scriptblock]::Create($stubs + "`n" + $functionAst.Extent.Text))
         try {
             $descriptors = @(
