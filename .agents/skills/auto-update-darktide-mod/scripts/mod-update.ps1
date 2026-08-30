@@ -2828,6 +2828,12 @@ function Invoke-Claim {
     New-Item -ItemType Directory -Path (Join-Path $runRoot 'artifacts') -Force | Out-Null
     $claimedArchive = Join-Path (Join-Path $runRoot 'source') ([IO.Path]::GetFileName($sourceFull))
 
+    $resolvedMetadataPaths = if (@($MetadataPath).Count -eq 0) {
+        @('README.md', ".hash/$slug.hash")
+    }
+    else {
+        @($MetadataPath)
+    }
     $state = [ordered]@{
         schemaVersion = if ($sourceReceipt) { 15 } else { 14 }
         workflowSchemaVersion = if ($sourceReceipt) { 15 } else { 14 }
@@ -2852,7 +2858,7 @@ function Invoke-Claim {
         pullRequestBase = $PullRequestBase
         baseOid = $baseOid
         checkedMainOid = $baseOid
-        metadataPaths = @($MetadataPath)
+        metadataPaths = @($resolvedMetadataPaths)
         sourceReceipt = $sourceReceipt
         sourceTuple = $sourceTuple
         sourceAcquisition = if ($sourceReceipt) {
@@ -4099,10 +4105,24 @@ function Invoke-BuildCommits {
     $stage = Start-Stage -Name 'build-commits'
     try {
         Assert-LockOwner -State $State
-        if ($State.published) { throw 'A published evidence branch is append-only; completed checkpoints are never reset or rebuilt in place.' }
         $worktree = Assert-NoReparsePath -Path ([string]$State.worktreePath) `
             -Root ([IO.Path]::GetPathRoot([string]$State.worktreePath)) -Label 'Evidence worktree'
         $null = Assert-NoReparseTree -Path ([string]$State.installRoot) -Root $worktree -Label 'Installed MOD tree before evidence commits'
+
+        $remoteTrackingRef = "refs/remotes/$($State.remote)/$($State.branch)"
+        $remoteTracking = Invoke-Git -WorkingDirectory $worktree -Arguments @('show-ref', '--verify', '--quiet', $remoteTrackingRef) -AllowFailure
+        if (-not $State.published -and $remoteTracking.exitCode -eq 0) {
+            $remoteTrackingOid = Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', '--verify', "$remoteTrackingRef^{commit}")
+            $State.published = $true
+            $State.headOid = $remoteTrackingOid.output.Trim()
+            Save-State -State $State
+            throw 'The run state said unpublished, but its remote-tracking branch already exists. State was repaired to published; prepare an append-only same-run refresh before rebuilding checkpoints.'
+        }
+        if ($remoteTracking.exitCode -notin @(0, 1)) { throw 'Unable to inspect the run remote-tracking branch before build-commits.' }
+
+        if ($State.published) {
+            throw 'A published evidence branch is append-only; completed checkpoints are never reset or rebuilt in place. Use the Workflow append-only same-run refresh procedure.'
+        }
 
         $metadataPreparation = @(Assert-BuildMetadataPaths -State $State -AllowMissing)
         $missingMetadataPaths = @($metadataPreparation | Where-Object { -not $_.exists } | ForEach-Object { [string]$_.relativePath })

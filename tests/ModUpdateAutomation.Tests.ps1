@@ -1765,7 +1765,7 @@ function Get-SourceTupleContractSha256 {
         $claimWallClock = [Diagnostics.Stopwatch]::StartNew()
         $claim = & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $archivePath -ModDirectory 'ExampleMod' `
             -SourceRequestPath $manualSourceRequestPath -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD `
-            -MetadataPath 'README.md', '.hash/examplemod.hash' -PassThru
+            -PassThru
         $claimWallClock.Stop()
         $claim.result | Should -Be 'passed'
         $claim.status | Should -Be 'worktree-ready'
@@ -1785,6 +1785,7 @@ function Get-SourceTupleContractSha256 {
         $claimOwner.workerId | Should -BeNullOrEmpty
 
         $claimedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        @($claimedState.metadataPaths) | Should -Be @('README.md', '.hash/examplemod.hash')
         $secondArchivePath = Join-Path $queueRoot 'ExampleMod-second.zip'
         [IO.File]::Copy($claimedState.archive.path, $secondArchivePath)
         $secondSourceRequestPath = Join-Path $TestDrive 'manual-source-request-second.json'
@@ -1933,6 +1934,9 @@ function Get-SourceTupleContractSha256 {
 
         $unexpectedInstallPath = Join-Path ([string]$recoveredLocalizationState.installRoot) 'unexpected-after-install.txt'
         [IO.File]::WriteAllText($unexpectedInstallPath, 'not from the verified archive', [Text.UTF8Encoding]::new($false))
+        $remoteTrackingRef = "refs/remotes/$($recoveredLocalizationState.remote)/$($recoveredLocalizationState.branch)"
+        & git -C $recoveredLocalizationState.worktreePath show-ref --verify --quiet $remoteTrackingRef
+        $LASTEXITCODE | Should -Be 1
         { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
             Should -Throw '*Pre-C1 raw install tree file count differs from its immutable manifest*'
         $installDriftState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
@@ -2191,15 +2195,30 @@ function Get-SourceTupleContractSha256 {
             Should -Throw '*Recorded partial HEAD is not bound to the saved build-commits recovery evidence*'
         (& git -C $state.worktreePath rev-parse HEAD).Trim() | Should -Be $headBeforeRerun
 
-        $recoveryState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
-        $recoveryState.status = 'candidate-committed'
-        $recoveryState.published = $true
-        $recoveryState.completedStages = @($recoveryState.completedStages | Where-Object { $_ -ne 'build-commits' })
-        [IO.File]::WriteAllText($statePath, ($recoveryState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        & git -C $state.worktreePath update-ref $remoteTrackingRef $headBeforeRerun
+        $LASTEXITCODE | Should -Be 0
+        $unpublishedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $evidenceChainBeforeRepair = $unpublishedState.evidenceChain | ConvertTo-Json -Depth 20 -Compress
+        $completedStagesBeforeRepair = @($unpublishedState.completedStages)
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*state said unpublished*remote-tracking branch already exists*'
+        $repairedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $repairedState.published | Should -BeTrue
+        $repairedState.headOid | Should -Be $headBeforeRerun
+        ($repairedState.evidenceChain | ConvertTo-Json -Depth 20 -Compress) | Should -Be $evidenceChainBeforeRepair
+        @($repairedState.completedStages) | Should -Be $completedStagesBeforeRepair
         { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
             Should -Throw '*append-only*'
 
+        $baseMismatchState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $baseMismatchState.baseOid = $baseMismatchState.evidenceChain.c1Oid
+        [IO.File]::WriteAllText($statePath, ($baseMismatchState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        { & $validatorPath -StatePath $statePath -PassThru } |
+            Should -Throw '*base-c0-identity*State base OID differs from C0*'
+        (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).candidateGate.status | Should -Be 'rejected'
+
         $tamperState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $tamperState.baseOid = $tamperState.evidenceChain.c0Oid
         $tamperState.published = $false
         $tamperState.status = 'candidate-committed'
         $tamperState.completedStages = @($tamperState.completedStages + 'build-commits' | Sort-Object -Unique)

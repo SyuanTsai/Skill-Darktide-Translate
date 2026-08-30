@@ -1536,6 +1536,17 @@ Add-ValidationCheck -Name 'candidate-head' -Action {
     $head
 }
 
+Add-ValidationCheck -Name 'base-c0-identity' -Action {
+    if ([string]::IsNullOrWhiteSpace([string]$state.baseOid) -or
+        [string]::IsNullOrWhiteSpace([string]$chain.c0Oid)) {
+        throw 'State base OID or C0 is missing.'
+    }
+    if ([string]$state.baseOid -cne [string]$chain.c0Oid) {
+        throw 'State base OID differs from C0.'
+    }
+    [string]$state.baseOid
+}
+
 Add-ValidationCheck -Name 'parent-tree-invariants' -Action {
     $c1Parent = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('rev-parse', "$($chain.c1Oid)^1")).output.Trim()
     $c1ParentTree = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('rev-parse', "$($chain.c1Oid)^1^{tree}")).output.Trim()
@@ -1731,7 +1742,6 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
     if ([string]$state.localizationMode -cne 'zh-tw' -or @($state.localizationFiles).Count -ne 1) {
         throw 'Schema 15 Candidate state must contain exactly one localization file.'
     }
-    if ([string]$state.baseOid -cne [string]$chain.c0Oid) { throw 'Schema 15 state base OID differs from C0.' }
     $worksetPath = Assert-NoReparsePath -Path ([string]$state.localizationWorkset.path) -Root ([string]$state.repositoryRoot) -Label 'Localization workset'
     if ($worksetPath -cne [IO.Path]::GetFullPath((Join-Path ([string]$state.runRoot) 'review-artifacts/localization-workset.json'))) {
         throw 'Localization workset is outside its fixed run-local path.'
