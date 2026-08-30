@@ -572,7 +572,14 @@ function Assert-SourceTupleIntegrity {
     }
     $actualMetadataPaths = @($previewFiles | ForEach-Object { ([string]$_.path).Replace('\', '/') } | Sort-Object)
     $expectedMetadataPaths = @($requiredMetadataFields.Keys | Sort-Object)
-    if (($actualMetadataPaths -join "`n") -cne ($expectedMetadataPaths -join "`n")) {
+    $matchesRequiredMetadataPaths = $actualMetadataPaths.Count -eq $expectedMetadataPaths.Count
+    foreach ($expectedMetadataPath in $expectedMetadataPaths) {
+        $matches = @($actualMetadataPaths | Where-Object {
+            $_.Equals($expectedMetadataPath, [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($matches.Count -ne 1) { $matchesRequiredMetadataPaths = $false }
+    }
+    if (-not $matchesRequiredMetadataPaths) {
         throw 'Metadata preview requires exactly README.md and this MOD formal hash file.'
     }
     $previewInput = [ordered]@{
