@@ -3433,6 +3433,7 @@ function Invoke-LocalizationWorkset {
         unitCount = @($workset.units).Count
         editCount = @($workset.apply.edits).Count
     }
+    $State.waitingReason = $null
     $State.status = 'localized'
     Complete-Stage -State $State -Context $stage -ArtifactSha256 (Get-FileSha256 -Path $manifestPath) -Data ([ordered]@{ mode = 'zh-tw-workset'; fileCount = 1; workset = $State.localizationWorkset })
 }
@@ -3546,6 +3547,7 @@ function Invoke-Localization {
     $targetPathBytes = [Text.Encoding]::UTF8.GetBytes($targetPathJson)
     $State.evidenceTargetPathsSha256 = Get-Sha256Bytes -Bytes $targetPathBytes
     $State.localizationManifestPath = $manifestPath
+    $State.waitingReason = $null
     $State.status = 'localized'
     Complete-Stage -State $State -Context $stage -ArtifactSha256 (Get-FileSha256 -Path $manifestPath) -Data ([ordered]@{ mode = $plan.mode; fileCount = $records.Count })
 }
@@ -4143,6 +4145,7 @@ function Invoke-BuildCommits {
                 })
         }
 
+        $State.waitingReason = $null
         $validator = Join-Path $PSScriptRoot 'Test-ModUpdateCandidate.ps1'
         $securityValidation = & $validator -StatePath $State.statePath -SecurityPayloadOnly `
             -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
