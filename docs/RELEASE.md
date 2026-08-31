@@ -6,16 +6,15 @@ This repository is versioned independently from the target DARKTIDE MOD reposito
 
 ## Release checklist
 
-1. Run `pwsh -File ./tests/Invoke-Tests.ps1`.
-2. Run `pwsh -File ./.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1`.
-3. Run `pwsh -File ./scripts/Get-SourcePin.ps1 -Ref HEAD` and retain the complete JSON: resolved commit, content SHA-256, Skill path, and per-file blob/SHA-256 manifest.
-4. Confirm the catalog exposes only `auto-update-darktide-mod` through the opt-in `darktide-mod-maintenance` profile.
-5. Confirm Schema 15 acquisition and multi-process tests cover known unsupported extensions before download, signature detection, partial downloads, URL sanitization, receipt verification, same-run claim, loader preflight, queue deduplication, the concurrency ceiling, distinct-MOD isolation, competing generations, stale-owner recovery, and old-token rejection.
-6. Confirm localization-workset tests cover deterministic classification (including missing zh-tw and fully locale-resolved `Localize(...)` expressions), byte spans, AI-only edit authorization, pure-loader exclusion, independent receipt-plan recomputation, idempotence, and Candidate Gate rejection outside approved edits.
-7. Confirm the GitHub `Validate` and `Skill Quality Gate` workflows pass on the exact PR head.
-8. Merge the approved release commit to `main`.
-9. Create an annotated tag matching `VERSION`, resolve it to an immutable commit, and regenerate the source content hash.
-10. Consumers retain that source-pin JSON outside the installed Skill and target repository, verify it with `Test-ReferenceIntegrity.ps1 -SkillSourcePinPath`, and pass it to every new `mod-update.ps1` run. The runner archives a run-owned copy.
+1. Commit the intended release snapshot, require a clean working tree and index, and run `pwsh -File ./scripts/Invoke-PrePushValidation.ps1` before push. This is the same clean-HEAD gate used by GitHub and binds the complete test suite, packaged-reference integrity, and source-pin validation to one unchanged commit.
+2. Run `pwsh -File ./scripts/Get-SourcePin.ps1 -Ref HEAD` and retain the complete JSON: resolved commit, content SHA-256, Skill path, and per-file blob/SHA-256 manifest.
+3. Confirm the catalog exposes only `auto-update-darktide-mod` through the opt-in `darktide-mod-maintenance` profile.
+4. Confirm Schema 15 acquisition and multi-process tests cover known unsupported extensions before download, signature detection, partial downloads, URL sanitization, receipt verification, same-run claim, loader preflight, queue deduplication, the concurrency ceiling, distinct-MOD isolation, competing generations, stale-owner recovery, and old-token rejection.
+5. Confirm localization-workset tests cover deterministic classification (including missing zh-tw and fully locale-resolved `Localize(...)` expressions), byte spans, AI-only edit authorization, pure-loader exclusion, independent receipt-plan recomputation, idempotence, and Candidate Gate rejection outside approved edits.
+6. Confirm the GitHub `Validate` and `Skill Quality Gate` workflows pass on the exact PR head.
+7. Merge the approved release commit to `main`.
+8. Create an annotated tag matching `VERSION`, resolve it to an immutable commit, and regenerate the source content hash.
+9. Consumers retain that source-pin JSON outside the installed Skill and target repository, verify it with `Test-ReferenceIntegrity.ps1 -SkillSourcePinPath`, and pass it to every new `mod-update.ps1` run. The runner archives a run-owned copy.
 
 A live Nexus smoke test is optional and must never persist API keys, ephemeral download URLs, cookies, authorization headers, or signed URL query strings. Synthetic tests remain the mandatory deterministic release gate.
 

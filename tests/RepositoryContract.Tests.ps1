@@ -64,6 +64,8 @@ Describe 'Darktide Translate repository contract' {
             'docs/RELEASE.md',
             'docs/ROLLBACK.md',
             'scripts/Get-SourcePin.ps1',
+            'scripts/Invoke-PrePushValidation.ps1',
+            'scripts/Test-CleanRepositoryHead.ps1',
             'tests/Invoke-Tests.ps1',
             'VERSION'
         )
@@ -181,9 +183,7 @@ Describe 'Darktide Translate repository contract' {
 
         $validate = Get-Content -LiteralPath $validatePath -Raw
         $validate | Should -Match 'MinimumVersion 5\.0\.0'
-        $validate | Should -Match 'tests/Invoke-Tests\.ps1'
-        $validate | Should -Match 'Test-ReferenceIntegrity\.ps1'
-        $validate | Should -Match 'scripts/Get-SourcePin\.ps1 -Ref HEAD'
+        $validate | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
 
         $exactHeadRef = 'ref: ${{ github.event_name == ''pull_request'' && github.event.pull_request.head.sha || github.sha }}'
         $validate | Should -Match ([regex]::Escape($exactHeadRef))
