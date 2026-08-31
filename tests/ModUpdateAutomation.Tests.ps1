@@ -1694,8 +1694,8 @@ function Get-SourceTupleContractSha256 {
         }
     }
 
-    # Scenario: the Candidate Gate fails once, records status=failed, then passes on a same-run retry.
-    # Purpose: Restore the publishable checkpoint state while preserving failed-attempt history in stage timings.
+    # Scenario: the Candidate Gate retry passes after a failure, or either repair guard remains unsatisfied.
+    # Purpose: Restore only the valid publishable checkpoint while preserving all non-eligible states and diagnostics.
     It 'UnitT210_RepairsTheTopLevelStateAfterACandidateGateRetryPasses' {
         $tokens = $null
         $parseErrors = $null
@@ -1720,6 +1720,27 @@ function Get-SourceTupleContractSha256 {
         $state.waitingReason | Should -BeNullOrEmpty
         $state.lastError | Should -BeNullOrEmpty
         $state.stageTimings.validate.attempts[0].result | Should -Be 'failed'
+
+        $negativeCases = @(
+            [ordered]@{ candidateGateStatus = 'rejected'; status = 'failed' },
+            [ordered]@{ candidateGateStatus = 'passed'; status = 'waiting-user' }
+        )
+        foreach ($case in $negativeCases) {
+            $unchangedState = [ordered]@{
+                status = $case.status
+                waitingReason = [ordered]@{ code = 'keep-wait' }
+                lastError = [ordered]@{ stage = 'validate'; error = 'keep-error' }
+                candidateGate = [ordered]@{ status = $case.candidateGateStatus }
+                stageTimings = [ordered]@{ validate = [ordered]@{ attempts = @([ordered]@{ result = 'failed' }) } }
+            }
+
+            (& $module { param($value) Repair-SuccessfulCandidateGateState -State $value } $unchangedState) | Should -BeFalse
+            $unchangedState.status | Should -Be $case.status
+            $unchangedState.waitingReason.code | Should -Be 'keep-wait'
+            $unchangedState.lastError.error | Should -Be 'keep-error'
+            $unchangedState.candidateGate.status | Should -Be $case.candidateGateStatus
+            $unchangedState.stageTimings.validate.attempts[0].result | Should -Be 'failed'
+        }
     }
 
     # Scenario: A real ZIP changes an active localization file, including metadata preflight failures and resumable evidence failures.
