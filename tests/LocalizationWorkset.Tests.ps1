@@ -80,11 +80,13 @@ return {
         $document.units[2].zhTwExpression.lengthByte | Should -BeGreaterThan 0
     }
 
-    # Scenario: A localization file shadows the game-global Localize name before using the same call syntax in a source expression.
-    # Purpose: Reserve localized_source for proven game-global calls so local helpers cannot hide untranslated English text.
+    # Scenario: Localization expressions use a game-global Localize call directly, combine only localized values and neutral separators, or shadow Localize.
+    # Purpose: Reserve localized_source for expressions whose visible text is fully locale-resolved without hiding literal or shadowed text.
     It 'UnitT22_RejectsShadowedLocalizeCallsFromTheLocalizedSourceException' {
         Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
         $globalLua = 'return { key = { en = Localize("loc_social_menu_leave_party") } }'
+        $contentlessLua = 'return { key = { en = (Localize("loc_weapon_special_defensive_stance") .. " - " .. Localize("loc_weapon_family_ogryn_powermaul_slabshield_p1_m1")) } }'
+        $contentfulLua = 'return { key = { en = Localize("loc_social_menu_leave_party") .. " now" } }'
         $shadowedLua = 'local Localize = function(value) return value end; return { key = { en = Localize("plain English") } }'
 
         $globalDocument = Get-LuaLocalizationDocument `
@@ -93,9 +95,19 @@ return {
         $shadowedDocument = Get-LuaLocalizationDocument `
             -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($shadowedLua)) `
             -DisplayPath '<shadowed-localize>' -SourceId 'shadowed-localize'
+        $contentlessDocument = Get-LuaLocalizationDocument `
+            -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($contentlessLua)) `
+            -DisplayPath '<contentless-localize>' -SourceId 'contentless-localize'
+        $contentfulDocument = Get-LuaLocalizationDocument `
+            -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($contentfulLua)) `
+            -DisplayPath '<contentful-localize>' -SourceId 'contentful-localize'
 
         $globalDocument.units[0].sourceExpression.isDirectLocalizeCall | Should -BeTrue
         $shadowedDocument.units[0].sourceExpression.isDirectLocalizeCall | Should -BeFalse
+        $globalDocument.units[0].sourceExpression.isFullyLocaleResolvedExpression | Should -BeTrue
+        $contentlessDocument.units[0].sourceExpression.isFullyLocaleResolvedExpression | Should -BeTrue
+        $contentfulDocument.units[0].sourceExpression.isFullyLocaleResolvedExpression | Should -BeFalse
+        $shadowedDocument.units[0].sourceExpression.isFullyLocaleResolvedExpression | Should -BeFalse
     }
 
     # Scenario: A bracketed zh-tw language key uses a valid Lua hexadecimal escape for the hyphen.
@@ -669,9 +681,9 @@ return {
             Should -Throw '*reparse*'
     }
 
-    # Scenario: Existing and newly added entries use a direct game Localize call while a neighboring entry appends custom text.
-    # Purpose: Skip redundant zh-tw authoring only for complete Localize(...) source expressions, without hiding composed text that still needs translation.
-    It 'InterT35_SkipsDirectLocalizeSourcesButStillTranslatesComposedExpressions' {
+    # Scenario: Entries use direct or composed game Localize calls, with either neutral separators or literal content.
+    # Purpose: Skip redundant zh-tw authoring when all visible text is locale-resolved, while translating compositions that add actual text.
+    It 'InterT35_SkipsContentlessLocalizeSourcesButStillTranslatesContentfulExpressions' {
         $repository = Join-Path $TestDrive 'direct-localize-workset-repository'
         $oldModRoot = Join-Path $repository 'mods/ExampleMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
@@ -683,7 +695,7 @@ return {
 return {
     existing_localized = { en = Localize("loc_social_menu_leave_party") },
     existing_translated = { en = Localize("loc_social_menu_leave_party"), ["zh-tw"] = "保留既有翻譯" },
-    composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
+    contentful_composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
 }
 '@ | Set-Content -LiteralPath $oldPath -NoNewline
         & git -C $repository add mods/ExampleMod/ExampleMod_localization.lua
@@ -699,7 +711,9 @@ return {
     existing_localized = { en = Localize("loc_social_menu_leave_party") },
     existing_translated = { en = Localize("loc_social_menu_leave_party") },
     new_localized = { en = Localize("loc_item_type_end_of_round") },
-    composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
+    contentless_composed = { en = Localize("loc_weapon_special_defensive_stance") .. " - " .. Localize("loc_weapon_family_ogryn_powermaul_slabshield_p1_m1") },
+    parenthesized_contentless = { en = (Localize("loc_weapon_special_defensive_stance") .. " / " .. Localize("loc_weapon_family_ogryn_powermaul_slabshield_p1_m1")) },
+    contentful_composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
 }
 '@ | Set-Content -LiteralPath $newPath -NoNewline
         $rawNewPath = Join-Path $runRoot 'review-artifacts/new.lua'
@@ -712,7 +726,7 @@ return {
                 -StagingModPath $staging -OutputPath $outputPath -SourceId 'example' -PassThru).result |
             Should -Be 'passed'
         $workset = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
-        foreach ($key in @('existing_localized', 'new_localized')) {
+        foreach ($key in @('existing_localized', 'new_localized', 'contentless_composed', 'parenthesized_contentless')) {
             $unit = @($workset.units | Where-Object key -eq $key)[0]
             $unit.changeType | Should -Be 'localized_source'
             $unit.action | Should -Be 'NONE'
@@ -722,7 +736,7 @@ return {
         $existingTranslated.changeType | Should -Be 'zh_tw_only_changed'
         $existingTranslated.action | Should -Be 'RESTORE_OLD_ZH_TW'
         $existingTranslated.reviewStatus | Should -Be 'not-required'
-        $composed = @($workset.units | Where-Object key -eq 'composed')[0]
+        $composed = @($workset.units | Where-Object key -eq 'contentful_composed')[0]
         $composed.changeType | Should -Be 'missing_zh_tw'
         $composed.action | Should -Be 'AI_REQUIRED'
         $composed.reviewStatus = 'approved'
@@ -732,12 +746,12 @@ return {
         (& (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru).result | Should -Be 'passed'
         Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
         $applied = Get-LuaLocalizationDocument -Path $newPath -SourceId 'example'
-        foreach ($key in @('existing_localized', 'new_localized')) {
+        foreach ($key in @('existing_localized', 'new_localized', 'contentless_composed', 'parenthesized_contentless')) {
             (@($applied.units | Where-Object key -eq $key)[0]).zhTwExpression | Should -BeNullOrEmpty
         }
         (@($applied.units | Where-Object key -eq 'existing_translated')[0]).zhTwExpression.raw |
             Should -Be '"保留既有翻譯"'
-        (@($applied.units | Where-Object key -eq 'composed')[0]).zhTwExpression.raw |
+        (@($applied.units | Where-Object key -eq 'contentful_composed')[0]).zhTwExpression.raw |
             Should -Be 'Localize("loc_social_menu_leave_party") .. " 現在"'
         (& (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') `
                 -WorksetPath $outputPath -NewPath $rawNewPath -MergedPath $newPath `
