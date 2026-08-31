@@ -264,9 +264,9 @@ function Suspend-Stage {
         }
     }
 
-    # Scenario: A Schema 14 MOD descriptor registers mod_localization and the caller omits a localization plan.
-    # Purpose: Detect equivalent bare, multiline, and bracketed Lua table fields so active localization cannot silently become mode=none.
-    It 'UnitT137_SuspendsSchema14LocalizationWhenARegisteredSourceHasNoPlan' {
+    # Scenario: A Schema 14 MOD descriptor registers mod_localization, first suspends without a plan, then resumes with an explicit mode=none plan.
+    # Purpose: Detect equivalent Lua table fields and clear the resolved localization-plan waiting reason after the same state resumes successfully.
+    It 'UnitT137_SuspendsAndResumesSchema14LocalizationWithAnExplicitPlan' {
         $tokens = $null
         $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
@@ -300,6 +300,9 @@ function Suspend-Stage {
         Import-Module (Join-Path (Join-Path $skillRoot 'scripts') 'LuaLocalizationScanner.psm1') -Force
         $module = New-Module -ScriptBlock ([scriptblock]::Create($stubs + "`n" + $functionAst.Extent.Text))
         try {
+            $planPath = Join-Path $TestDrive 'schema14-explicit-none-plan.json'
+            [ordered]@{ schemaVersion = 1; mode = 'none'; files = @(); removedPaths = @() } |
+                ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $planPath -NoNewline
             $descriptors = @(
                 'return { run = function() new_mod("ExampleMod", { mod_localization = "ExampleMod/ExampleMod_localization" }) end }',
                 "return { run = function() new_mod(`"ExampleMod`", { mod_localization`n=`n`"ExampleMod/ExampleMod_localization`" }) end }",
@@ -324,6 +327,7 @@ function Suspend-Stage {
                     evidenceChain = [ordered]@{ c0Oid = '1' * 40 }
                 }
 
+                & $module { $script:LocalizationPlanPath = $null }
                 $result = & $module { param($value) Invoke-Localization -State $value } $state
 
                 $result.result | Should -Be 'waiting-input'
@@ -333,6 +337,13 @@ function Suspend-Stage {
                 $state.status | Should -Be 'waiting-input'
                 $state.waitingReason.code | Should -Be 'localization_plan_required'
                 $state.Contains('localizationMode') | Should -BeFalse
+
+                & $module { param($path) $script:LocalizationPlanPath = $path } $planPath
+                $resumed = & $module { param($value) Invoke-Localization -State $value } $state
+
+                $resumed.result | Should -Be 'passed'
+                $state.status | Should -Be 'localized'
+                $state.waitingReason | Should -BeNullOrEmpty
             }
         }
         finally {
@@ -1994,6 +2005,7 @@ function Get-SourceTupleContractSha256 {
         $recordedC1State = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         $recordedC1State.evidenceChain.c1Oid | Should -Match '^[0-9a-f]{40}$'
         $recordedC1State.evidenceChain.c2Oid | Should -BeNullOrEmpty
+        $recordedC1State.waitingReason | Should -BeNullOrEmpty
         $recordedC1State.buildCommitsRecovery.partialCheckpoint | Should -Be 'c1'
         $recordedC1State.buildCommitsRecovery.recoveryDisposition | Should -Be 'same-run-checkpoint-resume'
 
