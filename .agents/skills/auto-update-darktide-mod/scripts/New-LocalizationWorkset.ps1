@@ -216,7 +216,7 @@ function New-UnitRecord {
     $changeType = $null; $action = $null
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { $changeType = 'blocked'; $action = 'BLOCKED' }
     elseif ($null -eq $NewUnit) { $changeType = 'deleted_key'; $action = 'ACCEPT_REMOVAL' }
-    elseif ([bool]$NewUnit.sourceExpression.isDirectLocalizeCall -and $null -eq $oldZhTw -and $null -eq $newZhTw) { $changeType = 'localized_source'; $action = 'NONE' }
+    elseif ([bool]$NewUnit.sourceExpression.isFullyLocaleResolvedExpression -and $null -eq $oldZhTw -and $null -eq $newZhTw) { $changeType = 'localized_source'; $action = 'NONE' }
     elseif ($null -eq $OldUnit) { $changeType = 'new_key'; $action = 'AI_REQUIRED' }
     elseif ($null -eq $oldZhTw -and $null -eq $newZhTw) { $changeType = 'missing_zh_tw'; $action = 'AI_REQUIRED' }
     elseif ($oldSource -ceq $newSource -and $oldZhTw -ceq $newZhTw) { $changeType = 'unchanged'; $action = 'NONE' }

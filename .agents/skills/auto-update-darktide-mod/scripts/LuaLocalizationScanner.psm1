@@ -392,15 +392,95 @@ function Test-LuaIdentifierIsOnlyCalled {
     $true
 }
 
-function Test-DirectLocalizeCall {
+function Test-DirectLocalizeCallRange {
     param([object[]] $Tokens, [int] $StartIndex, [int] $EndIndex)
     if (($EndIndex - $StartIndex) -lt 2 -or
         $Tokens[$StartIndex].type -cne 'identifier' -or $Tokens[$StartIndex].text -cne 'Localize' -or
         $Tokens[$StartIndex + 1].text -cne '(' -or $Tokens[$EndIndex].text -cne ')') {
         return $false
     }
-    if (-not (Test-LuaIdentifierIsOnlyCalled -Tokens $Tokens -Name 'Localize')) { return $false }
     (Get-MatchingTokenIndex -Tokens $Tokens -StartIndex ($StartIndex + 1) -Open '(' -Close ')') -eq $EndIndex
+}
+
+function Test-DirectLocalizeCall {
+    param([object[]] $Tokens, [int] $StartIndex, [int] $EndIndex)
+    if (-not (Test-LuaIdentifierIsOnlyCalled -Tokens $Tokens -Name 'Localize')) { return $false }
+    Test-DirectLocalizeCallRange -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex
+}
+
+function Test-NeutralLuaStringLiteral {
+    param([object[]] $Tokens, [int] $StartIndex, [int] $EndIndex)
+    if ($StartIndex -ne $EndIndex -or $Tokens[$StartIndex].type -cne 'string') { return $false }
+    try { $content = ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$StartIndex].text) }
+    catch { return $false }
+    $content -notmatch '[\p{L}\p{N}]'
+}
+
+function Get-FullyLocaleResolvedExpressionPart {
+    param([object[]] $Tokens, [int] $StartIndex, [int] $EndIndex, [int] $Depth)
+    if ($StartIndex -gt $EndIndex -or $Depth -gt 256) {
+        return [pscustomobject]@{ valid = $false; hasLocalize = $false }
+    }
+
+    while ($StartIndex -lt $EndIndex -and $Tokens[$StartIndex].text -ceq '(') {
+        $matchingIndex = Get-MatchingTokenIndex -Tokens $Tokens -StartIndex $StartIndex -Open '(' -Close ')'
+        if ($matchingIndex -ne $EndIndex) { break }
+        $StartIndex++
+        $EndIndex--
+    }
+
+    if (Test-DirectLocalizeCallRange -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex) {
+        return [pscustomobject]@{ valid = $true; hasLocalize = $true }
+    }
+    if (Test-NeutralLuaStringLiteral -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex) {
+        return [pscustomobject]@{ valid = $true; hasLocalize = $false }
+    }
+
+    $segments = [Collections.Generic.List[object]]::new()
+    $segmentStart = $StartIndex
+    $parenthesisDepth = 0
+    $bracketDepth = 0
+    $braceDepth = 0
+    for ($index = $StartIndex; $index -le $EndIndex; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        $token = [string]$Tokens[$index].text
+        switch -CaseSensitive ($token) {
+            '(' { $parenthesisDepth++ }
+            ')' { $parenthesisDepth-- }
+            '[' { $bracketDepth++ }
+            ']' { $bracketDepth-- }
+            '{' { $braceDepth++ }
+            '}' { $braceDepth-- }
+        }
+        if ($parenthesisDepth -lt 0 -or $bracketDepth -lt 0 -or $braceDepth -lt 0) {
+            return [pscustomobject]@{ valid = $false; hasLocalize = $false }
+        }
+        if ($token -ceq '..' -and $parenthesisDepth -eq 0 -and $bracketDepth -eq 0 -and $braceDepth -eq 0) {
+            if ($index -eq $segmentStart) { return [pscustomobject]@{ valid = $false; hasLocalize = $false } }
+            $segments.Add([pscustomobject]@{ start = $segmentStart; end = $index - 1 })
+            $segmentStart = $index + 1
+        }
+    }
+    if ($parenthesisDepth -ne 0 -or $bracketDepth -ne 0 -or $braceDepth -ne 0 -or
+        $segments.Count -eq 0 -or $segmentStart -gt $EndIndex) {
+        return [pscustomobject]@{ valid = $false; hasLocalize = $false }
+    }
+    $segments.Add([pscustomobject]@{ start = $segmentStart; end = $EndIndex })
+
+    $hasLocalize = $false
+    foreach ($segment in $segments) {
+        $result = Get-FullyLocaleResolvedExpressionPart -Tokens $Tokens -StartIndex $segment.start -EndIndex $segment.end -Depth ($Depth + 1)
+        if (-not $result.valid) { return [pscustomobject]@{ valid = $false; hasLocalize = $false } }
+        $hasLocalize = $hasLocalize -or $result.hasLocalize
+    }
+    [pscustomobject]@{ valid = $true; hasLocalize = $hasLocalize }
+}
+
+function Test-FullyLocaleResolvedExpression {
+    param([object[]] $Tokens, [int] $StartIndex, [int] $EndIndex)
+    if (-not (Test-LuaIdentifierIsOnlyCalled -Tokens $Tokens -Name 'Localize')) { return $false }
+    $result = Get-FullyLocaleResolvedExpressionPart -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex -Depth 0
+    [bool]($result.valid -and $result.hasLocalize)
 }
 
 function Test-LuaTableFieldAssignment {
@@ -469,6 +549,7 @@ function New-ExpressionRecord {
         raw = $Text.Substring($valueStart, $valueEnd - $valueStart)
         canonical = Get-CanonicalTokenText -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
         isDirectLocalizeCall = Test-DirectLocalizeCall -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
+        isFullyLocaleResolvedExpression = Test-FullyLocaleResolvedExpression -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
         startByte = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex $valueStart -BomLength $BomLength
         lengthByte = Get-LuaUtf8ByteCount -Text $Text -StartIndex $valueStart -CharacterCount ($valueEnd - $valueStart)
         fieldStartByte = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex $fieldStart -BomLength $BomLength

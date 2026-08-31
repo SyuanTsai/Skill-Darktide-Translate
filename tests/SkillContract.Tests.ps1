@@ -32,7 +32,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $result.result | Should -Be 'passed'
         $result.workflow.sha256 | Should -Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
         $result.reviewBaseline.sha256 | Should -Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
-        $result.schema15.sha256 | Should -Be 'ef775b7a72efd4a775507fd7a8b9b5eb4575d338ffd26b5fab6ce2bbc63afd72'
+        $result.schema15.sha256 | Should -Be 'fce76ba0e7e57db845a434ae29f7996f9729fb8cb84e3c6799f9748b3d8f7d57'
         $result.schema15.path | Should -Be '.agents/skills/auto-update-darktide-mod/references/schema-15.md'
         $result.workflow.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz'
         $result.reviewBaseline.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz'
