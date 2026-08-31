@@ -136,9 +136,34 @@ function Enter-SharedCoordinationLease {
         $runner | Should -Match 'startByte'
         $runner | Should -Match 'oldSha256'
         $runner | Should -Match 'indexedSha256'
+        $runner | Should -Match 'Get-LuaLocalizationDocument -Bytes \$mergedBytes'
         $validator | Should -Match 'approvedSpans'
         $validator | Should -Match 'outside approved localization spans'
+        $validator | Should -Match 'Get-LuaLocalizationDocument -Bytes \$merged'
         $validator | Should -Not -Match 'ModUpdate\.Automation\.psm1'
+    }
+
+    # Scenario: An approved Schema 14 insertion places zh-tw after a Lua table field whose separator is missing.
+    # Purpose: Reject a merged localization artifact that would otherwise be recorded as passed despite invalid table syntax.
+    It 'UnitT132_RejectsMissingSeparatorBeforeLocalizationField' {
+        $scannerPath = Join-Path (Join-Path $skillRoot 'scripts') 'LuaLocalizationScanner.psm1'
+        Import-Module $scannerPath -Force
+        $invalid = @'
+local loc = {
+    mechsword = {
+        en = Localize("loc_weapon_family_powersword_p3_m1")
+        ["zh-tw"] = Localize("loc_weapon_family_powersword_p3_m1"),
+    },
+}
+return loc
+'@
+        $valid = $invalid.Replace('p3_m1")' + "`n" + '        ["zh-tw"]', 'p3_m1"),' + "`n" + '        ["zh-tw"]')
+
+        { Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($invalid)) -SourceId 'invalid-separator' } |
+            Should -Throw '*separator*'
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($valid)) -SourceId 'valid-separator'
+        @($document.units).Count | Should -Be 1
+        $document.units[0].zhTwExpression.raw | Should -Be 'Localize("loc_weapon_family_powersword_p3_m1")'
     }
 
     # Scenario: A Schema 14 MOD has no active localization and the caller omits a localization plan.
