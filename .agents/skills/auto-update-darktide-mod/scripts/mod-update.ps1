@@ -4444,6 +4444,15 @@ function Assert-LocalizationWorksetDeletionEvidence {
     [ordered]@{ status = 'deleted'; worksetSha256 = $State.localizationWorkset.sha256; receiptPath = $receiptPath; receiptSha256 = $receiptSha }
 }
 
+function Repair-SuccessfulCandidateGateState {
+    param([Collections.IDictionary] $State)
+    if ([string]$State.candidateGate.status -cne 'passed' -or [string]$State.status -cne 'failed') { return $false }
+    $State.status = 'candidate-committed'
+    $State.waitingReason = $null
+    $State.lastError = $null
+    $true
+}
+
 function Invoke-Validate {
     param([Collections.IDictionary] $State)
     $validator = Join-Path $PSScriptRoot 'Test-ModUpdateCandidate.ps1'
@@ -4471,6 +4480,10 @@ function Invoke-Validate {
         $result = & $validator -StatePath $State.statePath -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
         $State = Read-State -Path $State.statePath
         if ($result.result -ne 'passed') { throw 'Independent Final Candidate Gate rejected the candidate.' }
+        if (Repair-SuccessfulCandidateGateState -State $State) {
+            Save-State -State $State
+            $State = Read-State -Path $State.statePath
+        }
         if ([int]$State.schemaVersion -ge 15) {
             $finalizer = Join-Path $PSScriptRoot 'Finalize-LocalizationWorksetEvidence.ps1'
             $null = & $finalizer -StatePath $State.statePath -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
