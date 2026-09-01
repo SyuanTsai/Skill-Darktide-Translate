@@ -30,6 +30,10 @@ New automatic-source runs also bind `references/schema-15.md`. It is a repositor
 
 A Schema 15 state records `workflowSchemaVersion = 15`, `schema15Path`, `schema15BlobOid`, and `schema15Sha256` in addition to the existing Workflow and Review Baseline tuple. Schema 14 states do not gain these fields and are never migrated implicitly.
 
+## Translation-quality extension binding
+
+Schema 14 and Schema 15 translation decisions also bind `references/translation-quality.md` through the complete run-local Skill source pin. Read it after the packaged Workflow and with the packaged Review Baseline. It is a repository-native normative refinement of semantic translation quality: English/in-game meaning authority, independent zh-tw wording, curated existing-translation preservation, and functional rather than word-for-word completeness. It does not alter archive/source identity, deterministic target classification, byte authorization, Lua structure, security, Git evidence, Candidate Gate, publication, or merge-finalization boundaries.
+
 ## State and evidence mapping
 
 For new packaged runs:
@@ -38,7 +42,7 @@ For new packaged runs:
 - `workflow_commit_oid` records the resolved `darktide-translate` source commit.
 - `workflow_path` records `.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz`.
 - `workflow_sha256` records the expanded Workflow content SHA-256; `workflow_package_sha256` records the compressed container SHA-256.
-- `reference_sources[]` records the Workflow, Review Baseline, this package binding, `SKILL.md`, and Schema 15 extension when applicable, including repository-relative path, resolved source commit, packaged blob, size, and SHA-256. Converted documents also retain expanded sizes and SHA-256 values. The blob values come from the verified runtime pin and are recomputed from the installed bytes, so commit, path, and blob form one directly reproducible tuple.
+- `reference_sources[]` records the Workflow, Review Baseline, this package binding, `SKILL.md`, translation-quality refinement, and Schema 15 extension when applicable, including repository-relative path, resolved source commit, packaged blob, size, and SHA-256. Converted documents also retain expanded sizes and SHA-256 values. The blob values come from the verified runtime pin and are recomputed from the installed bytes, so commit, path, and blob form one directly reproducible tuple.
 - For converted documents, `packagedGitBlobOid` names that packaged gzip blob while `sourceGitBlobOid` retains the original uncompressed authoring blob. The integrity command recomputes both OIDs from their respective bytes. Never substitute `sourceGitBlobOid` into runtime `reference_sources[].gitBlobOid`.
 - The consumer source pin's repository URL and content SHA-256 are retained with the run evidence so a future verifier can reconstruct the package.
 - A Schema 15 run additionally records the repository-relative extension path, Git blob OID, SHA-256, source receipt, and source request hash.
@@ -47,4 +51,4 @@ The `f2912...` commit in `source-provenance.json` belongs to the original Warham
 
 ## Precedence
 
-For package-location questions only, this binding overrides the original `AI Prompt` paths and workflow-branch lookup commands. `references/schema-15.md` overrides only automatic acquisition, receipt-bound claim, status distinctions, localization workset, and workset lifecycle for new Schema 15 states. It does not weaken content scope, safety checks, Git normalization, C0/C1/C2/C3/F evidence, Candidate Gate, Review classification, append-only refresh, main-advance handling, or finalization requirements.
+For package-location questions, this binding overrides the original `AI Prompt` paths and workflow-branch lookup commands. `references/translation-quality.md` controls semantic translation authority, curated unchanged-source preservation, functional completeness, and the corresponding Review Finding threshold for both schemas. `references/schema-15.md` controls automatic acquisition, receipt-bound claim, status distinctions, localization workset, and workset lifecycle for new Schema 15 states. These extensions preserve content scope, safety checks, Git normalization, C0/C1/C2/C3/F evidence, Candidate Gate, append-only refresh, main-advance handling, and finalization requirements.

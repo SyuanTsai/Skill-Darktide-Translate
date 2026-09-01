@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('acquire-source', 'claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'run')]
+    [ValidateSet('acquire-source', 'claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'finalize-merge', 'run')]
     [string] $Command,
 
     [Parameter(Mandatory)]
@@ -730,6 +730,8 @@ $sharedCoordinationModulePath = Join-Path $PSScriptRoot 'SharedCoordinationLock.
 Import-Module -Name $sharedCoordinationModulePath -Force -ErrorAction Stop
 $luaLocalizationScannerModulePath = Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1'
 Import-Module -Name $luaLocalizationScannerModulePath -Force -ErrorAction Stop
+$mergeFinalizationScriptPath = Join-Path $PSScriptRoot 'Finalize-ModUpdateMerge.ps1'
+. $mergeFinalizationScriptPath
 
 function Enter-SharedCoordinationLock {
     param(
@@ -808,7 +810,7 @@ function Invoke-Git {
     )
     $gitCommand = if ($Arguments.Count -gt 0) { [string]$Arguments[0] } else { '' }
     $gitSubcommand = if ($Arguments.Count -gt 1) { [string]$Arguments[1] } else { '' }
-    $requiresCoordination = $gitCommand -in @('fetch', 'push') -or
+    $requiresCoordination = $gitCommand -in @('fetch', 'push', 'update-ref') -or
         ($gitCommand -ceq 'worktree' -and $gitSubcommand -in @('add', 'remove', 'prune')) -or
         ($gitCommand -ceq 'branch' -and $gitSubcommand -in @('-d', '-D', '-m', '-M', '--delete', '--move'))
     $coordinationLease = $null
@@ -1160,6 +1162,7 @@ function Get-StageArtifactPath {
         'validate' { if ($State.candidateGate) { [string]$State.candidateGate.validationReportPath } }
         'publish' { Join-Path ([string]$State.artifactsRoot) 'publication.json' }
         'review-snapshot' { Join-Path ([string]$State.artifactsRoot) 'review-completion-validation.json' }
+        'finalize-merge' { Join-Path ([string]$State.artifactsRoot) 'merge-finalization.json' }
     }
 }
 
@@ -2781,6 +2784,7 @@ function Invoke-Claim {
     $workflowSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.workflow.path)
     $reviewSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.reviewBaseline.path)
     $bindingSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath '.agents/skills/auto-update-darktide-mod/references/package-binding.md'
+    $translationQualitySourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath '.agents/skills/auto-update-darktide-mod/references/translation-quality.md'
     $skillSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath '.agents/skills/auto-update-darktide-mod/SKILL.md'
     $schema15SourceEntry = if ($sourceReceipt) { Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.schema15.path) } else { $null }
     $plannedOwner = Read-ActiveReservationOwner
@@ -2894,6 +2898,9 @@ function Invoke-Claim {
         reviewBaselineBlobOid = $reviewSourceEntry.blobOid
         reviewBaselineSha256 = $integrity.reviewBaseline.sha256
         reviewBaselinePackageSha256 = $reviewSourceEntry.sha256
+        translationQualityPath = $translationQualitySourceEntry.repositoryPath
+        translationQualityBlobOid = $translationQualitySourceEntry.blobOid
+        translationQualitySha256 = $translationQualitySourceEntry.sha256
         schema15Path = if ($sourceReceipt) { $integrity.schema15.path } else { $null }
         schema15BlobOid = if ($sourceReceipt) { $schema15SourceEntry.blobOid } else { $null }
         schema15Sha256 = if ($sourceReceipt) { $integrity.schema15.sha256 } else { $null }
@@ -2901,6 +2908,7 @@ function Invoke-Claim {
             [ordered]@{ role = 'workflow'; path = $integrity.workflow.path; sourceCommit = $skillSourcePin.resolvedCommit; blobOid = $workflowSourceEntry.blobOid; size = $workflowSourceEntry.size; sha256 = $workflowSourceEntry.sha256; expandedSize = $integrity.workflow.sizeBytes; expandedSha256 = $integrity.workflow.sha256 },
             [ordered]@{ role = 'review-baseline'; path = $integrity.reviewBaseline.path; sourceCommit = $skillSourcePin.resolvedCommit; blobOid = $reviewSourceEntry.blobOid; size = $reviewSourceEntry.size; sha256 = $reviewSourceEntry.sha256; expandedSize = $integrity.reviewBaseline.sizeBytes; expandedSha256 = $integrity.reviewBaseline.sha256 },
             [ordered]@{ role = 'package-binding'; path = $bindingSourceEntry.repositoryPath; sourceCommit = $skillSourcePin.resolvedCommit; blobOid = $bindingSourceEntry.blobOid; size = $bindingSourceEntry.size; sha256 = $bindingSourceEntry.sha256 },
+            [ordered]@{ role = 'translation-quality'; path = $translationQualitySourceEntry.repositoryPath; sourceCommit = $skillSourcePin.resolvedCommit; blobOid = $translationQualitySourceEntry.blobOid; size = $translationQualitySourceEntry.size; sha256 = $translationQualitySourceEntry.sha256 },
             [ordered]@{ role = 'skill'; path = $skillSourceEntry.repositoryPath; sourceCommit = $skillSourcePin.resolvedCommit; blobOid = $skillSourceEntry.blobOid; size = $skillSourceEntry.size; sha256 = $skillSourceEntry.sha256 }
         ) + @(
             if ($sourceReceipt) { [ordered]@{ role = 'schema-15-extension'; path = $integrity.schema15.path; sourceCommit = $skillSourcePin.resolvedCommit; blobOid = $schema15SourceEntry.blobOid; size = $schema15SourceEntry.size; sha256 = $schema15SourceEntry.sha256 } }
@@ -4564,6 +4572,7 @@ function Get-PrBody {
 - Workflow commit/SHA-256: $($State.workflowCommitOid) / $($State.workflowSha256)
 - Skill source repository/ref/content/pin SHA-256: $($State.workflowSourceRepository) / $($State.workflowRef) / $($State.workflowSourceContentSha256) / $($State.workflowSourcePinSha256)
 - Review Baseline path/blob/SHA-256: $($State.reviewBaselinePath) / $($State.reviewBaselineBlobOid) / $($State.reviewBaselineSha256)
+- Translation quality path/blob/SHA-256: $($State.translationQualityPath) / $($State.translationQualityBlobOid) / $($State.translationQualitySha256)
 - Localization mode/ids: $($State.localizationMode) / $localizationIds
 - Localization raw/indexed/merged evidence: $localizationEvidence
 - Localization workset SHA-256: $worksetSha
@@ -4862,6 +4871,7 @@ function Invoke-StageCommand {
         'validate' { Invoke-Validate -State $State }
         'publish' { Invoke-Publish -State $State }
         'review-snapshot' { Invoke-ReviewSnapshot -State $State }
+        'finalize-merge' { Invoke-ModUpdateMergeFinalization -State $State }
         default { throw "Unsupported stage: $StageName" }
     }
 }

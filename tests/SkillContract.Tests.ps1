@@ -22,6 +22,17 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $skill | Should -Match 'scripts/Test-ReferenceIntegrity\.ps1'
     }
 
+    # Scenario: The Skill entrypoint is evaluated by the repository quality gate.
+    # Purpose: Keep discovery metadata concise and preserve progressive disclosure as the workflow grows.
+    It 'UnitT12_KeepsDiscoveryMetadataAndTopLevelRoutingConcise' {
+        $skill = Get-Content -LiteralPath (Join-Path $skillRoot 'SKILL.md') -Raw
+        $description = [regex]::Match($skill, '(?m)^description: (?<value>.+)$').Groups['value'].Value
+        $topLevelSections = [regex]::Matches($skill, '(?m)^## [^#].+$')
+
+        $description.Length | Should -BeLessOrEqual 300
+        $topLevelSections.Count | Should -BeLessOrEqual 5
+    }
+
     # Scenario: The original Workflow and Review Baseline are packaged from a fixed source commit.
     # Purpose: Detect any silent truncation or content drift in the converted Skill references.
     It 'UnitT20_VerifiesByteExactSchema14ReferenceProvenance' {
@@ -32,7 +43,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $result.result | Should -Be 'passed'
         $result.workflow.sha256 | Should -Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
         $result.reviewBaseline.sha256 | Should -Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
-        $result.schema15.sha256 | Should -Be 'fce76ba0e7e57db845a434ae29f7996f9729fb8cb84e3c6799f9748b3d8f7d57'
+        $result.schema15.sha256 | Should -Be '4cb3fa95c205b28e3c33bc1bf4eb763842ccc350335a7b65deda647bc932e6c4'
         $result.schema15.path | Should -Be '.agents/skills/auto-update-darktide-mod/references/schema-15.md'
         $result.workflow.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz'
         $result.reviewBaseline.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz'
