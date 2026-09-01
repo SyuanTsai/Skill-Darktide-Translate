@@ -1,6 +1,6 @@
 ---
 name: auto-update-darktide-mod
-description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs while preserving active zh-tw localization and producing Schema 14 or 15 Git evidence. Use for acquisition, claims, resumptions, review feedback, or merge finalization. Route standalone translation and MOD authoring to their dedicated workflows.
+description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs, preserve active zh-tw, and produce Schema 14 or 15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
 ---
 
 # Auto Update a DARKTIDE MOD
@@ -19,7 +19,7 @@ Use the packaged Schema 14 workflow as the normative base. For a new automatic-s
 
 Existing runs continue with the workflow tuple recorded in their own state. Runs pinned to version 0.3.12 or later expose `finalize-merge`; an older run follows the finalization or recovery procedure in its recorded package. A package upgrade starts a new run and leaves the old state unchanged.
 
-## Example
+### Example
 
 From this Skill directory, materialize only the Workflow needed for a claim into a new temporary directory:
 
