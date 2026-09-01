@@ -2,6 +2,8 @@ name: Validate
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -33,20 +35,6 @@ jobs:
           }
           Write-Host "Pester $($module.Version)"
 
-      - name: Run repository and Skill contract tests
+      - name: Run the same clean-HEAD gate required before push
         shell: pwsh
-        run: ./tests/Invoke-Tests.ps1
-
-      - name: Validate packaged Schema 14 and Schema 15 references
-        shell: pwsh
-        run: ./.agents/skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1
-
-      - name: Validate reproducible source pin
-        shell: pwsh
-        run: |
-          $pin = ./scripts/Get-SourcePin.ps1 -Ref HEAD | ConvertFrom-Json
-          if ($pin.sourceId -ne 'darktide-translate') { throw 'Unexpected sourceId.' }
-          if ($pin.resolvedCommit -notmatch '^[0-9a-f]{40}$') { throw 'Invalid resolved commit.' }
-          if ($pin.contentSha256 -notmatch '^[0-9a-f]{64}$') { throw 'Invalid content SHA-256.' }
-          if ($pin.resolvedVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid repository version.' }
-          Write-Host "Validated pin for $($pin.resolvedCommit) with content SHA-256 $($pin.contentSha256)."
+        run: ./scripts/Invoke-PrePushValidation.ps1

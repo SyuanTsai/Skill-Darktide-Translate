@@ -2,6 +2,8 @@ name: Skill Quality Gate
 
 on:
   push:
+    branches:
+      - main
     paths:
       - '.agents/skills/**'
       - '.github/workflows/skill-validator.yml'
