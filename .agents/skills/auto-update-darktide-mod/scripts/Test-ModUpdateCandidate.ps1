@@ -873,8 +873,8 @@ function Assert-ReferenceIntegrity {
         }
     }
     $references = @($State.referenceSources)
-    $expectedRoles = if ([int]$State.schemaVersion -ge 15) { @('workflow', 'review-baseline', 'package-binding', 'skill', 'schema-15-extension') }
-        else { @('workflow', 'review-baseline', 'package-binding', 'skill') }
+    $expectedRoles = if ([int]$State.schemaVersion -ge 15) { @('workflow', 'review-baseline', 'package-binding', 'translation-quality', 'skill', 'schema-15-extension') }
+        else { @('workflow', 'review-baseline', 'package-binding', 'translation-quality', 'skill') }
     if ($references.Count -ne $expectedRoles.Count) { throw 'Recorded reference_sources count changed.' }
     foreach ($role in $expectedRoles) {
         $roleReferences = @($references | Where-Object { [string]$_.role -ceq $role })
@@ -886,6 +886,12 @@ function Assert-ReferenceIntegrity {
             [int64]$roleReferences[0].size -ne [int64]$pinEntries[0].size -or [string]$roleReferences[0].sha256 -cne [string]$pinEntries[0].sha256) {
             throw "Recorded reference_sources evidence differs from the source pin: $role"
         }
+    }
+    $translationReference = @($references | Where-Object { [string]$_.role -ceq 'translation-quality' })[0]
+    if ([string]$State.translationQualityPath -cne [string]$translationReference.path -or
+        [string]$State.translationQualityBlobOid -cne [string]$translationReference.blobOid -or
+        [string]$State.translationQualitySha256 -cne [string]$translationReference.sha256) {
+        throw 'Translation-quality reference binding changed.'
     }
     if ([int]$State.schemaVersion -ge 15) {
         if ([string]$State.schema15Path -cne [string]$integrity.schema15.path -or
@@ -1177,6 +1183,7 @@ function Assert-PrBodyEvidenceSummary {
         "- Candidate Gate: passed",
         "- Validation SHA-256: $($State.candidateGate.validationReportSha256)",
         "- Review Baseline path/blob/SHA-256: $($State.reviewBaselinePath) / $($State.reviewBaselineBlobOid) / $($State.reviewBaselineSha256)",
+        "- Translation quality path/blob/SHA-256: $($State.translationQualityPath) / $($State.translationQualityBlobOid) / $($State.translationQualitySha256)",
         "- Archive filename/SHA-256: $($State.archive.filename) / $($State.archive.sha256)",
         "- Source tuple contract SHA-256: $($State.sourceTuple.contractSha256)",
         "- Security override receipt SHA-256: $(if ($State.Contains('securityOverrideReceipt') -and $State.securityOverrideReceipt) { $State.securityOverrideReceipt.sha256 } else { 'not-applicable' })",

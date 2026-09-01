@@ -14,6 +14,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         Test-Path -LiteralPath $runnerPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath $validatorPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath (Join-Path $skillRoot 'references/automation.md') -PathType Leaf | Should -Be $true
+        Test-Path -LiteralPath (Join-Path $skillRoot 'references/translation-quality.md') -PathType Leaf | Should -Be $true
         foreach ($script in @('Receive-NexusMainFile.ps1', 'Test-SourceReceipt.ps1', 'Invoke-ModUpdateQueue.ps1', 'SharedCoordinationLock.psm1', 'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1')) {
             Test-Path -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') $script) -PathType Leaf | Should -Be $true
         }
@@ -22,6 +23,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $skill | Should -Match 'scripts/mod-update\.ps1'
         $skill | Should -Match 'scripts/Test-ModUpdateCandidate\.ps1'
         $skill | Should -Match 'references/automation\.md'
+        $skill | Should -Match 'references/translation-quality\.md'
     }
 
     # Scenario: The fixed automation package is loaded into a PowerShell session that relies on built-in automatic variables.
@@ -40,7 +42,7 @@ Describe 'Deterministic Darktide MOD update automation' {
     # Purpose: Preserve the fixed command surface, structured JSON, timing, state, and idempotency contracts.
     It 'UnitT110_DeclaresTheFixedResumableStageContract' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
-        foreach ($stage in @('acquire-source', 'claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'run')) {
+        foreach ($stage in @('acquire-source', 'claim', 'verify-source', 'extract', 'install', 'localization', 'build-commits', 'validate', 'publish', 'review-snapshot', 'finalize-merge', 'run')) {
             $runner | Should -Match ([regex]::Escape("'$stage'"))
         }
 
@@ -50,6 +52,313 @@ Describe 'Deterministic Darktide MOD update automation' {
         $runner | Should -Match 'waitingMilliseconds'
         $runner | Should -Match 'artifactSha256'
         $runner | Should -Match 'ConvertTo-Json'
+    }
+
+    # Scenario: A merged MOD PR is ready for standard cleanup or contains a head that changed after Review.
+    # Purpose: Provide one state-driven finalization implementation instead of generating MOD/date/SHA-specific scripts.
+    It 'UnitT111_PublishesAReusableMergeFinalizationStage' {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        Test-Path -LiteralPath $finalizerPath -PathType Leaf | Should -BeTrue
+
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $finalizer = Get-Content -LiteralPath $finalizerPath -Raw
+        $runner | Should -Match "'finalize-merge'"
+        $runner | Should -Match 'Finalize-ModUpdateMerge\.ps1'
+        $runner | Should -Match 'Invoke-ModUpdateMergeFinalization -State \$State'
+        $finalizer | Should -Match 'function Get-MergeFinalizationDisposition'
+        $finalizer | Should -Match 'function Invoke-ModUpdateMergeFinalization'
+        $finalizer | Should -Match 'post-merge-reconciliation\.json'
+        $finalizer | Should -Match 'merge-fingerprint\.json'
+        $finalizer | Should -Not -Match 'Reconcile-Recolor-Skitarius|20260901|5000fa4f|26a1a93e'
+    }
+
+    # Scenario: GitHub reports an open, closed, reviewed-head merge, or post-Review changed-head PR.
+    # Purpose: Derive the safe action only from the observed PR tuple and immutable reviewed F.
+    It 'UnitT112_ClassifiesMergeFinalizationWithoutRunSpecificConstants' {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Get-MergeFinalizationDisposition'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        try {
+            (& $module { Get-MergeFinalizationDisposition -PullRequestState 'OPEN' -ReviewedOid ('a' * 40) -ObservedHeadOid ('a' * 40) }) |
+                Should -Be 'awaiting-merge'
+            (& $module { Get-MergeFinalizationDisposition -PullRequestState 'OPEN' -ReviewedOid ('a' * 40) -ObservedHeadOid ('b' * 40) }) |
+                Should -Be 'open-head-changed-after-review'
+            (& $module { Get-MergeFinalizationDisposition -PullRequestState 'CLOSED' -ReviewedOid ('a' * 40) -ObservedHeadOid ('a' * 40) }) |
+                Should -Be 'closed-without-merge'
+            (& $module { Get-MergeFinalizationDisposition -PullRequestState 'MERGED' -ReviewedOid ('a' * 40) -ObservedHeadOid ('a' * 40) }) |
+                Should -Be 'finalize-reviewed-head'
+            (& $module { Get-MergeFinalizationDisposition -PullRequestState 'MERGED' -ReviewedOid ('a' * 40) -ObservedHeadOid ('b' * 40) }) |
+                Should -Be 'reconcile-changed-head'
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: A translation unit has an existing human-edited zh-tw value or needs new Taiwanese Traditional Chinese wording.
+    # Purpose: Make natural functional meaning, old-translation preservation, and English-first authority explicit across Schema 14 and 15.
+    It 'UnitT113_DefinesTheHumanTranslationQualityContract' {
+        $skill = Get-Content -LiteralPath (Join-Path $skillRoot 'SKILL.md') -Raw
+        $automation = Get-Content -LiteralPath (Join-Path $skillRoot 'references/automation.md') -Raw
+        $schema15 = Get-Content -LiteralPath (Join-Path $skillRoot 'references/schema-15.md') -Raw
+        $translationQuality = Get-Content -LiteralPath (Join-Path $skillRoot 'references/translation-quality.md') -Raw
+        $packageBinding = Get-Content -LiteralPath (Join-Path $skillRoot 'references/package-binding.md') -Raw
+        $combined = @($skill, $automation, $schema15, $translationQuality) -join "`n"
+
+        $combined | Should -Match 'English source and in-game context are the primary meaning authority'
+        $combined | Should -Match 'zh-cn.*clarification reference.*not a wording template'
+        $combined | Should -Match 'existing.*zh-tw.*curated human translation asset'
+        $combined | Should -Match 'functional meaning.*not word-for-word coverage'
+        $combined | Should -Match 'omitted nonessential modifier alone does not make a translation unusable'
+        $combined | Should -Match 'byte-for-byte'
+        $combined | Should -Match 'garbled|Simplified Chinese|wrong number|wrong unit|placeholder|markup|reversed|materially wrong mechanic'
+        $translationQuality | Should -Match 'A one-to-one English-to-Chinese detail checklist is supporting evidence, not the acceptance definition'
+        $packageBinding | Should -Match 'translation-quality\.md.*controls semantic translation authority'
+    }
+
+    # Scenario: A legacy-compatible state lacks optional fields when a changed merged head invalidates its old Gate and Review.
+    # Purpose: Add missing state properties safely and retain only the stages that remain truthful.
+    It 'UnitT114_ReconcilesAChangedMergedHeadWithoutAssumingOptionalPropertiesExist' {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functions = $ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst]
+        }, $true)
+        $source = @($functions | Where-Object Name -in @('Set-MergeStateValue', 'Set-ModUpdateChangedHeadState') |
+            ForEach-Object { $_.Extent.Text }) -join "`n"
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($source))
+        try {
+            $state = [ordered]@{
+                status = 'awaiting-user-merge'
+                reviewedOid = 'a' * 40
+                localReview = [ordered]@{ result = 'passed' }
+                reviewSnapshot = [ordered]@{ sha256 = '1' * 64 }
+                completedStages = @('claim', 'validate', 'publish', 'review-snapshot')
+                candidateGate = [ordered]@{ status = 'passed' }
+            }
+            $pullRequest = [ordered]@{
+                headRefOid = 'b' * 40
+                mergeCommit = [ordered]@{ oid = 'c' * 40 }
+                mergedAt = '2026-09-01T00:00:00.0000000+00:00'
+            }
+            $updated = & $module {
+                param($value, $pr)
+                Set-ModUpdateChangedHeadState -State $value -PullRequest $pr -OriginMainOid ('d' * 40) `
+                    -FingerprintSha256 ('e' * 64) -ReconciliationPath 'C:\evidence\post-merge-reconciliation.json' `
+                    -ReconciliationSha256 ('f' * 64)
+            } $state $pullRequest
+
+            $updated.status | Should -Be 'waiting-user'
+            $updated.waitingReason.code | Should -Be 'merged_head_changed_after_review'
+            $updated.headOid | Should -Be ('b' * 40)
+            $updated.reviewedOid | Should -BeNullOrEmpty
+            $updated.localReview | Should -BeNullOrEmpty
+            $updated.reviewSnapshot | Should -BeNullOrEmpty
+            $updated.lastError | Should -BeNullOrEmpty
+            $updated.Contains('lastError') | Should -BeTrue
+            $updated.completedStages | Should -Be @('claim')
+            $updated.candidateGate.status | Should -Be 'not-run'
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: A reviewed-head merge reaches terminal archival and exact resource cleanup.
+    # Purpose: Preserve recoverable evidence while limiting destructive operations to verified run-owned identities.
+    It 'UnitT116_UsesOwnerCheckedExactCleanupForReviewedHeadFinalization' {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $finalizer = Get-Content -LiteralPath $finalizerPath -Raw
+
+        $finalizer | Should -Match 'AI Auto Update/Finished'
+        $finalizer | Should -Match 'archive-manifest\.json'
+        $finalizer | Should -Match 'Assert-ModUpdateFinalEvidence'
+        $finalizer | Should -Match '@\(''worktree'', ''remove'', ''--'', \$worktree\)'
+        $finalizer | Should -Match '@\(''update-ref'', ''-d'', \$localRef, \$reviewedOid\)'
+        $finalizer | Should -Match 'Read-ActiveReservationOwner'
+        $finalizer | Should -Match 'Suspend-ModReservationWorker -State \$State'
+        $finalizer | Should -Match 'Exit-RunWriterLock -Lease \$script:writerLease'
+        $finalizer | Should -Not -Match '@\(''branch'', ''-D'''
+        $finalizer | Should -Not -Match 'Remove-Item\s+-Recurse'
+    }
+
+    # Scenario: A new Schema 14 or 15 run relies on the translation-quality precedence refinement.
+    # Purpose: Bind that normative reference to immutable run evidence and revalidate it at the independent Candidate Gate.
+    It 'UnitT117_BindsTranslationQualityToTheRunAndCandidateGate' {
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+        $validator = Get-Content -LiteralPath $validatorPath -Raw
+
+        $runner | Should -Match "role = 'translation-quality'"
+        $runner | Should -Match 'references/translation-quality\.md'
+        $runner | Should -Match 'Translation quality path/blob/SHA-256'
+        $validator | Should -Match "'translation-quality'"
+        $validator | Should -Match "@\('workflow', 'review-baseline', 'package-binding', 'translation-quality', 'skill'"
+        $validator | Should -Match 'Translation quality path/blob/SHA-256'
+    }
+
+    # Scenario: Git for Windows renders registered worktrees with forward slashes while state uses native full paths.
+    # Purpose: Recognize the exact registered worktree without weakening the owner/path comparison.
+    It 'UnitT118_MatchesTheExactWorktreeAcrossGitAndWindowsPathForms' {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-ModUpdateWorktreeRegistered'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        try {
+            $nativePath = 'F:\Runs\Darktide Update'
+            $porcelain = "worktree F:/Runs/Darktide Update`nHEAD $('a' * 40)`nbranch refs/heads/Update/example"
+            (& $module { param($text, $path) Test-ModUpdateWorktreeRegistered -Porcelain $text -ExpectedPath $path } $porcelain $nativePath) |
+                Should -BeTrue
+            (& $module { param($text) Test-ModUpdateWorktreeRegistered -Porcelain $text -ExpectedPath 'F:\Runs\Other' } $porcelain) |
+                Should -BeFalse
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: A PR was closed without merge and is later reopened or merged under the same retained run.
+    # Purpose: Keep that explicit recovery state observable while rejecting unrelated waiting-user states.
+    It 'UnitT119_AllowsOnlyTheRecordedClosedPrStateToResumeFinalization' {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-ModUpdateFinalizationStateStatus'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        try {
+            (& $module { Test-ModUpdateFinalizationStateStatus -Status 'awaiting-user-merge' -CompletedStages @() -WaitingReason $null }) | Should -BeTrue
+            (& $module { Test-ModUpdateFinalizationStateStatus -Status 'merged' -CompletedStages @('finalize-merge') -WaitingReason $null }) | Should -BeTrue
+            (& $module { Test-ModUpdateFinalizationStateStatus -Status 'waiting-user' -CompletedStages @() -WaitingReason @{ code = 'pull_request_closed_without_merge' } }) | Should -BeTrue
+            (& $module { Test-ModUpdateFinalizationStateStatus -Status 'waiting-user' -CompletedStages @() -WaitingReason @{ code = 'merge_topology_requires_reconciliation' } }) | Should -BeTrue
+            (& $module { Test-ModUpdateFinalizationStateStatus -Status 'waiting-user' -CompletedStages @() -WaitingReason @{ code = 'open_head_changed_after_review' } }) | Should -BeTrue
+            (& $module { Test-ModUpdateFinalizationStateStatus -Status 'waiting-user' -CompletedStages @() -WaitingReason @{ code = 'unrelated' } }) | Should -BeFalse
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: Cleanup verifies the exact remote tip before deleting the merged run branch.
+    # Purpose: Make the remote delete atomic and keep archive and fingerprint hashes distinctly named.
+    It 'UnitT120_DeletesTheRemoteBranchWithAnExactReviewedHeadLease' {
+        $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
+
+        $finalizer | Should -Match '--force-with-lease=\$\{remoteRef\}:\$reviewedOid'
+        $finalizer | Should -Match 'fingerprintArtifactSha256 = \[string\]\$State\.mergeFingerprintSha256'
+        $finalizer | Should -Match 'fingerprintBlobSha256 = \[string\]\$Fingerprint\.fingerprintBlobSha256'
+        $finalizer | Should -Match 'archiveSha256 = \[string\]\$State\.archive\.sha256'
+        $finalizer | Should -Not -Match 'fingerprintSha256 = \[string\]\$State\.archive\.sha256'
+    }
+
+    # Scenario: State records a Windows-form formal fingerprint path or an unsafe parent traversal.
+    # Purpose: Normalize the valid repository-relative path while rejecting traversal before Git object lookup.
+    It 'UnitT121_NormalizesAndContainsTheFormalFingerprintPath' {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Get-ModUpdateFingerprintPath'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        try {
+            (& $module { Get-ModUpdateFingerprintPath -State @{ metadataPaths = @('.hash\example.hash') } }) |
+                Should -Be '.hash/example.hash'
+            { & $module { Get-ModUpdateFingerprintPath -State @{ metadataPaths = @('.hash/../other.hash') } } } |
+                Should -Throw
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: Finalization constructs fetch destinations and deletion refspecs from identities recorded in state.
+    # Purpose: Prove the remote exists and every constructed local/remote ref is a valid exact Git ref first.
+    It 'UnitT122_ValidatesRecordedGitIdentitiesBeforeFinalization' {
+        $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
+
+        $finalizer | Should -Match "@\('remote'\)"
+        $finalizer | Should -Match '@\(''check-ref-format'', \$refName\)'
+        $finalizer | Should -Match 'Recorded Git remote does not exist'
+        $finalizer | Should -Match 'Recorded Git ref is invalid'
+    }
+
+    # Scenario: GitHub reports a squash or rebase merge whose reviewed head is not an ancestor of the merge commit.
+    # Purpose: Retain evidence and the reservation for reconciliation instead of misclassifying the reviewed F or failing the run.
+    It 'UnitT123_RetainsUnsupportedMergeTopologyWithFingerprintEvidence' {
+        $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
+
+        $finalizer | Should -Match 'merge-topology-reconciliation\.json'
+        $finalizer | Should -Match 'merge_topology_requires_reconciliation'
+        $finalizer | Should -Match 'Invoke-ModUpdateMergeTopologyReconciliation'
+        $finalizer | Should -Match '(?s)Get-ModUpdateFingerprintRecord.*?\$headInMerge.*?Invoke-ModUpdateMergeTopologyReconciliation'
+    }
+
+    # Scenario: Mutable state supplies both the run-owned source archive path and the eventual Finished filename.
+    # Purpose: Derive both locations from the canonical run root and one safe filename before any move or delete.
+    It 'UnitT124_ContainsSourceAndFinishedArchiveLocations' {
+        $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
+
+        $finalizer | Should -Match 'function Get-ModUpdateArchiveLocations'
+        $finalizer | Should -Match '\[IO\.Path\]::GetFileName\(\$filename\) -cne \$filename'
+        $finalizer | Should -Match 'Join-Path \(Join-Path \(\[string\]\$State\.runRoot\) ''source''\) \$filename'
+        $finalizer | Should -Match "Assert-ContainedPath.*?'Finished archive'"
+        $finalizer | Should -Match 'Run-owned archive path differs from its canonical location'
+    }
+
+    # Scenario: Evidence is archived before source, branch, worktree, claim, and reservation cleanup finishes.
+    # Purpose: Keep persisted timestamps and dispositions truthful at every interruption boundary.
+    It 'UnitT125_DescribesArchivedEvidenceWithoutPrematureCleanupClaims' {
+        $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
+
+        $finalizer | Should -Match "disposition = 'merge-verified-cleanup-pending'"
+        $finalizer | Should -Match "disposition = 'merge-evidence-archived'"
+        $finalizer | Should -Match 'archivedAt = Get-UtcTimestamp'
+        $finalizer | Should -Not -Match "(?s)state-final\.json.*?disposition = 'merged-and-finalized'"
+        $finalizer | Should -Match "status = 'merged-and-finalized'"
+    }
+
+    # Scenario: An open PR receives a commit after immutable F was reviewed.
+    # Purpose: Retain F and its evidence, expose the changed head, and require a fresh Review before merge finalization.
+    It 'UnitT126_WaitsWhenAnOpenPrHeadChangesAfterReview' {
+        $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
+
+        $finalizer | Should -Match 'open-head-changed-after-review'
+        $finalizer | Should -Match 'open_head_changed_after_review'
+        $finalizer | Should -Match 'Set-MergeStateValue -State \$State -Name ''observedPrHeadOid'''
+        $finalizer | Should -Match 'The open pull request head differs from reviewed F'
+    }
+
+    # Scenario: Terminal cleanup is interrupted after the writer and worker leases are released.
+    # Purpose: Release the exact MOD reservation before deleting state so interruption cannot leave an owner lock with no recovery state.
+    It 'UnitT127_ReleasesTheReservationBeforeRemovingTheRunRoot' {
+        $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
+        $releaseIndex = $finalizer.IndexOf('[IO.Directory]::Move([string]$State.modLockPath, $releasedTombstone)', [StringComparison]::Ordinal)
+        $runRemovalIndex = $finalizer.IndexOf("Remove-ModUpdateOwnedTree -Path ([string]`$State.runRoot) -Root `$inProgressRoot", [StringComparison]::Ordinal)
+
+        $releaseIndex | Should -BeGreaterThan -1
+        $runRemovalIndex | Should -BeGreaterThan $releaseIndex
     }
 
     # Scenario: A stage spends controlled monotonic-clock intervals on source stability, coordination, and active work.
@@ -527,7 +836,7 @@ function Suspend-Stage {
         $coordination | Should -Match '\[scriptblock\] \$WaitHeartbeatAction'
         $coordination | Should -Match '\$null = & \$WaitHeartbeatAction'
         $queue | Should -Match 'Enter-SharedCoordinationLease.+source-acquisition'
-        $runner | Should -Match '\$gitCommand -in @\(''fetch'', ''push''\)'
+        $runner | Should -Match '\$gitCommand -in @\(''fetch'', ''push'', ''update-ref''\)'
         $runner | Should -Match '\$gitCommand -ceq ''worktree'''
         $runner | Should -Match 'HeartbeatAction = \{ Update-ActiveReservationHeartbeat \}'
         $runner | Should -Match '-WaitHeartbeatAction \{ Update-ActiveReservationHeartbeat \}'

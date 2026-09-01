@@ -1,6 +1,6 @@
 # Deterministic MOD Update Automation
 
-Load this reference only when executing, resuming, diagnosing, or extending the fixed stage runner. The expanded Schema 14 Workflow remains normative when this reference omits a policy detail.
+Load this reference when executing, resuming, diagnosing, or extending the fixed stage runner. The expanded Schema 14 Workflow supplies the base process, and `translation-quality.md` supplies the semantic translation outcome standard.
 
 ## Install
 
@@ -73,6 +73,7 @@ The JSON result returns the generated `statePath`. Resume individual stages with
 ./scripts/mod-update.ps1 validate -RepositoryRoot $repository -StatePath $statePath
 ./scripts/mod-update.ps1 publish -RepositoryRoot $repository -StatePath $statePath
 ./scripts/mod-update.ps1 review-snapshot -RepositoryRoot $repository -StatePath $statePath -LocalReviewPath $localReview
+./scripts/mod-update.ps1 finalize-merge -RepositoryRoot $repository -StatePath $statePath
 ```
 
 If `extract` reports a changed risky payload, do not edit `state.json`. After the user approves the exact file, provide a separate JSON artifact and resume the same stage with `-SecurityOverridePath`:
@@ -95,7 +96,7 @@ The runner accepts no wildcard, directory, or reusable approval. It copies the c
 
 ZIP listing rejects Windows reparse attributes, Unix symlinks and other non-regular special entry types, exact/case/Unicode collisions, directory/file collisions, and a file entry that is also an ancestor of another entry before extraction begins.
 
-`run` executes the same ordered stages. After publication it captures one zero-wait PR feedback/external-review snapshot and returns `waiting-input` instead of pretending to perform semantic Review. Expand and read the packaged Review Baseline, review the immutable F plus the returned feedback snapshot, write the local Review artifact below, then resume the same `run` with `-StatePath` and `-LocalReviewPath`. The second invocation revalidates that same snapshot and stops at `awaiting-user-merge`. It does not merge a PR or release the MOD identity reservation.
+`run` executes the same ordered stages. After publication it captures one zero-wait PR feedback/external-review snapshot and returns `waiting-input` for the Agent's semantic Review. Expand and read the packaged Review Baseline, review immutable F plus the returned feedback snapshot, write the local Review artifact below, then resume the same `run` with `-StatePath` and `-LocalReviewPath`. The second invocation revalidates that snapshot and stops at `awaiting-user-merge`. A later user request or merge event activates `finalize-merge`; the runner observes the PR once and either completes the reviewed-head finalization or records a changed-head reconciliation while retaining the run.
 
 Every completed-stage result contains the run ID, stage, state, primary artifact SHA-256, and `wallClockMilliseconds`, `activeMilliseconds`, `waitingMilliseconds`, `stabilityObservationMilliseconds`, and `coordinationWaitMilliseconds`. Active plus waiting equals wall-clock; Schema 14 claim classifies its required archive stability observation as waiting, while contended shared-lock acquisition is recorded separately as coordination wait. Completed stages are idempotent: rerunning them reuses the matching same-run receipt instead of creating duplicate commits or PRs. Before any state-mutating resume takes its writer lock, and again before a completed-stage fast path reuses a receipt, the runner verifies the complete installed Skill package against the run-local `review-artifacts/skill-source-pin.json` and matches its pin SHA, repository, version, immutable commit, and repository content hash to state. Package drift fails closed without replacing or updating the old run pin. A completed localization receipt repairs a stale top-level `installed` state to `localized` without reapplying localization.
 
@@ -105,7 +106,13 @@ New Schema 14 and Schema 15 states record the runtime Skill pin. A pre-0.3 Schem
 
 This subsection is Schema 14 only.
 
-The Agent first determines active `zh-tw` targets, wording, placeholders, markup, and lookup structure under Schema 14. When the unit has no zh-tw field and the complete `en` expression is provably composed only of unshadowed global `Localize(...)` calls, parentheses, concatenation operators, and string literals whose decoded content contains no letters or numbers, the game already resolves every visible text fragment through the active locale: exclude that unit from translation and do not add zh-tw. A direct `Localize(...)` call is the simplest qualifying form. Literal text, formatting, fallback logic, method or shadowed calls, dynamic operands, and otherwise unproven expressions remain translation targets. This exclusion does not delete an existing zh-tw field. The Agent then supplies deterministic byte-span approvals over the Git-normalized indexed base:
+The Agent first determines active `zh-tw` targets, wording, placeholders, markup, and lookup structure under Schema 14. English source and in-game context are the primary meaning authority. Use zh-cn as a clarification reference, not a wording template, and produce natural Taiwan Traditional Chinese in the established voice.
+
+An existing reliable C0 zh-tw unit is a curated human translation asset. When its English/source expression and structure are unchanged, retain that unit byte-for-byte. Garbled text, Simplified Chinese leakage, a wrong number, wrong unit, damaged placeholder or markup, reversed meaning, or a materially wrong mechanic becomes an objective quality finding. Correct an unchanged-source unit when the user authorizes that quality-revision scope and the active schema supplies its exact zh-tw edit path. Style preference, terminology preference, added explicitness, or an omitted nonessential modifier alone keeps the curated unit intact.
+
+For a translation target, preserve functional meaning, gameplay conditions, values, placeholders, and markup in fluent zh-tw. Semantic completeness is functional meaning in context, not word-for-word coverage, so idiomatic compression and restructuring remain available. An omitted nonessential modifier alone does not make a translation unusable.
+
+When a unit has no zh-tw field and the complete `en` expression is provably composed only of unshadowed global `Localize(...)` calls, parentheses, concatenation operators, and string literals whose decoded content contains no letters or numbers, the game already resolves every visible text fragment through the active locale; classify it as already localized. A direct `Localize(...)` call is the simplest qualifying form. Literal text, formatting, fallback logic, method or shadowed calls, dynamic operands, and otherwise unproven expressions remain translation targets. An existing zh-tw field stays protected by the prior-translation rule. The Agent then supplies deterministic byte-span approvals over the Git-normalized indexed base:
 
 ```json
 {
@@ -139,7 +146,7 @@ Spans must not overlap. `oldSha256` binds each decision to the immutable indexed
 
 After raw installation, `localization` creates the fixed run-local `review-artifacts/localization-workset.json` with `New-LocalizationWorkset.ps1`. OLD comes from `baseOid`; NEW is a byte-identical physical staging copy. The scanner never executes Lua.
 
-If the workset contains pending `AI_REQUIRED` units, including active `missing_zh_tw` units, the runner returns `waiting-input`. When both OLD and NEW lack zh-tw, a complete NEW source expression that is provably composed only of unshadowed global `Localize(...)` calls, parentheses, concatenation operators, and string literals whose decoded content contains no letters or numbers is instead deterministic `localized_source/NONE`; preserve an existing OLD zh-tw through the normal classification table. Literal text and shadowed, dynamic, or otherwise unproven expressions remain eligible for `AI_REQUIRED`. Review only those unit IDs, set `reviewStatus` to `approved`, and provide `suggestedZhTwExpression`. Do not edit classification, action, paths, source spans, or non-AI units; non-AI review fields remain `not-required` and null. `immutableContractSha256` binds every other field and is independently recomputed. Resume the same `localization` stage.
+If the workset contains pending `AI_REQUIRED` units, including active `missing_zh_tw` units, the runner returns `waiting-input`. Apply the same English-first, natural zh-tw, functional-meaning standard from the Schema 14 subsection. When both OLD and NEW lack zh-tw, a complete NEW source expression that is provably composed only of unshadowed global `Localize(...)` calls, parentheses, concatenation operators, and string literals whose decoded content contains no letters or numbers is deterministic `localized_source/NONE`; the normal classification table preserves an existing OLD zh-tw. Literal text and shadowed, dynamic, or otherwise unproven expressions remain eligible for `AI_REQUIRED`. For those unit IDs, set `reviewStatus` to `approved` and provide `suggestedZhTwExpression`; deterministic fields and non-AI review fields keep their generated values. `immutableContractSha256` binds every other field and is independently recomputed. Resume the same `localization` stage.
 
 `Apply-LocalizationWorkset.ps1` selects INSERT, REPLACE, or REMOVE, preserves BOM/newlines, and records byte edits. It persists a `pending` deterministic apply receipt before replacing NEW bytes; a resume accepts only the recorded input or output hash, then completes the same receipt. C2 checkpoints raw upstream localization and C3 applies the merged workset artifact. `Test-LocalizationWorksetReceipt.ps1` independently recomputes the exact authorized edits from immutable units plus raw NEW bytes and rejects any self-authorizing receipt mutation before the Gate proves the merged and Git bytes. A passing Gate records the workset hash and counts, then deletes the JSON through a separate pending/deleted receipt before publication; it is never added to Git.
 
@@ -161,6 +168,19 @@ Local Review is an Agent decision over the packaged Review Baseline, not a resul
 ```
 
 Every actionable finding must contain priority, location, violated baseline, evidence, consequence, and a completed `keep` or `resolved` disposition. Out-of-scope observations are not findings. The runner copies this input into run-local `artifacts/review.json`; the independent validator then re-hashes the immutable feedback snapshot, checks its run/F/external-observation tuple against state, verifies the local Review's snapshot SHA and timestamp/finding schema, and verifies local HEAD, remote branch, non-draft PR head, F, reviewed OID, Gate SHA, and immutable evidence receipt/artifacts before state can become `awaiting-user-merge`. A completed-stage resume reruns that independent completion check instead of trusting only the old completion artifact.
+
+### Merge finalization and reconciliation
+
+`finalize-merge` is the reusable post-Review entrypoint for runs pinned to version 0.3.12 or later. Supply only the target repository and exact run `state.json`; `Finalize-ModUpdateMerge.ps1` derives the MOD, run ID, PR, reviewed F, formal fingerprint path, archive tuple, branch, worktree, claim, and reservation from verified state and live Git/GitHub observations. Older immutable runs use the finalization or recovery procedure from their recorded package. The fixed entrypoint covers future runs without embedded names, dates, PR numbers, paths, or SHA values.
+
+The command observes the PR once:
+
+- `OPEN` at reviewed F keeps `awaiting-user-merge` and records the observation. If the open head changed after Review, the command retains F and its evidence, records the observed head, and returns `waiting-user` for a fresh append-only Review.
+- `CLOSED` without merge returns `waiting-user` with the run, source, evidence, and reservation intact.
+- `MERGED` with `headRefOid == reviewedOid == F` verifies the merge commit in the recorded main branch and the formal fingerprint against the immutable archive tuple. It archives final evidence, moves or exact-deduplicates the source into `AI Auto Update/Finished`, removes only the exact F-owned worktree and local/remote branch, and releases only the matching reservation.
+- `MERGED` with a different head verifies and records the actual merged fingerprint plus exact F-to-head diff/name-status evidence under `artifacts/rejected/<F>/post-merge-reconciliation`. It marks Candidate Gate and Review as superseded, retains the exact worktree, source, branch, reservation, and evidence, and returns `waiting-user` for an append-only recovery selected from the recorded merged content. The finalizer does not rewrite an already merged PR or synthesize replacement Review evidence.
+
+The finalizer uses atomic state/evidence writes, immutable file tuples, short shared source/Git leases, and owner-checked run locks. Repeating an observation is safe; a retained partial final-evidence directory is preserved under a unique recovery name before a fresh finalization attempt.
 
 ## Recovery
 
@@ -193,7 +213,7 @@ When identity, archive provenance, path containment, or security evidence is amb
 
 Before publication, abandon a run only with explicit user authorization: retain rejected evidence, remove only the exact run-owned worktree and branch, return the archive without overwriting a different file, and release only the matching lock-owner tuple.
 
-After publication, rollback is a new append-only repair or PR closure; never rewrite the published branch. After merge, use Schema 14 finalization to verify the merged F, archive evidence, and owner tuple before removing the worktree or releasing the reservation.
+After publication, rollback is a new append-only repair or PR closure that preserves published evidence. After merge, use `finalize-merge` to verify the merged F, archive evidence, and owner tuple before the exact worktree and reservation are released.
 
 Rolling back the Skill itself means restoring a previous immutable `darktide-translate` source pin. Existing MOD runs remain pinned to the source tuple recorded in their own `state.json`.
 
@@ -203,7 +223,8 @@ Rolling back the Skill itself means restoring a previous immutable `darktide-tra
 - Nexus identity remains receipt-verified. Translation wording is Agent-supplied only for Schema 15 `AI_REQUIRED` units or Schema 14 approved spans; scripts do not log in, bypass CAPTCHA, scrape credentials, or invent translations.
 - The runner assumes one canonical MOD directory and one repository-local `main` base. Conflicting or multi-root archives stop.
 - Publication needs authenticated `git` and `gh`; unavailable external review is recorded and does not trigger login prompts.
-- The automation does not merge PRs, poll reviews, release reservations, or finalize merged runs automatically.
+- Merge remains a user-authorized GitHub action. The fixed finalizer runs after an explicit user request or merge event, observes once without background polling, and releases resources only for a verified reviewed-head merge.
+- Reviewed-head automatic cleanup currently proves merge-commit topology (`F` is an ancestor of the reported merge commit). A squash or rebase topology retains the run for user-selected reconciliation instead of being treated as reviewed F.
 
 ## MOD exceptions
 

@@ -4,14 +4,14 @@ Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive up
 
 - Stable source ID: `darktide-translate`
 - Catalog: `catalog/skills-catalog.json`
-- Current repository version: `0.3.11`
+- Current repository version: `0.3.12`
 - Jira delivery items: `SYP-112` checkpoint reasons, `SYP-113` immutable source metadata, `SYP-114` shared coordination locks, `SYP-115` reservation heartbeat/lifecycle, `SYP-116` runner observability/Windows byte preservation, `SYP-117` deterministic partial commit recovery, and `SYP-118` resume-time Skill pin validation, building on `SYP-91`, `SYP-92`, and `SYP-88`
 
 ## Skill
 
 | Skill | Profile | Purpose | Capability gate |
 | --- | --- | --- | --- |
-| `auto-update-darktide-mod` | `darktide-mod-maintenance` | Execute or resume manual Schema 14 runs or receipt-bound Schema 15 Nexus Main-file, localization-workset, Git evidence, Candidate Gate, PR, Review, and finalization runs. | Windows, PowerShell 7, Git, and either a configured GitHub connector or authenticated `gh` |
+| `auto-update-darktide-mod` | `darktide-mod-maintenance` | Execute or resume manual Schema 14 runs or receipt-bound Schema 15 Nexus Main-file, natural zh-tw maintenance, Git evidence, Candidate Gate, PR, Review, and state-driven merge finalization. | Windows, PowerShell 7, Git, and either a configured GitHub connector or authenticated `gh` |
 
 The profile is opt-in because the workflow can mutate isolated branches, publish PRs, and retain per-MOD reservations. Normal user authorization remains required for external writes and security overrides.
 
@@ -24,6 +24,7 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
   assets/
   references/schema-15.md
   references/schema-15-provenance.json
+  references/translation-quality.md
   scripts/mod-update.ps1
   scripts/Receive-NexusMainFile.ps1
   scripts/Test-SourceReceipt.ps1
@@ -34,6 +35,7 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
   scripts/Apply-LocalizationWorkset.ps1
   scripts/Test-LocalizationWorksetReceipt.ps1
   scripts/Finalize-LocalizationWorksetEvidence.ps1
+  scripts/Finalize-ModUpdateMerge.ps1
   scripts/Test-ModUpdateCandidate.ps1
   scripts/Expand-Schema14Reference.ps1
   scripts/Test-ReferenceIntegrity.ps1
