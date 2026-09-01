@@ -2077,8 +2077,48 @@ function Get-SourceTupleContractSha256 {
         }
     }
 
-    # Scenario: A real ZIP changes an active localization file, including metadata preflight failures and resumable evidence failures.
-    # Purpose: Prove fail-closed metadata validation, C0/C1/C2/C3/F recovery, byte preservation, manifests, timings, and rerun idempotency.
+    # Scenario: A normalization path is exact, a unique case-only variant, untracked, case-sensitive, or ambiguous under core.ignorecase.
+    # Purpose: Preserve exact Git identity, canonicalize only the unique ignore-case case, and fail closed on ambiguous tracked paths.
+    It 'UnitT215_ResolvesOnlyUniqueIgnoreCaseGitNormalizationPaths' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Resolve-GitNormalizationRepositoryPath'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $trackedPath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/UI/UI.lua'
+        $caseVariant = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/ui/UI.lua'
+        $untrackedPath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/ui/New.lua'
+        $exact = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $null = $exact.Add($trackedPath)
+        $ignoreCase = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $ignoreCase.Add($trackedPath, $trackedPath)
+        $ambiguous = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $index = [ordered]@{ coreIgnoreCase = $true; exact = $exact; ignoreCase = $ignoreCase; ambiguousIgnoreCase = $ambiguous }
+
+        (& $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $trackedPath $index) | Should -BeExactly $trackedPath
+        (& $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $caseVariant $index) | Should -BeExactly $trackedPath
+        (& $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $untrackedPath $index) | Should -BeExactly $untrackedPath
+
+        $index.coreIgnoreCase = $false
+        (& $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $caseVariant $index) | Should -BeExactly $caseVariant
+        $index.coreIgnoreCase = $true
+        $null = $ambiguous.Add($caseVariant)
+        { & $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $caseVariant $index } | Should -Throw '*ambiguous under core.ignorecase*'
+    }
+
+    # Scenario: A real ZIP changes an active localization file, uses archive path casing that differs from the tracked index, and exercises resumable failures.
+    # Purpose: Prove index-path casing canonicalization, fail-closed metadata validation, C0/C1/C2/C3/F recovery, byte preservation, manifests, timings, and rerun idempotency.
     It 'InterT200_ExecutesABytePreservingLocalizedCandidateEndToEnd' {
         $fixtureRepo = Join-Path $TestDrive 'fixture-repository'
         $modRoot = Join-Path $fixtureRepo 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
@@ -2093,10 +2133,15 @@ function Get-SourceTupleContractSha256 {
         [IO.File]::WriteAllText($oldLocalizationPath, "return { key = `"Old`" }`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $fixtureRepo $relativeRemovedLocalization), "return { removed = `"舊翻譯`" }`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $modRoot 'upstream.txt'), "old`n", [Text.UTF8Encoding]::new($false))
+        $trackedCaseRelative = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/scripts/mods/ExampleMod/UI/UI.lua'
+        $trackedCasePath = Join-Path $fixtureRepo $trackedCaseRelative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $trackedCasePath) -Force | Out-Null
+        [IO.File]::WriteAllText($trackedCasePath, "old case-preserved content`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $fixtureRepo '.gitattributes'), "*.lua text`n*.txt text`n", [Text.UTF8Encoding]::new($false))
         & git -C $fixtureRepo init --quiet --initial-branch=main
         & git -C $fixtureRepo config user.name 'Fixture User'
         & git -C $fixtureRepo config user.email 'fixture@example.invalid'
+        & git -C $fixtureRepo config core.ignorecase true
         & git -C $fixtureRepo add --all
         & git -C $fixtureRepo commit --quiet -m 'fixture baseline'
 
@@ -2124,6 +2169,13 @@ function Get-SourceTupleContractSha256 {
             $entryStream = $upstreamEntry.Open()
             try {
                 $bytes = [Text.Encoding]::UTF8.GetBytes("new`r`n")
+                $entryStream.Write($bytes, 0, $bytes.Length)
+            }
+            finally { $entryStream.Dispose() }
+            $caseVariantEntry = $archive.CreateEntry('ExampleMod/scripts/mods/ExampleMod/ui/UI.lua')
+            $entryStream = $caseVariantEntry.Open()
+            try {
+                $bytes = [Text.Encoding]::UTF8.GetBytes("new case-preserved content`r`n")
                 $entryStream.Write($bytes, 0, $bytes.Length)
             }
             finally { $entryStream.Dispose() }
@@ -2264,6 +2316,11 @@ function Get-SourceTupleContractSha256 {
             Move-Item -LiteralPath $outsideInstallTarget -Destination $worktreeModRoot
         }
         (& $runnerPath install -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
+        $installedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $normalization = Get-Content -LiteralPath $installedState.gitIndexNormalization.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $caseVariantRecord = @($normalization.files | Where-Object { $_.path -ceq 'scripts/mods/ExampleMod/ui/UI.lua' })
+        $caseVariantRecord.Count | Should -Be 1
+        $caseVariantRecord[0].repositoryPath | Should -BeExactly $trackedCaseRelative
 
         $indexedText = $rawText.Replace("`r`n", "`n")
         $indexedBytes = [Text.Encoding]::UTF8.GetBytes($indexedText)

@@ -1166,21 +1166,75 @@ function Get-StageArtifactPath {
     }
 }
 
+function New-GitTrackedPathIndex {
+    param(
+        [Parameter(Mandatory)][string] $WorkingDirectory,
+        [Parameter(Mandatory)][string] $Root
+    )
+    $ignoreCaseResult = Invoke-Git -WorkingDirectory $WorkingDirectory `
+        -Arguments @('config', '--bool', 'core.ignorecase') -AllowFailure
+    if ($ignoreCaseResult.exitCode -notin @(0, 1)) {
+        throw 'Unable to inspect core.ignorecase before Git normalization.'
+    }
+    $coreIgnoreCase = $ignoreCaseResult.exitCode -eq 0 -and $ignoreCaseResult.output.Trim() -ceq 'true'
+    $trackedResult = Invoke-Git -WorkingDirectory $WorkingDirectory `
+        -Arguments @('-c', 'core.quotepath=false', 'ls-files', '-z', '--full-name', '--', $Root)
+    $exact = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $ignoreCase = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $ambiguousIgnoreCase = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($trackedPathValue in @($trackedResult.output -split ([string][char]0))) {
+        if ([string]::IsNullOrEmpty($trackedPathValue)) { continue }
+        $trackedPath = $trackedPathValue.Replace('\', '/')
+        $null = $exact.Add($trackedPath)
+        $existing = $null
+        if ($ignoreCase.TryGetValue($trackedPath, [ref]$existing)) {
+            if ($existing -cne $trackedPath) { $null = $ambiguousIgnoreCase.Add($trackedPath) }
+        }
+        else { $ignoreCase.Add($trackedPath, $trackedPath) }
+    }
+    [ordered]@{
+        coreIgnoreCase = $coreIgnoreCase
+        exact = $exact
+        ignoreCase = $ignoreCase
+        ambiguousIgnoreCase = $ambiguousIgnoreCase
+    }
+}
+
+function Resolve-GitNormalizationRepositoryPath {
+    param(
+        [Parameter(Mandatory)][string] $RepositoryPath,
+        [Parameter(Mandatory)][Collections.IDictionary] $TrackedPathIndex
+    )
+    if ($TrackedPathIndex.exact.Contains($RepositoryPath) -or -not $TrackedPathIndex.coreIgnoreCase) {
+        return $RepositoryPath
+    }
+    if ($TrackedPathIndex.ambiguousIgnoreCase.Contains($RepositoryPath)) {
+        throw "Tracked Git paths are ambiguous under core.ignorecase for normalization path: $RepositoryPath"
+    }
+    $canonical = $null
+    if ($TrackedPathIndex.ignoreCase.TryGetValue($RepositoryPath, [ref]$canonical)) { return $canonical }
+    $RepositoryPath
+}
+
 function New-GitNormalizationManifest {
     param([Collections.IDictionary] $State)
     $records = [Collections.Generic.List[object]]::new()
+    $trackedPathIndex = New-GitTrackedPathIndex -WorkingDirectory ([string]$State.worktreePath) `
+        -Root ([string]$State.modRelativePath)
     foreach ($file in Get-ChildItem -LiteralPath $State.installRoot -File -Recurse | Sort-Object FullName) {
         $relativeToRepository = [IO.Path]::GetRelativePath($State.worktreePath, $file.FullName).Replace('\', '/')
+        $repositoryPath = Resolve-GitNormalizationRepositoryPath -RepositoryPath $relativeToRepository `
+            -TrackedPathIndex $trackedPathIndex
         $relativeToMod = [IO.Path]::GetRelativePath($State.installRoot, $file.FullName).Replace('\', '/')
         $rawBytes = Read-FileBytesWithHeartbeat -Path $file.FullName
-        $blobOid = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.autocrlf=true', 'hash-object', '-w', "--path=$relativeToRepository", '--', $file.FullName)).output.Trim()
+        $blobOid = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.autocrlf=true', 'hash-object', '-w', "--path=$repositoryPath", '--', $file.FullName)).output.Trim()
         $indexedBytes = Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $blobOid
         $transform = if ((Get-Sha256Bytes -Bytes $rawBytes) -eq (Get-Sha256Bytes -Bytes $indexedBytes)) { 'none' }
             elseif (Test-CrlfNormalizationOnly -RawBytes $rawBytes -IndexedBytes $indexedBytes) { 'crlf-to-lf' }
-            else { throw "Git clean processing changed bytes beyond CRLF-to-LF for $relativeToRepository." }
+            else { throw "Git clean processing changed bytes beyond CRLF-to-LF for $repositoryPath." }
         $records.Add([ordered]@{
             path = $relativeToMod
-            repositoryPath = $relativeToRepository
+            repositoryPath = $repositoryPath
             rawSize = $rawBytes.LongLength
             rawSha256 = Get-Sha256Bytes -Bytes $rawBytes
             indexedSize = $indexedBytes.LongLength
