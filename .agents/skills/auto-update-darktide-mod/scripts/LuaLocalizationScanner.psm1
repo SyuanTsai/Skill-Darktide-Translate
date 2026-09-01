@@ -565,6 +565,17 @@ function Join-LuaContainerPath {
     $ContainerPath + '.' + $Key
 }
 
+function Test-LuaTableFieldStart {
+    param([object[]] $Tokens, [int] $Index, [int] $CloseIndex)
+    if ($Tokens[$Index].type -ceq 'identifier' -and ($Index + 1) -lt $CloseIndex -and
+        $Tokens[$Index + 1].text -ceq '=') {
+        return $true
+    }
+    if ($Tokens[$Index].text -cne '[') { return $false }
+    $keyEnd = Get-MatchingTokenIndex -Tokens $Tokens -StartIndex $Index -Open '[' -Close ']'
+    ($keyEnd + 1) -lt $CloseIndex -and $Tokens[$keyEnd + 1].text -ceq '='
+}
+
 function Read-LuaTable {
     param(
         [string] $Text,
@@ -615,6 +626,11 @@ function Read-LuaTable {
             if ($token -in @(',', ';') -and $braceDepth -eq 0 -and $parenDepth -eq 0 -and $bracketDepth -eq 0 -and $blockDepth -eq 0) {
                 $separatorIndex = $cursor
                 break
+            }
+            if ($cursor -gt $valueStart -and $braceDepth -eq 0 -and $parenDepth -eq 0 -and
+                $bracketDepth -eq 0 -and $blockDepth -eq 0 -and
+                (Test-LuaTableFieldStart -Tokens $Tokens -Index $cursor -CloseIndex $closeIndex)) {
+                throw "Lua table field $key is missing a separator before the next field."
             }
             switch -CaseSensitive ($token) {
                 '{' { $braceDepth++ }

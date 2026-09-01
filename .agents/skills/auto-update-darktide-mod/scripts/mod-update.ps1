@@ -3509,6 +3509,12 @@ function Invoke-Localization {
         $indexedSha = Get-Sha256Bytes -Bytes $indexedBytes
         if ($indexedSha -ne [string]$file.indexedSha256) { throw 'Localization indexedSha256 does not match the Git-normalized source.' }
         $mergedBytes = Invoke-ApprovedSpans -IndexedBytes $indexedBytes -ApprovedSpans @($file.approvedSpans)
+        try {
+            $null = Get-LuaLocalizationDocument -Bytes $mergedBytes -DisplayPath $relative -SourceId $relative -HeartbeatAction { Update-ActiveReservationHeartbeat }
+        }
+        catch {
+            throw "Merged Schema 14 localization structure is invalid: $($_.Exception.Message)"
+        }
         $safeId = (Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($relative))).Substring(0, 16)
         $artifactDirectory = Join-Path $localizationRoot $safeId
         $oldObject = "$($State.evidenceChain.c0Oid):$relative"

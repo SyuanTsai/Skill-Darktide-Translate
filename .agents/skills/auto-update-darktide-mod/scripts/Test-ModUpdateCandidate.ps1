@@ -13,6 +13,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$luaLocalizationScannerModulePath = Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1'
+Import-Module -Name $luaLocalizationScannerModulePath -Force -ErrorAction Stop
 
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
@@ -1868,6 +1870,12 @@ Add-ValidationCheck -Name 'localization-byte-boundary' -Action {
         if ((Get-Sha256Bytes -Bytes $raw) -ne $record.rawSha256) { throw 'Raw localization artifact sha256 mismatch.' }
         if ((Get-Sha256Bytes -Bytes $indexed) -ne $record.indexedSha256) { throw 'Indexed localization artifact sha256 mismatch.' }
         if ((Get-Sha256Bytes -Bytes $merged) -ne $record.mergedSha256) { throw 'Merged localization artifact sha256 mismatch.' }
+        try {
+            $null = Get-LuaLocalizationDocument -Bytes $merged -DisplayPath ([string]$record.relativePath) -SourceId ([string]$record.relativePath) -HeartbeatAction $HeartbeatAction
+        }
+        catch {
+            throw "Merged Schema 14 localization structure is invalid: $($_.Exception.Message)"
+        }
         $relativeToMod = ([string]$record.relativePath).Substring(([string]$state.modRelativePath).Length).TrimStart('/')
         $rawEntry = @($rawInstall.files | Where-Object { $_.path -ceq $relativeToMod })
         $normalizationEntry = @($normalization.files | Where-Object { $_.path -ceq $relativeToMod })
