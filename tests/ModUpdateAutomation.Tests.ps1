@@ -2188,6 +2188,47 @@ function Get-SourceTupleContractSha256 {
         }
     }
 
+    # Scenario: Git diff --check ends with an offending line whose trailing space is the evidence under review.
+    # Purpose: Remove only terminal line separators from Git stdout so the final whitespace byte survives signature construction.
+    It 'UnitT218_PreservesSignificantTrailingWhitespaceInGitCheckOutput' {
+        $fixtureRepo = Join-Path $TestDrive 'git-check-output-repository'
+        New-Item -ItemType Directory -Path $fixtureRepo -Force | Out-Null
+        & git -C $fixtureRepo init --quiet --initial-branch=main
+        & git -C $fixtureRepo config user.name 'Fixture User'
+        & git -C $fixtureRepo config user.email 'fixture@example.invalid'
+        $fixturePath = Join-Path $fixtureRepo 'upstream.lua'
+        [IO.File]::WriteAllText($fixturePath, "return true`n", [Text.UTF8Encoding]::new($false))
+        & git -C $fixtureRepo add upstream.lua
+        & git -C $fixtureRepo commit --quiet -m 'fixture baseline'
+        [IO.File]::WriteAllText($fixturePath, ('return true' + ' ' + "`n"), [Text.UTF8Encoding]::new($false))
+
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($validatorPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $gitCheckFunction = $validatorAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Invoke-GitCheck'
+        }, $true)
+        $gitCheckModule = New-Module -ScriptBlock ([scriptblock]::Create(
+                "function Invoke-Heartbeat {}`n" + $gitCheckFunction.Extent.Text
+            ))
+        try {
+            $check = & $gitCheckModule {
+                param($repository)
+                Invoke-GitCheck -WorkingDirectory $repository -Arguments @('diff', '--check') -AllowFailure
+            } $fixtureRepo
+            $check.exitCode | Should -Be 2
+            $check.output.EndsWith("`r", [StringComparison]::Ordinal) | Should -BeFalse
+            $check.output.EndsWith("`n", [StringComparison]::Ordinal) | Should -BeFalse
+            $check.output.EndsWith(' ', [StringComparison]::Ordinal) | Should -BeTrue
+        }
+        finally {
+            Remove-Module $gitCheckModule -Force
+        }
+    }
+
     # Scenario: A real ZIP changes an active localization file, uses archive path casing that differs from the tracked index, and exercises resumable failures.
     # Purpose: Prove index-path casing canonicalization, fail-closed metadata validation, C0/C1/C2/C3/F recovery, byte preservation, manifests, timings, and rerun idempotency.
     It 'InterT200_ExecutesABytePreservingLocalizedCandidateEndToEnd' {

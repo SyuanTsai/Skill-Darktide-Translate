@@ -929,7 +929,7 @@ function Invoke-GitCheck {
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
     while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
-    $output = $stdoutTask.Result.TrimEnd()
+    $output = $stdoutTask.Result.TrimEnd([char[]]@("`r", "`n"))
     $warning = $stderrTask.Result.TrimEnd()
     $exitCode = $process.ExitCode
     if ($exitCode -ne 0 -and -not $AllowFailure) {
