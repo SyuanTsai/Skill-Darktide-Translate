@@ -2117,6 +2117,43 @@ function Get-SourceTupleContractSha256 {
                 $caseVariant $index } | Should -Throw '*ambiguous under core.ignorecase*'
     }
 
+    # Scenario: Git diff --check reports exactly one recognized upstream whitespace exception.
+    # Purpose: Keep the independent Candidate Gate from scalar-unwrapping the single signature before reading Count.
+    It 'UnitT216_PreservesASingleDiffCheckSignatureAsAnArray' {
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($validatorPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+
+        $finalSignatureAssignments = @($validatorAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -ceq 'finalSignatures'
+        }, $true))
+        $finalSignatureAssignments.Count | Should -Be 1
+        $finalSignatureAssignments[0].Right | Should -BeOfType ([Management.Automation.Language.CommandExpressionAst])
+        $finalSignatureAssignments[0].Right.Expression | Should -BeOfType ([Management.Automation.Language.ArrayExpressionAst])
+
+        $signatureFunction = $validatorAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Get-DiffCheckSignatures'
+        }, $true)
+        $signatureFunction | Should -Not -BeNullOrEmpty
+        $signatureModule = New-Module -ScriptBlock ([scriptblock]::Create($signatureFunction.Extent.Text))
+        try {
+            $singleSignature = & $signatureModule {
+                Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output 'upstream.lua:12: trailing whitespace.')
+            }
+            $singleSignature.Count | Should -Be 1
+            $singleSignature[0] | Should -BeExactly 'upstream.lua:12: trailing whitespace'
+        }
+        finally {
+            Remove-Module $signatureModule -Force
+        }
+    }
+
     # Scenario: A real ZIP changes an active localization file, uses archive path casing that differs from the tracked index, and exercises resumable failures.
     # Purpose: Prove index-path casing canonicalization, fail-closed metadata validation, C0/C1/C2/C3/F recovery, byte preservation, manifests, timings, and rerun idempotency.
     It 'InterT200_ExecutesABytePreservingLocalizedCandidateEndToEnd' {

@@ -1628,7 +1628,7 @@ Add-ValidationCheck -Name 'diff-check' -Action {
         $localizationCheck = Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--check', "$($chain.c2Oid)..$($chain.c3Oid)") -AllowFailure
         if ($localizationCheck.exitCode -ne 0) { throw "Localization introduced whitespace errors: $($localizationCheck.output)" }
     }
-    $finalSignatures = Get-DiffCheckSignatures -Output $finalCheck.output
+    $finalSignatures = @(Get-DiffCheckSignatures -Output $finalCheck.output)
     if ($finalSignatures.Count -eq 0) { throw "Standard Git diff --check produced an unrecognized rejection: $($finalCheck.output)" }
     foreach ($signature in $finalSignatures) {
         if ($signature -cnotin $upstreamSignatures) { throw "Final diff contains a non-upstream whitespace error: $signature" }
