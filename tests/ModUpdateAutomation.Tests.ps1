@@ -2077,8 +2077,160 @@ function Get-SourceTupleContractSha256 {
         }
     }
 
-    # Scenario: A real ZIP changes an active localization file, including metadata preflight failures and resumable evidence failures.
-    # Purpose: Prove fail-closed metadata validation, C0/C1/C2/C3/F recovery, byte preservation, manifests, timings, and rerun idempotency.
+    # Scenario: A normalization path is exact, a unique case-only variant, untracked, case-sensitive, or ambiguous under core.ignorecase.
+    # Purpose: Preserve exact Git identity, canonicalize only the unique ignore-case case, and fail closed on ambiguous tracked paths.
+    It 'UnitT215_ResolvesOnlyUniqueIgnoreCaseGitNormalizationPaths' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Resolve-GitNormalizationRepositoryPath'
+        }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $trackedPath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/UI/UI.lua'
+        $caseVariant = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/ui/UI.lua'
+        $untrackedPath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/ui/New.lua'
+        $exact = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $null = $exact.Add($trackedPath)
+        $ignoreCase = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $ignoreCase.Add($trackedPath, $trackedPath)
+        $ambiguous = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $index = [ordered]@{ coreIgnoreCase = $true; exact = $exact; ignoreCase = $ignoreCase; ambiguousIgnoreCase = $ambiguous }
+
+        (& $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $trackedPath $index) | Should -BeExactly $trackedPath
+        (& $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $caseVariant $index) | Should -BeExactly $trackedPath
+        (& $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $untrackedPath $index) | Should -BeExactly $untrackedPath
+
+        $index.coreIgnoreCase = $false
+        (& $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $caseVariant $index) | Should -BeExactly $caseVariant
+        $index.coreIgnoreCase = $true
+        $null = $ambiguous.Add($caseVariant)
+        { & $module { param($path, $value) Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $value } `
+                $caseVariant $index } | Should -Throw '*ambiguous under core.ignorecase*'
+    }
+
+    # Scenario: Git diff --check reports exactly one recognized upstream whitespace exception.
+    # Purpose: Keep the independent Candidate Gate from scalar-unwrapping the single signature before reading Count.
+    It 'UnitT216_PreservesASingleDiffCheckSignatureAsAnArray' {
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($validatorPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+
+        $finalSignatureAssignments = @($validatorAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -ceq 'finalSignatures'
+        }, $true))
+        $finalSignatureAssignments.Count | Should -Be 1
+        $finalSignatureAssignments[0].Right | Should -BeOfType ([Management.Automation.Language.CommandExpressionAst])
+        $finalSignatureAssignments[0].Right.Expression | Should -BeOfType ([Management.Automation.Language.ArrayExpressionAst])
+
+        $signatureFunction = $validatorAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Get-DiffCheckSignatures'
+        }, $true)
+        $signatureFunction | Should -Not -BeNullOrEmpty
+        $signatureModule = New-Module -ScriptBlock ([scriptblock]::Create($signatureFunction.Extent.Text))
+        try {
+            $singleSignature = & $signatureModule {
+                Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output 'upstream.lua:12: trailing whitespace.')
+            }
+            $singleSignature.Count | Should -Be 1
+            $singleSignature[0] | Should -BeExactly 'upstream.lua|trailing whitespace|'
+        }
+        finally {
+            Remove-Module $signatureModule -Force
+        }
+    }
+
+    # Scenario: Later translation edits insert lines before an unchanged upstream whitespace exception.
+    # Purpose: Bind the exception to its path, kind, and exact offending line without treating a shifted line number as new whitespace.
+    It 'UnitT217_MatchesShiftedDiffCheckSignaturesByExactOffendingLine' {
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($validatorPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $signatureFunction = $validatorAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Get-DiffCheckSignatures'
+        }, $true)
+        $signatureModule = New-Module -ScriptBlock ([scriptblock]::Create($signatureFunction.Extent.Text))
+        try {
+            $offendingLine = '+        -- Need loc - ["zh-cn"] = ' + ' '
+            $beforeTranslation = "SpecialsTracker_localization.lua:182: trailing whitespace.`n$offendingLine"
+            $afterTranslation = "SpecialsTracker_localization.lua:184: trailing whitespace.`n$offendingLine"
+            $differentOffendingLine = "SpecialsTracker_localization.lua:184: trailing whitespace.`n" +
+                '+        -- Different line = ' + ' '
+
+            $beforeSignature = & $signatureModule { param($output) Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output $output) } $beforeTranslation
+            $afterSignature = & $signatureModule { param($output) Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output $output) } $afterTranslation
+            $differentSignature = & $signatureModule { param($output) Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output $output) } $differentOffendingLine
+
+            $beforeSignature.Count | Should -Be 1
+            $afterSignature.Count | Should -Be 1
+            $beforeSignature[0] | Should -BeExactly $afterSignature[0]
+            $beforeSignature[0] | Should -Not -BeExactly $differentSignature[0]
+        }
+        finally {
+            Remove-Module $signatureModule -Force
+        }
+    }
+
+    # Scenario: Git diff --check ends with an offending line whose trailing space is the evidence under review.
+    # Purpose: Remove only terminal line separators from Git stdout so the final whitespace byte survives signature construction.
+    It 'UnitT218_PreservesSignificantTrailingWhitespaceInGitCheckOutput' {
+        $fixtureRepo = Join-Path $TestDrive 'git-check-output-repository'
+        New-Item -ItemType Directory -Path $fixtureRepo -Force | Out-Null
+        & git -C $fixtureRepo init --quiet --initial-branch=main
+        & git -C $fixtureRepo config user.name 'Fixture User'
+        & git -C $fixtureRepo config user.email 'fixture@example.invalid'
+        $fixturePath = Join-Path $fixtureRepo 'upstream.lua'
+        [IO.File]::WriteAllText($fixturePath, "return true`n", [Text.UTF8Encoding]::new($false))
+        & git -C $fixtureRepo add upstream.lua
+        & git -C $fixtureRepo commit --quiet -m 'fixture baseline'
+        [IO.File]::WriteAllText($fixturePath, ('return true' + ' ' + "`n"), [Text.UTF8Encoding]::new($false))
+
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($validatorPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $gitCheckFunction = $validatorAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Invoke-GitCheck'
+        }, $true)
+        $gitCheckModule = New-Module -ScriptBlock ([scriptblock]::Create(
+                "function Invoke-Heartbeat {}`n" + $gitCheckFunction.Extent.Text
+            ))
+        try {
+            $check = & $gitCheckModule {
+                param($repository)
+                Invoke-GitCheck -WorkingDirectory $repository -Arguments @('diff', '--check') -AllowFailure
+            } $fixtureRepo
+            $check.exitCode | Should -Be 2
+            $check.output.EndsWith("`r", [StringComparison]::Ordinal) | Should -BeFalse
+            $check.output.EndsWith("`n", [StringComparison]::Ordinal) | Should -BeFalse
+            $check.output.EndsWith(' ', [StringComparison]::Ordinal) | Should -BeTrue
+        }
+        finally {
+            Remove-Module $gitCheckModule -Force
+        }
+    }
+
+    # Scenario: A real ZIP changes an active localization file, uses archive path casing that differs from the tracked index, and exercises resumable failures.
+    # Purpose: Prove index-path casing canonicalization, fail-closed metadata validation, C0/C1/C2/C3/F recovery, byte preservation, manifests, timings, and rerun idempotency.
     It 'InterT200_ExecutesABytePreservingLocalizedCandidateEndToEnd' {
         $fixtureRepo = Join-Path $TestDrive 'fixture-repository'
         $modRoot = Join-Path $fixtureRepo 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
@@ -2093,10 +2245,15 @@ function Get-SourceTupleContractSha256 {
         [IO.File]::WriteAllText($oldLocalizationPath, "return { key = `"Old`" }`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $fixtureRepo $relativeRemovedLocalization), "return { removed = `"舊翻譯`" }`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $modRoot 'upstream.txt'), "old`n", [Text.UTF8Encoding]::new($false))
+        $trackedCaseRelative = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/scripts/mods/ExampleMod/UI/UI.lua'
+        $trackedCasePath = Join-Path $fixtureRepo $trackedCaseRelative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $trackedCasePath) -Force | Out-Null
+        [IO.File]::WriteAllText($trackedCasePath, "old case-preserved content`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $fixtureRepo '.gitattributes'), "*.lua text`n*.txt text`n", [Text.UTF8Encoding]::new($false))
         & git -C $fixtureRepo init --quiet --initial-branch=main
         & git -C $fixtureRepo config user.name 'Fixture User'
         & git -C $fixtureRepo config user.email 'fixture@example.invalid'
+        & git -C $fixtureRepo config core.ignorecase true
         & git -C $fixtureRepo add --all
         & git -C $fixtureRepo commit --quiet -m 'fixture baseline'
 
@@ -2124,6 +2281,13 @@ function Get-SourceTupleContractSha256 {
             $entryStream = $upstreamEntry.Open()
             try {
                 $bytes = [Text.Encoding]::UTF8.GetBytes("new`r`n")
+                $entryStream.Write($bytes, 0, $bytes.Length)
+            }
+            finally { $entryStream.Dispose() }
+            $caseVariantEntry = $archive.CreateEntry('ExampleMod/scripts/mods/ExampleMod/ui/UI.lua')
+            $entryStream = $caseVariantEntry.Open()
+            try {
+                $bytes = [Text.Encoding]::UTF8.GetBytes("new case-preserved content`r`n")
                 $entryStream.Write($bytes, 0, $bytes.Length)
             }
             finally { $entryStream.Dispose() }
@@ -2264,6 +2428,11 @@ function Get-SourceTupleContractSha256 {
             Move-Item -LiteralPath $outsideInstallTarget -Destination $worktreeModRoot
         }
         (& $runnerPath install -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru).result | Should -Be 'passed'
+        $installedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $normalization = Get-Content -LiteralPath $installedState.gitIndexNormalization.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $caseVariantRecord = @($normalization.files | Where-Object { $_.path -ceq 'scripts/mods/ExampleMod/ui/UI.lua' })
+        $caseVariantRecord.Count | Should -Be 1
+        $caseVariantRecord[0].repositoryPath | Should -BeExactly $trackedCaseRelative
 
         $indexedText = $rawText.Replace("`r`n", "`n")
         $indexedBytes = [Text.Encoding]::UTF8.GetBytes($indexedText)
