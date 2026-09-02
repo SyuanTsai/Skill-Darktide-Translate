@@ -1007,12 +1007,27 @@ function Test-CrlfNormalizationOnly {
 
 function Get-DiffCheckSignatures {
     param([string] $Output)
-    @(
-        $Output -split "`r?`n" |
-            Where-Object { $_ -match '^.+:\d+: (?:trailing whitespace|new blank line at EOF)\.?$' } |
-            ForEach-Object { $_.TrimEnd('.') } |
-            Sort-Object -Unique
-    )
+    $lines = @($Output -split "`r?`n")
+    $signatures = [Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $header = [regex]::Match(
+            [string]$lines[$index],
+            '^(?<path>.+):\d+: (?<kind>trailing whitespace|new blank line at EOF)\.?$'
+        )
+        if (-not $header.Success) { continue }
+        $offendingLine = ''
+        if (($index + 1) -lt $lines.Count -and
+            ([string]$lines[$index + 1]).StartsWith('+', [StringComparison]::Ordinal)) {
+            $index++
+            $offendingLine = [string]$lines[$index]
+        }
+        $offendingLineBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($offendingLine))
+        $signatures.Add(('{0}|{1}|{2}' -f
+                $header.Groups['path'].Value,
+                $header.Groups['kind'].Value,
+                $offendingLineBase64))
+    }
+    @($signatures | Sort-Object -Unique)
 }
 
 function Get-ChangedPaths {

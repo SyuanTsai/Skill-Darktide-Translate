@@ -2147,7 +2147,41 @@ function Get-SourceTupleContractSha256 {
                 Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output 'upstream.lua:12: trailing whitespace.')
             }
             $singleSignature.Count | Should -Be 1
-            $singleSignature[0] | Should -BeExactly 'upstream.lua:12: trailing whitespace'
+            $singleSignature[0] | Should -BeExactly 'upstream.lua|trailing whitespace|'
+        }
+        finally {
+            Remove-Module $signatureModule -Force
+        }
+    }
+
+    # Scenario: Later translation edits insert lines before an unchanged upstream whitespace exception.
+    # Purpose: Bind the exception to its path, kind, and exact offending line without treating a shifted line number as new whitespace.
+    It 'UnitT217_MatchesShiftedDiffCheckSignaturesByExactOffendingLine' {
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($validatorPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $signatureFunction = $validatorAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Get-DiffCheckSignatures'
+        }, $true)
+        $signatureModule = New-Module -ScriptBlock ([scriptblock]::Create($signatureFunction.Extent.Text))
+        try {
+            $offendingLine = '+        -- Need loc - ["zh-cn"] = ' + ' '
+            $beforeTranslation = "SpecialsTracker_localization.lua:182: trailing whitespace.`n$offendingLine"
+            $afterTranslation = "SpecialsTracker_localization.lua:184: trailing whitespace.`n$offendingLine"
+            $differentOffendingLine = "SpecialsTracker_localization.lua:184: trailing whitespace.`n" +
+                '+        -- Different line = ' + ' '
+
+            $beforeSignature = & $signatureModule { param($output) Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output $output) } $beforeTranslation
+            $afterSignature = & $signatureModule { param($output) Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output $output) } $afterTranslation
+            $differentSignature = & $signatureModule { param($output) Write-Output -NoEnumerate @(Get-DiffCheckSignatures -Output $output) } $differentOffendingLine
+
+            $beforeSignature.Count | Should -Be 1
+            $afterSignature.Count | Should -Be 1
+            $beforeSignature[0] | Should -BeExactly $afterSignature[0]
+            $beforeSignature[0] | Should -Not -BeExactly $differentSignature[0]
         }
         finally {
             Remove-Module $signatureModule -Force
