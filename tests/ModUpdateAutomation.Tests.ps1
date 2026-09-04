@@ -1059,7 +1059,7 @@ function Suspend-Stage {
         $identityLockIndex | Should -BeGreaterThan $baseResolutionIndex
     }
 
-    Context 'SYP-118 completed-stage run-local Skill pin validation' {
+    Context 'Completed-stage run-local Skill pin validation' {
         BeforeEach {
             $script:syp118Fixture = New-TestPinnedCompletedStageRun -SkillRoot $skillRoot `
                 -FixtureRoot (Join-Path $TestDrive ("syp118-" + [guid]::NewGuid().ToString('N')))
@@ -1101,7 +1101,7 @@ function Suspend-Stage {
         It 'InterT172_RejectsDifferentPinnedPackageContentBeforeReceiptReuse' {
             [IO.File]::AppendAllText(
                 (Join-Path $script:syp118Fixture.SkillRoot 'references/automation.md'),
-                "`nSYP-118 package drift`n",
+                "`nRepository package drift`n",
                 [Text.UTF8Encoding]::new($false)
             )
             $protectedPaths = @(
@@ -1169,7 +1169,7 @@ function Suspend-Stage {
         It 'InterT174_RejectsRunnerFileDriftBeforeStateOrLockMutation' {
             [IO.File]::AppendAllText(
                 $script:syp118Fixture.RunnerPath,
-                "`n# SYP-118 runner drift`n",
+                "`n# Runner drift`n",
                 [Text.UTF8Encoding]::new($false)
             )
             $protectedPaths = @(
