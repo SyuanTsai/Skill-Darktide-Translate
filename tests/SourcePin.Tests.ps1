@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
 Describe 'Immutable Skill source pin' {
     BeforeAll {
         $sourceScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Get-SourcePin.ps1'

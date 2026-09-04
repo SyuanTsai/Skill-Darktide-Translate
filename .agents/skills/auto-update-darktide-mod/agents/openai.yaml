@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
 interface:
   display_name: "Auto Update Darktide MOD"
   short_description: "Maintain DARKTIDE MODs, natural zh-tw, evidence, and merge finalization"

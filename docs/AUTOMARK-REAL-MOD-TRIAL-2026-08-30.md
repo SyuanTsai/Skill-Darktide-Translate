@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 SyuanTsai
+SPDX-License-Identifier: Apache-2.0
+-->
 # AutoMark 2.5.1 real-MOD trial — 2026-08-30
 
 ## Scope
