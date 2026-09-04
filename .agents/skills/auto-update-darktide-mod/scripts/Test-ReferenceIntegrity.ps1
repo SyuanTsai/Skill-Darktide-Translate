@@ -246,7 +246,7 @@ function Test-Schema15Extension {
     $extensionProvenancePath = Join-Path $skillRoot 'references/schema-15-provenance.json'
     $extensionProvenancePath = Assert-NoReparsePath -Path $extensionProvenancePath -Root $skillRoot -Name 'Schema 15 provenance'
     $extensionProvenance = Get-Content -LiteralPath $extensionProvenancePath -Raw | ConvertFrom-Json
-    if ($extensionProvenance.schemaVersion -ne 1 -or $extensionProvenance.issue -cne 'SYP-91') { throw 'Unsupported Schema 15 provenance contract.' }
+    if ($extensionProvenance.schemaVersion -ne 1 -or $extensionProvenance.issue -cne 'repository-local') { throw 'Unsupported Schema 15 provenance contract.' }
     if ($extensionProvenance.derivedFrom.workflowSchemaVersion -ne 14 -or
         $extensionProvenance.derivedFrom.workflowSha256 -cne $provenance.documents.workflow.contentSha256 -or
         $extensionProvenance.derivedFrom.reviewBaselineSha256 -cne $provenance.documents.reviewBaseline.contentSha256) {
