@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 SyuanTsai
+SPDX-License-Identifier: Apache-2.0
+-->
 # Skill Darktide Translate
 
 Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive updates and `zh-tw` source synchronization.
@@ -5,7 +9,7 @@ Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive up
 - Stable source ID: `darktide-translate`
 - Catalog: `catalog/skills-catalog.json`
 - Current repository version: `0.3.13`
-- Jira delivery items: `SYP-112` checkpoint reasons, `SYP-113` immutable source metadata, `SYP-114` shared coordination locks, `SYP-115` reservation heartbeat/lifecycle, `SYP-116` runner observability/Windows byte preservation, `SYP-117` deterministic partial commit recovery, and `SYP-118` resume-time Skill pin validation, building on `SYP-91`, `SYP-92`, and `SYP-88`
+- Delivery tracking is maintained outside this public source and does not change the repository licensing boundary.
 
 ## Skill
 
@@ -69,7 +73,15 @@ GitHub Actions also runs strict `skill-validator` and `skill-tools` Quality Gate
 
 Release and immutable pin rules are in `docs/RELEASE.md`. Consumers start and roll back runs with the complete JSON emitted by `scripts/Get-SourcePin.ps1`, including the tag/ref, resolved commit, deterministic content hash, and installed Skill file manifest, as described in `docs/ROLLBACK.md`. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
 
-The real Reconnect trial, immutable Git evidence, Gate hashes, Review result, and measured 9-minute-18-second wall-clock run are recorded in [`docs/SYP-88-E2E.md`](docs/SYP-88-E2E.md).
+The real Reconnect trial, immutable Git evidence, Gate hashes, Review result, and measured wall-clock run are recorded in the versioned end-to-end evidence document.
+
+## License and contribution boundary
+
+The Apache-2.0 license in [LICENSE](LICENSE) applies to the repository-authored Skill instructions, agent metadata, scripts, tests, catalog and version metadata, documentation, and workflow configuration that this repository created. The two compressed reference archives under `assets/` are source-derived upstream material and are expressly excluded from that grant; their provenance and treatment are recorded in [PROVENANCE.md](PROVENANCE.md).
+
+Downloaded Mods, game data, localization files, archives, upstream translations, Nexus or other external-service content, trademarks, credentials, user-provided inputs, and generated outputs are outside this repository's Apache-2.0 scope. Processing or transforming such material with this workflow does not automatically relicense it.
+
+The repository does not vendor third-party source code. CI and developer dependencies are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and their upstream terms remain applicable. Contributors must have the right to submit their contribution; unless a separate written agreement says otherwise, an intentional contribution to the repository-authored scope is submitted under Apache-2.0 and must preserve existing notices.
 
 ## Scope
 

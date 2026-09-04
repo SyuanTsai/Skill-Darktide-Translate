@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
 Describe 'Darktide Translate repository contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot

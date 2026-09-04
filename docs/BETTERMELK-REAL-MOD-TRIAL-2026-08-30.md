@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 SyuanTsai
+SPDX-License-Identifier: Apache-2.0
+-->
 # BetterMelk real-MOD trial report (2026-08-30)
 
 ## Outcome

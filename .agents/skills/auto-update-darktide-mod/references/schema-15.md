@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 SyuanTsai
+SPDX-License-Identifier: Apache-2.0
+-->
 # Schema 15 automatic source and localization workset extension
 
 This reference is normative for new Schema 15 runs. It extends the packaged Schema 14 Workflow; every Schema 14 safety, Git evidence, Candidate Gate, Review, publication, and recovery requirement remains in force unless this document explicitly replaces that behavior.

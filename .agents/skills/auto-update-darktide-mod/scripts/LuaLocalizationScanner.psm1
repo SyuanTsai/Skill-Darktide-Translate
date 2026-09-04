@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:luaScannerHeartbeatAction = $null

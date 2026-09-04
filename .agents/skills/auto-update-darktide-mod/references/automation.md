@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 SyuanTsai
+SPDX-License-Identifier: Apache-2.0
+-->
 # Deterministic MOD Update Automation
 
 Load this reference when executing, resuming, diagnosing, or extending the fixed stage runner. The expanded Schema 14 Workflow supplies the base process, and `translation-quality.md` supplies the semantic translation outcome standard.

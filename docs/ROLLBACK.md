@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 SyuanTsai
+SPDX-License-Identifier: Apache-2.0
+-->
 # Rollback
 
 Rollback is source-pin based. Do not rewrite a released tag, force-update consumers under the same version, migrate active Schema 14 run state, or downgrade Schema 15 state implicitly.

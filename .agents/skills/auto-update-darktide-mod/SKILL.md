@@ -2,6 +2,10 @@
 name: auto-update-darktide-mod
 description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs, preserve active zh-tw, and produce Schema 14 or 15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
 ---
+<!--
+SPDX-FileCopyrightText: 2026 SyuanTsai
+SPDX-License-Identifier: Apache-2.0
+-->
 
 # Auto Update a DARKTIDE MOD
 

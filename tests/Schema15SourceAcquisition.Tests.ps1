@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
 Describe 'Schema 15 source acquisition contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot

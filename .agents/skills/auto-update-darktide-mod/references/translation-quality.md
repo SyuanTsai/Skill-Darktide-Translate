@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 SyuanTsai
+SPDX-License-Identifier: Apache-2.0
+-->
 # Taiwan Traditional Chinese translation quality contract
 
 This reference is normative for Schema 14 and Schema 15 translation selection, translation writing, local Review, and external-feedback classification. Read it before deciding translation eligibility and again with the packaged Review Baseline. It refines only semantic translation quality; source identity, byte-span/workset authorization, Lua structure, security, Git evidence, Candidate Gate, publication, and finalization contracts keep their existing authority.
