@@ -144,7 +144,7 @@ Describe 'Darktide Translate repository contract' {
     }
 
     # Scenario: A release process resolves the repository version before pin generation.
-    # Purpose: Keep source pins compatible with the SYP-81 through SYP-84 SemVer contract.
+    # Purpose: Keep source pins compatible with the shared SemVer contract.
     It 'UnitT30_UsesASemVerCompatibleRepositoryVersion' {
         $versionPath = Join-Path $repoRoot 'VERSION'
         Test-Path -LiteralPath $versionPath | Should -Be $true
@@ -167,7 +167,7 @@ Describe 'Darktide Translate repository contract' {
         $userAgentMatches[0].Groups['version'].Value | Should -Be $version
     }
 
-    # Scenario: GitHub validates a branch or pull request using the shared SYP-81 through SYP-84 tool policy.
+    # Scenario: GitHub validates a branch or pull request using the shared tool policy.
     # Purpose: Prevent the repository from silently pinning stale quality tools or weakening the required gates.
     It 'UnitT40_PreservesTheSharedLatestAtRunTimeQualityGate' {
         $qualityPath = Join-Path $repoRoot '.github/workflows/skill-validator.yml'
