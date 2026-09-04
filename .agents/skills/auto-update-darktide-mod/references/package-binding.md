@@ -30,7 +30,7 @@ Never look for these packaged references in the target MOD repository. The targe
 
 ## Schema 15 extension binding
 
-New automatic-source runs also bind `references/schema-15.md`. It is a repository-native normative extension derived from the byte-exact Schema 14 Workflow and Review Baseline, not a replacement compressed document. `references/schema-15-provenance.json` records its exact size, SHA-256, SYP-91 identity, and the Schema 14 Workflow/Baseline hashes it extends. `scripts/Test-ReferenceIntegrity.ps1` verifies all three references together before acquisition or claim.
+New automatic-source runs also bind `references/schema-15.md`. It is a repository-native normative extension derived from the byte-exact Schema 14 Workflow and Review Baseline, not a replacement compressed document. `references/schema-15-provenance.json` records its exact size, SHA-256, repository-local contract identity, and the Schema 14 Workflow/Baseline hashes it extends. `scripts/Test-ReferenceIntegrity.ps1` verifies all three references together before acquisition or claim.
 
 A Schema 15 state records `workflowSchemaVersion = 15`, `schema15Path`, `schema15BlobOid`, and `schema15Sha256` in addition to the existing Workflow and Review Baseline tuple. Schema 14 states do not gain these fields and are never migrated implicitly.
 

@@ -2,7 +2,7 @@
 SPDX-FileCopyrightText: 2026 SyuanTsai
 SPDX-License-Identifier: Apache-2.0
 -->
-# SYP-88 Real MOD End-to-End Trial
+# Darktide MOD Real End-to-End Trial
 
 ## Trial
 
@@ -59,4 +59,4 @@ The second validation attempt added the independent diff-readability artifact wi
 - Copilot Review: completed for F with zero inline comments. Its request for human runtime confirmation of non-localization networking behavior was classified `out-of-scope` under the packaged Review Baseline.
 - External Review polling wait: 0; no watcher or periodic polling was scheduled.
 
-This trial belongs only to the independently installed Darktide Skill. It does not add SYP-88 or SYP-92 to the AI-Instructions Catalog, Lock, bootstrap, or fan-out.
+This trial belongs only to the independently installed Darktide Skill. It does not add internal tracker references to the AI-Instructions Catalog, Lock, bootstrap, or fan-out.
