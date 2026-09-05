@@ -179,21 +179,31 @@ function Assert-ContainedPath {
 
 function Assert-NoReparsePath {
     param([string] $Path, [string] $Root, [switch] $AllowMissing)
-    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $rawRoot = [IO.Path]::GetFullPath($Root)
+    $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $current = [IO.Path]::GetFullPath($Path)
     if (-not $current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
         -not $current.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Localization workset path escapes its verification root.'
     }
     for ($depth = 0; $depth -lt 2048; $depth++) {
-        if (Test-Path -LiteralPath $current) {
-            if ((Get-Item -LiteralPath $current).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Localization workset path contains a symlink or reparse point.' }
+        $item = $null
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
-        elseif (-not $AllowMissing) { throw 'Localization workset path component is missing.' }
-        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw 'Unable to prove NEW localization containment.' }
-        $current = $parent
+        catch [Management.Automation.ItemNotFoundException] {
+            if (-not $AllowMissing) { throw 'Localization workset path component is missing.' }
+        }
+        catch { throw "Unable to inspect Localization workset physical containment component: $($_.Exception.Message)" }
+        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Localization workset path contains a symlink or reparse point.' }
+        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($null -eq $item) { throw 'Unable to prove NEW localization containment.' }
+            return
+        }
+        $parentInfo = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parentInfo) { throw 'Unable to prove NEW localization containment.' }
+        $current = $parentInfo.FullName
     }
     throw 'Unable to prove localization workset containment within 2048 path components.'
 }

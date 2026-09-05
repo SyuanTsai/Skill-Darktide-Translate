@@ -170,9 +170,9 @@ function Assert-NoReparsePath {
             throw 'Workset NEW localization path contains a symlink or reparse point.'
         }
         if ($current.FullName.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { break }
-        $parent = Split-Path -Parent $current.FullName
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw 'Unable to prove Workset NEW localization containment.' }
-        $current = Get-Item -LiteralPath $parent
+        $parent = [IO.DirectoryInfo]::new($current.FullName).Parent
+        if ($null -eq $parent) { throw 'Unable to prove Workset NEW localization containment.' }
+        $current = $parent
     }
 }
 

@@ -529,16 +529,28 @@ function Assert-NoReparsePath {
     }
     $current = $pathFull
     for ($depth = 0; $depth -lt 2048; $depth++) {
-        if (Test-Path -LiteralPath $current) {
-            if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                throw "$Label path contains a symlink or reparse point."
-            }
+        $item = $null
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            # This is required for broken symlinks and keeps reparse checks fail-closed.
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
-        elseif (-not $AllowMissing) { throw "$Label path component is missing." }
-        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw "Unable to prove $Label physical containment." }
-        $current = $parent
+        catch [Management.Automation.ItemNotFoundException] {
+            if (-not $AllowMissing) { throw "$Label path component is missing." }
+        }
+        catch {
+            throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+        }
+        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "$Label path contains a symlink or reparse point."
+        }
+        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($null -eq $item) { throw "Unable to prove $Label physical containment." }
+            return $pathFull
+        }
+        $parentInfo = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parentInfo) { throw "Unable to prove $Label physical containment." }
+        $current = $parentInfo.FullName
     }
     throw "Unable to prove $Label physical containment within 2048 path components."
 }

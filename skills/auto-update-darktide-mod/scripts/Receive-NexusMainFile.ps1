@@ -162,7 +162,8 @@ function Assert-ContainedFilePath {
 
 function Assert-NoReparsePath {
     param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Root, [Parameter(Mandatory)][string] $Label, [switch] $AllowMissingLeaf)
-    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $rawRoot = [IO.Path]::GetFullPath($Root)
+    $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     if (-not $pathFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
         -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
@@ -174,11 +175,19 @@ function Assert-NoReparsePath {
     $paths = @($rootFull)
     foreach ($component in $components) { $current = Join-Path $current $component; $paths += $current }
     for ($index = 0; $index -lt $paths.Count; $index++) {
-        if (-not (Test-Path -LiteralPath $paths[$index])) {
+        $item = $null
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            $item = Get-Item -LiteralPath $paths[$index] -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
             if ($AllowMissingLeaf -and $index -eq ($paths.Count - 1)) { continue }
             throw "$Label path component is missing."
         }
-        if ((Get-Item -LiteralPath $paths[$index]).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        catch {
+            throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+        }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "$Label path contains a symlink or reparse point."
         }
     }

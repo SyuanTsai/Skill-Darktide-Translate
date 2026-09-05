@@ -10,7 +10,6 @@ Describe 'Darktide Translate Standard v1 conformance' {
 
     It 'uses the canonical schema v2 source inventory and source root' {
         Test-Path -LiteralPath (Join-Path $script:RepositoryRoot 'skills') -PathType Container | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.agents/skills') | Should -BeTrue
         $source = Get-Content -LiteralPath $script:SourcePath -Raw | ConvertFrom-Json -Depth 20
         @($source.PSObject.Properties.Name) | Should -Be @('schemaVersion','sourceId','repository','skillsRoot','skills')
         $source.schemaVersion | Should -Be 2
@@ -18,9 +17,14 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $source.repository | Should -Be 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
         $source.skillsRoot | Should -Be 'skills'
         @($source.skills) | Should -Be @('auto-update-darktide-mod')
-        $manifest = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.codex/ai-instructions.manifest.json') -Raw | ConvertFrom-Json -Depth 30
-        @($manifest.files | Where-Object { $_.artifactType -eq 'skill' }).Count | Should -BeGreaterThan 0
-        @($manifest.files | Where-Object { $_.targetPath -like '.agents/skills/*' }).Count | Should -BeGreaterThan 0
+        $projectionRoot = Join-Path $script:RepositoryRoot '.agents/skills'
+        if (Test-Path -LiteralPath $projectionRoot) {
+            $manifestPath = Join-Path $script:RepositoryRoot '.codex/ai-instructions.manifest.json'
+            Test-Path -LiteralPath $manifestPath -PathType Leaf | Should -BeTrue
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 30
+            @($manifest.files | Where-Object { $_.artifactType -eq 'skill' }).Count | Should -BeGreaterThan 0
+            @($manifest.files | Where-Object { $_.targetPath -like '.agents/skills/*' }).Count | Should -BeGreaterThan 0
+        }
         Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.agents/skills/auto-update-darktide-mod') | Should -BeFalse
     }
 

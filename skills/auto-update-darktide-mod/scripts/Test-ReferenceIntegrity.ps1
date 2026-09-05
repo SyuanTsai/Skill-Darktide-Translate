@@ -63,14 +63,24 @@ function Assert-NoReparsePath {
     }
     $current = $pathFull
     for ($depth = 0; $depth -lt 2048; $depth++) {
-        if (-not (Test-Path -LiteralPath $current)) { throw "$Name path component is missing." }
-        if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        $item = $null
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            throw "$Name path component is missing."
+        }
+        catch {
+            throw "Unable to inspect $Name physical containment component: $($_.Exception.Message)"
+        }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "$Name path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw "Unable to prove $Name physical containment." }
-        $current = $parent
+        $parentInfo = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parentInfo) { throw "Unable to prove $Name physical containment." }
+        $current = $parentInfo.FullName
     }
     throw "Unable to prove $Name physical containment within 2048 path components."
 }
