@@ -4136,34 +4136,28 @@ function Assert-CheckpointIndexState {
         $expected.Add($path, $sha256)
     }
 
-    $indexListing = Invoke-Git -WorkingDirectory $WorkingDirectory -Arguments @('ls-files', '--stage', '-z', '--full-name')
-    $indexPaths = [Collections.Generic.List[string]]::new()
-    foreach ($entry in @($indexListing.output -split ([string][char]0))) {
-        if ([string]::IsNullOrEmpty($entry)) { continue }
-        $tabIndex = $entry.IndexOf([char]9)
-        if ($tabIndex -lt 0 -or $entry.Substring(0, $tabIndex) -notmatch '^[0-7]{6} [0-9a-f]{40} \d+$') {
-            throw "$Checkpoint index listing is malformed."
-        }
-        $indexPaths.Add($entry.Substring($tabIndex + 1))
-    }
     $ignoreCaseResult = Invoke-Git -WorkingDirectory $WorkingDirectory `
         -Arguments @('config', '--bool', 'core.ignorecase') -AllowFailure
     if ($ignoreCaseResult.exitCode -notin @(0, 1)) { throw 'Unable to inspect core.ignorecase for checkpoint index verification.' }
     $coreIgnoreCase = $ignoreCaseResult.exitCode -eq 0 -and $ignoreCaseResult.output.Trim() -ceq 'true'
 
     foreach ($path in $expected.Keys) {
-        $exactMatches = @($indexPaths | Where-Object { $_ -ceq $path })
-        if ($exactMatches.Count -gt 1) {
+        $pathSpec = if ($coreIgnoreCase) { ":(icase)$path" } else { $path }
+        $indexListing = Invoke-Git -WorkingDirectory $WorkingDirectory `
+            -Arguments @('ls-files', '--stage', '-z', '--full-name', '--', $pathSpec)
+        $entries = @(
+            $indexListing.output -split ([string][char]0) |
+                Where-Object { -not [string]::IsNullOrEmpty($_) }
+        )
+        if ($entries.Count -ne 1) {
             throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
         }
-        $indexPath = if ($exactMatches.Count -eq 1) { [string]$exactMatches[0] }
-            elseif ($coreIgnoreCase) {
-                $caseMatches = @($indexPaths | Where-Object { $_ -ieq $path })
-                if ($caseMatches.Count -eq 1) { [string]$caseMatches[0] }
-            }
-        if ([string]::IsNullOrWhiteSpace($indexPath)) {
-            throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
+        $entry = [string]$entries[0]
+        $tabIndex = $entry.IndexOf([char]9)
+        if ($tabIndex -lt 0 -or $entry.Substring(0, $tabIndex) -notmatch '^[0-7]{6} [0-9a-f]{40} \d+$') {
+            throw "$Checkpoint index listing is malformed."
         }
+        $indexPath = $entry.Substring($tabIndex + 1)
         try {
             $blobBytes = Get-GitBlobBytes -WorkingDirectory $WorkingDirectory -Object ":$indexPath"
         }
