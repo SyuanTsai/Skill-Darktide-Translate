@@ -3,7 +3,7 @@
 Describe 'Schema 15 multi-process coordination contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
-        $skillRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod'
+        $skillRoot = Join-Path $repoRoot 'skills/auto-update-darktide-mod'
         $scriptRoot = Join-Path $skillRoot 'scripts'
         $runnerPath = Join-Path $scriptRoot 'mod-update.ps1'
         $coordinationModule = Join-Path $scriptRoot 'SharedCoordinationLock.psm1'

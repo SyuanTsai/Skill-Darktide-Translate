@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
+
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function Get-MergeFinalizationDisposition {
     param(
         [Parameter(Mandatory)][string] $PullRequestState,
@@ -50,13 +53,16 @@ function Test-ModUpdateWorktreeRegistered {
         [Parameter(Mandatory)][AllowEmptyString()][string] $Porcelain,
         [Parameter(Mandatory)][string] $ExpectedPath
     )
-    $expected = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($ExpectedPath))
+    $normalizePath = {
+        param([string] $Value)
+        $portable = $Value.Replace([char]92, [IO.Path]::DirectorySeparatorChar).Replace([char]47, [IO.Path]::DirectorySeparatorChar)
+        [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($portable))
+    }
+    $expected = & $normalizePath $ExpectedPath
     foreach ($line in @($Porcelain -split '\r?\n')) {
         if (-not $line.StartsWith('worktree ', [StringComparison]::Ordinal)) { continue }
         try {
-            $candidate = [IO.Path]::TrimEndingDirectorySeparator(
-                [IO.Path]::GetFullPath($line.Substring('worktree '.Length))
-            )
+            $candidate = & $normalizePath $line.Substring('worktree '.Length)
         }
         catch { continue }
         if ($candidate.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { return $true }
@@ -119,7 +125,7 @@ function Assert-MergeFileTuple {
         [Parameter(Mandatory)][string] $Sha256
     )
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+    if ($item.PSIsContainer -or (Test-PortableReparseItem -Path $Path -Item $item -Label 'Immutable merge file') -or
         $item.Length -ne $Size -or (Get-FileSha256 -Path $item.FullName) -cne $Sha256) {
         throw "Immutable file tuple mismatch: $Path"
     }
@@ -235,7 +241,7 @@ function Copy-ModUpdateEvidenceTree {
         New-Item -ItemType Directory -Path $destinationFull -Force | Out-Null
     }
     foreach ($file in Get-ChildItem -LiteralPath $sourceFull -File -Recurse -Force | Sort-Object FullName) {
-        if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Finalization evidence contains a reparse point.' }
+        if (Test-PortableReparseItem -Path $file.FullName -Item $file -Label 'Finalization evidence') { throw 'Finalization evidence contains a reparse point.' }
         $relative = [IO.Path]::GetRelativePath($sourceFull, $file.FullName)
         $target = Assert-ContainedPath -Candidate (Join-Path $destinationFull $relative) -Root $destinationFull -Label 'Finalization evidence target'
         $parent = Split-Path -Parent $target

@@ -25,6 +25,17 @@ function ConvertFrom-TestJsonToken {
     ([Newtonsoft.Json.Linq.JValue]$Token).Value
 }
 
+function New-TestReparsePoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Target
+    )
+
+    $itemType = if ([OperatingSystem]::IsWindows()) { 'Junction' } else { 'SymbolicLink' }
+    New-Item -ItemType $itemType -Path $Path -Target $Target
+}
+
 function ConvertFrom-TestJson {
     [CmdletBinding()]
     param(
@@ -55,7 +66,7 @@ function New-TestSkillSourcePin {
         [Parameter(Mandatory)][string] $OutputPath
     )
 
-    $skillPath = '.agents/skills/auto-update-darktide-mod'
+    $skillPath = 'skills/auto-update-darktide-mod'
     $files = @(
         Get-ChildItem -LiteralPath $SkillRoot -File -Recurse | ForEach-Object {
             $bytes = [IO.File]::ReadAllBytes($_.FullName)

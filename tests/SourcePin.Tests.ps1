@@ -51,9 +51,9 @@ Describe 'Immutable Skill source pin' {
         $pin = (& $repositoryScript -Ref HEAD | Out-String) | ConvertFrom-Json
 
         $pin.schemaVersion | Should -Be 1
-        $pin.skillPath | Should -Be '.agents/skills/auto-update-darktide-mod'
+        $pin.skillPath | Should -Be 'skills/auto-update-darktide-mod'
         @($pin.skillFiles).Count | Should -BeGreaterThan 10
-        @($pin.skillFiles | Where-Object repositoryPath -eq '.agents/skills/auto-update-darktide-mod/SKILL.md').Count | Should -Be 1
+        @($pin.skillFiles | Where-Object repositoryPath -eq 'skills/auto-update-darktide-mod/SKILL.md').Count | Should -Be 1
         @($pin.skillFiles | Where-Object { $_.blobOid -notmatch '^[0-9a-f]{40}$' -or $_.sha256 -notmatch '^[0-9a-f]{64}$' }).Count | Should -Be 0
     }
 }

@@ -12,6 +12,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function Get-UtcTimestamp {
     [DateTimeOffset]::UtcNow.ToString('o')
 }
@@ -59,11 +61,22 @@ function Assert-NoReparsePath {
     foreach ($component in $components) { $current = Join-Path $current $component; $paths += $current }
     for ($index = 0; $index -lt $paths.Count; $index++) {
         $candidate = $paths[$index]
-        if (-not (Test-Path -LiteralPath $candidate)) {
+        $item = $null
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $candidate -Label $Label) {
+                throw "$Label path contains a symlink or reparse point."
+            }
             if ($AllowMissingLeaf -and $index -eq ($paths.Count - 1)) { continue }
             throw "$Label path component is missing."
         }
-        if ((Get-Item -LiteralPath $candidate -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        catch {
+            throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+        }
+        if (Test-PortableReparseItem -Path $candidate -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
     }

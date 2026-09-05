@@ -60,21 +60,20 @@ Describe 'Repository pre-push validation' {
         $prePush = Get-Content -LiteralPath $script:prePushPath -Raw
         $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot '.github/workflows/validate.yml') -Raw
 
-        $prePush | Should -Match 'Test-CleanRepositoryHead\.ps1'
-        $prePush | Should -Match 'tests/Invoke-Tests\.ps1'
-        $prePush | Should -Match 'Test-ReferenceIntegrity\.ps1'
-        $prePush | Should -Match 'scripts/Get-SourcePin\.ps1'
-        ([regex]::Matches($prePush, 'Test-CleanRepositoryHead\.ps1')).Count | Should -Be 2
-        $workflow | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
+        $prePush | Should -Match 'scripts/Validate\.ps1'
+        $prePush | Should -Match 'ArtifactsRoot'
+        $prePush | Should -Match 'BaseCommit'
+        $prePush | Should -Not -Match 'tests/Invoke-Tests\.ps1'
+        $prePush | Should -Not -Match 'Test-ReferenceIntegrity\.ps1'
+        $workflow | Should -Match 'scripts/Validate\.ps1'
         $workflow | Should -Not -Match 'run: \./tests/Invoke-Tests\.ps1'
     }
 
     It 'UnitT50_RunsEachPullRequestHeadOnceAndRevalidatesMainAfterMerge' {
-        foreach ($workflowName in @('validate.yml', 'skill-validator.yml')) {
+        foreach ($workflowName in @('validate.yml')) {
             $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot ".github/workflows/$workflowName") -Raw
 
             $workflow | Should -Match '(?m)^  push:\r?$'
-            $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
             $workflow | Should -Match '(?m)^  pull_request:'
         }
     }

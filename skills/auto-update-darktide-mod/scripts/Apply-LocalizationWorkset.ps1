@@ -13,6 +13,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -164,16 +165,30 @@ function Assert-ContainedPath {
 function Assert-NoReparsePath {
     param([string] $Path, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root)
-    $current = Get-Item -LiteralPath $Path
-    while ($true) {
-        if ($current.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    $currentPath = [IO.Path]::GetFullPath($Path)
+    for ($depth = 0; $depth -lt 2048; $depth++) {
+        $current = $null
+        try {
+            $current = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $currentPath -Label 'Workset NEW localization') {
+                throw 'Workset NEW localization path contains a symlink or reparse point.'
+            }
+            throw
+        }
+        catch {
+            throw "Unable to inspect Workset NEW localization physical containment component: $($_.Exception.Message)"
+        }
+        if (Test-PortableReparseItem -Path $currentPath -Item $current -Label 'Workset NEW localization') {
             throw 'Workset NEW localization path contains a symlink or reparse point.'
         }
-        if ($current.FullName.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { break }
-        $parent = Split-Path -Parent $current.FullName
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw 'Unable to prove Workset NEW localization containment.' }
-        $current = Get-Item -LiteralPath $parent
+        if ($currentPath.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return }
+        $parent = [IO.DirectoryInfo]::new($currentPath).Parent
+        if ($null -eq $parent) { throw 'Unable to prove Workset NEW localization containment.' }
+        $currentPath = $parent.FullName
     }
+    throw 'Unable to prove Workset NEW localization containment within 2048 path components.'
 }
 
 function ConvertTo-NewlineStyle {

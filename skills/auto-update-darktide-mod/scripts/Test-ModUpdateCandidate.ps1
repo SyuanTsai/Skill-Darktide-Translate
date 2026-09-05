@@ -17,6 +17,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $luaLocalizationScannerModulePath = Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1'
 Import-Module -Name $luaLocalizationScannerModulePath -Force -ErrorAction Stop
+Import-Module -Name (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
@@ -246,14 +247,24 @@ function Assert-NoReparsePath {
     }
     $current = $pathFull
     for ($depth = 0; $depth -lt 2048; $depth++) {
-        if (-not (Test-Path -LiteralPath $current)) { throw "$Label path component is missing." }
-        if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label $Label) {
+                throw "$Label path contains a symlink or reparse point."
+            }
+            throw "$Label path component is missing."
+        }
+        catch { throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)" }
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw "Unable to prove $Label physical containment." }
-        $current = $parent
+        $parentInfo = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parentInfo) { throw "Unable to prove $Label physical containment." }
+        $current = $parentInfo.FullName
     }
     throw "Unable to prove $Label physical containment within 2048 path components."
 }
@@ -265,7 +276,7 @@ function Assert-NoReparseTree {
     Invoke-Heartbeat
     Get-ChildItem -LiteralPath $treeFull -Recurse -Force | ForEach-Object {
         $item = $_
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label $Label) {
             throw "$Label contains a symlink or reparse point."
         }
         Invoke-Heartbeat
@@ -1748,16 +1759,52 @@ Add-ValidationCheck -Name 'install-normalization' -Action {
     $install = Get-Content -LiteralPath $state.installManifest.path -Raw | ConvertFrom-Json -AsHashtable
     $candidate = Get-Content -LiteralPath $state.candidateTreeManifest.path -Raw | ConvertFrom-Json -AsHashtable
     $normalization = Get-Content -LiteralPath $state.gitIndexNormalization.path -Raw | ConvertFrom-Json -AsHashtable
-    $candidateByPath = @{}; foreach ($file in $candidate.files) { $candidateByPath[$file.path] = $file }
-    $normalizationByPath = @{}; foreach ($file in $normalization.files) { $normalizationByPath[$file.path] = $file }
+    $candidateByPath = @{}
+    foreach ($file in $candidate.files) {
+        if ($candidateByPath.ContainsKey([string]$file.path)) { throw "Candidate manifest path is duplicated: $($file.path)" }
+        $candidateByPath[[string]$file.path] = $file
+    }
+    $normalizationByPath = @{}
+    $normalizationByRepositoryPath = @{}
+    $modPrefix = ([string]$state.modRelativePath).TrimEnd('/') + '/'
+    foreach ($file in $normalization.files) {
+        $installRelativePath = [string]$file.path
+        $repositoryPath = [string]$file.repositoryPath
+        if ($normalizationByPath.ContainsKey($installRelativePath)) { throw "Git normalization path is duplicated: $installRelativePath" }
+        if (-not $repositoryPath.StartsWith($modPrefix, [StringComparison]::Ordinal)) {
+            throw "Git normalization repository path is outside the MOD root: $repositoryPath"
+        }
+        $repositoryRelativePath = $repositoryPath.Substring($modPrefix.Length)
+        if ($normalizationByRepositoryPath.ContainsKey($repositoryRelativePath)) {
+            throw "Git normalization repository path is duplicated: $repositoryPath"
+        }
+        $normalizationByPath[$installRelativePath] = $file
+        $normalizationByRepositoryPath[$repositoryRelativePath] = $file
+    }
+    $localizationRelativePaths = @($state.localizationFiles | ForEach-Object {
+        ([string]$_.relativePath).Substring(([string]$state.modRelativePath).Length).TrimStart('/')
+    })
     foreach ($file in $install.files) {
-        if (-not $candidateByPath.ContainsKey($file.path) -or -not $normalizationByPath.ContainsKey($file.path)) { throw "Install path is missing from Git candidate evidence: $($file.path). Candidate paths: $($candidateByPath.Keys -join ', '). Normalization paths: $($normalizationByPath.Keys -join ', ')." }
-        $rawPath = Assert-NoReparsePath -Path (Join-Path $state.installRoot $file.path) -Root $worktree -Label 'Installed candidate file'
+        $installPath = [string]$file.path
+        $normalizationFile = if ($normalizationByPath.ContainsKey($installPath)) { $normalizationByPath[$installPath] } else { $null }
+        if (-not $normalizationFile -and $normalizationByRepositoryPath.ContainsKey($installPath)) {
+            $normalizationFile = $normalizationByRepositoryPath[$installPath]
+        }
+        if (-not $normalizationFile) {
+            throw "Install path is missing from Git normalization evidence: $installPath. Normalization paths: $($normalizationByPath.Keys -join ', ')."
+        }
+        $repositoryPath = [string]$normalizationFile.repositoryPath
+        $repositoryRelativePath = $repositoryPath.Substring($modPrefix.Length)
+        $candidatePath = if ($candidateByPath.ContainsKey($installPath)) { $installPath } else { $repositoryRelativePath }
+        if (-not $candidateByPath.ContainsKey($candidatePath)) {
+            throw "Install path is missing from Git candidate evidence: $installPath -> $candidatePath. Candidate paths: $($candidateByPath.Keys -join ', ')."
+        }
+        $rawPath = Assert-NoReparsePath -Path (Join-Path $state.installRoot $installPath) -Root $worktree -Label 'Installed candidate file'
         $raw = Read-FileBytesWithHeartbeat -Path $rawPath
-        $candidateBytes = Get-GitBlobBytes -WorkingDirectory $worktree -Object ([string]$candidateByPath[$file.path].blobOid)
+        $candidateBytes = Get-GitBlobBytes -WorkingDirectory $worktree -Object ([string]$candidateByPath[$candidatePath].blobOid)
         $same = (Get-Sha256Bytes -Bytes $raw) -eq (Get-Sha256Bytes -Bytes $candidateBytes)
-        if (-not $same -and -not (Test-CrlfNormalizationOnly -RawBytes $raw -IndexedBytes $candidateBytes)) { throw "Candidate changed bytes beyond CRLF-to-LF for $($file.path)" }
-        if ((Get-Sha256Bytes -Bytes $candidateBytes) -ne $normalizationByPath[$file.path].indexedSha256 -and $file.path -notin @($state.localizationFiles.relativePath | ForEach-Object { $_.Substring(([string]$state.modRelativePath).Length).TrimStart('/') })) { throw "Candidate blob differs from normalization evidence for $($file.path)" }
+        if (-not $same -and -not (Test-CrlfNormalizationOnly -RawBytes $raw -IndexedBytes $candidateBytes)) { throw "Candidate changed bytes beyond CRLF-to-LF for $installPath" }
+        if ((Get-Sha256Bytes -Bytes $candidateBytes) -ne $normalizationFile.indexedSha256 -and $installPath -notin $localizationRelativePaths) { throw "Candidate blob differs from normalization evidence for $installPath" }
     }
     'install, Git normalization, and candidate tree agree'
 }

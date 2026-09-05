@@ -7,7 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive updates and `zh-tw` source synchronization.
 
 - Stable source ID: `darktide-translate`
-- Catalog: `catalog/skills-catalog.json`
+- Source inventory: `catalog/source.json`
+- Profile catalog extension: `catalog/profiles.json`
 - Current repository version: `0.3.13`
 - Delivery tracking is maintained outside this public source and does not change the repository licensing boundary.
 
@@ -22,7 +23,7 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
 ## Repository layout
 
 ```text
-.agents/skills/auto-update-darktide-mod/
+skills/auto-update-darktide-mod/
   SKILL.md
   agents/openai.yaml
   assets/
@@ -43,7 +44,11 @@ The profile is opt-in because the workflow can mutate isolated branches, publish
   scripts/Test-ModUpdateCandidate.ps1
   scripts/Expand-Schema14Reference.ps1
   scripts/Test-ReferenceIntegrity.ps1
-catalog/skills-catalog.json
+catalog/source.json
+catalog/profiles.json
+config/standard-v1.json
+scripts/Validate.ps1
+scripts/Test-Repository.ps1
 docs/RELEASE.md
 docs/ROLLBACK.md
 scripts/Get-SourcePin.ps1
@@ -59,15 +64,15 @@ VERSION
 Run from the repository root:
 
 Repository contract tests require Pester 5 or later.
-Commit the intended snapshot, ensure the working tree and index are clean, then run the same gate used by GitHub before pushing:
+Commit the intended snapshot, ensure the working tree and index are clean, then run the canonical Standard v1 gate used by GitHub before pushing:
 
 ```powershell
 pwsh -File ./scripts/Invoke-PrePushValidation.ps1
 ```
 
-The gate binds tests, packaged-reference integrity, and the reproducible source pin to one unchanged HEAD. Run the component commands directly only when diagnosing a failed gate.
+The gate binds the central Standard v1 authority, controlled tool acquisition, package integrity, SkillSpector, repository/domain tests, and the reproducible source pin to one unchanged HEAD. Run component commands directly only when diagnosing a failed gate. The six `.agents/skills/*` directories remain managed consumer projections declared by `.codex/ai-instructions.manifest.json`; they are not Darktide source packages and are not part of `catalog/source.json`.
 
-GitHub Actions also runs strict `skill-validator` and `skill-tools` Quality Gates using versions resolved once per workflow run and reported in logs and the job summary.
+GitHub Actions calls the same `scripts/Validate.ps1` entry point and records the resolved formal tools and security-gate evidence in the run artifacts.
 
 ## Versioning and rollback
 
@@ -77,7 +82,7 @@ The real Reconnect trial, immutable Git evidence, Gate hashes, Review result, an
 
 ## License and contribution boundary
 
-The Apache-2.0 license in [LICENSE](LICENSE) applies to the repository-authored Skill instructions, agent metadata, scripts, tests, catalog and version metadata, documentation, and workflow configuration that this repository created. The two compressed reference archives under `assets/` are source-derived upstream material and are expressly excluded from that grant; their provenance and treatment are recorded in [PROVENANCE.md](PROVENANCE.md).
+The Apache-2.0 license in [LICENSE](LICENSE) applies to the repository-authored Skill instructions under `skills/`, agent metadata, scripts, tests, catalog and version metadata, documentation, and workflow configuration that this repository created. The two source-derived normative reference documents under `skills/auto-update-darktide-mod/assets/` are expressly excluded from that grant; their provenance and treatment are recorded in [PROVENANCE.md](PROVENANCE.md).
 
 Downloaded Mods, game data, localization files, archives, upstream translations, Nexus or other external-service content, trademarks, credentials, user-provided inputs, and generated outputs are outside this repository's Apache-2.0 scope. Processing or transforming such material with this workflow does not automatically relicense it.
 

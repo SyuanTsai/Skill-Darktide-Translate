@@ -46,6 +46,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
     if ($null -eq $Token -or $Token.Type -in @(
@@ -193,7 +195,7 @@ function Remove-DirectoryTreeWithHeartbeat {
     $root = [IO.Path]::GetFullPath($Path)
     $directories = [Collections.Generic.List[string]]::new()
     foreach ($item in Get-ChildItem -LiteralPath $root -Recurse -Force) {
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label 'removal tree') {
             throw 'Refusing heartbeat-aware removal of a tree containing a reparse point.'
         }
         if ($item.PSIsContainer) { $directories.Add($item.FullName) }
@@ -529,16 +531,31 @@ function Assert-NoReparsePath {
     }
     $current = $pathFull
     for ($depth = 0; $depth -lt 2048; $depth++) {
-        if (Test-Path -LiteralPath $current) {
-            if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        $item = $null
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            # This is required for broken symlinks and keeps reparse checks fail-closed.
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label $Label) {
                 throw "$Label path contains a symlink or reparse point."
             }
+            if (-not $AllowMissing) { throw "$Label path component is missing." }
         }
-        elseif (-not $AllowMissing) { throw "$Label path component is missing." }
-        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw "Unable to prove $Label physical containment." }
-        $current = $parent
+        catch {
+            throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+        }
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
+            throw "$Label path contains a symlink or reparse point."
+        }
+        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($null -eq $item) { throw "Unable to prove $Label physical containment." }
+            return $pathFull
+        }
+        $parentInfo = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parentInfo) { throw "Unable to prove $Label physical containment." }
+        $current = $parentInfo.FullName
     }
     throw "Unable to prove $Label physical containment within 2048 path components."
 }
@@ -554,7 +571,7 @@ function Assert-NoReparseTree {
     Update-ActiveReservationHeartbeat -Force
     Get-ChildItem -LiteralPath $treeFull -Recurse -Force | ForEach-Object {
         $item = $_
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label $Label) {
             throw "$Label contains a symlink or reparse point."
         }
         Update-ActiveReservationHeartbeat
@@ -1034,7 +1051,7 @@ function Import-SecurityOverrides {
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     $fullPath = [IO.Path]::GetFullPath($Path)
     $item = Get-Item -LiteralPath $fullPath -Force
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    if ($item.PSIsContainer -or (Test-PortableReparseItem -Path $fullPath -Item $item -Label 'Security override input')) {
         throw 'Security override input must be one ordinary non-reparse JSON file.'
     }
     $overrideDocument = Get-Content -LiteralPath $fullPath -Raw | ConvertFrom-Json -AsHashtable
@@ -1216,6 +1233,119 @@ function Resolve-GitNormalizationRepositoryPath {
     $canonical = $null
     if ($TrackedPathIndex.ignoreCase.TryGetValue($RepositoryPath, [ref]$canonical)) { return $canonical }
     $RepositoryPath
+}
+
+function Get-GitIndexStagePathMap {
+    param(
+        [Parameter(Mandatory)][string] $WorkingDirectory,
+        [Parameter(Mandatory)][string] $Checkpoint
+    )
+    $indexListing = Invoke-Git -WorkingDirectory $WorkingDirectory `
+        -Arguments @('-c', 'core.quotepath=false', 'ls-files', '--stage', '-z', '--full-name')
+    $indexPaths = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($entryValue in @($indexListing.output -split ([string][char]0))) {
+        if ([string]::IsNullOrEmpty($entryValue)) { continue }
+        $tabIndex = $entryValue.IndexOf([char]9)
+        if ($tabIndex -lt 0 -or $entryValue.Substring(0, $tabIndex) -notmatch '^[0-7]{6} [0-9a-f]{40} \d+$' -or
+            [string]::IsNullOrEmpty($entryValue.Substring($tabIndex + 1))) {
+            throw "$Checkpoint index listing is malformed."
+        }
+        $entryPath = $entryValue.Substring($tabIndex + 1)
+        if ($indexPaths.ContainsKey($entryPath)) {
+            throw "$Checkpoint index listing contains a duplicate path: $entryPath"
+        }
+        $indexPaths.Add($entryPath, $entryPath)
+    }
+    $indexPaths
+}
+
+function Normalize-GitCaseVariantWorktreePaths {
+    param(
+        [Parameter(Mandatory)][string] $WorkingDirectory,
+        [Parameter(Mandatory)][string] $ModRelativePath,
+        [object[]] $Records = @()
+    )
+    $worktreeRoot = [IO.Path]::GetFullPath($WorkingDirectory)
+    $modRoot = $ModRelativePath.Replace('\', '/').TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($modRoot) -or $modRoot.StartsWith('/', [StringComparison]::Ordinal)) {
+        throw 'Git index normalization MOD root is invalid.'
+    }
+    $modPrefix = "$modRoot/"
+    $canonicalPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $moves = [Collections.Generic.List[object]]::new()
+    foreach ($record in @($Records)) {
+        $relativePath = ([string]$record.path).Replace('\', '/')
+        $canonicalPath = ([string]$record.repositoryPath).Replace('\', '/')
+        $rawSha256 = [string]$record.rawSha256
+        if ([string]::IsNullOrWhiteSpace($relativePath) -or
+            [string]::IsNullOrWhiteSpace($canonicalPath) -or
+            $rawSha256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'Git index normalization record is incomplete before case-variant repair.'
+        }
+        if ($relativePath.StartsWith('/', [StringComparison]::Ordinal) -or
+            $canonicalPath.StartsWith('/', [StringComparison]::Ordinal) -or
+            $relativePath -match '(^|/)\.\.?(/|$)' -or $canonicalPath -match '(^|/)\.\.?(/|$)') {
+            throw 'Git index normalization record contains a traversal path.'
+        }
+        $actualPath = "$modRoot/$relativePath"
+        if (-not $actualPath.StartsWith($modPrefix, [StringComparison]::Ordinal) -or
+            -not $canonicalPath.StartsWith($modPrefix, [StringComparison]::Ordinal)) {
+            throw "Git index normalization path escapes the MOD root: $actualPath -> $canonicalPath"
+        }
+        if (-not $canonicalPaths.Add($canonicalPath)) {
+            throw "Git index normalization has multiple files for one canonical path: $canonicalPath"
+        }
+        if ($actualPath -ceq $canonicalPath) { continue }
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualPath, $canonicalPath)) {
+            throw "Git index normalization changed a non-case path: $actualPath -> $canonicalPath"
+        }
+        $source = Assert-NoReparsePath -Path (Join-Path $worktreeRoot $actualPath) `
+            -Root $worktreeRoot -Label 'Case-variant install source' -AllowMissing
+        $destination = Assert-ContainedPath -Candidate (Join-Path $worktreeRoot $canonicalPath) `
+            -Root $worktreeRoot -Label 'Canonical install destination'
+        $destination = Assert-NoReparsePath -Path $destination -Root $worktreeRoot `
+            -Label 'Canonical install destination' -AllowMissing
+        $sourceFullPath = [IO.Path]::GetFullPath($source)
+        $destinationFullPath = [IO.Path]::GetFullPath($destination)
+        $physicalPathComparison = if ([OperatingSystem]::IsWindows()) {
+            [StringComparison]::OrdinalIgnoreCase
+        }
+        else {
+            [StringComparison]::Ordinal
+        }
+        if ([string]::Equals($sourceFullPath, $destinationFullPath, $physicalPathComparison)) {
+            continue
+        }
+        $sourceExists = Test-Path -LiteralPath $source -PathType Leaf
+        $destinationExists = Test-Path -LiteralPath $destination -PathType Leaf
+        if (-not $sourceExists -and $destinationExists) {
+            if ((Get-FileSha256 -Path $destination) -cne $rawSha256) {
+                throw "Canonical install destination differs from the immutable raw install file: $canonicalPath"
+            }
+            continue
+        }
+        if (-not $sourceExists) {
+            throw "Case-variant install source is missing: $actualPath"
+        }
+        if ($destinationExists) {
+            throw "Canonical install destination already exists: $canonicalPath"
+        }
+        $moves.Add([ordered]@{ source = $source; destination = $destination; sourcePath = $actualPath; destinationPath = $canonicalPath })
+    }
+
+    foreach ($move in $moves) {
+        $parent = Split-Path -Parent ([string]$move.destination)
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        $null = Assert-NoReparsePath -Path $parent -Root $worktreeRoot -Label 'Canonical install destination parent'
+        if (Test-Path -LiteralPath ([string]$move.destination)) {
+            throw "Canonical install destination appeared during normalization: $($move.destinationPath)"
+        }
+        [IO.File]::Move([string]$move.source, [string]$move.destination)
+        Update-ActiveReservationHeartbeat -Force
+        Update-ActiveSharedCoordinationHeartbeat -Force
+    }
 }
 
 function New-GitNormalizationManifest {
@@ -1980,7 +2110,8 @@ function Enter-ModReservation {
                 $null = Assert-NoReparsePath -Path $preparedLockPath -Root ([string]$Plan.repositoryRoot) -Label 'Unpublished prepared MOD reservation'
                 $preparedItems = @(Get-ChildItem -LiteralPath $preparedLockPath -Force)
                 if ($preparedItems.Count -eq 1 -and -not $preparedItems[0].PSIsContainer -and
-                    $preparedItems[0].Name -ceq 'owner.json' -and -not ($preparedItems[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    $preparedItems[0].Name -ceq 'owner.json' -and
+                    -not (Test-PortableReparseItem -Path $preparedItems[0].FullName -Item $preparedItems[0] -Label 'Prepared MOD reservation owner')) {
                     [IO.File]::Delete($preparedItems[0].FullName)
                     [IO.Directory]::Delete($preparedLockPath)
                 }
@@ -2591,7 +2722,7 @@ function Complete-IncompleteClaim {
         }
     }
     $claimedArchiveItem = Get-Item -LiteralPath $claimedArchive -ErrorAction SilentlyContinue
-    if ($claimedArchiveItem -and ($claimedArchiveItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    if ($claimedArchiveItem -and (Test-PortableReparseItem -Path $claimedArchive -Item $claimedArchiveItem -Label 'Claimed archive')) {
         throw 'Claimed archive must be a regular file, not a reparse point.'
     }
     if (-not (Test-Path -LiteralPath $claimedArchive -PathType Leaf) -or (Get-FileSha256 -Path $claimedArchive) -ne $State.archive.sha256) {
@@ -2764,7 +2895,7 @@ function Invoke-Claim {
         if (-not (Test-Path -LiteralPath $sourceFull -PathType Leaf)) { throw 'Archive is missing.' }
         $null = Assert-NoReparsePath -Path $sourceFull -Root $repository -Label 'Source archive'
         $sampleOne = Get-Item -LiteralPath $sourceFull
-        if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $sourceFull -Item $sampleOne -Label 'Source archive') {
             throw 'Source archive must be a regular file, not a reparse point.'
         }
         $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
@@ -2785,7 +2916,7 @@ function Invoke-Claim {
             throw 'Archive did not remain stable across the required ten-second observation.'
         }
     }
-    if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Source archive must be a regular file, not a reparse point.' }
+    if (Test-PortableReparseItem -Path $sourceFull -Item $sampleOne -Label 'Source archive') { throw 'Source archive must be a regular file, not a reparse point.' }
     if (Test-Path -LiteralPath $actualStatePath -PathType Leaf) {
         $existing = Read-State -Path $actualStatePath
         if ($existing.runId -ne $actualRunId) { throw 'Existing state belongs to another run.' }
@@ -2837,11 +2968,12 @@ function Invoke-Claim {
     $lockKey = [string]$plan.lockKey
     $modLockPath = [string]$plan.modLockPath
     $skillSourcePin = $integrity.skillSourcePin
+    $skillSourceRootPath = [string]$skillSourcePin.skillPath
     $workflowSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.workflow.path)
     $reviewSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.reviewBaseline.path)
-    $bindingSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath '.agents/skills/auto-update-darktide-mod/references/package-binding.md'
-    $translationQualitySourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath '.agents/skills/auto-update-darktide-mod/references/translation-quality.md'
-    $skillSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath '.agents/skills/auto-update-darktide-mod/SKILL.md'
+    $bindingSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath "$skillSourceRootPath/references/package-binding.md"
+    $translationQualitySourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath "$skillSourceRootPath/references/translation-quality.md"
+    $skillSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath "$skillSourceRootPath/SKILL.md"
     $schema15SourceEntry = if ($sourceReceipt) { Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.schema15.path) } else { $null }
     $plannedOwner = Read-ActiveReservationOwner
     $plannedOwner.workflowCommitOid = $skillSourcePin.resolvedCommit
@@ -4067,7 +4199,8 @@ function Assert-FileTreeMatchesManifest {
         [Parameter(Mandatory)][string] $Root,
         [Parameter(Mandatory)][string] $Repository,
         [Parameter(Mandatory)][Collections.IDictionary] $ManifestReceipt,
-        [Parameter(Mandatory)][string] $Label
+        [Parameter(Mandatory)][string] $Label,
+        [switch] $AllowCaseOnlyPathNormalization
     )
     $rootFull = [IO.Path]::GetFullPath($Root)
     $manifestPath = Assert-NoReparsePath -Path ([string]$ManifestReceipt.path) `
@@ -4089,11 +4222,35 @@ function Assert-FileTreeMatchesManifest {
         } | Sort-Object { [string]$_.path }
     )
     if ($actual.Count -ne $expected.Count) { throw "$Label file count differs from its immutable manifest." }
-    for ($index = 0; $index -lt $actual.Count; $index++) {
-        if ([string]$actual[$index].path -cne [string]$expected[$index].path -or
-            [int64]$actual[$index].size -ne [int64]$expected[$index].size -or
-            [string]$actual[$index].sha256 -cne [string]$expected[$index].sha256) {
-            throw "$Label differs from its immutable manifest at $($actual[$index].path)."
+    if (-not $AllowCaseOnlyPathNormalization) {
+        for ($index = 0; $index -lt $actual.Count; $index++) {
+            if ([string]$actual[$index].path -cne [string]$expected[$index].path -or
+                [int64]$actual[$index].size -ne [int64]$expected[$index].size -or
+                [string]$actual[$index].sha256 -cne [string]$expected[$index].sha256) {
+                throw "$Label differs from its immutable manifest at $($actual[$index].path)."
+            }
+        }
+    }
+    else {
+        $expectedByPath = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        $actualByPath = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in $expected) {
+            if (-not $expectedByPath.TryAdd([string]$file.path, $file)) {
+                throw "$Label contains case-colliding expected paths: $($file.path)."
+            }
+        }
+        foreach ($file in $actual) {
+            if (-not $actualByPath.TryAdd([string]$file.path, $file)) {
+                throw "$Label contains case-colliding actual paths: $($file.path)."
+            }
+        }
+        foreach ($path in $expectedByPath.Keys) {
+            $actualFile = $null
+            if (-not $actualByPath.TryGetValue($path, [ref]$actualFile) -or
+                [int64]$actualFile.size -ne [int64]$expectedByPath[$path].size -or
+                [string]$actualFile.sha256 -cne [string]$expectedByPath[$path].sha256) {
+                throw "$Label differs from its immutable manifest at $path."
+            }
         }
     }
     [ordered]@{ root = $rootFull; fileCount = $actual.Count; manifestSha256 = [string]$ManifestReceipt.sha256 }
@@ -4116,8 +4273,22 @@ function Assert-CheckpointIndexState {
         if ($expected.ContainsKey($path)) { throw "$Checkpoint expected index path is duplicated: $path" }
         $expected.Add($path, $sha256)
     }
+
+    $trackedPathIndex = New-GitTrackedPathIndex -WorkingDirectory $WorkingDirectory -Root '.'
+    $indexPaths = Get-GitIndexStagePathMap -WorkingDirectory $WorkingDirectory -Checkpoint $Checkpoint
+
     foreach ($path in $expected.Keys) {
-        $blobBytes = Get-GitBlobBytes -WorkingDirectory $WorkingDirectory -Object ":$path"
+        $indexPath = Resolve-GitNormalizationRepositoryPath -RepositoryPath $path `
+            -TrackedPathIndex $trackedPathIndex
+        if (-not $indexPaths.ContainsKey($indexPath)) {
+            throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
+        }
+        try {
+            $blobBytes = Get-GitBlobBytes -WorkingDirectory $WorkingDirectory -Object ":$([string]$indexPaths[$indexPath])"
+        }
+        catch {
+            throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
+        }
         if ((Get-Sha256Bytes -Bytes $blobBytes) -cne $expected[$path]) {
             throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
         }
@@ -4238,7 +4409,7 @@ function Invoke-BuildCommits {
         if ($resumeRank -lt 3) {
             $null = Assert-FileTreeMatchesManifest -Root ([string]$State.installRoot) `
                 -Repository ([string]$State.repositoryRoot) -ManifestReceipt $State.rawInstallManifest `
-                -Label 'Pre-C1 raw install tree'
+                -Label 'Pre-C1 raw install tree' -AllowCaseOnlyPathNormalization
             $normalizationPath = Assert-NoReparsePath -Path ([string]$State.gitIndexNormalization.path) `
                 -Root ([string]$State.repositoryRoot) -Label 'Git index normalization manifest'
             if ((Get-FileSha256 -Path $normalizationPath) -cne [string]$State.gitIndexNormalization.sha256) {
@@ -4261,6 +4432,9 @@ function Invoke-BuildCommits {
         $targets = @($State.evidenceTargetPaths)
         if ($resumeRank -lt 1) {
             $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('reset', '--quiet', 'HEAD', '--', $State.modRelativePath)
+            $c1NormalizationRecords = @($normalization.files | Where-Object { [string]$_.repositoryPath -cnotin $targets })
+            Normalize-GitCaseVariantWorktreePaths -WorkingDirectory $worktree `
+                -ModRelativePath ([string]$State.modRelativePath) -Records $c1NormalizationRecords
             $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('-c', 'core.autocrlf=true', 'add', '-A', '--', $State.modRelativePath)
             foreach ($target in $targets) {
                 $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('reset', '--quiet', 'HEAD', '--', $target)

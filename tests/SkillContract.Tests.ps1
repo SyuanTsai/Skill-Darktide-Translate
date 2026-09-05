@@ -3,7 +3,7 @@
 Describe 'Auto Update Darktide MOD Skill contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
-        $skillRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod'
+        $skillRoot = Join-Path $repoRoot 'skills/auto-update-darktide-mod'
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:skillSourcePinPath = New-TestSkillSourcePin -SkillRoot $skillRoot -OutputPath (Join-Path $TestDrive 'skill-source-pin.json')
     }
@@ -17,8 +17,8 @@ Describe 'Auto Update Darktide MOD Skill contract' {
 
         $skill | Should -Match '(?m)^name: auto-update-darktide-mod$'
         $skill | Should -Match 'references/package-binding\.md'
-        $skill | Should -Match 'assets/workflow-schema-14\.md\.gz'
-        $skill | Should -Match 'assets/review-baseline\.md\.gz'
+        $skill | Should -Match 'assets/workflow-schema-14\.md'
+        $skill | Should -Match 'assets/review-baseline\.md'
         $skill | Should -Match 'references/schema-15\.md'
         $skill | Should -Match 'scripts/Expand-Schema14Reference\.ps1'
         $skill | Should -Match 'scripts/Test-ReferenceIntegrity\.ps1'
@@ -46,15 +46,15 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $result.workflow.sha256 | Should -Be '931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549'
         $result.reviewBaseline.sha256 | Should -Be 'd8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26'
         $result.schema15.sha256 | Should -Be '4cb3fa95c205b28e3c33bc1bf4eb763842ccc350335a7b65deda647bc932e6c4'
-        $result.schema15.path | Should -Be '.agents/skills/auto-update-darktide-mod/references/schema-15.md'
-        $result.workflow.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/workflow-schema-14.md.gz'
-        $result.reviewBaseline.path | Should -Be '.agents/skills/auto-update-darktide-mod/assets/review-baseline.md.gz'
-        $result.workflow.packagedPath | Should -Be 'assets/workflow-schema-14.md.gz'
-        $result.reviewBaseline.packagedPath | Should -Be 'assets/review-baseline.md.gz'
+        $result.schema15.path | Should -Be 'skills/auto-update-darktide-mod/references/schema-15.md'
+        $result.workflow.path | Should -Be 'skills/auto-update-darktide-mod/assets/workflow-schema-14.md'
+        $result.reviewBaseline.path | Should -Be 'skills/auto-update-darktide-mod/assets/review-baseline.md'
+        $result.workflow.packagedPath | Should -Be 'assets/workflow-schema-14.md'
+        $result.reviewBaseline.packagedPath | Should -Be 'assets/review-baseline.md'
         $result.workflow.packageSha256 | Should -Match '^[0-9a-f]{64}$'
         $result.reviewBaseline.packageSha256 | Should -Match '^[0-9a-f]{64}$'
-        $result.workflow.gitBlobOid | Should -Be '48d1ace4f2c6095a7df2ab45af6ce03c57aa2ab1'
-        $result.reviewBaseline.gitBlobOid | Should -Be 'ac411332ec53e9524d687a87f0694214e858ad43'
+        $result.workflow.gitBlobOid | Should -Be '40752444d26a4ce39c4f32201076b1c84ad1db31'
+        $result.reviewBaseline.gitBlobOid | Should -Be 'e1b94428c041238e3aff8cf02408b3de1387ee15'
         $result.workflow.sourceGitBlobOid | Should -Be '40752444d26a4ce39c4f32201076b1c84ad1db31'
         $result.reviewBaseline.sourceGitBlobOid | Should -Be 'e1b94428c041238e3aff8cf02408b3de1387ee15'
     }
@@ -106,7 +106,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
     }
 
     # Scenario: A run loads each normative Schema 14 document only when its stage needs it.
-    # Purpose: Prove both compressed packages reconstruct byte-exact originals before an agent reads them.
+    # Purpose: Prove both packaged references reconstruct byte-exact originals before an agent reads them.
     It 'UnitT25_ExpandsVerifiedSchema14DocumentsOnDemand' {
         $expanderPath = Join-Path $skillRoot 'scripts/Expand-Schema14Reference.ps1'
         Test-Path -LiteralPath $expanderPath | Should -Be $true
@@ -133,7 +133,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
         $outsideAssets = Join-Path $TestDrive 'reparse-reference-assets'
         Move-Item -LiteralPath (Join-Path $fixtureRoot 'assets') -Destination $outsideAssets
-        New-Item -ItemType Junction -Path (Join-Path $fixtureRoot 'assets') -Target $outsideAssets | Out-Null
+        New-TestReparsePoint -Path (Join-Path $fixtureRoot 'assets') -Target $outsideAssets | Out-Null
         { & (Join-Path $fixtureRoot 'scripts/Test-ReferenceIntegrity.ps1') -PassThru } |
             Should -Throw '*reparse*'
 
@@ -141,7 +141,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $linkedPin = Join-Path $TestDrive 'reparse-pin-link'
         New-Item -ItemType Directory -Path $outsidePin -Force | Out-Null
         Copy-Item -LiteralPath $script:skillSourcePinPath -Destination (Join-Path $outsidePin 'skill-source-pin.json')
-        New-Item -ItemType Junction -Path $linkedPin -Target $outsidePin | Out-Null
+        New-TestReparsePoint -Path $linkedPin -Target $outsidePin | Out-Null
         { & (Join-Path $skillRoot 'scripts/Test-ReferenceIntegrity.ps1') `
                 -SkillSourcePinPath (Join-Path $linkedPin 'skill-source-pin.json') -PassThru } |
             Should -Throw '*reparse*'
@@ -193,8 +193,8 @@ Describe 'Auto Update Darktide MOD Skill contract' {
 
         $binding | Should -Match 'darktide-translate'
         $binding | Should -Match 'workflow_commit_oid'
-        $binding | Should -Match 'workflow-schema-14\.md\.gz'
-        $binding | Should -Match 'review-baseline\.md\.gz'
+        $binding | Should -Match 'workflow-schema-14\.md'
+        $binding | Should -Match 'review-baseline\.md'
         $binding | Should -Match 'Expand-Schema14Reference\.ps1'
         $binding | Should -Match 'target MOD repository'
         $binding | Should -Match 'packagedGitBlobOid'

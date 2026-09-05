@@ -13,7 +13,7 @@ Rollback is source-pin based. Do not rewrite a released tag, force-update consum
 3. Restore the matching installed Skill files and verify `scripts/Test-ReferenceIntegrity.ps1` from that pinned revision.
 4. Re-run consumer discovery and compatibility filtering.
 5. Resume an existing MOD run only with the exact Workflow/Baseline tuple recorded in that state. Schema 15 also requires its recorded extension, source request, source receipt, verified source, and localization-workset evidence tuple.
-6. Remove only files managed by the newer source pin. Do not delete unrelated Skills or target MOD run evidence.
+6. Remove only files managed by the newer source pin. Do not delete unrelated Skills, the `.agents/skills/*` managed projections, or target MOD run evidence.
 
 Version 0.2.x cannot resume a Schema 15 state. Restore an exact compatible 0.3.x source pin or leave the run stopped for explicit recovery. Preserve `.incoming-<run-id>` retained evidence, `verified-source`, `review-artifacts/source-receipt.json`, acquisition records, reservations, state, worktree, branch, and any pre-publication localization workset.
 
