@@ -18,6 +18,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -193,10 +194,13 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label 'Localization workset') {
+                throw 'Localization workset path contains a symlink or reparse point.'
+            }
             if (-not $AllowMissing) { throw 'Localization workset path component is missing.' }
         }
         catch { throw "Unable to inspect Localization workset physical containment component: $($_.Exception.Message)" }
-        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Localization workset path contains a symlink or reparse point.' }
+        if (Test-PortableReparseItem -Path $current -Item $item -Label 'Localization workset') { throw 'Localization workset path contains a symlink or reparse point.' }
         if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
             if ($null -eq $item) { throw 'Unable to prove NEW localization containment.' }
             return

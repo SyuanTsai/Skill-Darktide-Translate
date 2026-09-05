@@ -10,6 +10,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $skillRoot = Split-Path -Parent $PSScriptRoot
 
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function Invoke-Heartbeat {
     if ($HeartbeatAction) { $null = & $HeartbeatAction }
 }
@@ -69,12 +71,15 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label $Name) {
+                throw "$Name path contains a symlink or reparse point."
+            }
             throw "$Name path component is missing."
         }
         catch {
             throw "Unable to inspect $Name physical containment component: $($_.Exception.Message)"
         }
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Name) {
             throw "$Name path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
@@ -316,7 +321,7 @@ function Test-SkillSourcePin {
         $expectedByPath[$repositoryPath] = $entry
     }
     $actualItems = @(Get-ChildItem -LiteralPath $skillRoot -Recurse -Force)
-    if (@($actualItems | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count -ne 0) {
+    if (@($actualItems | Where-Object { Test-PortableReparseItem -Path $_.FullName -Item $_ -Label 'Installed Skill source' }).Count -ne 0) {
         throw 'Installed Skill source contains a reparse-point path.'
     }
     $actualFiles = @($actualItems | Where-Object { -not $_.PSIsContainer })

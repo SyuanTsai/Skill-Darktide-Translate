@@ -19,6 +19,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -83,9 +84,9 @@ function Assert-RegularFile {
     $full = [IO.Path]::GetFullPath($Path)
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "$Label does not exist." }
     $item = Get-Item -LiteralPath $full
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$Label must not be a symlink or reparse point." }
+    if (Test-PortableReparseItem -Path $full -Item $item -Label $Label) { throw "$Label must not be a symlink or reparse point." }
     $parent = Get-Item -LiteralPath (Split-Path -Parent $full)
-    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$Label parent must not be a symlink or reparse point." }
+    if (Test-PortableReparseItem -Path (Split-Path -Parent $full) -Item $parent -Label "$Label parent") { throw "$Label parent must not be a symlink or reparse point." }
     $full
 }
 
@@ -104,9 +105,14 @@ function Assert-NoReparsePath {
             # Inspect the link itself before treating a missing target as a missing path.
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
-        catch [Management.Automation.ItemNotFoundException] { throw "$Label path component is missing." }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label $Label) {
+                throw "$Label path contains a symlink or reparse point."
+            }
+            throw "$Label path component is missing."
+        }
         catch { throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)" }
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }

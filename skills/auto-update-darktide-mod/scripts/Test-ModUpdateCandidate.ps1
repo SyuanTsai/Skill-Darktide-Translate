@@ -17,6 +17,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $luaLocalizationScannerModulePath = Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1'
 Import-Module -Name $luaLocalizationScannerModulePath -Force -ErrorAction Stop
+Import-Module -Name (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
@@ -250,9 +251,14 @@ function Assert-NoReparsePath {
             # Inspect the link itself before treating a missing target as a missing path.
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
-        catch [Management.Automation.ItemNotFoundException] { throw "$Label path component is missing." }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label $Label) {
+                throw "$Label path contains a symlink or reparse point."
+            }
+            throw "$Label path component is missing."
+        }
         catch { throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)" }
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
@@ -270,7 +276,7 @@ function Assert-NoReparseTree {
     Invoke-Heartbeat
     Get-ChildItem -LiteralPath $treeFull -Recurse -Force | ForEach-Object {
         $item = $_
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label $Label) {
             throw "$Label contains a symlink or reparse point."
         }
         Invoke-Heartbeat

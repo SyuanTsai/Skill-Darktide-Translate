@@ -5,6 +5,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function ConvertFrom-JsonToken {
     param(
         [AllowNull()][Newtonsoft.Json.Linq.JToken] $Token,
@@ -79,17 +81,22 @@ function Assert-CoordinationPath {
     $current = $fullPath
     for ($depth = 0; $depth -lt 2048; $depth++) {
         if (Test-Path -LiteralPath $current) {
-            if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            if (Test-PortableReparseItem -Path $current -Item (Get-Item -LiteralPath $current -Force) -Label 'Shared coordination') {
                 throw 'Shared coordination path contains a symlink or reparse point.'
             }
         }
-        elseif (-not $AllowMissing) {
-            throw 'Shared coordination path is missing.'
+        else {
+            if (Test-PortableReparseItem -Path $current -Label 'Shared coordination') {
+                throw 'Shared coordination path contains a symlink or reparse point.'
+            }
+            if (-not $AllowMissing) {
+                throw 'Shared coordination path is missing.'
+            }
         }
         if ($current.Equals($repository, [StringComparison]::OrdinalIgnoreCase)) { return $fullPath }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent)) { break }
-        $current = $parent
+        $parent = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parent) { break }
+        $current = $parent.FullName
     }
     throw 'Unable to prove shared coordination path containment.'
 }

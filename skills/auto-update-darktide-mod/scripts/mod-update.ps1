@@ -46,6 +46,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
     if ($null -eq $Token -or $Token.Type -in @(
@@ -193,7 +195,7 @@ function Remove-DirectoryTreeWithHeartbeat {
     $root = [IO.Path]::GetFullPath($Path)
     $directories = [Collections.Generic.List[string]]::new()
     foreach ($item in Get-ChildItem -LiteralPath $root -Recurse -Force) {
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label 'removal tree') {
             throw 'Refusing heartbeat-aware removal of a tree containing a reparse point.'
         }
         if ($item.PSIsContainer) { $directories.Add($item.FullName) }
@@ -536,12 +538,15 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label $Label) {
+                throw "$Label path contains a symlink or reparse point."
+            }
             if (-not $AllowMissing) { throw "$Label path component is missing." }
         }
         catch {
             throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
         }
-        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
@@ -566,7 +571,7 @@ function Assert-NoReparseTree {
     Update-ActiveReservationHeartbeat -Force
     Get-ChildItem -LiteralPath $treeFull -Recurse -Force | ForEach-Object {
         $item = $_
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label $Label) {
             throw "$Label contains a symlink or reparse point."
         }
         Update-ActiveReservationHeartbeat
@@ -1046,7 +1051,7 @@ function Import-SecurityOverrides {
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     $fullPath = [IO.Path]::GetFullPath($Path)
     $item = Get-Item -LiteralPath $fullPath -Force
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    if ($item.PSIsContainer -or (Test-PortableReparseItem -Path $fullPath -Item $item -Label 'Security override input')) {
         throw 'Security override input must be one ordinary non-reparse JSON file.'
     }
     $overrideDocument = Get-Content -LiteralPath $fullPath -Raw | ConvertFrom-Json -AsHashtable
@@ -1992,7 +1997,8 @@ function Enter-ModReservation {
                 $null = Assert-NoReparsePath -Path $preparedLockPath -Root ([string]$Plan.repositoryRoot) -Label 'Unpublished prepared MOD reservation'
                 $preparedItems = @(Get-ChildItem -LiteralPath $preparedLockPath -Force)
                 if ($preparedItems.Count -eq 1 -and -not $preparedItems[0].PSIsContainer -and
-                    $preparedItems[0].Name -ceq 'owner.json' -and -not ($preparedItems[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    $preparedItems[0].Name -ceq 'owner.json' -and
+                    -not (Test-PortableReparseItem -Path $preparedItems[0].FullName -Item $preparedItems[0] -Label 'Prepared MOD reservation owner')) {
                     [IO.File]::Delete($preparedItems[0].FullName)
                     [IO.Directory]::Delete($preparedLockPath)
                 }
@@ -2603,7 +2609,7 @@ function Complete-IncompleteClaim {
         }
     }
     $claimedArchiveItem = Get-Item -LiteralPath $claimedArchive -ErrorAction SilentlyContinue
-    if ($claimedArchiveItem -and ($claimedArchiveItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    if ($claimedArchiveItem -and (Test-PortableReparseItem -Path $claimedArchive -Item $claimedArchiveItem -Label 'Claimed archive')) {
         throw 'Claimed archive must be a regular file, not a reparse point.'
     }
     if (-not (Test-Path -LiteralPath $claimedArchive -PathType Leaf) -or (Get-FileSha256 -Path $claimedArchive) -ne $State.archive.sha256) {
@@ -2776,7 +2782,7 @@ function Invoke-Claim {
         if (-not (Test-Path -LiteralPath $sourceFull -PathType Leaf)) { throw 'Archive is missing.' }
         $null = Assert-NoReparsePath -Path $sourceFull -Root $repository -Label 'Source archive'
         $sampleOne = Get-Item -LiteralPath $sourceFull
-        if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $sourceFull -Item $sampleOne -Label 'Source archive') {
             throw 'Source archive must be a regular file, not a reparse point.'
         }
         $plannedOwner = Enter-ModReservation -Plan $plan -ActualRunId $actualRunId -PlannedStatePath $actualStatePath
@@ -2797,7 +2803,7 @@ function Invoke-Claim {
             throw 'Archive did not remain stable across the required ten-second observation.'
         }
     }
-    if ($sampleOne.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Source archive must be a regular file, not a reparse point.' }
+    if (Test-PortableReparseItem -Path $sourceFull -Item $sampleOne -Label 'Source archive') { throw 'Source archive must be a regular file, not a reparse point.' }
     if (Test-Path -LiteralPath $actualStatePath -PathType Leaf) {
         $existing = Read-State -Path $actualStatePath
         if ($existing.runId -ne $actualRunId) { throw 'Existing state belongs to another run.' }

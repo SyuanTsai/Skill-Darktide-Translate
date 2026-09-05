@@ -36,6 +36,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
     if ($null -eq $Token -or $Token.Type -in @(
@@ -181,13 +183,16 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $paths[$index] -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $paths[$index] -Label $Label) {
+                throw "$Label path contains a symlink or reparse point."
+            }
             if ($AllowMissingLeaf -and $index -eq ($paths.Count - 1)) { continue }
             throw "$Label path component is missing."
         }
         catch {
             throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
         }
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if (Test-PortableReparseItem -Path $paths[$index] -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
     }
@@ -349,7 +354,8 @@ function Move-ApiPartialToRetainedEvidence {
     param([string] $PartialPath, [string] $IncomingRoot)
     if (-not (Test-Path -LiteralPath $PartialPath)) { return $null }
     $item = Get-Item -LiteralPath $PartialPath
-    if (-not $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    if (-not $item.PSIsContainer -and
+        -not (Test-PortableReparseItem -Path $PartialPath -Item $item -Label 'API partial download')) {
         $retainedName = '.retained-partial-' + [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') + '-' + [guid]::NewGuid().ToString('N') + '-' + $item.Name
         $retainedPath = Assert-ContainedFilePath -Candidate (Join-Path $IncomingRoot $retainedName) -Root $IncomingRoot
         Invoke-Heartbeat
@@ -471,7 +477,7 @@ if ($candidateExtension -in @('.part', '.crdownload')) {
 }
 if (-not (Test-Path -LiteralPath $candidateFull -PathType Leaf)) { throw 'Downloaded file does not exist.' }
 $candidateItem = Get-Item -LiteralPath $candidateFull
-if ($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Downloaded file must be a regular file, not a reparse point.' }
+if (Test-PortableReparseItem -Path $candidateFull -Item $candidateItem -Label 'Downloaded file') { throw 'Downloaded file must be a regular file, not a reparse point.' }
 
 $sampleOne = [ordered]@{ size = [int64]$candidateItem.Length; lastWriteTimeUtc = $candidateItem.LastWriteTimeUtc.ToString('o'); observedAt = Get-UtcTimestamp }
 if ($ObservationIntervalMilliseconds -gt 0) {

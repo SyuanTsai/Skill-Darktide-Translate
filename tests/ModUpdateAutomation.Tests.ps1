@@ -959,7 +959,9 @@ function Suspend-Stage {
             $functionAst | Should -Not -BeNullOrEmpty
             $functionAst.Extent.Text
         }
-        $module = New-Module -ScriptBlock ([scriptblock]::Create(($functionTexts -join "`n")))
+        $pathSafetyModule = Join-Path $skillRoot 'scripts/PathSafety.psm1'
+        $moduleSource = "Import-Module -Name '$($pathSafetyModule.Replace("'", "''"))' -Force`n" + ($functionTexts -join "`n")
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
         $repository = Join-Path $TestDrive 'old-reservation-token-repository'
         $lockPath = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod/test.lock'
         New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
