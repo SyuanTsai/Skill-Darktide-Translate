@@ -123,4 +123,22 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         if ($LASTEXITCODE -ne 0) { throw 'Could not stage the optional license fixture.' }
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
     }
+
+    It 'accepts the allowed optional allowed-tools frontmatter field' {
+        $skillPath = Join-Path $script:SkillRoot 'SKILL.md'
+        $skill = Get-Content -LiteralPath $skillPath -Raw
+        $skill = [regex]::Replace($skill, '(?m)^allowed-tools:.*\r?\n', '')
+        $lines = [Collections.Generic.List[string]]::new()
+        $lines.AddRange([string[]]($skill.Replace([Environment]::NewLine, ([string][char]10)).Split([char]10)))
+        $descriptionIndex = 0
+        for ($index = 0; $index -lt $lines.Count; $index++) {
+            if ($lines[$index].StartsWith('description:', [StringComparison]::Ordinal)) { $descriptionIndex = $index; break }
+        }
+        $lines.Insert($descriptionIndex + 1, 'allowed-tools: "git pwsh"')
+        $skill = $lines -join [Environment]::NewLine
+        Set-Content -LiteralPath $skillPath -Value $skill -Encoding utf8NoBOM -NoNewline
+        & $script:GitPath -C $script:FixtureRoot add -- skills/$($script:SkillId)/SKILL.md
+        if ($LASTEXITCODE -ne 0) { throw 'Could not stage the optional allowed-tools fixture.' }
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
+    }
 }

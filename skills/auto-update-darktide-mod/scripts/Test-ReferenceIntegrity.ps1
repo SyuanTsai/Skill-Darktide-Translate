@@ -182,28 +182,27 @@ function Test-Document {
         throw "$Name package Git blob OID mismatch."
     }
 
-    $packageStream = [IO.File]::OpenRead($candidate)
-    try {
-        $gzipStream = [IO.Compression.GZipStream]::new(
-            $packageStream,
-            [IO.Compression.CompressionMode]::Decompress
-        )
+    if ([IO.Path]::GetExtension($candidate) -ieq '.gz') {
+        $packageStream = [IO.File]::OpenRead($candidate)
         try {
-            $expandedStream = [IO.MemoryStream]::new()
+            $gzipStream = [IO.Compression.GZipStream]::new(
+                $packageStream,
+                [IO.Compression.CompressionMode]::Decompress
+            )
             try {
-                Copy-StreamWithHeartbeat -Source $gzipStream -Destination $expandedStream
-                $expandedBytes = $expandedStream.ToArray()
+                $expandedStream = [IO.MemoryStream]::new()
+                try {
+                    Copy-StreamWithHeartbeat -Source $gzipStream -Destination $expandedStream
+                    $expandedBytes = $expandedStream.ToArray()
+                }
+                finally { $expandedStream.Dispose() }
             }
-            finally {
-                $expandedStream.Dispose()
-            }
+            finally { $gzipStream.Dispose() }
         }
-        finally {
-            $gzipStream.Dispose()
-        }
+        finally { $packageStream.Dispose() }
     }
-    finally {
-        $packageStream.Dispose()
+    else {
+        $expandedBytes = $packageBytes
     }
 
     $contentSha = Get-Sha256Bytes -Bytes $expandedBytes

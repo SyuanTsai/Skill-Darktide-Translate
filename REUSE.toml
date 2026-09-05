@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
-# The packaged .gz reference archives are source-derived upstream material and are intentionally excluded; see PROVENANCE.md.
+# The packaged source-derived reference documents are intentionally excluded; see PROVENANCE.md.
 
 version = 1
 

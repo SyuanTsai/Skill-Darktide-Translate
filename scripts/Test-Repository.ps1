@@ -195,11 +195,11 @@ function Read-SkillFrontmatter {
         }
         $key = [string]$Matches.key
         $value = ConvertFrom-RestrictedYamlString -Value ([string]$Matches.value).Trim() -Context "SKILL.md $key for '$ExpectedSkillId'"
-        if ($key -cnotin @('name', 'description', 'license') -or -not $values.TryAdd($key, $value)) {
+        if ($key -cnotin @('name', 'description', 'license', 'allowed-tools') -or -not $values.TryAdd($key, $value)) {
             throw "SKILL.md for '$ExpectedSkillId' has an unsupported or duplicate frontmatter key '$key'."
         }
     }
-    if ($values.Count -lt 2 -or $values.Count -gt 3 -or -not $values.ContainsKey('name') -or -not $values.ContainsKey('description')) {
+    if ($values.Count -lt 2 -or $values.Count -gt 4 -or -not $values.ContainsKey('name') -or -not $values.ContainsKey('description')) {
         throw "SKILL.md for '$ExpectedSkillId' must define name and description, with only the allowed optional fields."
     }
     if ($values['name'] -cne $ExpectedSkillId) {
@@ -210,7 +210,10 @@ function Read-SkillFrontmatter {
     if ([string]::IsNullOrWhiteSpace($description) -or $descriptionLength -gt 1024 -or $description.Contains('<') -or $description.Contains('>')) {
         throw "SKILL.md description for '$ExpectedSkillId' violates the Standard v1 text contract."
     }
-    return [pscustomobject]@{ name = $values['name']; description = $description }
+    if ($values.ContainsKey('allowed-tools') -and [string]::IsNullOrWhiteSpace($values['allowed-tools'])) {
+        throw "SKILL.md allowed-tools for '$ExpectedSkillId' must be a non-empty string."
+    }
+    return [pscustomobject]@{ name = $values['name']; description = $description; allowedTools = if ($values.ContainsKey('allowed-tools')) { $values['allowed-tools'] } else { $null } }
 }
 
 function Read-OpenAiMetadata {

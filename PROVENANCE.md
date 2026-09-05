@@ -12,7 +12,7 @@ SPDX-License-Identifier: Apache-2.0
 
 The audited tree contains the Darktide maintenance Skill, agent metadata, scripts, tests, references, catalog/version metadata, release and rollback documentation, and CI configuration. It contains no downloaded game data, Mod installation, localization package, upstream translation archive, credentials, or private company/Jira URL.
 
-The repository-authored workflow, tools, tests, metadata, and documentation are the Apache-2.0 scope. The packaged reference archives described below are excluded from that grant.
+The repository-authored workflow, tools, tests, metadata, and documentation are the Apache-2.0 scope. The packaged source-derived reference documents described below are excluded from that grant.
 
 ## Standard v1 migration evidence
 
@@ -26,10 +26,10 @@ The six other `.agents/skills/*` directories are not Darktide-owned source packa
 
 The two packaged files were inspected as bytes and expanded, rather than classified by filename:
 
-| Path | File type | Compressed SHA-256 | Expanded SHA-256 | Decision |
+| Path | File type | Packaged SHA-256 | Content SHA-256 | Decision |
 | --- | --- | --- | --- | --- |
-| `assets/workflow-schema-14.md.gz` | gzip; not zip/tar | `43bdbb41c041be4bdbac5e0a2b0b11f50a12c2c5a06a575653d0807da499438d` | `931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549` | Source-derived upstream reference; not relicensed |
-| `assets/review-baseline.md.gz` | gzip; not zip/tar | `b6ef60d5ea59ceaeb66130b69781b70457dc687fe70875bf91c656a50e919999` | `d8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26` | Source-derived upstream reference; not relicensed |
+| `assets/workflow-schema-14.md` | UTF-8 Markdown; byte-exact source copy | `931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549` | `931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549` | Source-derived upstream reference; not relicensed |
+| `assets/review-baseline.md` | UTF-8 Markdown; byte-exact source copy | `d8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26` | `d8bcaedb66f3aa6e40ad271dbf07a7a738db37bcc071c19c8eef512bb1183d26` | Source-derived upstream reference; not relicensed |
 
 The repository's `references/source-provenance.json` records source repository `SyuanTsai/Warhammer-40-000-DARKTIDE-Mods`, source commit `f2912faf7a52304198aa0ffc096eb12a436bbb45`, workflow source blob `40752444d26a4ce39c4f32201076b1c84ad1db31`, review source blob `e1b94428c041238e3aff8cf02408b3de1387ee15`, and the historical ref `Codex/AI-Auto-Update-Workflow-Hash`. The source commit and both source blobs were checked directly. The historical branch ref is no longer available, so branch-level re-fetch is a documented residual; the commit/blob evidence remains available.
 
@@ -37,8 +37,8 @@ The repository's `references/source-provenance.json` records source repository `
 
 Downloaded Mods, game data, localization, archives, upstream translations, Nexus content, external service content, trademarks, credentials, and user-provided or generated content retain their own rights. Handling them with this workflow does not automatically place them under Apache-2.0.
 
-GitHub Actions, the skill validator, skill-tools, PowerShell, Git, and other runtime or hosted-service dependencies are not vendored or relicensed here. Their upstream terms apply. The two compressed reference archives are not included in the Apache-2.0 decision and are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+GitHub Actions, the skill validator, skill-tools, PowerShell, Git, and other runtime or hosted-service dependencies are not vendored or relicensed here. Their upstream terms apply. The two source-derived reference documents are not included in the Apache-2.0 decision and are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Decision and limits
 
-Decision: apply Apache-2.0 only to the confirmed repository-authored current-tree scope, while preserving upstream rights for the two source-derived reference archives and all external/user content. This record does not grant a license to game, Mod, localization, archive, translation, service, or generated material. It is a source and evidence record, not a legal opinion; unreviewed future additions require a new provenance decision.
+Decision: apply Apache-2.0 only to the confirmed repository-authored current-tree scope, while preserving upstream rights for the two source-derived reference documents and all external/user content. This record does not grant a license to game, Mod, localization, archive, translation, service, or generated material. It is a source and evidence record, not a legal opinion; unreviewed future additions require a new provenance decision.

@@ -2837,11 +2837,12 @@ function Invoke-Claim {
     $lockKey = [string]$plan.lockKey
     $modLockPath = [string]$plan.modLockPath
     $skillSourcePin = $integrity.skillSourcePin
+    $skillSourceRootPath = [string]$skillSourcePin.skillPath
     $workflowSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.workflow.path)
     $reviewSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.reviewBaseline.path)
-    $bindingSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath 'skills/auto-update-darktide-mod/references/package-binding.md'
-    $translationQualitySourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath 'skills/auto-update-darktide-mod/references/translation-quality.md'
-    $skillSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath 'skills/auto-update-darktide-mod/SKILL.md'
+    $bindingSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath "$skillSourceRootPath/references/package-binding.md"
+    $translationQualitySourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath "$skillSourceRootPath/references/translation-quality.md"
+    $skillSourceEntry = Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath "$skillSourceRootPath/SKILL.md"
     $schema15SourceEntry = if ($sourceReceipt) { Get-SkillSourceFileEntry -SkillSourcePin $skillSourcePin -RepositoryPath ([string]$integrity.schema15.path) } else { $null }
     $plannedOwner = Read-ActiveReservationOwner
     $plannedOwner.workflowCommitOid = $skillSourcePin.resolvedCommit

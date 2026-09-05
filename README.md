@@ -82,7 +82,7 @@ The real Reconnect trial, immutable Git evidence, Gate hashes, Review result, an
 
 ## License and contribution boundary
 
-The Apache-2.0 license in [LICENSE](LICENSE) applies to the repository-authored Skill instructions under `skills/`, agent metadata, scripts, tests, catalog and version metadata, documentation, and workflow configuration that this repository created. The two compressed reference archives under `skills/auto-update-darktide-mod/assets/` are source-derived upstream material and are expressly excluded from that grant; their provenance and treatment are recorded in [PROVENANCE.md](PROVENANCE.md).
+The Apache-2.0 license in [LICENSE](LICENSE) applies to the repository-authored Skill instructions under `skills/`, agent metadata, scripts, tests, catalog and version metadata, documentation, and workflow configuration that this repository created. The two source-derived normative reference documents under `skills/auto-update-darktide-mod/assets/` are expressly excluded from that grant; their provenance and treatment are recorded in [PROVENANCE.md](PROVENANCE.md).
 
 Downloaded Mods, game data, localization files, archives, upstream translations, Nexus or other external-service content, trademarks, credentials, user-provided inputs, and generated outputs are outside this repository's Apache-2.0 scope. Processing or transforming such material with this workflow does not automatically relicense it.
 

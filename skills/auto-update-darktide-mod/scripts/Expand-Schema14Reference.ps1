@@ -56,34 +56,31 @@ if (Test-Path -LiteralPath $outputPath) {
 
 $created = $false
 try {
-    $packageStream = [IO.File]::OpenRead($packagePath)
+    $outputStream = [IO.File]::Open(
+        $outputPath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    $created = $true
     try {
-        $gzipStream = [IO.Compression.GZipStream]::new(
-            $packageStream,
-            [IO.Compression.CompressionMode]::Decompress
-        )
+        $packageStream = [IO.File]::OpenRead($packagePath)
         try {
-            $outputStream = [IO.File]::Open(
-                $outputPath,
-                [IO.FileMode]::CreateNew,
-                [IO.FileAccess]::Write,
-                [IO.FileShare]::None
-            )
-            $created = $true
-            try {
-                $gzipStream.CopyTo($outputStream)
+            if ([IO.Path]::GetExtension($packagePath) -ieq '.gz') {
+                $gzipStream = [IO.Compression.GZipStream]::new(
+                    $packageStream,
+                    [IO.Compression.CompressionMode]::Decompress
+                )
+                try { $gzipStream.CopyTo($outputStream) }
+                finally { $gzipStream.Dispose() }
             }
-            finally {
-                $outputStream.Dispose()
+            else {
+                $packageStream.CopyTo($outputStream)
             }
         }
-        finally {
-            $gzipStream.Dispose()
-        }
+        finally { $packageStream.Dispose() }
     }
-    finally {
-        $packageStream.Dispose()
-    }
+    finally { $outputStream.Dispose() }
 
     $outputFile = Get-Item -LiteralPath $outputPath
     $outputSha = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash.ToLowerInvariant()
