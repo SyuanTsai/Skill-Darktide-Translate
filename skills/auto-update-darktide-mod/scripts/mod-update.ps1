@@ -1235,6 +1235,30 @@ function Resolve-GitNormalizationRepositoryPath {
     $RepositoryPath
 }
 
+function Get-GitIndexStagePathMap {
+    param(
+        [Parameter(Mandatory)][string] $WorkingDirectory,
+        [Parameter(Mandatory)][string] $Checkpoint
+    )
+    $indexListing = Invoke-Git -WorkingDirectory $WorkingDirectory `
+        -Arguments @('-c', 'core.quotepath=false', 'ls-files', '--stage', '-z', '--full-name')
+    $indexPaths = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($entryValue in @($indexListing.output -split ([string][char]0))) {
+        if ([string]::IsNullOrEmpty($entryValue)) { continue }
+        $tabIndex = $entryValue.IndexOf([char]9)
+        if ($tabIndex -lt 0 -or $entryValue.Substring(0, $tabIndex) -notmatch '^[0-7]{6} [0-9a-f]{40} \d+$' -or
+            [string]::IsNullOrEmpty($entryValue.Substring($tabIndex + 1))) {
+            throw "$Checkpoint index listing is malformed."
+        }
+        $entryPath = $entryValue.Substring($tabIndex + 1)
+        if ($indexPaths.ContainsKey($entryPath)) {
+            throw "$Checkpoint index listing contains a duplicate path: $entryPath"
+        }
+        $indexPaths.Add($entryPath, $entryPath)
+    }
+    $indexPaths
+}
+
 function New-GitNormalizationManifest {
     param([Collections.IDictionary] $State)
     $records = [Collections.Generic.List[object]]::new()
@@ -4137,27 +4161,16 @@ function Assert-CheckpointIndexState {
     }
 
     $trackedPathIndex = New-GitTrackedPathIndex -WorkingDirectory $WorkingDirectory -Root '.'
+    $indexPaths = Get-GitIndexStagePathMap -WorkingDirectory $WorkingDirectory -Checkpoint $Checkpoint
 
     foreach ($path in $expected.Keys) {
         $indexPath = Resolve-GitNormalizationRepositoryPath -RepositoryPath $path `
             -TrackedPathIndex $trackedPathIndex
-        $indexListing = Invoke-Git -WorkingDirectory $WorkingDirectory `
-            -Arguments @('-c', 'core.quotepath=false', 'ls-files', '--stage', '-z', '--full-name', '--', $indexPath)
-        $entries = @(
-            $indexListing.output -split ([string][char]0) |
-                Where-Object { -not [string]::IsNullOrEmpty($_) }
-        )
-        if ($entries.Count -ne 1) {
+        if (-not $indexPaths.ContainsKey($indexPath)) {
             throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
         }
-        $entry = [string]$entries[0]
-        $tabIndex = $entry.IndexOf([char]9)
-        if ($tabIndex -lt 0 -or $entry.Substring(0, $tabIndex) -notmatch '^[0-7]{6} [0-9a-f]{40} \d+$') {
-            throw "$Checkpoint index listing is malformed."
-        }
-        $indexPath = $entry.Substring($tabIndex + 1)
         try {
-            $blobBytes = Get-GitBlobBytes -WorkingDirectory $WorkingDirectory -Object ":$indexPath"
+            $blobBytes = Get-GitBlobBytes -WorkingDirectory $WorkingDirectory -Object ":$([string]$indexPaths[$indexPath])"
         }
         catch {
             throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
