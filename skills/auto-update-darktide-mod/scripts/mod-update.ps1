@@ -4149,6 +4149,19 @@ function Assert-CheckpointIndexState {
             $indexListing.output -split ([string][char]0) |
                 Where-Object { -not [string]::IsNullOrEmpty($_) }
         )
+        if ($entries.Count -eq 0 -and $coreIgnoreCase) {
+            $allIndex = Invoke-Git -WorkingDirectory $WorkingDirectory `
+                -Arguments @('ls-files', '--stage', '-z', '--full-name')
+            $fallbackEntries = [Collections.Generic.List[string]]::new()
+            foreach ($candidate in @($allIndex.output -split ([string][char]0))) {
+                if ([string]::IsNullOrEmpty($candidate)) { continue }
+                $candidateTab = $candidate.IndexOf([char]9)
+                if ($candidateTab -ge 0 -and $candidate.Substring($candidateTab + 1) -ieq $path) {
+                    $fallbackEntries.Add($candidate)
+                }
+            }
+            $entries = $fallbackEntries
+        }
         if ($entries.Count -ne 1) {
             throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
         }
