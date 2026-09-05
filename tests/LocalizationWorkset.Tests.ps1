@@ -669,7 +669,7 @@ return {
         $outsideWorkset = Join-Path $TestDrive 'workset-output-reparse-target'
         $linkedReviewArtifacts = Join-Path $repository 'AI Auto Update/In Progress/output-reparse/review-artifacts'
         New-Item -ItemType Directory -Path (Split-Path -Parent $linkedReviewArtifacts), $outsideWorkset -Force | Out-Null
-        New-Item -ItemType Junction -Path $linkedReviewArtifacts -Target $outsideWorkset | Out-Null
+        New-TestReparsePoint -Path $linkedReviewArtifacts -Target $outsideWorkset | Out-Null
         { & (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') `
                 -RepositoryRoot $repository -BaseOid $baseOid -ModRelativePath 'mods/ExampleMod' `
                 -StagingModPath $staging -OutputPath (Join-Path $linkedReviewArtifacts 'localization-workset.json') `
@@ -677,7 +677,7 @@ return {
 
         $outside = Join-Path $TestDrive 'reparse-outside'
         Move-Item -LiteralPath $nested -Destination $outside
-        New-Item -ItemType Junction -Path $nested -Target $outside | Out-Null
+        New-TestReparsePoint -Path $nested -Target $outside | Out-Null
 
         { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru } |
             Should -Throw '*reparse*'
@@ -1113,7 +1113,7 @@ return localization
 
         $outside = Join-Path $TestDrive 'workset-deletion-outside'
         Move-Item -LiteralPath $reviewArtifacts -Destination $outside
-        New-Item -ItemType Junction -Path $reviewArtifacts -Target $outside | Out-Null
+        New-TestReparsePoint -Path $reviewArtifacts -Target $outside | Out-Null
 
         { & $finalizer -StatePath $statePath -PassThru } | Should -Throw '*reparse*'
         Test-Path -LiteralPath (Join-Path $outside 'localization-workset.json') -PathType Leaf | Should -Be $true

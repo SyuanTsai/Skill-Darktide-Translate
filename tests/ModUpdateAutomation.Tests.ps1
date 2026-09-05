@@ -2413,7 +2413,7 @@ function Get-SourceTupleContractSha256 {
         $worktreeModRoot = Join-Path ([string]$preInstallState.worktreePath) 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
         $outsideInstallTarget = Join-Path $TestDrive 'install-junction-target'
         Move-Item -LiteralPath $worktreeModRoot -Destination $outsideInstallTarget
-        New-Item -ItemType Junction -Path $worktreeModRoot -Target $outsideInstallTarget | Out-Null
+        New-TestReparsePoint -Path $worktreeModRoot -Target $outsideInstallTarget | Out-Null
         try {
             { & $runnerPath install -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
                 Should -Throw '*reparse*'
@@ -3063,7 +3063,7 @@ function Get-SourceTupleContractSha256 {
         $ownerPath = Join-Path $outside 'owner.json'
         [IO.File]::WriteAllText($ownerPath, ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         $ownerBefore = [IO.File]::ReadAllBytes($ownerPath)
-        New-Item -ItemType Junction -Path $lockPath -Target $outside | Out-Null
+        New-TestReparsePoint -Path $lockPath -Target $outside | Out-Null
 
         { & $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru } |
             Should -Throw '*reparse*'

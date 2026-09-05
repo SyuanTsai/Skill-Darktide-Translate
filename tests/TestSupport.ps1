@@ -25,6 +25,17 @@ function ConvertFrom-TestJsonToken {
     ([Newtonsoft.Json.Linq.JValue]$Token).Value
 }
 
+function New-TestReparsePoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Target
+    )
+
+    $itemType = if ([OperatingSystem]::IsWindows()) { 'Junction' } else { 'SymbolicLink' }
+    New-Item -ItemType $itemType -Path $Path -Target $Target
+}
+
 function ConvertFrom-TestJson {
     [CmdletBinding()]
     param(
