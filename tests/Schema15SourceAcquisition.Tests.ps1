@@ -3,7 +3,7 @@
 Describe 'Schema 15 source acquisition contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
-        $scriptRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod/scripts'
+        $scriptRoot = Join-Path $repoRoot 'skills/auto-update-darktide-mod/scripts'
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:skillSourcePinPath = New-TestSkillSourcePin -SkillRoot (Split-Path -Parent $scriptRoot) -OutputPath (Join-Path $TestDrive 'skill-source-pin.json')
     }

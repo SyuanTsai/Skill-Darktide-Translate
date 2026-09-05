@@ -3,7 +3,7 @@
 Describe 'Deterministic Darktide MOD update automation' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
-        $skillRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod'
+        $skillRoot = Join-Path $repoRoot 'skills/auto-update-darktide-mod'
         $runnerPath = Join-Path $skillRoot 'scripts/mod-update.ps1'
         $validatorPath = Join-Path $skillRoot 'scripts/Test-ModUpdateCandidate.ps1'
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')

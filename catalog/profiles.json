@@ -24,7 +24,7 @@
       "group": "darktide-mod-maintenance",
       "source": {
         "sourceId": "darktide-translate",
-        "path": ".agents/skills/auto-update-darktide-mod"
+        "path": "skills/auto-update-darktide-mod"
       },
       "profiles": [
         "darktide-mod-maintenance"

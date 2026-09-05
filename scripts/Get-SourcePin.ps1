@@ -11,7 +11,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 function Invoke-GitText {
     param([Parameter(Mandatory = $true)] [string[]] $Arguments)
 
-    $output = & git -C $repoRoot @Arguments 2>&1
+    $output = & git -c "safe.directory=$repoRoot" -C $repoRoot @Arguments 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "git $($Arguments -join ' ') failed: $($output -join [Environment]::NewLine)"
     }
@@ -26,7 +26,7 @@ function Invoke-GitBytes {
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    foreach ($argument in @('-C', $repoRoot) + $Arguments) { $start.ArgumentList.Add($argument) }
+    foreach ($argument in @('-c', "safe.directory=$repoRoot", '-C', $repoRoot) + $Arguments) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git for source-pin blob hashing.' }
@@ -76,7 +76,7 @@ $version = (@(Invoke-GitText -Arguments @('show', "${resolvedCommit}:VERSION")) 
 if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
     throw "VERSION at ref '$Ref' is not SemVer-compatible."
 }
-$skillPath = '.agents/skills/auto-update-darktide-mod'
+$skillPath = 'skills/auto-update-darktide-mod'
 $skillFiles = @(
     foreach ($line in @(Invoke-GitText -Arguments @('ls-tree', '-r', '--full-tree', '-l', $resolvedCommit, '--', $skillPath))) {
         if ($line -notmatch '^([0-7]{6}) blob ([0-9a-f]{40,64})\s+(\d+)\t(.+)$') {

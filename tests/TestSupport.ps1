@@ -55,7 +55,7 @@ function New-TestSkillSourcePin {
         [Parameter(Mandatory)][string] $OutputPath
     )
 
-    $skillPath = '.agents/skills/auto-update-darktide-mod'
+    $skillPath = 'skills/auto-update-darktide-mod'
     $files = @(
         Get-ChildItem -LiteralPath $SkillRoot -File -Recurse | ForEach-Object {
             $bytes = [IO.File]::ReadAllBytes($_.FullName)

@@ -1,11 +1,9 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
-name: Validate
+name: Standard v1 Validation
 
 on:
   push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
@@ -13,30 +11,45 @@ permissions:
   contents: read
 
 jobs:
-  repository-contract:
-    runs-on: windows-latest
+  canonical-validation:
+    name: Darktide Translate Standard v1
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout immutable candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Resolve Pester
+      - name: Set up approved Go runtime
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          check-latest: false
+          cache: false
+
+      - name: Run canonical Standard v1 validation
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
-          $module = Get-Module -Name Pester -ListAvailable |
-            Where-Object { $_.Version.Major -ge 5 } |
-            Sort-Object Version -Descending |
-            Select-Object -First 1
-          if ($null -eq $module) {
-            Install-Module -Name Pester -MinimumVersion 5.0.0 -Scope CurrentUser -Force -SkipPublisherCheck
-            $module = Get-Module -Name Pester -ListAvailable |
-              Where-Object { $_.Version.Major -ge 5 } |
-              Sort-Object Version -Descending |
-              Select-Object -First 1
+          $ErrorActionPreference = 'Stop'
+          $baseCommit = if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            $env:PULL_REQUEST_BASE_SHA
           }
-          Write-Host "Pester $($module.Version)"
-
-      - name: Run the same clean-HEAD gate required before push
-        shell: pwsh
-        run: ./scripts/Invoke-PrePushValidation.ps1
+          elseif ($env:GITHUB_EVENT_NAME -eq 'push' -and
+              -not [string]::IsNullOrWhiteSpace($env:PUSH_BEFORE_SHA) -and
+              $env:PUSH_BEFORE_SHA -notmatch '^0+$') {
+            $env:PUSH_BEFORE_SHA
+          }
+          elseif (git rev-parse HEAD^ 2>$null) {
+            'HEAD^'
+          }
+          else {
+            ''
+          }
+          $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
+          & ./scripts/Validate.ps1 -ArtifactsRoot $env:RUNNER_TEMP -BaseCommit $baseCommit -OutputPath $outputPath

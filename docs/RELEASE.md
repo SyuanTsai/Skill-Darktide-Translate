@@ -10,13 +10,13 @@ This repository is versioned independently from the target DARKTIDE MOD reposito
 
 ## Release checklist
 
-1. Commit the intended release snapshot, require a clean working tree and index, and run `pwsh -File ./scripts/Invoke-PrePushValidation.ps1` before push. This is the same clean-HEAD gate used by GitHub and binds the complete test suite, packaged-reference integrity, and source-pin validation to one unchanged commit.
+1. Commit the intended release snapshot, require a clean working tree and index, and run `pwsh -File ./scripts/Invoke-PrePushValidation.ps1` before push. This wrapper invokes the canonical Standard v1 validation entry and binds authority, integrity, formal static tools, repository/domain tests, and source-pin evidence to one unchanged commit.
 2. Run `pwsh -File ./scripts/Get-SourcePin.ps1 -Ref HEAD` and retain the complete JSON: resolved commit, content SHA-256, Skill path, and per-file blob/SHA-256 manifest.
 3. Confirm the catalog exposes only `auto-update-darktide-mod` through the opt-in `darktide-mod-maintenance` profile.
 4. Confirm Schema 15 acquisition and multi-process tests cover known unsupported extensions before download, signature detection, partial downloads, URL sanitization, receipt verification, same-run claim, loader preflight, queue deduplication, the concurrency ceiling, distinct-MOD isolation, competing generations, stale-owner recovery, and old-token rejection.
 5. Confirm localization-workset tests cover deterministic classification (including missing zh-tw and fully locale-resolved `Localize(...)` expressions), curated unchanged-source zh-tw preservation, English-first natural translation guidance, byte spans, AI-only edit authorization, pure-loader exclusion, independent receipt-plan recomputation, idempotence, and Candidate Gate rejection outside approved edits.
 6. Confirm merge-finalization tests cover open/closed/merged PR classification, changed-head state reconciliation, missing optional state properties, Windows worktree identity, formal fingerprint paths, atomic remote-branch leases, exact cleanup construction, and owner-checked reservation release; exercise the reviewed-F GitHub path in an authorized release smoke test when credentials and a disposable merged branch are available.
-7. Confirm the GitHub `Validate` and `Skill Quality Gate` workflows pass on the exact PR head.
+7. Confirm the GitHub Standard v1 Validation workflow passes on the exact PR head.
 8. Merge the approved release commit to `main`.
 9. Create an annotated tag matching `VERSION`, resolve it to an immutable commit, and regenerate the source content hash.
 10. Consumers retain that source-pin JSON outside the installed Skill and target repository, verify it with `Test-ReferenceIntegrity.ps1 -SkillSourcePinPath`, and pass it to every new `mod-update.ps1` run. The runner archives a run-owned copy.
@@ -26,7 +26,8 @@ A live Nexus smoke test is optional and must never persist API keys, ephemeral d
 ## Compatibility-sensitive contracts
 
 - Stable source ID: `darktide-translate`
-- Skill ID and path: `auto-update-darktide-mod` at `.agents/skills/auto-update-darktide-mod`
+- Skill ID and path: `auto-update-darktide-mod` at `skills/auto-update-darktide-mod`
+- Source inventory: `catalog/source.json`; product-local profile extension: `catalog/profiles.json`
 - Profile ID: `darktide-mod-maintenance`
 - Schema 14 state semantics and C0/C1/C2/C3/F evidence boundaries
 - Schema 15 state semantics, source request/receipt tuple, per-MOD reservation, bounded concurrency, and `review-artifacts/localization-workset.json` lifecycle

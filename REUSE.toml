@@ -5,19 +5,25 @@
 version = 1
 
 [[annotations]]
-path = ".agents/skills/auto-update-darktide-mod/references/schema-15-provenance.json"
+path = "skills/auto-update-darktide-mod/references/schema-15-provenance.json"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 SyuanTsai"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
-path = ".agents/skills/auto-update-darktide-mod/references/source-provenance.json"
+path = "skills/auto-update-darktide-mod/references/source-provenance.json"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 SyuanTsai"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
-path = "catalog/skills-catalog.json"
+path = "catalog/source.json"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 SyuanTsai"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "catalog/profiles.json"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 SyuanTsai"
 SPDX-License-Identifier = "Apache-2.0"

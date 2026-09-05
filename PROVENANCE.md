@@ -14,6 +14,14 @@ The audited tree contains the Darktide maintenance Skill, agent metadata, script
 
 The repository-authored workflow, tools, tests, metadata, and documentation are the Apache-2.0 scope. The packaged reference archives described below are excluded from that grant.
 
+## Standard v1 migration evidence
+
+The SYP-158 migration separates the repository-owned source package into the canonical `skills/auto-update-darktide-mod/` layout and records it in `catalog/source.json` with source ID `darktide-translate`. The former `catalog/skills-catalog.json` is retained as the product-local `catalog/profiles.json` extension; it does not replace the source inventory or define central validation, security, lifecycle, or approval policy.
+
+The six other `.agents/skills/*` directories are not Darktide-owned source packages. They are managed consumer projections whose exact target files, source repositories, revisions, and hashes are declared by `.codex/ai-instructions.manifest.json`. The migration preserves them and validates their manifest binding; it does not infer ownership or delete them.
+
+`config/standard-v1.json` pins the reviewed `SyuanTsai-AI-Instructions` Standard v1 authority archive and normative files. `scripts/Validate.ps1` is the single local, pre-push, and CI validation entry point, while the existing Darktide domain regressions remain repository-test extensions within the canonical stage order.
+
 ## Compressed reference audit
 
 The two packaged files were inspected as bytes and expanded, rather than classified by filename:

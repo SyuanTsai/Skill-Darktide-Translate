@@ -3,7 +3,7 @@
   "sourceRepository": "https://github.com/SyuanTsai/Warhammer-40-000-DARKTIDE-Mods.git",
   "sourceRef": "Codex/AI-Auto-Update-Workflow-Hash",
   "sourceCommit": "f2912faf7a52304198aa0ffc096eb12a436bbb45",
-  "skillRepositoryPath": ".agents/skills/auto-update-darktide-mod",
+  "skillRepositoryPath": "skills/auto-update-darktide-mod",
   "documents": {
     "workflow": {
       "originalPath": "AI Prompt/AI-Auto-Update-MOD-Workflow.md",
