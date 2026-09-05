@@ -1259,6 +1259,87 @@ function Get-GitIndexStagePathMap {
     $indexPaths
 }
 
+function Normalize-GitCaseVariantWorktreePaths {
+    param(
+        [Parameter(Mandatory)][string] $WorkingDirectory,
+        [Parameter(Mandatory)][string] $ModRelativePath,
+        [object[]] $Records = @()
+    )
+    $worktreeRoot = [IO.Path]::GetFullPath($WorkingDirectory)
+    $modRoot = $ModRelativePath.Replace('\', '/').TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($modRoot) -or $modRoot.StartsWith('/', [StringComparison]::Ordinal)) {
+        throw 'Git index normalization MOD root is invalid.'
+    }
+    $modPrefix = "$modRoot/"
+    $canonicalPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $moves = [Collections.Generic.List[object]]::new()
+    foreach ($record in @($Records)) {
+        $relativePath = ([string]$record.path).Replace('\', '/')
+        $canonicalPath = ([string]$record.repositoryPath).Replace('\', '/')
+        $rawSha256 = [string]$record.rawSha256
+        if ([string]::IsNullOrWhiteSpace($relativePath) -or
+            [string]::IsNullOrWhiteSpace($canonicalPath) -or
+            $rawSha256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'Git index normalization record is incomplete before case-variant repair.'
+        }
+        if ($relativePath.StartsWith('/', [StringComparison]::Ordinal) -or
+            $canonicalPath.StartsWith('/', [StringComparison]::Ordinal) -or
+            $relativePath -match '(^|/)\.\.?(/|$)' -or $canonicalPath -match '(^|/)\.\.?(/|$)') {
+            throw 'Git index normalization record contains a traversal path.'
+        }
+        $actualPath = "$modRoot/$relativePath"
+        if (-not $actualPath.StartsWith($modPrefix, [StringComparison]::Ordinal) -or
+            -not $canonicalPath.StartsWith($modPrefix, [StringComparison]::Ordinal)) {
+            throw "Git index normalization path escapes the MOD root: $actualPath -> $canonicalPath"
+        }
+        if (-not $canonicalPaths.Add($canonicalPath)) {
+            throw "Git index normalization has multiple files for one canonical path: $canonicalPath"
+        }
+        if ($actualPath -ceq $canonicalPath) { continue }
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualPath, $canonicalPath)) {
+            throw "Git index normalization changed a non-case path: $actualPath -> $canonicalPath"
+        }
+        $source = Assert-NoReparsePath -Path (Join-Path $worktreeRoot $actualPath) `
+            -Root $worktreeRoot -Label 'Case-variant install source' -AllowMissing
+        $destination = Assert-ContainedPath -Candidate (Join-Path $worktreeRoot $canonicalPath) `
+            -Root $worktreeRoot -Label 'Canonical install destination'
+        $destination = Assert-NoReparsePath -Path $destination -Root $worktreeRoot `
+            -Label 'Canonical install destination' -AllowMissing
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($source), [IO.Path]::GetFullPath($destination))) {
+            continue
+        }
+        $sourceExists = Test-Path -LiteralPath $source -PathType Leaf
+        $destinationExists = Test-Path -LiteralPath $destination -PathType Leaf
+        if (-not $sourceExists -and $destinationExists) {
+            if ((Get-FileSha256 -Path $destination) -cne $rawSha256) {
+                throw "Canonical install destination differs from the immutable raw install file: $canonicalPath"
+            }
+            continue
+        }
+        if (-not $sourceExists) {
+            throw "Case-variant install source is missing: $actualPath"
+        }
+        if ($destinationExists) {
+            throw "Canonical install destination already exists: $canonicalPath"
+        }
+        $moves.Add([ordered]@{ source = $source; destination = $destination; sourcePath = $actualPath; destinationPath = $canonicalPath })
+    }
+
+    foreach ($move in $moves) {
+        $parent = Split-Path -Parent ([string]$move.destination)
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        $null = Assert-NoReparsePath -Path $parent -Root $worktreeRoot -Label 'Canonical install destination parent'
+        if (Test-Path -LiteralPath ([string]$move.destination)) {
+            throw "Canonical install destination appeared during normalization: $($move.destinationPath)"
+        }
+        [IO.File]::Move([string]$move.source, [string]$move.destination)
+        Update-ActiveReservationHeartbeat -Force
+        Update-ActiveSharedCoordinationHeartbeat -Force
+    }
+}
+
 function New-GitNormalizationManifest {
     param([Collections.IDictionary] $State)
     $records = [Collections.Generic.List[object]]::new()
@@ -4110,7 +4191,8 @@ function Assert-FileTreeMatchesManifest {
         [Parameter(Mandatory)][string] $Root,
         [Parameter(Mandatory)][string] $Repository,
         [Parameter(Mandatory)][Collections.IDictionary] $ManifestReceipt,
-        [Parameter(Mandatory)][string] $Label
+        [Parameter(Mandatory)][string] $Label,
+        [switch] $AllowCaseOnlyPathNormalization
     )
     $rootFull = [IO.Path]::GetFullPath($Root)
     $manifestPath = Assert-NoReparsePath -Path ([string]$ManifestReceipt.path) `
@@ -4132,11 +4214,35 @@ function Assert-FileTreeMatchesManifest {
         } | Sort-Object { [string]$_.path }
     )
     if ($actual.Count -ne $expected.Count) { throw "$Label file count differs from its immutable manifest." }
-    for ($index = 0; $index -lt $actual.Count; $index++) {
-        if ([string]$actual[$index].path -cne [string]$expected[$index].path -or
-            [int64]$actual[$index].size -ne [int64]$expected[$index].size -or
-            [string]$actual[$index].sha256 -cne [string]$expected[$index].sha256) {
-            throw "$Label differs from its immutable manifest at $($actual[$index].path)."
+    if (-not $AllowCaseOnlyPathNormalization) {
+        for ($index = 0; $index -lt $actual.Count; $index++) {
+            if ([string]$actual[$index].path -cne [string]$expected[$index].path -or
+                [int64]$actual[$index].size -ne [int64]$expected[$index].size -or
+                [string]$actual[$index].sha256 -cne [string]$expected[$index].sha256) {
+                throw "$Label differs from its immutable manifest at $($actual[$index].path)."
+            }
+        }
+    }
+    else {
+        $expectedByPath = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        $actualByPath = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in $expected) {
+            if (-not $expectedByPath.TryAdd([string]$file.path, $file)) {
+                throw "$Label contains case-colliding expected paths: $($file.path)."
+            }
+        }
+        foreach ($file in $actual) {
+            if (-not $actualByPath.TryAdd([string]$file.path, $file)) {
+                throw "$Label contains case-colliding actual paths: $($file.path)."
+            }
+        }
+        foreach ($path in $expectedByPath.Keys) {
+            $actualFile = $null
+            if (-not $actualByPath.TryGetValue($path, [ref]$actualFile) -or
+                [int64]$actualFile.size -ne [int64]$expectedByPath[$path].size -or
+                [string]$actualFile.sha256 -cne [string]$expectedByPath[$path].sha256) {
+                throw "$Label differs from its immutable manifest at $path."
+            }
         }
     }
     [ordered]@{ root = $rootFull; fileCount = $actual.Count; manifestSha256 = [string]$ManifestReceipt.sha256 }
@@ -4295,7 +4401,7 @@ function Invoke-BuildCommits {
         if ($resumeRank -lt 3) {
             $null = Assert-FileTreeMatchesManifest -Root ([string]$State.installRoot) `
                 -Repository ([string]$State.repositoryRoot) -ManifestReceipt $State.rawInstallManifest `
-                -Label 'Pre-C1 raw install tree'
+                -Label 'Pre-C1 raw install tree' -AllowCaseOnlyPathNormalization
             $normalizationPath = Assert-NoReparsePath -Path ([string]$State.gitIndexNormalization.path) `
                 -Root ([string]$State.repositoryRoot) -Label 'Git index normalization manifest'
             if ((Get-FileSha256 -Path $normalizationPath) -cne [string]$State.gitIndexNormalization.sha256) {
@@ -4318,6 +4424,9 @@ function Invoke-BuildCommits {
         $targets = @($State.evidenceTargetPaths)
         if ($resumeRank -lt 1) {
             $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('reset', '--quiet', 'HEAD', '--', $State.modRelativePath)
+            $c1NormalizationRecords = @($normalization.files | Where-Object { [string]$_.repositoryPath -cnotin $targets })
+            Normalize-GitCaseVariantWorktreePaths -WorkingDirectory $worktree `
+                -ModRelativePath ([string]$State.modRelativePath) -Records $c1NormalizationRecords
             $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('-c', 'core.autocrlf=true', 'add', '-A', '--', $State.modRelativePath)
             foreach ($target in $targets) {
                 $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('reset', '--quiet', 'HEAD', '--', $target)

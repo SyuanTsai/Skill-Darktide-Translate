@@ -53,3 +53,59 @@ jobs:
           }
           $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
           & ./scripts/Validate.ps1 -ArtifactsRoot $env:RUNNER_TEMP -BaseCommit $baseCommit -OutputPath $outputPath
+
+  # These jobs preserve the repository's existing required status contexts while
+  # keeping the canonical Standard v1 gate as the only validation policy.
+  repository-contract:
+    name: repository-contract
+    if: ${{ always() }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror canonical Standard v1 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          result='${{ needs['canonical-validation'].result }}'
+          if [[ "$result" != 'success' ]]; then
+            echo "Canonical Standard v1 validation result: $result"
+            exit 1
+          fi
+          echo 'Canonical Standard v1 validation passed.'
+
+  skill-validator:
+    name: skill-validator
+    if: ${{ always() }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror canonical Standard v1 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          result='${{ needs['canonical-validation'].result }}'
+          if [[ "$result" != 'success' ]]; then
+            echo "Canonical Standard v1 validation result: $result"
+            exit 1
+          fi
+          echo 'Canonical Standard v1 validation passed.'
+
+  skill-tools:
+    name: skill-tools
+    if: ${{ always() }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror canonical Standard v1 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          result='${{ needs['canonical-validation'].result }}'
+          if [[ "$result" != 'success' ]]; then
+            echo "Canonical Standard v1 validation result: $result"
+            exit 1
+          fi
+          echo 'Canonical Standard v1 validation passed.'
