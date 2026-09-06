@@ -3,65 +3,65 @@
   "standardVersion": "v1",
   "authority": {
     "repository": "https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git",
-    "commit": "fc4b4a3394a98c44c3fc18ac6e291e719fbaaa57",
-    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/fc4b4a3394a98c44c3fc18ac6e291e719fbaaa57",
-    "archiveSha256": "f27f9f8c83a30f48373aec6522c36afc597a042631a07515f00ee8f27018a8fe",
+    "commit": "d213b66123045c6a551decfb370c4aadc357d6fa",
+    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/d213b66123045c6a551decfb370c4aadc357d6fa",
+    "archiveSha256": "727d922a6668bc574889fd153858ec7216e0115950998259acdad55c1bbf5505",
     "files": [
       {
         "path": "docs/standards/README.md",
-        "sha256": "202f180ff1b32badb37c135e5eec3b7938db35f4137822c6a91aee3d3f8c29dd"
+        "sha256": "5dde1105220ee9f13bd4e548c1fe35091c8b4612e3035d5151281490876226b6"
       },
       {
         "path": "docs/standards/managed-skill-lifecycle.md",
-        "sha256": "70950cf8bdd02819efae6f6e06ac5be1da3e70f809c23e3c6f8d3b217797416c"
+        "sha256": "be4bd5f6d437935a0584d1849023d1a1522f5097c8deeee55eabd6d7b602261f"
       },
       {
         "path": "docs/standards/schemas/managed-skill-lifecycle-v1.schema.json",
-        "sha256": "9a7f4c02588d2b88194e953a41766a72a9426fa89d4c3781c5750dcc22d35863"
+        "sha256": "7a7a01d483ebc53b4c953c5e462c0112a8f8fe8d78b3b5b0f6fb8a4f9c371f39"
       },
       {
         "path": "docs/standards/schemas/openai-agent-metadata.schema.json",
-        "sha256": "23c1aaee28a54fea1946a61d6122a2097906ffa5bdd66c8014fc6b1625c9062a"
+        "sha256": "52739009c5c92b4e62799989e4bf1b205b5491cb57a49b610e3fb48623b487f9"
       },
       {
         "path": "docs/standards/schemas/source-inventory-v2.schema.json",
-        "sha256": "084550944b4141ab5535f58fb6e99730a5c34b56103f6b59fd5a352679caa98e"
+        "sha256": "53c9daf32888b5139aa2df072f1ca50cea271f0a7c28fcf217fad1534ea7fc35"
       },
       {
         "path": "docs/standards/schemas/validation-security-gate-v1.schema.json",
-        "sha256": "2502efc27c823fcc4109b767fe360579e4de9f59e509a4500eb92753349d3ced"
+        "sha256": "f27407057bb1ed9d58d71c13237debe4acb50e5feacb0a6e450674f5c6eb64d7"
       },
       {
         "path": "docs/standards/skill-repository-review-matrix.md",
-        "sha256": "93b3ced32506196a333b85aaa964995d46d95d75f0b7f6ffee31d1d692aada7e"
+        "sha256": "c90c71a08891650bbd82793a1b476cb8b263299f4b8ffad92165fc447adf0ab2"
       },
       {
         "path": "docs/standards/skill-repository-standard.md",
-        "sha256": "a7e5da27cd71c9ca05caa94f180fd3d0782e1b6df652f81d8c53fb258f9f7f87"
+        "sha256": "268cf317d4bdf531e4d228893ca71b169a6075f162ca82d442c8a64b0458b373"
       },
       {
         "path": "docs/standards/upstream-interoperability.md",
-        "sha256": "9c544fbfb6b77a589514f1926aa1488882e932786a303a42ce6c6c9b2ba80c7e"
+        "sha256": "bca90a2e8dbc51cc4d5e0b90c98a64eb9a10ab6ab2ce76f6ff2dd9c76f728f8a"
       },
       {
         "path": "docs/standards/validation-security-gate.json",
-        "sha256": "8c0a7e9e739e600817c4e5ef34c18db3e22ed19907bda589de0f8252e6763181"
+        "sha256": "15ea6d77c320e9ac3abd28bd5138c95f3bbcae0630586d2c322ee373bec8425e"
       },
       {
         "path": "docs/standards/validation-toolchain.json",
-        "sha256": "5925dcb1aea1e545b9787a29825e7a0cc03a04c777cd68ab44c9bdd7482ff579"
+        "sha256": "3257123ee1ddf672bd7f95a8f52165a01169a26cad72560db10f768671a38635"
       },
       {
         "path": "scripts/Invoke-StandardAuthorityGate.ps1",
-        "sha256": "8018dc2685c342f5e21d4115b7aea4a07007aebaa209e7352ede851ce92c7bf8"
+        "sha256": "98945f186656831a6df649c1a9658065dc7cc21e67daca0b01d29b042dc7ecd2"
       },
       {
         "path": "scripts/Resolve-PythonWheelClosure.py",
-        "sha256": "7fa1511a3e3ba257c6d9e37f929f68e5684184a3a2756a3f9e765ccc6e69d208"
+        "sha256": "71d02ec5ea265f4fb247132e71a354cdb1d0a5700743d516b6bb2ae73b9360b2"
       },
       {
         "path": "scripts/Resolve-StandardValidationTool.ps1",
-        "sha256": "7e5376775b2b456a27fc47aae9ea03f6207121e15adf95a250cb3f175ae31b71"
+        "sha256": "2d6f8fedc987dd65a316fd390823422f1ae13db10af893314629a87d7616648d"
       }
     ]
   },

@@ -11,6 +11,7 @@ param(
     ),
     [string] $AuthorityArchivePath,
     [string] $BaseCommit,
+    [string] $ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION,
     [string] $OutputPath
 )
 
@@ -561,7 +562,7 @@ $expectedSources = [ordered]@{
 $receipts = [ordered]@{}
 foreach ($toolName in $expectedSources.Keys) {
     $receiptPath = Join-Path $runRoot "receipt-$toolName.json"
-    & $resolverPath -PolicyPath $policyPath -ToolName $toolName -Install -InstallRoot $installRoot -OutputPath $receiptPath | Out-Host
+    & $resolverPath -PolicyPath $policyPath -ToolName $toolName -Install -InstallRoot $installRoot -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion -OutputPath $receiptPath | Out-Host
     $receipt = Read-JsonFile -Path $receiptPath -Context "$toolName resolver receipt"
     if ($receipt.toolName -cne $toolName -or $receipt.source -cne $expectedSources[$toolName] -or
         $receipt.channel -cne 'latest-stable' -or $receipt.frozenForRun -ne $true -or
