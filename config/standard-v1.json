@@ -3,21 +3,21 @@
   "standardVersion": "v1",
   "authority": {
     "repository": "https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git",
-    "commit": "16c58ce2ae41450085000734c2ad32b319c69131",
-    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/16c58ce2ae41450085000734c2ad32b319c69131",
-    "archiveSha256": "04d282d701dbb9b2dd747932fc3f779816f41d03595a64a02d82349183d37cef",
+    "commit": "fc4b4a3394a98c44c3fc18ac6e291e719fbaaa57",
+    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/fc4b4a3394a98c44c3fc18ac6e291e719fbaaa57",
+    "archiveSha256": "f27f9f8c83a30f48373aec6522c36afc597a042631a07515f00ee8f27018a8fe",
     "files": [
       {
         "path": "docs/standards/README.md",
-        "sha256": "a727f55e8b690ef80b328b525dff0f0a418b11e2f0181e854cd9b6bd7c1edf2a"
+        "sha256": "202f180ff1b32badb37c135e5eec3b7938db35f4137822c6a91aee3d3f8c29dd"
       },
       {
         "path": "docs/standards/managed-skill-lifecycle.md",
-        "sha256": "1fb64e5692b4a85e9b088a62219de2def6575fdb10e344e2befaecc9e98155f0"
+        "sha256": "70950cf8bdd02819efae6f6e06ac5be1da3e70f809c23e3c6f8d3b217797416c"
       },
       {
         "path": "docs/standards/schemas/managed-skill-lifecycle-v1.schema.json",
-        "sha256": "70f3b66f1ea6012952cc0ed26fe11f8aa6574f35ef188b14f0be1d1aaae5b451"
+        "sha256": "9a7f4c02588d2b88194e953a41766a72a9426fa89d4c3781c5750dcc22d35863"
       },
       {
         "path": "docs/standards/schemas/openai-agent-metadata.schema.json",
@@ -29,39 +29,39 @@
       },
       {
         "path": "docs/standards/schemas/validation-security-gate-v1.schema.json",
-        "sha256": "376b864cc624c337151044a3699484c878ca7235f908717a83a55a8c0bef99de"
+        "sha256": "2502efc27c823fcc4109b767fe360579e4de9f59e509a4500eb92753349d3ced"
       },
       {
         "path": "docs/standards/skill-repository-review-matrix.md",
-        "sha256": "44b874a603398525ab75cfad98618059082821e3ea877d2c9018799c22df1ef6"
+        "sha256": "93b3ced32506196a333b85aaa964995d46d95d75f0b7f6ffee31d1d692aada7e"
       },
       {
         "path": "docs/standards/skill-repository-standard.md",
-        "sha256": "7c9cedbae970b35a805faa1ff05c0f385e87de793d9e527d47fd3cb910608849"
+        "sha256": "a7e5da27cd71c9ca05caa94f180fd3d0782e1b6df652f81d8c53fb258f9f7f87"
       },
       {
         "path": "docs/standards/upstream-interoperability.md",
-        "sha256": "a1e00abc66e8ddddc59e0e5c7bb8f096410c3642772f0b39917d2f7fdcdd3384"
+        "sha256": "9c544fbfb6b77a589514f1926aa1488882e932786a303a42ce6c6c9b2ba80c7e"
       },
       {
         "path": "docs/standards/validation-security-gate.json",
-        "sha256": "8aa3502e4c76bb345df1a23366f6b4dc6e39e5385350d3947b1ed8b7f8ddc2f6"
+        "sha256": "8c0a7e9e739e600817c4e5ef34c18db3e22ed19907bda589de0f8252e6763181"
       },
       {
         "path": "docs/standards/validation-toolchain.json",
-        "sha256": "d3ddbfec42d03a1bf478759f8eb610cd783063a7f780154ba2c1122ef4662ac4"
+        "sha256": "5925dcb1aea1e545b9787a29825e7a0cc03a04c777cd68ab44c9bdd7482ff579"
       },
       {
         "path": "scripts/Invoke-StandardAuthorityGate.ps1",
-        "sha256": "2d11cd1d34999b5fc5e6f65c25f8881b3dc8bbccdac83af75eb59de583121e5d"
+        "sha256": "8018dc2685c342f5e21d4115b7aea4a07007aebaa209e7352ede851ce92c7bf8"
       },
       {
         "path": "scripts/Resolve-PythonWheelClosure.py",
-        "sha256": "1d62cc63a5e314de58d7b47eab2cc608e65cd55ec290d96fa60c09954ad50d76"
+        "sha256": "7fa1511a3e3ba257c6d9e37f929f68e5684184a3a2756a3f9e765ccc6e69d208"
       },
       {
         "path": "scripts/Resolve-StandardValidationTool.ps1",
-        "sha256": "92f12d2b2c5ac30b471004bf3b75edd59763b9075002901ff92ce39a77f44712"
+        "sha256": "7e5376775b2b456a27fc47aae9ea03f6207121e15adf95a250cb3f175ae31b71"
       }
     ]
   },

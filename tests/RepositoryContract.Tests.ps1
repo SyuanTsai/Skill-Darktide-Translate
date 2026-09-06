@@ -184,7 +184,9 @@ Describe 'Darktide Translate repository contract' {
         $validate | Should -Match 'actions/checkout@[0-9a-f]{40}'
         $validate | Should -Match 'actions/setup-go@[0-9a-f]{40}'
         $validate | Should -Match 'persist-credentials:\s*false'
-        $validate | Should -Match "go-version: '1\.26\.8'"
+        $validate | Should -Match "go-version: 'stable'"
+        $validate | Should -Match 'check-latest: true'
+        $validate | Should -Not -Match "go-version: '[0-9]+\.[0-9]+\.[0-9]+'"
         $validate | Should -Match 'scripts/Validate\.ps1'
     }
 }
