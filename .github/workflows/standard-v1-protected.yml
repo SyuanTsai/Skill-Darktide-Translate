@@ -174,7 +174,6 @@ jobs:
         id: canonical-validation
         shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ github.token }}
           PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |

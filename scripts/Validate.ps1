@@ -1180,6 +1180,58 @@ function Assert-PathWithinRoot {
     return $fullPath
 }
 
+function Get-InstalledDirectoryClosureSha256 {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $root = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "$Context install root is missing: $root" }
+    Assert-NoReparseAncestors -Path $root -Context "$Context install root"
+    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | Sort-Object FullName)
+    if ($files.Count -eq 0) { throw "$Context install root is empty: $root" }
+    $canonical = [Text.StringBuilder]::new()
+    foreach ($file in $files) {
+        if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Context installed closure contains a reparse-backed file: $($file.FullName)"
+        }
+        Assert-NoReparseAncestors -Path $file.FullName -Context "$Context installed closure file"
+        $relative = $file.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $relative = $relative.Replace([IO.Path]::DirectorySeparatorChar, '/')
+        if ([string]::IsNullOrWhiteSpace($relative) -or $relative -match '(^|/)\.\.?(/|$)') {
+            throw "$Context installed closure contains an unsafe relative path."
+        }
+        $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+        [void]$canonical.Append($relative).Append("`t").Append($sha256).Append("`n")
+    }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical.ToString()))) -replace '-', '').ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
+}
+
+function Assert-ReceiptInstalledClosure {
+    param(
+        [Parameter(Mandatory = $true)] $Receipt,
+        [Parameter(Mandatory = $true)][string] $InstallRoot,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $rootValue = $Receipt.PSObject.Properties['installRoot']
+    $hashValue = $Receipt.PSObject.Properties['installedClosureSha256']
+    if ($null -eq $rootValue -or $rootValue.Value -isnot [string] -or
+        $null -eq $hashValue -or $hashValue.Value -isnot [string]) {
+        throw "$Context receipt does not provide installRoot/installedClosureSha256."
+    }
+    Assert-Sha256 -Value ([string]$hashValue.Value) -Context "$Context installed closure hash"
+    $root = Assert-PathWithinRoot -Path ([string]$rootValue.Value) -Root $InstallRoot -Context "$Context install root"
+    $actual = Get-InstalledDirectoryClosureSha256 -Path $root -Context $Context
+    if ($actual -cne [string]$hashValue.Value) {
+        throw "$Context installed closure changed after resolution."
+    }
+    return $root
+}
+
 function Assert-ReceiptFile {
     param(
         [Parameter(Mandatory = $true)] $Receipt,
@@ -1649,6 +1701,13 @@ if (Test-Path -LiteralPath $runRoot) { throw 'Run-owned artifacts path unexpecte
 Assert-NoReparseAncestors -Path $runRoot -Context 'Run-owned artifacts path'
 [void](New-Item -ItemType Directory -Path $authorityExtractRoot -Force)
 [void](New-Item -ItemType Directory -Path $installRoot -Force)
+$trustedGitConfigPath = Join-Path $runRoot 'empty-git-config'
+$trustedGitHooksPath = Join-Path $runRoot 'empty-git-hooks'
+[IO.File]::WriteAllText($trustedGitConfigPath, '', [Text.UTF8Encoding]::new($false))
+[void](New-Item -ItemType Directory -Path $trustedGitHooksPath -Force)
+$trustedGitConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedGitConfigPath).Hash.ToLowerInvariant()
+Assert-NoReparseAncestors -Path $trustedGitConfigPath -Context 'Run-owned Git global config'
+Assert-NoReparseAncestors -Path $trustedGitHooksPath -Context 'Run-owned empty Git hooks directory'
 
 # Bind the exact package/file inventory before any scanner is acquired or executed.
 $integrityReportPath = Join-Path $runRoot 'candidate-integrity.json'
@@ -1764,6 +1823,13 @@ $skillValidatorPath = Assert-ReceiptFile -Receipt $receipts.'skill-validator' -P
 $skillToolsNodePath = Assert-ExternalReceiptFile -Receipt $receipts.'skill-tools' -PathProperty 'nodePath' -HashProperty 'nodeSha256' -Context 'skill-tools Node'
 $skillToolsEntryPoint = Assert-ReceiptFile -Receipt $receipts.'skill-tools' -PathProperty 'entryPointPath' -HashProperty 'entryPointSha256' -InstallRoot $installRoot -Context 'skill-tools entry point'
 $pesterModulePath = Assert-ReceiptFile -Receipt $receipts.pester -PathProperty 'modulePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'Pester module'
+$receiptClosureRoots = @{}
+foreach ($toolName in $expectedSources.Keys) {
+    $receipt = $receipts[$toolName]
+    if ($null -ne $receipt.PSObject.Properties['installedClosureSha256']) {
+        $receiptClosureRoots[$toolName] = Assert-ReceiptInstalledClosure -Receipt $receipt -InstallRoot $installRoot -Context "$toolName installed closure"
+    }
+}
 
 $securityFindings = @()
 $securityBlockers = @()
@@ -1910,6 +1976,9 @@ $semanticReports = @()
 # Required CI remains credential-free and deterministic; semantic scanning is opt-in.
 if ($semanticTriggered) {
     $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector semantic scanner'
+    if ($receiptClosureRoots.ContainsKey('skillspector')) {
+        [void](Assert-ReceiptInstalledClosure -Receipt $receipts.skillspector -InstallRoot $installRoot -Context 'SkillSpector semantic scanner')
+    }
     foreach ($skillId in $skillIds) {
         $skillRoot = Join-Path $repoRoot "skills/$skillId"
         $expectedInventoryPaths = @(
@@ -2053,6 +2122,23 @@ if ($null -eq $postPesterRepositoryValidatorScript) {
 }
 
 $postPesterRepositoryReportPath = Join-Path $runRoot 'repository-validation-post-pester.json'
+$trustedGitConfigActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedGitConfigPath).Hash.ToLowerInvariant()
+if ($trustedGitConfigActualSha256 -cne $trustedGitConfigSha256) {
+    throw 'Run-owned Git global config changed before post-Pester evidence collection.'
+}
+Assert-NoReparseAncestors -Path $trustedGitConfigPath -Context 'Run-owned Git global config'
+Assert-NoReparseAncestors -Path $trustedGitHooksPath -Context 'Run-owned empty Git hooks directory'
+$hookEntries = @(Get-ChildItem -LiteralPath $trustedGitHooksPath -Force)
+if ($hookEntries.Count -ne 0) {
+    throw 'Run-owned Git hooks directory is not empty before post-Pester evidence collection.'
+}
+$env:GIT_CONFIG_NOSYSTEM = '1'
+$env:GIT_CONFIG_GLOBAL = $trustedGitConfigPath
+$env:GIT_CONFIG_COUNT = '2'
+$env:GIT_CONFIG_KEY_0 = 'core.hooksPath'
+$env:GIT_CONFIG_VALUE_0 = $trustedGitHooksPath
+$env:GIT_CONFIG_KEY_1 = 'core.fsmonitor'
+$env:GIT_CONFIG_VALUE_1 = 'false'
 $postPesterCandidateCommit = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
 if ($LASTEXITCODE -ne 0 -or $postPesterCandidateCommit -cne $candidateCommit) {
     throw "Candidate commit changed during repository tests; expected '$candidateCommit' but found '$postPesterCandidateCommit'."
