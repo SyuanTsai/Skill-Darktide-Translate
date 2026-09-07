@@ -295,7 +295,7 @@ function Remove-ModUpdateOwnedTree {
     $fullPath = Assert-NoReparseTree -Path $Path -Root $Root -Label $Label
     $rootFull = [IO.Path]::GetFullPath($Root)
     if ($fullPath -ceq $rootFull) { throw "$Label cannot be the containment root." }
-    Remove-DirectoryTreeWithHeartbeat -Path $fullPath
+    Remove-DirectoryTreeWithHeartbeat -Path $fullPath -Root $rootFull
 }
 
 function Assert-ModUpdateMergeFinalizationState {

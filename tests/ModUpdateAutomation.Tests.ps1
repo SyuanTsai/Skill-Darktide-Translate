@@ -199,6 +199,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $finalizer | Should -Match 'Read-ActiveReservationOwner'
         $finalizer | Should -Match 'Suspend-ModReservationWorker -State \$State'
         $finalizer | Should -Match 'Exit-RunWriterLock -Lease \$script:writerLease'
+        $finalizer | Should -Match 'Remove-DirectoryTreeWithHeartbeat -Path \$fullPath -Root \$rootFull'
         $finalizer | Should -Not -Match '@\(''branch'', ''-D'''
         $finalizer | Should -Not -Match 'Remove-Item\s+-Recurse'
     }
