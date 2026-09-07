@@ -1301,8 +1301,8 @@ function Invoke-NativeChecked {
                 Add-ProcessIdentityToObservation -ProcessId ([int]$supervisorProcessId) -ObservedProcessIdentities $baselineSupervisorProcessIdentities
             }
             if ($script:IsWindowsHost) {
-                # Create containment before Process.Start so detached descendants
-                # remain in the kill-on-close boundary after the root exits.
+                # Create containment before Process.Start, then assign the child
+                # immediately after it returns so descendants stay in the boundary.
                 $windowsJobHandle = New-WindowsKillOnCloseJob -Context $Context
             }
             $nativeCommand = $Command
