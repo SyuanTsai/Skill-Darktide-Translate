@@ -58,7 +58,7 @@ Describe 'Repository pre-push validation' {
     It 'UnitT40_UsesOnePrePushEntrypointForTheLocalAndCiContract' {
         Test-Path -LiteralPath $script:prePushPath | Should -Be $true
         $prePush = Get-Content -LiteralPath $script:prePushPath -Raw
-        $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot '.github/workflows/validate.yml') -Raw
+        $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot '.github/workflows/standard-v1-protected.yml') -Raw
 
         $prePush | Should -Match 'scripts/Validate\.ps1'
         $prePush | Should -Match 'ArtifactsRoot'
@@ -70,11 +70,11 @@ Describe 'Repository pre-push validation' {
     }
 
     It 'UnitT50_RunsEachPullRequestHeadOnceAndRevalidatesMainAfterMerge' {
-        foreach ($workflowName in @('validate.yml')) {
+        foreach ($workflowName in @('standard-v1-protected.yml')) {
             $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot ".github/workflows/$workflowName") -Raw
 
             $workflow | Should -Match '(?m)^  push:\r?$'
-            $workflow | Should -Match '(?m)^  pull_request:'
+            $workflow | Should -Match '(?m)^  pull_request_target:'
         }
     }
 }

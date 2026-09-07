@@ -156,11 +156,14 @@ Describe 'Canonical Standard v1 validation adapter' {
         $pesterIndex = $script:Validator.IndexOf('$pesterRunnerPath')
         $semanticIndex | Should -BeGreaterThan -1
         $pesterIndex | Should -BeGreaterThan $semanticIndex
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/validate.yml') -Raw
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
         $workflow | Should -Match 'github\.run_attempt'
         $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
+        $workflow | Should -Match 'pull_request_target:'
+        $workflow | Should -Match 'ref: \$\{\{ github\.event_name == .pull_request_target. && github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}'
         $workflow | Should -Match 'Materialize protected validation supervisor'
-        $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.event_name == .pull_request. && github\.event\.pull_request\.base\.sha \|\| github\.sha \}\}'
+        $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.sha \}\}'
+        $workflow | Should -Not -Match "github\.event_name == 'pull_request'"
         $workflow | Should -Not -Match 'TRUSTED_VALIDATE_BLOB|TRUSTED_REPOSITORY_VALIDATOR_BLOB'
         $workflow | Should -Match '\$actualBlob = .*rev-parse \$revision'
         $workflow | Should -Match 'TRUSTED_SUPERVISOR_ROOT'
@@ -172,7 +175,7 @@ Describe 'Canonical Standard v1 validation adapter' {
     }
 
     It 'keeps required CI free of implicit LLM credentials and skipped tests' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/validate.yml') -Raw
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
         $workflow | Should -Not -Match 'EnableSemanticScan'
         $script:Validator | Should -Match 'credential-free and deterministic'
         $script:Validator | Should -Match 'SkippedCount -ne 0'

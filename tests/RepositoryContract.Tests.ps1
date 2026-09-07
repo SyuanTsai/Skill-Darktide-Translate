@@ -62,7 +62,7 @@ Describe 'Darktide Translate repository contract' {
             'skills/auto-update-darktide-mod/scripts/Test-LocalizationWorksetReceipt.ps1',
             'skills/auto-update-darktide-mod/scripts/Finalize-LocalizationWorksetEvidence.ps1',
             'skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1',
-            '.github/workflows/validate.yml',
+            '.github/workflows/standard-v1-protected.yml',
             'catalog/source.json',
             'catalog/profiles.json',
             'config/standard-v1.json',
@@ -176,7 +176,7 @@ Describe 'Darktide Translate repository contract' {
     # Scenario: GitHub validates a branch or pull request using the shared tool policy.
     # Purpose: Prevent the repository from silently pinning stale quality tools or weakening the required gates.
     It 'UnitT40_PreservesTheSharedLatestAtRunTimeQualityGate' {
-        $validatePath = Join-Path $repoRoot '.github/workflows/validate.yml'
+        $validatePath = Join-Path $repoRoot '.github/workflows/standard-v1-protected.yml'
         Test-Path -LiteralPath (Join-Path $repoRoot '.github/workflows/skill-validator.yml') | Should -Be $false
         Test-Path -LiteralPath $validatePath | Should -Be $true
 

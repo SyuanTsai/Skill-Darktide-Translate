@@ -1,10 +1,15 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
-name: Standard v1 Validation
+name: Darktide Translate Standard v1 Protected Validation
+# This workflow is base-owned for pull_request_target. Candidate files are
+# checked out only as data; trusted supervisor files are materialized from
+# github.sha, the event-bound base commit.
 
 on:
   push:
-  pull_request:
+    branches:
+      - main
+  pull_request_target:
   workflow_dispatch:
 
 permissions:
@@ -18,7 +23,7 @@ jobs:
       - name: Checkout immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -37,14 +42,14 @@ jobs:
       - name: Checkout immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Materialize protected validation supervisor
         shell: pwsh
         env:
-          TRUSTED_SUPERVISOR_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          TRUSTED_SUPERVISOR_COMMIT: ${{ github.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
@@ -125,7 +130,7 @@ jobs:
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $baseCandidate = if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+          $baseCandidate = if ($env:GITHUB_EVENT_NAME -eq 'pull_request_target') {
             $env:PULL_REQUEST_BASE_SHA
           }
           elseif ($env:GITHUB_EVENT_NAME -eq 'push' -and
