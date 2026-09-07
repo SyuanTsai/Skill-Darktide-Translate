@@ -185,6 +185,8 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'Assert-ReceiptFile -Receipt \$receipts\.skillspector'
         $script:Validator | Should -Match 'Assert-ReceiptInstalledClosure'
         $script:Validator | Should -Match 'installedClosureSha256'
+        $script:Validator | Should -Match 'installed closure contains a reparse-backed entry'
+        $script:Validator | Should -Match 'Get-ChildItem -LiteralPath \$root -Recurse -Force'
         $script:Validator | Should -Match 'GIT_CONFIG_NOSYSTEM'
         $script:Validator | Should -Match 'core\.hooksPath'
         $script:Validator | Should -Match '\$repositoryValidatorPath'
