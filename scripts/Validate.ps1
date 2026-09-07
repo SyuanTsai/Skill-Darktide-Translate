@@ -702,16 +702,8 @@ foreach ($skillId in $skillIds) {
 }
 
 $routeCases = @(
-    [pscustomobject]@{ query = 'Update Jira issue PROJ-123 and assign it to me'; expected = 'work-with-jira' },
-    [pscustomobject]@{ query = 'My Jira API token returns 401; validate authentication'; expected = 'configure-jira-api-access' },
-    [pscustomobject]@{ query = 'Set up Jira environment variables for GitHub Copilot in my IDE and prove a read-only JQL query'; expected = 'work-with-jira' },
-    [pscustomobject]@{ query = 'In GitHub Copilot IDE, read Jira issue PROJ-123 using my verified REST setup'; expected = 'work-with-jira' },
-    [pscustomobject]@{ query = 'My BITBUCKET API environment settings are missing before a pull request review'; expected = 'configure-bitbucket-api-access' },
-    [pscustomobject]@{ query = 'My Bitbucket API token returns 401; validate authentication without showing secrets'; expected = 'configure-bitbucket-api-access' },
-    [pscustomobject]@{ query = 'Publish this approved requirements analysis to Confluence'; expected = 'publish-requirements-to-confluence' },
-    [pscustomobject]@{ query = 'My CONFLUENCE API environment settings are missing before requirements publishing'; expected = 'configure-confluence-api-access' },
-    [pscustomobject]@{ query = 'Resolve my missing Confluence Cloud ID and scoped API base URL safely'; expected = 'configure-confluence-api-access' },
-    [pscustomobject]@{ query = 'Review Bitbucket PR 42 and draft comments without publishing'; expected = 'review-bitbucket-pull-request' }
+    [pscustomobject]@{ query = 'Update a Warhammer 40,000 DARKTIDE MOD from a verified Nexus Main file and preserve active zh-tw'; expected = 'auto-update-darktide-mod' },
+    [pscustomobject]@{ query = 'Resume a DARKTIDE MOD update run using its exact evidence and finalize the merge'; expected = 'auto-update-darktide-mod' }
 )
 foreach ($routeCase in $routeCases) {
     $routeOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @(
