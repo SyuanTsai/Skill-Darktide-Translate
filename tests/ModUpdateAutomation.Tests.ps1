@@ -47,6 +47,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
         $pathSafety = Get-Content -LiteralPath $pathSafetyPath -Raw
         $pathSafety | Should -Match '\$inspectProviderItem \$Item\) \{ return \$true \}\s*if \(\$null -ne \$Item\) \{ return \$false \}'
+        $pathSafety | Should -Not -Match 'knownSafePhysicalPaths'
     }
 
     # Scenario: A caller invokes a single stage or resumes the same run.

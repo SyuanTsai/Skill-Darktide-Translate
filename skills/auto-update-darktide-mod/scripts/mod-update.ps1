@@ -793,6 +793,7 @@ function Read-State {
     param([Parameter(Mandatory)][string] $Path)
     $repositoryFull = [IO.Path]::GetFullPath($RepositoryRoot)
     $stateFull = [IO.Path]::GetFullPath($Path)
+    $physicalPathComparison = Get-PortablePathComparison
     $null = Assert-NoReparsePath -Path $stateFull -Root $repositoryFull -Label 'Run state'
     if (-not (Test-Path -LiteralPath $stateFull -PathType Leaf)) {
         throw "State file does not exist: $stateFull"
@@ -801,10 +802,10 @@ function Read-State {
     foreach ($field in @('repositoryRoot', 'statePath', 'runRoot')) {
         if (-not $state.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$state[$field])) { throw "Run state is missing $field." }
     }
-    if ([IO.Path]::GetFullPath([string]$state.repositoryRoot) -cne $repositoryFull) {
+    if (-not [string]::Equals([IO.Path]::GetFullPath([string]$state.repositoryRoot), $repositoryFull, $physicalPathComparison)) {
         throw 'Run state repositoryRoot differs from the requested repository.'
     }
-    if ([IO.Path]::GetFullPath([string]$state.statePath) -cne $stateFull) {
+    if (-not [string]::Equals([IO.Path]::GetFullPath([string]$state.statePath), $stateFull, $physicalPathComparison)) {
         throw 'Run state statePath differs from the file being read.'
     }
     $runRoot = [IO.Path]::GetFullPath([string]$state.runRoot)

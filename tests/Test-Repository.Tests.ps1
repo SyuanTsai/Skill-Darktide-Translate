@@ -66,6 +66,11 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         New-Item -ItemType Directory -Path (Join-Path $script:FixtureRoot '.agents/skills/unbound-skill') -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $script:FixtureRoot '.agents/skills/unbound-skill/SKILL.md') -Value 'unbound'
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*Required JSON file is missing*ai-instructions.manifest.json*'
+
+        $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
+        $validator | Should -Match 'Get-ChildItem -LiteralPath \$managedProjectionRoot -Recurse -Force'
+        $validator | Should -Match '\$projectionEntries\s*=\s*@\('
+        $validator | Should -Match 'Managed \.agents/skills projection contains a reparse entry'
     }
 
     It 'rejects schema v1 or unknown source metadata fields' {

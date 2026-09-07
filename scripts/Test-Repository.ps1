@@ -518,13 +518,14 @@ if (Test-Path -LiteralPath $managedProjectionRoot) {
     if (($projectionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw 'Managed .agents/skills projection root must not be a reparse point.'
     }
-    foreach ($directory in @(Get-ChildItem -LiteralPath $managedProjectionRoot -Directory -Force)) {
-        if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Managed .agents/skills projection contains a reparse package '$($directory.Name)'."
+    $projectionEntries = @(Get-ChildItem -LiteralPath $managedProjectionRoot -Recurse -Force)
+    foreach ($projectionEntry in $projectionEntries) {
+        if (($projectionEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Managed .agents/skills projection contains a reparse entry '$($projectionEntry.FullName)'."
         }
     }
     $actualManagedTargets = @(
-        Get-ChildItem -LiteralPath $managedProjectionRoot -File -Recurse -Force |
+        $projectionEntries | Where-Object { -not $_.PSIsContainer } |
             ForEach-Object { [IO.Path]::GetRelativePath($repoRoot, $_.FullName).Replace([char]92, [char]47) }
     )
     $missingManagedTargets = @($managedTargets | Where-Object { $actualManagedTargets -notcontains $_ })
