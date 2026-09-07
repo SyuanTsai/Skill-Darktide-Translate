@@ -151,6 +151,11 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'bounded candidate execution timeout'
         $script:Validator | Should -Match 'EventWaitHandle'
         $script:Validator | Should -Match 'CODEX_VALIDATION_RESUME_EVENT'
+        $script:Validator | Should -Match 'CreateSuspended'
+        $script:Validator | Should -Match '\.Resume\(\)'
+        $script:Validator | Should -Match 'ReadBoundedAsync'
+        $script:Validator | Should -Match 'bounded native-process output limit'
+        $script:Validator | Should -Match 'unassigned suspended Windows process safely'
         $windowsAssignmentIndex = $script:Validator.IndexOf('Assign-WindowsProcessToJob -JobHandle $windowsJobHandle')
         $windowsReleaseIndex = $script:Validator.IndexOf('$windowsResumeEvent.Set()')
         $windowsAssignmentIndex | Should -BeGreaterThan -1
