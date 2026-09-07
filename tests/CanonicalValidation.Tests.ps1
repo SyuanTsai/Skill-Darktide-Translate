@@ -66,6 +66,7 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match "'skill-validator' = 'github.com/agent-ecosystem/skill-validator/cmd/skill-validator'"
         $script:Validator | Should -Match "'skill-tools' = 'npm:skill-tools'"
         $script:Validator | Should -Match "'pester' = 'PowerShellGallery:Pester'"
+        $script:Validator | Should -Match '\$resolverPath\s+-PolicyPath \$policyPath\s+-ToolName \$toolName\s+-Install\s+-InstallRoot \$installRoot\s+-ExpectedGoRuntimeVersion \$ExpectedGoRuntimeVersion'
 
         $freezeIndex = $script:Validator.IndexOf('foreach ($toolName in $expectedSources.Keys)')
         $packageIndex = $script:Validator.IndexOf('skill-validator package validation for')
@@ -83,6 +84,7 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'ExpectedInventoryPaths'
         $script:Validator | Should -Match 'foreach \(\$skillId in \$skillIds\)'
         $script:Validator | Should -Match "validate', 'structure', '--allow-dirs=agents'"
+        $script:Validator | Should -Match "'check', '--strict', '--allow-dirs=agents'"
         $script:Validator | Should -Match ([regex]::Escape("'check', `$skillRoot, '--format', 'sarif'"))
     }
 
@@ -114,6 +116,18 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'Test-SecurityRelevantSkillChange'
         $script:Validator | Should -Match '\$staticFindingCount -gt 0'
         $script:Validator | Should -Match 'Triggered SkillSpector semantic scan did not complete'
+        $script:Validator | Should -Match '\[switch\] \$EnableSemanticScan'
+        $script:Validator | Should -Match '\$semanticTriggered = \[bool\]\$EnableSemanticScan -and'
+        $script:Validator | Should -Match 'repository-validation-post-pester'
+        $script:Validator | Should -Match "'route'"
+        $script:Validator | Should -Match 'skill-tools route did not return exactly one result'
         $script:Validator | Should -Not -Match 'semantic.*continue|continue.*semantic'
+    }
+
+    It 'keeps required CI free of implicit LLM credentials and skipped tests' {
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/validate.yml') -Raw
+        $workflow | Should -Not -Match 'EnableSemanticScan'
+        $script:Validator | Should -Match 'credential-free and deterministic'
+        $script:Validator | Should -Match 'SkippedCount -ne 0'
     }
 }

@@ -319,6 +319,34 @@ function Read-OpenAiMetadata {
         ($policy.Count -ne 1 -or -not $policy.ContainsKey('allow_implicit_invocation'))) {
         throw "agents/openai.yaml policy for '$ExpectedSkillId' must contain only allow_implicit_invocation."
     }
+    $skillRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent (Split-Path -Parent $Path)) '.'))
+    foreach ($iconKey in @('icon_small', 'icon_large')) {
+        if ($interface.ContainsKey($iconKey)) {
+            $iconValue = [string]$interface[$iconKey]
+            if ($iconValue -cnotmatch '^\./assets/[^\r\n]+$') {
+                throw "agents/openai.yaml interface.$iconKey for '$ExpectedSkillId' must be a relative ./assets/ path."
+            }
+            $relativeIconPath = $iconValue.Substring(2).Replace('/', [IO.Path]::DirectorySeparatorChar)
+            $iconSegments = $relativeIconPath.Split([IO.Path]::DirectorySeparatorChar)
+            if ($iconValue.Contains('\') -or $relativeIconPath.Contains(':') -or
+                $iconSegments -contains '' -or $iconSegments -contains '.' -or $iconSegments -contains '..') {
+                throw "agents/openai.yaml interface.$iconKey for '$ExpectedSkillId' contains an unsafe asset path."
+            }
+            $iconPath = [IO.Path]::GetFullPath((Join-Path $skillRoot $relativeIconPath))
+            $rootPrefix = $skillRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            if (-not $iconPath.StartsWith($rootPrefix, [StringComparison]::Ordinal) -or
+                -not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+                throw "agents/openai.yaml interface.$iconKey for '$ExpectedSkillId' must identify an existing file inside ./assets/."
+            }
+            $iconItem = Get-Item -LiteralPath $iconPath -Force
+            if (($iconItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "agents/openai.yaml interface.$iconKey for '$ExpectedSkillId' must not identify a reparse point."
+            }
+        }
+    }
+    if ($interface.ContainsKey('brand_color') -and [string]$interface['brand_color'] -cnotmatch '^#[0-9A-Fa-f]{6}$') {
+        throw "agents/openai.yaml interface.brand_color for '$ExpectedSkillId' must be a six-digit hexadecimal color."
+    }
     foreach ($tool in $tools) {
         if ($tool.type -cne 'mcp' -or $null -eq $tool.PSObject.Properties['value'] -or [string]::IsNullOrWhiteSpace([string]$tool.value)) {
             throw "agents/openai.yaml dependency for '$ExpectedSkillId' must declare quoted type 'mcp' and a non-empty value."
@@ -388,19 +416,20 @@ function Get-ContentInventory {
 
     $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot")
-    $tracked = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
-    $gitLines = @(& $git.Path @gitConfigArguments -C $RepositoryRoot ls-files -s -- "skills/$SkillId")
+    $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $gitOutput = [string]((& $git.Path @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- "skills/$SkillId") -join '')
     if ($LASTEXITCODE -ne 0) { throw "Git inventory lookup failed for '$SkillId'." }
-    foreach ($line in $gitLines) {
-        if ([string]$line -cnotmatch '^(?<mode>[0-9]{6}) (?<objectId>[0-9a-f]{40}) (?<stage>[0-3])\t(?<path>.+)$') {
-            throw "Git returned malformed index entry for '$SkillId': $line"
+    foreach ($record in @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })) {
+        if ([string]$record -cnotmatch '^(?<mode>[0-9]{6}) (?<objectId>[0-9a-f]{40}) (?<stage>[0-3])\t(?<path>[^\x00\r\n]+)$') {
+            throw "Git returned malformed index entry for '$SkillId': $record"
         }
         if ([string]$Matches.mode -cnotin @('100644', '100755') -or [string]$Matches.stage -cne '0') {
             throw "Skill '$SkillId' contains non-regular or unresolved Git entry '$($Matches.path)'."
         }
         $prefix = "skills/$SkillId/"
         $packagePath = ([string]$Matches.path).Substring($prefix.Length)
-        if (-not $tracked.TryAdd($packagePath, [string]$Matches.objectId)) {
+        $trackedEntry = [pscustomobject][ordered]@{ mode = [string]$Matches.mode; objectId = [string]$Matches.objectId }
+        if (-not $tracked.TryAdd($packagePath, $trackedEntry)) {
             throw "Skill '$SkillId' contains duplicate Git index path '$packagePath'."
         }
     }
@@ -420,12 +449,12 @@ function Get-ContentInventory {
         $workingObjectId = ([string](@(
             & $git.Path @gitConfigArguments -C $RepositoryRoot hash-object "--path=$repositoryPath" -- $pathToFile[$path].FullName
         ) | Select-Object -First 1)).Trim()
-        if ($LASTEXITCODE -ne 0 -or $workingObjectId -cnotmatch '^[0-9a-f]{40}$' -or $workingObjectId -cne $tracked[$path]) {
+        if ($LASTEXITCODE -ne 0 -or $workingObjectId -cnotmatch '^[0-9a-f]{40}$' -or $workingObjectId -cne $tracked[$path].objectId) {
             throw "Skill '$SkillId' working-tree content is not bound to its Git index entry '$path'."
         }
-        $sha256 = Get-GitBlobSha256 -GitPath $git.Path -RepositoryRoot $RepositoryRoot -ObjectId $tracked[$path]
-        $files += [pscustomobject][ordered]@{ path = $path; sha256 = $sha256 }
-        [void]$canonical.Append($path).Append("`t").Append($sha256).Append("`n")
+        $sha256 = Get-GitBlobSha256 -GitPath $git.Path -RepositoryRoot $RepositoryRoot -ObjectId $tracked[$path].objectId
+        $files += [pscustomobject][ordered]@{ path = $path; mode = $tracked[$path].mode; sha256 = $sha256 }
+        [void]$canonical.Append($path).Append("`t").Append($tracked[$path].mode).Append("`t").Append($sha256).Append("`n")
     }
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
@@ -504,7 +533,7 @@ if (Test-Path -LiteralPath $managedProjectionRoot) {
         throw "Managed .agents/skills projection does not exactly match its manifest. Missing='$($missingManagedTargets -join ',')' Unexpected='$($unexpectedManagedTargets -join ',')'."
     }
     foreach ($entry in $managedEntries) {
-        $entryPath = Join-Path $repoRoot ([string]$entry.targetPath -replace '/', '\')
+        $entryPath = Join-Path $repoRoot ([string]$entry.targetPath).Replace('/', [IO.Path]::DirectorySeparatorChar)
         $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $entryPath).Hash.ToLowerInvariant()
         if ($actualHash -cne [string]$entry.sha256) {
             throw "Managed .agents/skills projection hash mismatch for '$($entry.targetPath)'."

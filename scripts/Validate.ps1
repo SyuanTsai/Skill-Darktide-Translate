@@ -12,7 +12,8 @@ param(
     [string] $AuthorityArchivePath,
     [string] $BaseCommit,
     [string] $ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION,
-    [string] $OutputPath
+    [string] $OutputPath,
+    [switch] $EnableSemanticScan
 )
 
 Set-StrictMode -Version Latest
@@ -389,19 +390,31 @@ function Invoke-NativeChecked {
 
 function Test-SecurityRelevantSkillChange {
     param([string] $GitPath, [string] $RepositoryRoot, [string] $BaseCommit)
-    if ([string]::IsNullOrWhiteSpace($BaseCommit)) { return $false }
-    $lines = @(& $GitPath -c "safe.directory=$RepositoryRoot" -C $RepositoryRoot diff --find-renames=100% --name-status "$BaseCommit...HEAD")
+    if ([string]::IsNullOrWhiteSpace($BaseCommit)) {
+        # Without an immutable comparison base, fail closed instead of skipping
+        # the supplemental semantic-scan trigger decision.
+        return $true
+    }
+    $gitOutput = [string]((& $GitPath -c "safe.directory=$RepositoryRoot" -C $RepositoryRoot diff --find-renames=100% --name-status -z "$BaseCommit...HEAD") -join '')
     if ($LASTEXITCODE -ne 0) { throw "Could not compare candidate with base commit '$BaseCommit'." }
-    foreach ($line in $lines) {
-        $columns = ([string]$line).Split("`t")
-        $status = $columns[0]
-        if ($status -ceq 'R100' -and $columns.Count -eq 3 -and
-            $columns[1] -clike '.agents/skills/*' -and $columns[2] -clike 'skills/*') {
+    $tokens = @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $status = [string]$tokens[$index]
+        if ($status -cmatch '^R[0-9]{3}$' -or $status -cmatch '^C[0-9]{3}$') {
+            if ($index + 2 -ge $tokens.Count) { throw 'Git returned an incomplete rename/copy status record.' }
+            $oldPath = [string]$tokens[$index + 1]
+            $newPath = [string]$tokens[$index + 2]
+            if ($status -ceq 'R100' -and $oldPath -clike '.agents/skills/*' -and $newPath -clike 'skills/*') {
+                $index += 2
+                continue
+            }
+            if ($oldPath -clike 'skills/*' -or $newPath -clike 'skills/*') { return $true }
+            $index += 2
             continue
         }
-        foreach ($path in @($columns | Select-Object -Skip 1)) {
-            if ($path -clike 'skills/*') { return $true }
-        }
+        if ($index + 1 -ge $tokens.Count) { throw 'Git returned an incomplete path status record.' }
+        if ([string]$tokens[$index + 1] -clike 'skills/*') { return $true }
+        $index++
     }
     return $false
 }
@@ -477,6 +490,7 @@ if ($integrityReport.result -cne 'passed' -or [int]$integrityReport.activeSkillC
     throw 'Candidate integrity verification did not bind a non-empty active Skill inventory.'
 }
 $skillIds = @($integrityReport.skills | ForEach-Object { [string]$_.skillId })
+$skillsRoot = Join-Path $repoRoot 'skills'
 
 $archivePath = Join-Path $runRoot 'authority.zip'
 if ([string]::IsNullOrWhiteSpace($AuthorityArchivePath)) {
@@ -590,7 +604,9 @@ $securityTracked = @()
 $staticReports = @()
 $staticFindingCount = 0
 $skillValidatorReports = @()
+$skillValidatorCheckReports = @()
 $skillToolsReports = @()
+$skillToolsRouteReports = @()
 
 # Stage 3: Package Validation. This must complete before any SkillSpector scan.
 foreach ($skillId in $skillIds) {
@@ -604,6 +620,13 @@ foreach ($skillId in $skillIds) {
     $validatorReport = Read-JsonFile -Path $validatorReportPath -Context "skill-validator package validation report for $skillId"
     Assert-SkillValidatorReport -Report $validatorReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
     $skillValidatorReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($validatorReportPath) }
+
+    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot
+    $checkReportPath = Join-Path $runRoot "skill-validator-check-$skillId.json"
+    [IO.File]::WriteAllText($checkReportPath, $checkOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    $checkReport = Read-JsonFile -Path $checkReportPath -Context "skill-validator full check report for $skillId"
+    Assert-SkillValidatorReport -Report $checkReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
+    $skillValidatorCheckReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($checkReportPath) }
 }
 
 # Stage 4: SkillSpector Static.
@@ -678,6 +701,40 @@ foreach ($skillId in $skillIds) {
     $skillToolsReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($toolsReportPath) }
 }
 
+$routeCases = @(
+    [pscustomobject]@{ query = 'Update Jira issue PROJ-123 and assign it to me'; expected = 'work-with-jira' },
+    [pscustomobject]@{ query = 'My Jira API token returns 401; validate authentication'; expected = 'configure-jira-api-access' },
+    [pscustomobject]@{ query = 'Set up Jira environment variables for GitHub Copilot in my IDE and prove a read-only JQL query'; expected = 'work-with-jira' },
+    [pscustomobject]@{ query = 'In GitHub Copilot IDE, read Jira issue PROJ-123 using my verified REST setup'; expected = 'work-with-jira' },
+    [pscustomobject]@{ query = 'My BITBUCKET API environment settings are missing before a pull request review'; expected = 'configure-bitbucket-api-access' },
+    [pscustomobject]@{ query = 'My Bitbucket API token returns 401; validate authentication without showing secrets'; expected = 'configure-bitbucket-api-access' },
+    [pscustomobject]@{ query = 'Publish this approved requirements analysis to Confluence'; expected = 'publish-requirements-to-confluence' },
+    [pscustomobject]@{ query = 'My CONFLUENCE API environment settings are missing before requirements publishing'; expected = 'configure-confluence-api-access' },
+    [pscustomobject]@{ query = 'Resolve my missing Confluence Cloud ID and scoped API base URL safely'; expected = 'configure-confluence-api-access' },
+    [pscustomobject]@{ query = 'Review Bitbucket PR 42 and draft comments without publishing'; expected = 'review-bitbucket-pull-request' }
+)
+foreach ($routeCase in $routeCases) {
+    $routeOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @(
+        $skillToolsEntryPoint, 'route', [string]$routeCase.query, '--skills', $skillsRoot, '--top-k', '1', '--format', 'json'
+    ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot
+    $routePath = Join-Path $runRoot ("skill-tools-route-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+    [IO.File]::WriteAllText($routePath, $routeOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    $routeResults = Read-JsonFile -Path $routePath -Context "skill-tools route report for '$($routeCase.query)'"
+    if ($routeResults -isnot [array] -or @($routeResults).Count -ne 1) {
+        throw "skill-tools route did not return exactly one result for '$($routeCase.query)'."
+    }
+    $routeSkill = Get-RequiredProperty -Object @($routeResults)[0] -Name 'skill' -Context 'skill-tools route result'
+    if ($routeSkill -isnot [string] -or $routeSkill -cne [string]$routeCase.expected) {
+        throw "skill-tools route selected '$routeSkill' for '$($routeCase.query)'; expected '$($routeCase.expected)'."
+    }
+    $skillToolsRouteReports += [pscustomobject][ordered]@{
+        query = [string]$routeCase.query
+        expected = [string]$routeCase.expected
+        selected = [string]$routeSkill
+        report = [IO.Path]::GetFileName($routePath)
+    }
+}
+
 Remove-Module Pester -Force -ErrorAction SilentlyContinue
 Import-Module $pesterModulePath -Force -ErrorAction Stop
 $loadedPester = Get-Module Pester | Select-Object -First 1
@@ -686,11 +743,36 @@ if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne [string]$rece
 }
 $pesterResult = Invoke-Pester -Path (Join-Path $repoRoot 'tests') -PassThru
 if ($null -eq $pesterResult -or [int64]$pesterResult.TotalCount -le 0 -or [int64]$pesterResult.FailedCount -ne 0 -or
+    [int64]$pesterResult.SkippedCount -ne 0 -or
     [int64]$pesterResult.PassedCount + [int64]$pesterResult.SkippedCount -ne [int64]$pesterResult.TotalCount) {
     throw 'Pester repository regression did not complete successfully.'
 }
 
-$semanticTriggered = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
+$postPesterRepositoryReportPath = Join-Path $runRoot 'repository-validation-post-pester.json'
+$postPesterRepositoryJson = & (Join-Path $repoRoot 'scripts/Test-Repository.ps1') -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath | Select-Object -Last 1
+$postPesterRepositoryReport = $postPesterRepositoryJson | ConvertFrom-Json -Depth 100
+if ($postPesterRepositoryReport.result -cne 'passed' -or [int]$postPesterRepositoryReport.activeSkillCount -ne $skillIds.Count) {
+    throw 'Post-Pester repository validation did not cover the exact active Skill inventory.'
+}
+foreach ($skillId in $skillIds) {
+    $before = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
+    $after = @($postPesterRepositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })
+    if ($before.Count -ne 1 -or $after.Count -ne 1 -or $before[0].contentSha256 -cne $after[0].contentSha256) {
+        throw "Candidate Skill '$skillId' changed during repository tests."
+    }
+}
+$postPesterDirty = @(& $gitPath @gitConfigArguments -C $repoRoot status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $postPesterDirty.Count -ne 0) {
+    throw 'Candidate changed during repository tests; post-Pester evidence is not bound to a clean commit.'
+}
+$repositoryReport = $postPesterRepositoryReport
+
+# Standard CI is deliberately credential-free and deterministic. The LLM-backed
+# SkillSpector stage is an explicit supplemental review, never an implicit network
+# dependency of the required gate. Static findings remain governed above and
+# still block according to the central security policy.
+$semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
+$semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
 $semanticReports = @()
 if ($semanticTriggered) {
     foreach ($skillId in $skillIds) {
@@ -771,14 +853,15 @@ $summary = [pscustomobject][ordered]@{
     stages = [ordered]@{
         controlledAcquisition = 'passed'
         integrityVerification = 'passed'
-        packageValidation = $skillValidatorReports
+        packageValidation = [ordered]@{ structure = $skillValidatorReports; fullCheck = $skillValidatorCheckReports }
         skillspectorStatic = $staticReports
         repositoryTests = [ordered]@{
             repositoryValidation = 'passed'
             skillTools = $skillToolsReports
+            routing = $skillToolsRouteReports
             pester = [ordered]@{ result = 'passed'; total = [int]$pesterResult.TotalCount; passed = [int]$pesterResult.PassedCount; skipped = [int]$pesterResult.SkippedCount }
         }
-        conditionalSemanticScan = [ordered]@{ triggered = $semanticTriggered; reports = $semanticReports }
+        conditionalSemanticScan = [ordered]@{ requested = [bool]$EnableSemanticScan; triggered = $semanticTriggered; reports = $semanticReports }
         aiReview = 'required-before-release'
         humanApproval = 'required-before-release'
         publishOrInstall = 'blocked-until-approved-release'

@@ -31,6 +31,27 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         $first.skills[0].contentSha256 | Should -Match '^[0-9a-f]{64}$'
     }
 
+    It 'binds Git file modes into the per-Skill content identity' {
+        $before = & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot | Select-Object -Last 1 | ConvertFrom-Json
+        & $script:GitPath -C $script:FixtureRoot update-index --chmod=+x -- "skills/$($script:SkillId)/SKILL.md"
+        if ($LASTEXITCODE -ne 0) { throw 'Could not change the fixture Git mode.' }
+        $after = & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot | Select-Object -Last 1 | ConvertFrom-Json
+        $beforeFile = @($before.skills | Where-Object skillId -CEq $script:SkillId)[0].files | Where-Object path -CEq 'SKILL.md'
+        $afterFile = @($after.skills | Where-Object skillId -CEq $script:SkillId)[0].files | Where-Object path -CEq 'SKILL.md'
+        $beforeFile.mode | Should -Be '100644'
+        $afterFile.mode | Should -Be '100755'
+        $before.skills[0].contentSha256 | Should -Not -Be $after.skills[0].contentSha256
+    }
+
+    It 'reads non-ASCII Git paths from the NUL-delimited index output' {
+        $unicodePath = Join-Path $script:SkillRoot 'references/使用.md'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $unicodePath) -Force | Out-Null
+        Set-Content -LiteralPath $unicodePath -Value '# Unicode reference' -Encoding utf8NoBOM -NoNewline
+        & $script:GitPath -C $script:FixtureRoot add -- "skills/$($script:SkillId)/references/使用.md"
+        if ($LASTEXITCODE -ne 0) { throw 'Could not stage the Unicode fixture path.' }
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
+    }
+
     It 'rejects an unlisted Skill directory' {
         New-Item -ItemType Directory -Path (Join-Path $script:FixtureRoot 'skills/unlisted-skill') | Out-Null
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*inventory does not exactly match*'
@@ -76,7 +97,9 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         $sourcePath = Join-Path $script:FixtureRoot 'catalog/source.json'
         $source = Get-Content -LiteralPath $sourcePath -Raw | ConvertFrom-Json
         if (@($source.skills).Count -lt 2) {
-            Set-ItResult -Skipped -Because 'The repository has only one active Skill, so no ordering inversion can be represented.'
+            # Keep the full repository gate skip-free. A single-item inventory
+            # is already its own ordinally sorted sequence.
+            { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
             return
         }
         [array]::Reverse($source.skills)
@@ -140,5 +163,19 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         & $script:GitPath -C $script:FixtureRoot add -- skills/$($script:SkillId)/SKILL.md
         if ($LASTEXITCODE -ne 0) { throw 'Could not stage the optional allowed-tools fixture.' }
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
+    }
+
+    It 'rejects malformed optional OpenAI interface fields' {
+        $metadataPath = Join-Path $script:SkillRoot 'agents/openai.yaml'
+        $metadata = Get-Content -LiteralPath $metadataPath -Raw
+        $metadata = $metadata -replace '  default_prompt:', ('  brand_color: "not-a-color"' + [Environment]::NewLine + '  default_prompt:')
+        Set-Content -LiteralPath $metadataPath -Value $metadata -Encoding utf8NoBOM -NoNewline
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*brand_color*hexadecimal*'
+
+        $metadata = Get-Content -LiteralPath $metadataPath -Raw
+        $metadata = $metadata -replace ('  brand_color: "not-a-color"' + [Environment]::NewLine), ''
+        $metadata = $metadata -replace '  default_prompt:', ('  icon_small: "./assets/../../outside.svg"' + [Environment]::NewLine + '  default_prompt:')
+        Set-Content -LiteralPath $metadataPath -Value $metadata -Encoding utf8NoBOM -NoNewline
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*unsafe asset path*'
     }
 }
