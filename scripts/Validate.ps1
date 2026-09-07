@@ -1237,7 +1237,8 @@ function Invoke-NativeChecked {
         [Parameter()][AllowNull()][string] $StandardInput,
         [Parameter()][switch] $IsolateRunnerCommandFiles,
         [Parameter()][switch] $TerminateProcessTree,
-        [Parameter()][switch] $ProtectRunnerCommandFiles
+        [Parameter()][switch] $ProtectRunnerCommandFiles,
+        [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
     )
     if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) { throw "$Context executable is missing: $Command" }
     if ($ProtectRunnerCommandFiles -and -not $IsolateRunnerCommandFiles) {
@@ -1262,6 +1263,8 @@ function Invoke-NativeChecked {
     $baselineSupervisorProcessIdentities = [Collections.Generic.Dictionary[int,string]]::new()
     $processTreeStopped = $false
     $windowsJobHandle = [IntPtr]::Zero
+    $windowsResumeEvent = $null
+    $windowsResumeEventSignaled = $false
     try {
         if ($ProtectRunnerCommandFiles) {
             $runnerCommandFileSnapshot = Get-RunnerCommandFileSnapshot -Names $runnerCommandFileNames
@@ -1327,6 +1330,70 @@ function Invoke-NativeChecked {
                     $Command
                 ) + @($Arguments)
             }
+            elseif ($script:IsWindowsHost) {
+                # Start a trusted gate that waits on a supervisor-owned event.
+                # The candidate command is released only after Job Object assignment.
+                $payloadJson = [ordered]@{
+                    command = $Command
+                    arguments = @($Arguments)
+                } | ConvertTo-Json -Compress -Depth 20
+                $payloadEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payloadJson))
+                $createdNewEvent = $false
+                $eventName = "Local\CodexValidationResume-{0}" -f [guid]::NewGuid().ToString('N')
+                $windowsResumeEvent = [Threading.EventWaitHandle]::new(
+                    $false,
+                    [Threading.EventResetMode]::ManualReset,
+                    $eventName,
+                    [ref]$createdNewEvent
+                )
+                if (-not $createdNewEvent -or $null -eq $windowsResumeEvent) {
+                    throw "$Context could not create a private Windows resume event."
+                }
+                $wrapperScript = @'
+$payloadEncoded = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_NATIVE_PAYLOAD')
+$eventName = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_RESUME_EVENT')
+$hasStandardInput = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_HAS_STANDARD_INPUT')
+if ([string]::IsNullOrWhiteSpace($payloadEncoded) -or [string]::IsNullOrWhiteSpace($eventName)) {
+    exit 1
+}
+$payloadJson = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($payloadEncoded))
+$payload = $payloadJson | ConvertFrom-Json -Depth 20
+$payloadArguments = @($payload.arguments | ForEach-Object { [string]$_ })
+$resumeEvent = [Threading.EventWaitHandle]::OpenExisting($eventName)
+try {
+    $standardInput = $null
+    if ($hasStandardInput -eq '1') {
+        $standardInput = [Console]::In.ReadToEnd()
+    }
+    if (-not $resumeEvent.WaitOne()) {
+        exit 1
+    }
+    if ($hasStandardInput -eq '1') {
+        $standardInput | & ([string]$payload.command) @payloadArguments
+    }
+    else {
+        & ([string]$payload.command) @payloadArguments
+    }
+    exit $LASTEXITCODE
+}
+finally {
+    $resumeEvent.Dispose()
+}
+'@
+                $wrapperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapperScript))
+                $nativeCommand = Join-Path $PSHOME 'pwsh.exe'
+                if (-not (Test-Path -LiteralPath $nativeCommand -PathType Leaf)) {
+                    throw "$Context trusted PowerShell gate is missing: $nativeCommand"
+                }
+                Assert-NoReparseAncestors -Path $nativeCommand -Context "$Context trusted PowerShell gate"
+                $nativeArguments = @(
+                    '-NoLogo',
+                    '-NoProfile',
+                    '-NonInteractive',
+                    '-EncodedCommand',
+                    $wrapperEncoded
+                )
+            }
             $parentProcessGroupId = if ($script:IsLinuxHost) { Get-UnixProcessGroupId -ProcessId $PID } else { 0 }
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
             $startInfo.FileName = $nativeCommand
@@ -1347,6 +1414,11 @@ function Invoke-NativeChecked {
                 $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $nativeArguments
             }
             $startInfo.WorkingDirectory = [string](Get-Location).Path
+            if ($script:IsWindowsHost) {
+                $startInfo.EnvironmentVariables['CODEX_VALIDATION_NATIVE_PAYLOAD'] = $payloadEncoded
+                $startInfo.EnvironmentVariables['CODEX_VALIDATION_RESUME_EVENT'] = $eventName
+                $startInfo.EnvironmentVariables['CODEX_VALIDATION_HAS_STANDARD_INPUT'] = if ($PSBoundParameters.ContainsKey('StandardInput')) { '1' } else { '0' }
+            }
             $childProcess = [Diagnostics.Process]::new()
             $childProcess.StartInfo = $startInfo
             if (-not $childProcess.Start()) { throw "$Context process could not be started: $Command" }
@@ -1377,8 +1449,18 @@ function Invoke-NativeChecked {
                 $childProcess.StandardInput.Write($StandardInput)
                 $childProcess.StandardInput.Close()
             }
+            if ($script:IsWindowsHost) {
+                if (-not $windowsResumeEvent.Set()) {
+                    throw "$Context could not release the Windows candidate gate."
+                }
+                $windowsResumeEventSignaled = $true
+            }
+            $processDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             while (-not $childProcess.HasExited) {
+                if ([DateTime]::UtcNow -ge $processDeadline) {
+                    throw "$Context exceeded the bounded candidate execution timeout of $TimeoutMilliseconds milliseconds."
+                }
                 [void]$childProcess.WaitForExit(100)
                 Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             }
@@ -1416,12 +1498,20 @@ function Invoke-NativeChecked {
     }
     finally {
         try {
+            if ($null -ne $windowsResumeEvent -and -not $windowsResumeEventSignaled) {
+                [void]$windowsResumeEvent.Set()
+                $windowsResumeEventSignaled = $true
+            }
             if ($TerminateProcessTree -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $processTreeStopped) {
                 Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
                 $processTreeStopped = $true
             }
         }
         finally {
+            if ($null -ne $windowsResumeEvent) {
+                $windowsResumeEvent.Dispose()
+                $windowsResumeEvent = $null
+            }
             if ($windowsJobHandle -ne [IntPtr]::Zero) {
                 Close-WindowsProcessJob -JobHandle $windowsJobHandle
                 $windowsJobHandle = [IntPtr]::Zero
