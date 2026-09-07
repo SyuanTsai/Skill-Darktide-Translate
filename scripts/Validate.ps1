@@ -680,7 +680,11 @@ $diffArguments = if (-not [string]::IsNullOrWhiteSpace($BaseCommit)) {
     @($gitConfigArguments + @('-C', $repoRoot, 'diff', '--check', "$BaseCommit...HEAD"))
 }
 else {
-    @($gitConfigArguments + @('-C', $repoRoot, 'diff-tree', '--check', '--root', '-r', 'HEAD'))
+    # A missing event base must validate the complete committed candidate,
+    # not only the final commit. All supported GitHub repositories use the
+    # SHA-1 object format, whose canonical empty tree object is stable.
+    $emptyTreeObject = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+    @($gitConfigArguments + @('-C', $repoRoot, 'diff', '--check', $emptyTreeObject, 'HEAD'))
 }
 $diffOutput = @(& $gitPath @diffArguments 2>&1)
 if ($LASTEXITCODE -ne 0) {
