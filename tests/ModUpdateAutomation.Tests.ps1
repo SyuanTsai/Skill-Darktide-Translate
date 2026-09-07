@@ -230,7 +230,12 @@ Describe 'Deterministic Darktide MOD update automation' {
                 $node.Name -eq 'Test-ModUpdateWorktreeRegistered'
         }, $true)
         $functionAst | Should -Not -BeNullOrEmpty
-        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
+        $module = New-Module -ArgumentList $pathSafetyPath, $functionAst.Extent.Text -ScriptBlock {
+            param($modulePath, $functionSource)
+            Import-Module -Name $modulePath -Force -ErrorAction Stop
+            . ([scriptblock]::Create($functionSource))
+        }
         try {
             $nativePath = 'F:\Runs\Darktide Update'
             $porcelain = "worktree F:/Runs/Darktide Update`nHEAD $('a' * 40)`nbranch refs/heads/Update/example"

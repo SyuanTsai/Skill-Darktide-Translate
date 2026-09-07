@@ -31,9 +31,15 @@ $resolvedOutputRoot = $outputRoot.TrimEnd(
     [IO.Path]::AltDirectorySeparatorChar
 )
 $skillPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
+$pathComparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    [StringComparison]::OrdinalIgnoreCase
+}
+else {
+    [StringComparison]::Ordinal
+}
 if (
-    $resolvedOutputRoot.Equals($resolvedSkillRoot, [StringComparison]::OrdinalIgnoreCase) -or
-    $resolvedOutputRoot.StartsWith($skillPrefix, [StringComparison]::OrdinalIgnoreCase)
+    $resolvedOutputRoot.Equals($resolvedSkillRoot, $pathComparison) -or
+    $resolvedOutputRoot.StartsWith($skillPrefix, $pathComparison)
 ) {
     throw 'OutputDirectory must be outside the Skill source.'
 }

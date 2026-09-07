@@ -65,7 +65,7 @@ function Test-ModUpdateWorktreeRegistered {
             $candidate = & $normalizePath $line.Substring('worktree '.Length)
         }
         catch { continue }
-        if ($candidate.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($candidate.Equals($expected, (Get-PortablePathComparison))) { return $true }
     }
     $false
 }
@@ -103,7 +103,7 @@ function Get-ModUpdateArchiveLocations {
     $sourcePath = Assert-ContainedPath -Candidate (Join-Path (Join-Path ([string]$State.runRoot) 'source') $filename) `
         -Root $sourceRoot -Label 'Run-owned archive'
     $sourcePath = Assert-NoReparsePath -Path $sourcePath -Root ([string]$State.runRoot) -Label 'Run-owned archive' -AllowMissing
-    if (-not ([IO.Path]::GetFullPath([string]$State.archive.path)).Equals($sourcePath, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not ([IO.Path]::GetFullPath([string]$State.archive.path)).Equals($sourcePath, (Get-PortablePathComparison))) {
         throw 'Run-owned archive path differs from its canonical location.'
     }
     $finishedRoot = Join-Path ([string]$State.repositoryRoot) 'AI Auto Update/Finished'

@@ -156,7 +156,8 @@ function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    $comparison = Get-PortablePathComparison
+    if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Workset NEW path escapes its recorded staging root.'
     }
     $candidateFull
@@ -166,6 +167,7 @@ function Assert-NoReparsePath {
     param([string] $Path, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root)
     $currentPath = [IO.Path]::GetFullPath($Path)
+    $comparison = Get-PortablePathComparison
     for ($depth = 0; $depth -lt 2048; $depth++) {
         $current = $null
         try {
@@ -183,7 +185,7 @@ function Assert-NoReparsePath {
         if (Test-PortableReparseItem -Path $currentPath -Item $current -Label 'Workset NEW localization') {
             throw 'Workset NEW localization path contains a symlink or reparse point.'
         }
-        if ($currentPath.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return }
+        if ($currentPath.Equals($rootFull, $comparison)) { return }
         $parent = [IO.DirectoryInfo]::new($currentPath).Parent
         if ($null -eq $parent) { throw 'Unable to prove Workset NEW localization containment.' }
         $currentPath = $parent.FullName

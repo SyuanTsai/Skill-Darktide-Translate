@@ -5,6 +5,15 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-PortablePathComparison {
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        [StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [StringComparison]::Ordinal
+    }
+}
+
 $pathComparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     [StringComparer]::OrdinalIgnoreCase
 }
@@ -81,7 +90,7 @@ function Test-PortableReparseItem {
         }
 
         $parent = [IO.DirectoryInfo]::new($probe).Parent
-        if ($null -eq $parent -or $parent.FullName.Equals($probe, [StringComparison]::OrdinalIgnoreCase)) {
+        if ($null -eq $parent -or $parent.FullName.Equals($probe, (Get-PortablePathComparison))) {
             break
         }
         $probe = $parent.FullName
@@ -89,4 +98,4 @@ function Test-PortableReparseItem {
     $false
 }
 
-Export-ModuleMember -Function Test-PortableReparseItem
+Export-ModuleMember -Function Get-PortablePathComparison, Test-PortableReparseItem

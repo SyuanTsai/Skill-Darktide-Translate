@@ -172,7 +172,8 @@ function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    $comparison = Get-PortablePathComparison
+    if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'NEW localization path escapes the staging MOD root.'
     }
     $candidateFull
@@ -183,8 +184,9 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $current = [IO.Path]::GetFullPath($Path)
-    if (-not $current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
-        -not $current.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    $comparison = Get-PortablePathComparison
+    if (-not $current.Equals($rootFull, $comparison) -and
+        -not $current.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Localization workset path escapes its verification root.'
     }
     for ($depth = 0; $depth -lt 2048; $depth++) {
@@ -201,7 +203,7 @@ function Assert-NoReparsePath {
         }
         catch { throw "Unable to inspect Localization workset physical containment component: $($_.Exception.Message)" }
         if (Test-PortableReparseItem -Path $current -Item $item -Label 'Localization workset') { throw 'Localization workset path contains a symlink or reparse point.' }
-        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        if ($current.Equals($rootFull, (Get-PortablePathComparison))) {
             if ($null -eq $item) { throw 'Unable to prove NEW localization containment.' }
             return
         }

@@ -241,8 +241,9 @@ function Assert-NoReparsePath {
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    if (-not $pathFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
-        -not $pathFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    $comparison = Get-PortablePathComparison
+    if (-not $pathFull.Equals($rootFull, $comparison) -and
+        -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Label escapes its physical verification root."
     }
     $current = $pathFull
@@ -261,7 +262,7 @@ function Assert-NoReparsePath {
         if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
-        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
+        if ($current.Equals($rootFull, (Get-PortablePathComparison))) { return $pathFull }
         $parentInfo = [IO.DirectoryInfo]::new($current).Parent
         if ($null -eq $parentInfo) { throw "Unable to prove $Label physical containment." }
         $current = $parentInfo.FullName
@@ -1822,7 +1823,7 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
     if ((Get-FileSha256 -Path $worksetPath) -cne [string]$state.localizationWorkset.sha256) { throw 'Localization workset SHA-256 changed.' }
     $worksetFull = [IO.Path]::GetFullPath($worksetPath)
     $worktreeFull = [IO.Path]::GetFullPath([string]$state.worktreePath).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-    if ($worksetFull.StartsWith($worktreeFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'Localization workset must never be inside the Git worktree.' }
+    if ($worksetFull.StartsWith($worktreeFull, (Get-PortablePathComparison))) { throw 'Localization workset must never be inside the Git worktree.' }
     $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
     if ([int]$workset.workflowSchemaVersion -ne 15 -or [string]$workset.status -cne 'applied') { throw 'Localization workset is not an applied Schema 15 artifact.' }
     if (-not $workset.Contains('apply') -or -not $workset.apply -or [string]$workset.apply.status -cne 'applied') {

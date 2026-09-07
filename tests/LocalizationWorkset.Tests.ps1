@@ -1093,9 +1093,31 @@ return localization
     It 'UnitT59_UsesPlatformAppropriatePathContainmentComparison' {
         $finalizer = Get-Content -LiteralPath (Join-Path $scriptRoot 'Finalize-LocalizationWorksetEvidence.ps1') -Raw
 
-        $finalizer | Should -Match '(?s)function Get-PathComparison.*?if \(\$IsWindows\).*?\[StringComparison\]::OrdinalIgnoreCase.*?\[StringComparison\]::Ordinal'
-        $finalizer | Should -Match '(?s)function Assert-ContainedPath.*?\$comparison = Get-PathComparison.*?StartsWith\(\$rootFull \+ \[IO\.Path\]::DirectorySeparatorChar, \$comparison\)'
-        $finalizer | Should -Match '(?s)function Assert-NoReparsePath.*?\$comparison = Get-PathComparison.*?Equals\(\$rootFull, \$comparison\).*?StartsWith\(\$rootPrefix, \$comparison\)'
+        $finalizer | Should -Match '(?s)function Assert-ContainedPath.*?\$comparison = Get-PortablePathComparison.*?StartsWith\(\$rootFull \+ \[IO\.Path\]::DirectorySeparatorChar, \$comparison\)'
+        $finalizer | Should -Match '(?s)function Assert-NoReparsePath.*?\$comparison = Get-PortablePathComparison.*?Equals\(\$rootFull, \$comparison\).*?StartsWith\(\$rootPrefix, \$comparison\)'
+    }
+
+    It 'UnitT60_UsesPlatformAppropriatePathContainmentInTheApplier' {
+        $applier = Get-Content -LiteralPath (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -Raw
+
+        $applier | Should -Match '(?s)function Assert-ContainedPath.*?\$comparison = Get-PortablePathComparison.*?StartsWith\(\$rootFull \+ \[IO\.Path\]::DirectorySeparatorChar, \$comparison\)'
+        $applier | Should -Match '(?s)function Assert-NoReparsePath.*?\$comparison = Get-PortablePathComparison.*?Equals\(\$rootFull, \$comparison\)'
+    }
+
+    It 'UnitT61_UsesPlatformAppropriatePathContainmentAcrossTheWorkflow' {
+        foreach ($name in @(
+            'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1',
+            'Test-LocalizationWorksetReceipt.ps1', 'Finalize-LocalizationWorksetEvidence.ps1',
+            'Test-ModUpdateCandidate.ps1', 'Test-SourceReceipt.ps1',
+            'Receive-NexusMainFile.ps1', 'Test-ReferenceIntegrity.ps1',
+            'mod-update.ps1', 'Finalize-ModUpdateMerge.ps1', 'SharedCoordinationLock.psm1'
+        )) {
+            $content = Get-Content -LiteralPath (Join-Path $scriptRoot $name) -Raw
+            $content | Should -Match 'Get-PortablePathComparison' -Because "$name must use the shared platform-aware physical path comparison."
+        }
+
+        $expander = Get-Content -LiteralPath (Join-Path $scriptRoot 'Expand-Schema14Reference.ps1') -Raw
+        $expander | Should -Match '(?s)\$pathComparison = if \(\[Environment\]::OSVersion\.Platform.*?\[StringComparison\]::OrdinalIgnoreCase.*?\[StringComparison\]::Ordinal'
     }
 
     # Scenario: review-artifacts is swapped for a junction after validation and before transient workset deletion.

@@ -34,16 +34,11 @@ function Get-FileSha256 {
     finally { $hasher.Dispose(); $stream.Dispose() }
 }
 
-function Get-PathComparison {
-    if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase }
-    else { [StringComparison]::Ordinal }
-}
-
 function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root, [string] $Label)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $comparison = Get-PathComparison
+    $comparison = Get-PortablePathComparison
     if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes its allowed root."
     }
@@ -56,7 +51,7 @@ function Assert-NoReparsePath {
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    $comparison = Get-PathComparison
+    $comparison = Get-PortablePathComparison
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Label escapes its physical verification root."

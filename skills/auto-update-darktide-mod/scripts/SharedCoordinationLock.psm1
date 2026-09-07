@@ -74,8 +74,9 @@ function Assert-CoordinationPath {
     )
     $fullPath = [IO.Path]::GetFullPath($Path)
     $prefix = $repository + [IO.Path]::DirectorySeparatorChar
-    if (-not $fullPath.Equals($repository, [StringComparison]::OrdinalIgnoreCase) -and
-        -not $fullPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+    $comparison = Get-PortablePathComparison
+    if (-not $fullPath.Equals($repository, $comparison) -and
+        -not $fullPath.StartsWith($prefix, $comparison)) {
         throw 'Shared coordination path escapes the repository root.'
     }
     $current = $fullPath
@@ -93,7 +94,7 @@ function Assert-CoordinationPath {
                 throw 'Shared coordination path is missing.'
             }
         }
-        if ($current.Equals($repository, [StringComparison]::OrdinalIgnoreCase)) { return $fullPath }
+        if ($current.Equals($repository, (Get-PortablePathComparison))) { return $fullPath }
         $parent = [IO.DirectoryInfo]::new($current).Parent
         if ($null -eq $parent) { break }
         $current = $parent.FullName
