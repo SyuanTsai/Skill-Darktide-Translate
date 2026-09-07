@@ -1092,9 +1092,13 @@ return localization
     # Purpose: Avoid authorizing a different tree while retaining Windows case-insensitive path behavior.
     It 'UnitT59_UsesPlatformAppropriatePathContainmentComparison' {
         $finalizer = Get-Content -LiteralPath (Join-Path $scriptRoot 'Finalize-LocalizationWorksetEvidence.ps1') -Raw
+        $pathSafety = Get-Content -LiteralPath (Join-Path $scriptRoot 'PathSafety.psm1') -Raw
 
         $finalizer | Should -Match '(?s)function Assert-ContainedPath.*?\$comparison = Get-PortablePathComparison.*?StartsWith\(\$rootFull \+ \[IO\.Path\]::DirectorySeparatorChar, \$comparison\)'
         $finalizer | Should -Match '(?s)function Assert-NoReparsePath.*?\$comparison = Get-PortablePathComparison.*?Equals\(\$rootFull, \$comparison\).*?StartsWith\(\$rootPrefix, \$comparison\)'
+        $pathSafety | Should -Match 'TryGetDirectoryCaseSensitive'
+        $pathSafety | Should -Match 'FileCaseSensitiveInformation'
+        $pathSafety | Should -Match 'Strict comparison is the safe default'
     }
 
     It 'UnitT60_UsesPlatformAppropriatePathContainmentInTheApplier' {

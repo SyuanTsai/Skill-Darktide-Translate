@@ -156,7 +156,7 @@ function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $comparison = Get-PortablePathComparison
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
     if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Workset NEW path escapes its recorded staging root.'
     }
@@ -167,7 +167,7 @@ function Assert-NoReparsePath {
     param([string] $Path, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root)
     $currentPath = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $currentPath)
     for ($depth = 0; $depth -lt 2048; $depth++) {
         $current = $null
         try {

@@ -59,7 +59,7 @@ function Assert-NoReparsePath {
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    $comparison = Get-PortablePathComparison
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Name escapes its physical verification root."
@@ -83,7 +83,7 @@ function Assert-NoReparsePath {
         if (Test-PortableReparseItem -Path $current -Item $item -Label $Name) {
             throw "$Name path contains a symlink or reparse point."
         }
-        if ($current.Equals($rootFull, (Get-PortablePathComparison))) { return $pathFull }
+        if ($current.Equals($rootFull, $comparison)) { return $pathFull }
         $parentInfo = [IO.DirectoryInfo]::new($current).Parent
         if ($null -eq $parentInfo) { throw "Unable to prove $Name physical containment." }
         $current = $parentInfo.FullName
@@ -176,7 +176,7 @@ function Test-Document {
 
     $candidate = [IO.Path]::GetFullPath((Join-Path $skillRoot $Document.packagedPath))
     $expectedPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
-    if (-not $candidate.StartsWith($expectedPrefix, (Get-PortablePathComparison))) {
+    if (-not $candidate.StartsWith($expectedPrefix, (Get-PortablePathComparison -Paths @($resolvedSkillRoot, $candidate)))) {
         throw "$Name reference escaped the Skill root."
     }
     $candidate = Assert-NoReparsePath -Path $candidate -Root $skillRoot -Name "$Name reference"
@@ -270,7 +270,7 @@ function Test-Schema15Extension {
     $relativePath = ConvertTo-NormalizedRepositoryPath -Path $extensionProvenance.path -Name 'Schema 15 reference path'
     $candidate = [IO.Path]::GetFullPath((Join-Path $skillRoot $relativePath))
     $expectedPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
-    if (-not $candidate.StartsWith($expectedPrefix, (Get-PortablePathComparison))) { throw 'Schema 15 reference escaped the Skill root.' }
+    if (-not $candidate.StartsWith($expectedPrefix, (Get-PortablePathComparison -Paths @($resolvedSkillRoot, $candidate)))) { throw 'Schema 15 reference escaped the Skill root.' }
     $candidate = Assert-NoReparsePath -Path $candidate -Root $skillRoot -Name 'Schema 15 reference'
     $bytes = Read-FileBytesWithHeartbeat -Path $candidate
     $sha256 = Get-Sha256Bytes -Bytes $bytes

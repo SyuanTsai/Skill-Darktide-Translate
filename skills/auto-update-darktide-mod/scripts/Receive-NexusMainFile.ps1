@@ -156,7 +156,7 @@ function Assert-ContainedFilePath {
     param([Parameter(Mandatory)][string] $Candidate, [Parameter(Mandatory)][string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $comparison = Get-PortablePathComparison
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
     if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Downloaded file escapes the isolated incoming directory.'
     }
@@ -168,7 +168,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes the isolated source run root."

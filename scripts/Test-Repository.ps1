@@ -216,6 +216,54 @@ function Read-SkillFrontmatter {
     return [pscustomobject]@{ name = $values['name']; description = $description; allowedTools = if ($values.ContainsKey('allowed-tools')) { $values['allowed-tools'] } else { $null } }
 }
 
+function Get-ManagedProjectionSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string] $Root
+    )
+
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or
+        ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Managed .agents/skills projection root must be a non-reparse directory.'
+    }
+
+    $entries = @(Get-ChildItem -LiteralPath $Root -Recurse -Force)
+    $snapshot = foreach ($entry in $entries) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Managed .agents/skills projection contains a reparse entry '$($entry.FullName)'."
+        }
+        [pscustomobject][ordered]@{
+            path = [IO.Path]::GetRelativePath($repoRoot, $entry.FullName).Replace([char]92, [char]47)
+            isContainer = [bool]$entry.PSIsContainer
+            attributes = [int]$entry.Attributes
+            length = if ($entry.PSIsContainer) { [int64]-1 } else { [int64]$entry.Length }
+            creationTimeUtcTicks = [int64]$entry.CreationTimeUtc.Ticks
+            lastWriteTimeUtcTicks = [int64]$entry.LastWriteTimeUtc.Ticks
+        }
+    }
+    @($snapshot | Sort-Object -Property path)
+}
+
+function Assert-ManagedProjectionSnapshotUnchanged {
+    param(
+        [Parameter(Mandatory = $true)][object[]] $Before,
+        [Parameter(Mandatory = $true)][object[]] $After
+    )
+
+    if ($Before.Count -ne $After.Count) {
+        throw 'Managed .agents/skills projection changed during validation.'
+    }
+    for ($index = 0; $index -lt $Before.Count; $index++) {
+        $beforeEntry = $Before[$index]
+        $afterEntry = $After[$index]
+        foreach ($propertyName in @('path', 'isContainer', 'attributes', 'length', 'creationTimeUtcTicks', 'lastWriteTimeUtcTicks')) {
+            if ([string]$beforeEntry.$propertyName -cne [string]$afterEntry.$propertyName) {
+                throw "Managed .agents/skills projection entry '$($beforeEntry.path)' changed during validation."
+            }
+        }
+    }
+}
+
 function Read-OpenAiMetadata {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -514,34 +562,41 @@ if (Test-Path -LiteralPath $managedProjectionRoot) {
         }
         $managedTargets += [string]$entry.targetPath
     }
-    $projectionItem = Get-Item -LiteralPath $managedProjectionRoot -Force
-    if (($projectionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'Managed .agents/skills projection root must not be a reparse point.'
-    }
-    $projectionEntries = @(Get-ChildItem -LiteralPath $managedProjectionRoot -Recurse -Force)
-    foreach ($projectionEntry in $projectionEntries) {
-        if (($projectionEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Managed .agents/skills projection contains a reparse entry '$($projectionEntry.FullName)'."
-        }
-    }
+    $projectionSnapshotBeforeHash = @(Get-ManagedProjectionSnapshot -Root $managedProjectionRoot)
     $actualManagedTargets = @(
-        $projectionEntries | Where-Object { -not $_.PSIsContainer } |
-            ForEach-Object { [IO.Path]::GetRelativePath($repoRoot, $_.FullName).Replace([char]92, [char]47) }
+        $projectionSnapshotBeforeHash | Where-Object { -not $_.isContainer } |
+            ForEach-Object { [string]$_.path }
     )
     $missingManagedTargets = @($managedTargets | Where-Object { $actualManagedTargets -notcontains $_ })
     $unexpectedManagedTargets = @($actualManagedTargets | Where-Object { $managedTargets -notcontains $_ })
     if ($missingManagedTargets.Count -gt 0 -or $unexpectedManagedTargets.Count -gt 0) {
         throw "Managed .agents/skills projection does not exactly match its manifest. Missing='$($missingManagedTargets -join ',')' Unexpected='$($unexpectedManagedTargets -join ',')'."
     }
+    $projectionHashes = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     foreach ($entry in $managedEntries) {
         $entryPath = Join-Path $repoRoot ([string]$entry.targetPath).Replace('/', [IO.Path]::DirectorySeparatorChar)
         $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $entryPath).Hash.ToLowerInvariant()
         if ($actualHash -cne [string]$entry.sha256) {
             throw "Managed .agents/skills projection hash mismatch for '$($entry.targetPath)'."
         }
+        $projectionHashes[[string]$entry.targetPath] = $actualHash
         $managedSkillId = ([regex]::Match([string]$entry.targetPath, '^\.agents/skills/([^/]+)/')).Groups[1].Value
         if (@($inventory.skills) -ccontains $managedSkillId) {
             throw "Managed .agents/skills projection claims source-owned Skill '$managedSkillId'; source and consumer paths must remain separate."
+        }
+    }
+
+    # The initial recursive snapshot identifies every inspected entry, but the
+    # hash reads reopen paths later. Re-scan the root and compare entry metadata
+    # before success so a reparse swap or path replacement cannot be hidden by a
+    # manifest-matching external target between inspection and hashing.
+    $projectionSnapshotAfterHash = @(Get-ManagedProjectionSnapshot -Root $managedProjectionRoot)
+    Assert-ManagedProjectionSnapshotUnchanged -Before $projectionSnapshotBeforeHash -After $projectionSnapshotAfterHash
+    foreach ($entry in $managedEntries) {
+        $entryPath = Join-Path $repoRoot ([string]$entry.targetPath).Replace('/', [IO.Path]::DirectorySeparatorChar)
+        $rehash = (Get-FileHash -Algorithm SHA256 -LiteralPath $entryPath).Hash.ToLowerInvariant()
+        if ($rehash -cne [string]$projectionHashes[[string]$entry.targetPath]) {
+            throw "Managed .agents/skills projection content changed during validation for '$($entry.targetPath)'."
         }
     }
 }

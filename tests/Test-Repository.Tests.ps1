@@ -69,7 +69,9 @@ Describe 'Darktide Translate Standard v1 repository contract' {
 
         $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
         $validator | Should -Match 'Get-ChildItem -LiteralPath \$managedProjectionRoot -Recurse -Force'
-        $validator | Should -Match '\$projectionEntries\s*=\s*@\('
+        $validator | Should -Match 'function Get-ManagedProjectionSnapshot'
+        $validator | Should -Match '\$projectionSnapshotAfterHash\s*=\s*@\('
+        $validator | Should -Match 'Assert-ManagedProjectionSnapshotUnchanged'
         $validator | Should -Match 'Managed \.agents/skills projection contains a reparse entry'
     }
 

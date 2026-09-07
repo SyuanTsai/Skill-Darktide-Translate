@@ -158,7 +158,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes the source run root."
@@ -179,7 +179,7 @@ function Assert-NoReparsePath {
         if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
-        if ($current.Equals($rootFull, (Get-PortablePathComparison))) { return $pathFull }
+        if ($current.Equals($rootFull, $comparison)) { return $pathFull }
         $parentInfo = [IO.DirectoryInfo]::new($current).Parent
         if ($null -eq $parentInfo) { throw "Unable to prove $Label physical containment." }
         $current = $parentInfo.FullName
@@ -399,7 +399,7 @@ $deliveredPath = [IO.Path]::GetFullPath([string]$receipt.deliveredPath)
 $null = Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source'
 if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
     $verifiedRoot = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'verified-source')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    if (-not $deliveredPath.StartsWith($verifiedRoot + [IO.Path]::DirectorySeparatorChar, (Get-PortablePathComparison))) {
+    if (-not $deliveredPath.StartsWith($verifiedRoot + [IO.Path]::DirectorySeparatorChar, (Get-PortablePathComparison -Paths @($verifiedRoot, $deliveredPath)))) {
         throw 'Delivered source escapes the fixed run-local verified-source directory.'
     }
 }

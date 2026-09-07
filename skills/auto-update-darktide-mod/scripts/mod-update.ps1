@@ -508,7 +508,7 @@ function Assert-ContainedPath {
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
     $prefix = $rootFull + [IO.Path]::DirectorySeparatorChar
-    $comparison = Get-PortablePathComparison
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
     if (-not $candidateFull.StartsWith($prefix, $comparison)) {
         throw "$Label escapes the allowed root."
     }
@@ -526,7 +526,7 @@ function Assert-NoReparsePath {
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    $comparison = Get-PortablePathComparison
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Label escapes its physical verification root."
@@ -551,7 +551,7 @@ function Assert-NoReparsePath {
         if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
-        if ($current.Equals($rootFull, (Get-PortablePathComparison))) {
+        if ($current.Equals($rootFull, $comparison)) {
             if ($null -eq $item) { throw "Unable to prove $Label physical containment." }
             return $pathFull
         }
@@ -793,7 +793,7 @@ function Read-State {
     param([Parameter(Mandatory)][string] $Path)
     $repositoryFull = [IO.Path]::GetFullPath($RepositoryRoot)
     $stateFull = [IO.Path]::GetFullPath($Path)
-    $physicalPathComparison = Get-PortablePathComparison
+    $physicalPathComparison = Get-PortablePathComparison -Paths @($repositoryFull, $stateFull)
     $null = Assert-NoReparsePath -Path $stateFull -Root $repositoryFull -Label 'Run state'
     if (-not (Test-Path -LiteralPath $stateFull -PathType Leaf)) {
         throw "State file does not exist: $stateFull"
@@ -3406,7 +3406,7 @@ function Invoke-Install {
     if (Test-Path -LiteralPath $target) {
         $resolvedTarget = [IO.Path]::GetFullPath($target)
         $resolvedMods = [IO.Path]::GetFullPath($modsRoot) + [IO.Path]::DirectorySeparatorChar
-        if (-not $resolvedTarget.StartsWith($resolvedMods, (Get-PortablePathComparison))) { throw 'Refusing broad install deletion.' }
+        if (-not $resolvedTarget.StartsWith($resolvedMods, (Get-PortablePathComparison -Paths @($resolvedMods, $resolvedTarget)))) { throw 'Refusing broad install deletion.' }
         $null = Assert-NoReparseTree -Path $resolvedTarget -Root ([string]$State.worktreePath) -Label 'Existing MOD install tree before removal'
         Remove-DirectoryTreeWithHeartbeat -Path $resolvedTarget
     }
