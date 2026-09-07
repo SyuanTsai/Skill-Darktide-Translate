@@ -868,6 +868,10 @@ $semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevant
 $semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
 $semanticReports = @()
 if ($semanticTriggered) {
+    # Candidate Pester code runs before this stage and can write to run-owned
+    # tool directories. Rebind the scanner path and receipt hash immediately
+    # before semantic execution so a test cannot substitute the scanner.
+    $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector semantic scanner'
     foreach ($skillId in $skillIds) {
         $skillRoot = Join-Path $repoRoot "skills/$skillId"
         $expectedInventoryPaths = @(

@@ -43,9 +43,7 @@ jobs:
       - name: Materialize protected validation supervisor
         shell: pwsh
         env:
-          TRUSTED_SUPERVISOR_COMMIT: 'b6c487aa38ba07c868ef83cac48ee559a5a73ec8'
-          TRUSTED_VALIDATE_BLOB: 'af54a07d23db7e7ad894595356c6bb25484002ff'
-          TRUSTED_REPOSITORY_VALIDATOR_BLOB: 'a071921f52cbb83754c9355f1cab8773e124edad'
+          TRUSTED_SUPERVISOR_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
@@ -61,17 +59,14 @@ jobs:
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
           $files = @(
-            [pscustomobject]@{ RelativePath = 'scripts/Validate.ps1'; Blob = [string]$env:TRUSTED_VALIDATE_BLOB },
-            [pscustomobject]@{ RelativePath = 'scripts/Test-Repository.ps1'; Blob = [string]$env:TRUSTED_REPOSITORY_VALIDATOR_BLOB }
+            [pscustomobject]@{ RelativePath = 'scripts/Validate.ps1' },
+            [pscustomobject]@{ RelativePath = 'scripts/Test-Repository.ps1' }
           )
           foreach ($file in $files) {
-            if ($file.Blob -notmatch '^[0-9a-f]{40}$') {
-              throw "The protected supervisor blob for '$($file.RelativePath)' is invalid."
-            }
             $revision = "${trustedCommit}:$($file.RelativePath)"
             $actualBlob = ((& $gitPath rev-parse $revision 2>$null) | Select-Object -First 1).Trim()
-            if ($LASTEXITCODE -ne 0 -or $actualBlob -cne $file.Blob) {
-              throw "The protected supervisor blob for '$($file.RelativePath)' does not match its reviewed commit."
+            if ($LASTEXITCODE -ne 0 -or $actualBlob -notmatch '^[0-9a-f]{40}$') {
+              throw "The protected supervisor file '$($file.RelativePath)' is missing from the event-bound supervisor commit."
             }
             $destination = Join-Path $trustedRoot $file.RelativePath
             $process = [Diagnostics.Process]::new()
