@@ -1088,6 +1088,16 @@ return localization
         $finalizer | Should -Match '\[IO\.Path\]::GetFullPath\(\[string\]\$state\.statePath\) -cne \$stateFull'
     }
 
+    # Scenario: a case-only path mismatch is tested on a case-sensitive Unix filesystem.
+    # Purpose: Avoid authorizing a different tree while retaining Windows case-insensitive path behavior.
+    It 'UnitT59_UsesPlatformAppropriatePathContainmentComparison' {
+        $finalizer = Get-Content -LiteralPath (Join-Path $scriptRoot 'Finalize-LocalizationWorksetEvidence.ps1') -Raw
+
+        $finalizer | Should -Match '(?s)function Get-PathComparison.*?if \(\$IsWindows\).*?\[StringComparison\]::OrdinalIgnoreCase.*?\[StringComparison\]::Ordinal'
+        $finalizer | Should -Match '(?s)function Assert-ContainedPath.*?\$comparison = Get-PathComparison.*?StartsWith\(\$rootFull \+ \[IO\.Path\]::DirectorySeparatorChar, \$comparison\)'
+        $finalizer | Should -Match '(?s)function Assert-NoReparsePath.*?\$comparison = Get-PathComparison.*?Equals\(\$rootFull, \$comparison\).*?StartsWith\(\$rootPrefix, \$comparison\)'
+    }
+
     # Scenario: review-artifacts is swapped for a junction after validation and before transient workset deletion.
     # Purpose: Prevent finalization from deleting or writing through any reparse component outside the physical run root.
     It 'InterT58_RejectsAReparseParentBeforeWorksetDeletion' {
