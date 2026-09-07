@@ -1,0 +1,252 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
+name: Darktide Translate Standard v1 Protected Validation
+# This workflow is base-owned for pull_request_target. Candidate files are
+# checked out only as data; trusted supervisor files are materialized from
+# github.sha, the event-bound base commit.
+
+on:
+  pull_request_target:
+
+permissions:
+  contents: read
+
+jobs:
+  repository-contract-windows-powershell:
+    name: repository-contract (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate Windows PowerShell compatibility
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tests\validate-windows-powershell.ps1
+
+  canonical-validation:
+    name: Darktide Translate Standard v1
+    needs:
+      - repository-contract-windows-powershell
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize protected validation supervisor
+        shell: pwsh
+        env:
+          TRUSTED_SUPERVISOR_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
+          if ($trustedCommit -notmatch '^[0-9a-f]{40}$') {
+            throw 'The protected supervisor commit must be one lowercase full Git SHA.'
+          }
+          $trustedRoot = Join-Path $env:RUNNER_TEMP 'standard-v1-trusted-supervisor'
+          if (Test-Path -LiteralPath $trustedRoot) {
+            throw "The protected supervisor root already exists: $trustedRoot"
+          }
+          $trustedScriptsRoot = Join-Path $trustedRoot 'scripts'
+          [void](New-Item -ItemType Directory -Path $trustedScriptsRoot -Force)
+          $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+          $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          $files = @(
+            [pscustomobject]@{ RelativePath = 'scripts/Validate.ps1' },
+            [pscustomobject]@{ RelativePath = 'scripts/Test-Repository.ps1' }
+          )
+          foreach ($file in $files) {
+            $revision = "${trustedCommit}:$($file.RelativePath)"
+            $actualBlob = ((& $gitPath rev-parse $revision 2>$null) | Select-Object -First 1).Trim()
+            if ($LASTEXITCODE -ne 0 -or $actualBlob -notmatch '^[0-9a-f]{40}$') {
+              throw "The protected supervisor file '$($file.RelativePath)' is missing from the event-bound supervisor commit."
+            }
+            $destination = Join-Path $trustedRoot $file.RelativePath
+            $process = [Diagnostics.Process]::new()
+            $process.StartInfo.FileName = $gitPath
+            $process.StartInfo.UseShellExecute = $false
+            $process.StartInfo.RedirectStandardOutput = $true
+            $process.StartInfo.RedirectStandardError = $true
+            [void]$process.StartInfo.ArgumentList.Add('cat-file')
+            [void]$process.StartInfo.ArgumentList.Add('blob')
+            [void]$process.StartInfo.ArgumentList.Add($revision)
+            if (-not $process.Start()) { throw "Could not start Git to materialize '$($file.RelativePath)'." }
+            $stream = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            try { $process.StandardOutput.BaseStream.CopyTo($stream) }
+            finally { $stream.Dispose() }
+            $stderr = $process.StandardError.ReadToEnd()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) {
+              throw "Git could not materialize the protected supervisor '$($file.RelativePath)': $stderr"
+            }
+            $item = Get-Item -LiteralPath $destination -Force
+            if (-not $item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Protected supervisor file '$($file.RelativePath)' is a reparse point."
+            }
+          }
+          $rootItem = Get-Item -LiteralPath $trustedRoot -Force
+          if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Protected supervisor root must be a regular non-reparse directory.'
+          }
+          "TRUSTED_SUPERVISOR_ROOT=$trustedRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up approved Go runtime
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+          check-latest: true
+          cache: false
+
+      - name: Capture resolved stable Go runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $versionOutput = @(& go version)
+          if ($LASTEXITCODE -ne 0 -or $versionOutput.Count -ne 1 -or
+              [string]$versionOutput[0] -notmatch '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+) [^\s]+/[^\s]+$') {
+            throw "setup-go did not provide one stable Go runtime version. Evidence='$($versionOutput -join ' | ')'"
+          }
+          "STANDARD_GO_RUNTIME_VERSION=$($Matches.version)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run canonical Standard v1 validation
+        id: canonical-validation
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseCandidate = if ($env:GITHUB_EVENT_NAME -eq 'pull_request_target') {
+            $env:PULL_REQUEST_BASE_SHA
+          }
+          elseif ($env:GITHUB_EVENT_NAME -eq 'push' -and
+              -not [string]::IsNullOrWhiteSpace($env:PUSH_BEFORE_SHA) -and
+              $env:PUSH_BEFORE_SHA -notmatch '^0+$') {
+            $env:PUSH_BEFORE_SHA
+          }
+          else {
+            ''
+          }
+          $candidateHead = ((git rev-parse HEAD 2>$null) | Select-Object -First 1).Trim()
+          $baseCommit = ''
+          if ($baseCandidate -match '^[0-9a-f]{40}$' -and $candidateHead -match '^[0-9a-f]{40}$') {
+            & git merge-base --is-ancestor $baseCandidate $candidateHead 2>$null
+            $ancestryExitCode = $LASTEXITCODE
+            if ($ancestryExitCode -eq 0 -and $baseCandidate -cne $candidateHead) {
+              $baseCommit = $baseCandidate
+            }
+            else {
+              Write-Warning "The event base '$baseCandidate' is not a distinct ancestor of '$candidateHead'; running the validator without a comparison base."
+            }
+          }
+          elseif (-not [string]::IsNullOrWhiteSpace($baseCandidate)) {
+            Write-Warning 'The event base is not one full commit SHA; running the validator without a comparison base.'
+          }
+          $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
+          $trustedValidator = Join-Path $env:TRUSTED_SUPERVISOR_ROOT 'scripts/Validate.ps1'
+          & $trustedValidator -RepositoryRoot (Get-Location).Path -ArtifactsRoot $env:RUNNER_TEMP -BaseCommit $baseCommit -ExpectedGoRuntimeVersion $env:STANDARD_GO_RUNTIME_VERSION -OutputPath $outputPath
+
+      - name: Verify canonical validation evidence
+        if: ${{ success() }}
+        shell: pwsh
+        env:
+          EXPECTED_EVIDENCE_SHA256: ${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EXPECTED_EVIDENCE_SHA256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'Canonical validation did not emit one lowercase evidence SHA-256 output.'
+          }
+          $evidencePath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
+          if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) {
+            throw "Canonical validation evidence is missing: $evidencePath"
+          }
+          $actualEvidenceSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToLowerInvariant()
+          if ($actualEvidenceSha256 -cne $env:EXPECTED_EVIDENCE_SHA256) {
+            throw 'Canonical validation evidence changed after the validator returned.'
+          }
+
+      - name: Validate GitHub CLI Agent Skills publication
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh --version
+          gh skill publish --dry-run .
+
+      - name: Upload canonical validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: darktide-translate-standard-v1-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/darktide-translate-conformance-report.json
+            ${{ runner.temp }}/sgv1-*
+          if-no-files-found: warn
+          retention-days: 14
+
+  # These jobs preserve the repository's existing required status contexts while
+  # keeping the canonical Standard v1 gate as the only validation policy.
+  repository-contract:
+    name: repository-contract
+    if: ${{ always() }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror canonical Standard v1 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          result='${{ needs['canonical-validation'].result }}'
+          if [[ "$result" != 'success' ]]; then
+            echo "Canonical Standard v1 validation result: $result"
+            exit 1
+          fi
+          echo 'Canonical Standard v1 validation passed.'
+  skill-validator:
+    name: skill-validator
+    if: ${{ always() }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror canonical Standard v1 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          result='${{ needs['canonical-validation'].result }}'
+          if [[ "$result" != 'success' ]]; then
+            echo "Canonical Standard v1 validation result: $result"
+            exit 1
+          fi
+          echo 'Canonical Standard v1 validation passed.'
+
+  skill-tools:
+    name: skill-tools
+    if: ${{ always() }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror canonical Standard v1 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          result='${{ needs['canonical-validation'].result }}'
+          if [[ "$result" != 'success' ]]; then
+            echo "Canonical Standard v1 validation result: $result"
+            exit 1
+          fi
+          echo 'Canonical Standard v1 validation passed.'
