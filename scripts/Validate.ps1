@@ -369,12 +369,18 @@ function Invoke-NativeChecked {
         [Parameter(Mandatory = $true)][string] $Command,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
         [Parameter(Mandatory = $true)][string] $Context,
-        [Parameter(Mandatory = $true)][string] $DiagnosticRoot
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter()][AllowNull()][string] $StandardInput
     )
     if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) { throw "$Context executable is missing: $Command" }
     $stderrPath = Join-Path $DiagnosticRoot ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     try {
-        $stdout = @(& $Command @Arguments 2> $stderrPath)
+        $stdout = if ($PSBoundParameters.ContainsKey('StandardInput')) {
+            $StandardInput | & $Command @Arguments 2> $stderrPath
+        }
+        else {
+            @(& $Command @Arguments 2> $stderrPath)
+        }
         $exitCode = $LASTEXITCODE
         $stdoutText = ($stdout | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
         $stderrText = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -Encoding UTF8 } else { '' }
@@ -423,12 +429,20 @@ $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
     [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 }
 else { [IO.Path]::GetFullPath($RepositoryRoot) }
+$supervisorRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$repositoryValidatorPath = Join-Path $supervisorRoot 'scripts/Test-Repository.ps1'
+if (-not (Test-Path -LiteralPath $repositoryValidatorPath -PathType Leaf)) {
+    throw "Trusted repository validator is missing: $repositoryValidatorPath"
+}
+Assert-NoReparseAncestors -Path $repositoryValidatorPath -Context 'Trusted repository validator'
 $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
 $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
 $gitConfigArguments = @('-c', "safe.directory=$repoRoot")
 
 $candidateCommit = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
 if ($LASTEXITCODE -ne 0 -or $candidateCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Candidate must be an immutable Git commit.' }
+$candidateTree = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse "$candidateCommit^{tree}" 2>$null) | Select-Object -First 1)).Trim()
+if ($LASTEXITCODE -ne 0 -or $candidateTree -cnotmatch '^[0-9a-f]{40}$') { throw 'Candidate must be bound to one immutable Git tree.' }
 $dirty = @(& $gitPath @gitConfigArguments -C $repoRoot status --porcelain=v1 --untracked-files=all)
 if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
     throw 'Canonical validation requires a clean candidate commit; commit or remove every tracked/untracked change first.'
@@ -484,7 +498,7 @@ Assert-NoReparseAncestors -Path $runRoot -Context 'Run-owned artifacts path'
 
 # Bind the exact package/file inventory before any scanner is acquired or executed.
 $integrityReportPath = Join-Path $runRoot 'candidate-integrity.json'
-$integrityJson = & (Join-Path $repoRoot 'scripts/Test-Repository.ps1') -RepositoryRoot $repoRoot -OutputPath $integrityReportPath | Select-Object -Last 1
+$integrityJson = & $repositoryValidatorPath -RepositoryRoot $repoRoot -OutputPath $integrityReportPath | Select-Object -Last 1
 $integrityReport = $integrityJson | ConvertFrom-Json -Depth 100
 if ($integrityReport.result -cne 'passed' -or [int]$integrityReport.activeSkillCount -le 0) {
     throw 'Candidate integrity verification did not bind a non-empty active Skill inventory.'
@@ -664,7 +678,7 @@ foreach ($skillId in $skillIds) {
 
 # Stage 5: Repository Tests.
 $repositoryReportPath = Join-Path $runRoot 'repository-validation.json'
-$repositoryJson = & (Join-Path $repoRoot 'scripts/Test-Repository.ps1') -RepositoryRoot $repoRoot -OutputPath $repositoryReportPath | Select-Object -Last 1
+$repositoryJson = & $repositoryValidatorPath -RepositoryRoot $repoRoot -OutputPath $repositoryReportPath | Select-Object -Last 1
 $repositoryReport = $repositoryJson | ConvertFrom-Json -Depth 100
 if ($repositoryReport.result -cne 'passed' -or [int]$repositoryReport.activeSkillCount -ne $skillIds.Count) {
     throw 'Repository validation did not cover the exact active Skill inventory.'
@@ -744,15 +758,17 @@ $pesterRunnerScript = @'
 param(
     [Parameter(Mandatory = $true)][string] $TestsRoot,
     [Parameter(Mandatory = $true)][string] $PesterModulePath,
-    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
-    [Parameter(Mandatory = $true)][string] $OutputPath
+    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $testsRoot = [IO.Path]::GetFullPath($TestsRoot)
 $pesterModulePath = [IO.Path]::GetFullPath($PesterModulePath)
-$outputPath = [IO.Path]::GetFullPath($OutputPath)
+$resultMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
+if ($resultMarker -notmatch '^SGV1-Pester-Result-[0-9a-f]{32}:$') {
+    throw 'The isolated Pester supervisor did not receive a valid one-time completion marker.'
+}
 if (-not (Test-Path -LiteralPath $testsRoot -PathType Container)) { throw "Pester tests root is missing: $testsRoot" }
 if (-not (Test-Path -LiteralPath $pesterModulePath -PathType Leaf)) { throw "Pester module manifest is missing: $pesterModulePath" }
 
@@ -777,9 +793,7 @@ $summary = [ordered]@{
     failedCount = [int64]$result.FailedCount
     skippedCount = [int64]$result.SkippedCount
 }
-$outputDirectory = Split-Path -Parent $outputPath
-if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) { [void](New-Item -ItemType Directory -Path $outputDirectory -Force) }
-[IO.File]::WriteAllText($outputPath, ($summary | ConvertTo-Json -Depth 20) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+Write-Output ($resultMarker + ($summary | ConvertTo-Json -Depth 20 -Compress))
 '@
 [IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
@@ -787,17 +801,25 @@ $powerShellExecutableName = if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }
 $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
 if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
 Assert-NoReparseAncestors -Path $powerShellPath -Context 'PowerShell child executable'
-[void](Invoke-NativeChecked -Command $powerShellPath -Arguments @(
+$pesterResultMarker = 'SGV1-Pester-Result-{0}:' -f ([guid]::NewGuid().ToString('N'))
+$pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
     '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
     '-File', $pesterRunnerPath,
     '-TestsRoot', (Join-Path $repoRoot 'tests'),
     '-PesterModulePath', $pesterModulePath,
-    '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion,
-    '-OutputPath', $pesterResultPath
-) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot)
-if (-not (Test-Path -LiteralPath $pesterResultPath -PathType Leaf)) {
-    throw 'Isolated Pester exited without a candidate-bound result report.'
+    '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
+) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker
+$pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
+    $_.StartsWith($pesterResultMarker, [StringComparison]::Ordinal)
+})
+if ($pesterResultLines.Count -ne 1) {
+    throw 'Isolated Pester exited without exactly one supervisor-owned completion result.'
 }
+[IO.File]::WriteAllText(
+    $pesterResultPath,
+    $pesterResultLines[0].Substring($pesterResultMarker.Length) + [Environment]::NewLine,
+    [Text.UTF8Encoding]::new($false)
+)
 $pesterResult = Read-JsonFile -Path $pesterResultPath -Context 'Isolated Pester result'
 if ($pesterResult.result -cne 'passed' -or
     $pesterResult.pesterVersion -cne [string]$receipts.pester.resolvedVersion -or
@@ -808,7 +830,19 @@ if ($pesterResult.result -cne 'passed' -or
 }
 
 $postPesterRepositoryReportPath = Join-Path $runRoot 'repository-validation-post-pester.json'
-$postPesterRepositoryJson = & (Join-Path $repoRoot 'scripts/Test-Repository.ps1') -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath | Select-Object -Last 1
+$postPesterCandidateCommit = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
+if ($LASTEXITCODE -ne 0 -or $postPesterCandidateCommit -cne $candidateCommit) {
+    throw "Candidate commit changed during repository tests; expected '$candidateCommit' but found '$postPesterCandidateCommit'."
+}
+$postPesterTree = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse "$postPesterCandidateCommit^{tree}" 2>$null) | Select-Object -First 1)).Trim()
+if ($LASTEXITCODE -ne 0 -or $postPesterTree -cne $candidateTree) {
+    throw 'Candidate Git tree changed during repository tests.'
+}
+$postPesterIndexState = @(& $gitPath @gitConfigArguments -C $repoRoot ls-files -v)
+if ($LASTEXITCODE -ne 0 -or @($postPesterIndexState | Where-Object { [string]$_ -notmatch '^H ' }).Count -ne 0) {
+    throw 'Candidate Git index contains assume-unchanged or other non-normal entries after repository tests.'
+}
+$postPesterRepositoryJson = & $repositoryValidatorPath -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath | Select-Object -Last 1
 $postPesterRepositoryReport = $postPesterRepositoryJson | ConvertFrom-Json -Depth 100
 if ($postPesterRepositoryReport.result -cne 'passed' -or [int]$postPesterRepositoryReport.activeSkillCount -ne $skillIds.Count) {
     throw 'Post-Pester repository validation did not cover the exact active Skill inventory.'

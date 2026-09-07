@@ -127,6 +127,13 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match '\[switch\] \$EnableSemanticScan'
         $script:Validator | Should -Match '\$semanticTriggered = \[bool\]\$EnableSemanticScan -and'
         $script:Validator | Should -Match 'repository-validation-post-pester'
+        $script:Validator | Should -Match 'supervisor-owned completion result'
+        $script:Validator | Should -Match 'StandardInput \$pesterResultMarker'
+        $script:Validator | Should -Not -Match ([regex]::Escape("'-OutputPath', `$pesterResultPath"))
+        $script:Validator | Should -Match 'postPesterCandidateCommit'
+        $script:Validator | Should -Match 'postPesterTree'
+        $script:Validator | Should -Match 'ls-files -v'
+        $script:Validator | Should -Match '\$repositoryValidatorPath'
         $script:Validator | Should -Match 'pesterRunnerPath'
         $script:Validator | Should -Match 'Invoke-NativeChecked -Command \$powerShellPath'
         $script:Validator | Should -Match "'-NoProfile'"
@@ -137,6 +144,14 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Not -Match 'semantic.*continue|continue.*semantic'
         $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/validate.yml') -Raw
         $workflow | Should -Match 'github\.run_attempt'
+        $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
+        $workflow | Should -Match 'Materialize protected validation supervisor'
+        $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: .[0-9a-f]{40}.'
+        $workflow | Should -Match 'TRUSTED_VALIDATE_BLOB: .[0-9a-f]{40}.'
+        $workflow | Should -Match 'TRUSTED_REPOSITORY_VALIDATOR_BLOB: .[0-9a-f]{40}.'
+        $workflow | Should -Match 'TRUSTED_SUPERVISOR_ROOT'
+        $workflow | Should -Match '\$trustedValidator = Join-Path \$env:TRUSTED_SUPERVISOR_ROOT'
+        $workflow | Should -Not -Match '(?m)^\s*& \.\/scripts\/Validate\.ps1'
     }
 
     It 'keeps required CI free of implicit LLM credentials and skipped tests' {
