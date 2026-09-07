@@ -195,9 +195,86 @@ function Get-DescendantProcessIds {
     return @($descendantIds.ToArray())
 }
 
+function Get-UnixProcessGroupId {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId
+    )
+    if ($IsWindows) { return 0 }
+    if ($ProcessId -le 0) { throw 'Unix process-group inspection requires a positive process id.' }
+    $statPath = Join-Path '/proc' "$ProcessId/stat"
+    try {
+        $stat = [IO.File]::ReadAllText($statPath)
+    }
+    catch {
+        throw "Could not inspect Unix process group for process ${ProcessId}: $($_.Exception.Message)"
+    }
+    if ($stat -notmatch '^[0-9]+\s+\(.*\)\s+\S+\s+[0-9]+\s+(?<processGroupId>[0-9]+)\s') {
+        throw "Could not parse Unix process group for process $ProcessId."
+    }
+    return [int]$Matches.processGroupId
+}
+
+function Get-UnixProcessGroupProcessIds {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessGroupId
+    )
+    if ($IsWindows) { return @() }
+    if ($ProcessGroupId -le 0) { throw 'Unix process-group enumeration requires a positive process-group id.' }
+    $members = [Collections.Generic.List[int]]::new()
+    foreach ($entry in @(Get-ChildItem -LiteralPath '/proc' -Directory -ErrorAction SilentlyContinue)) {
+        if ([string]$entry.Name -notmatch '^[0-9]+$') { continue }
+        try {
+            $stat = [IO.File]::ReadAllText((Join-Path $entry.FullName 'stat'))
+        }
+        catch {
+            continue
+        }
+        if ($stat -cmatch '^[0-9]+\s+\(.*\)\s+\S+\s+[0-9]+\s+(?<processGroupId>[0-9]+)\s' -and
+            [int]$Matches.processGroupId -eq $ProcessGroupId) {
+            [void]$members.Add([int]$entry.Name)
+        }
+    }
+    return @($members.ToArray())
+}
+
+function Test-ProcessIdExists {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId
+    )
+    if ($ProcessId -le 0) { return $false }
+    if ($IsWindows) {
+        try {
+            Get-Process -Id $ProcessId -ErrorAction Stop | Out-Null
+            return $true
+        }
+        catch {
+            return $false
+        }
+    }
+    return Test-Path -LiteralPath (Join-Path '/proc' ([string]$ProcessId)) -PathType Container
+}
+
+function Add-ObservedProcessIds {
+    param(
+        [Parameter(Mandatory = $true)][int] $RootProcessId,
+        [Parameter(Mandatory = $true)] $ObservedProcessIds,
+        [Parameter()][int] $ProcessGroupId = 0
+    )
+    foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
+        if ($processId -ne $RootProcessId) { [void]$ObservedProcessIds.Add([int]$processId) }
+    }
+    if (-not $IsWindows -and $ProcessGroupId -gt 0) {
+        foreach ($processId in @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId)) {
+            if ($processId -ne $RootProcessId) { [void]$ObservedProcessIds.Add([int]$processId) }
+        }
+    }
+}
+
 function Stop-ProcessTree {
     param(
-        [Parameter(Mandatory = $true)][int] $RootProcessId
+        [Parameter(Mandatory = $true)][int] $RootProcessId,
+        [Parameter()][int] $ProcessGroupId = 0,
+        [Parameter()][AllowEmptyCollection()][int[]] $ObservedProcessIds = @()
     )
     if ($RootProcessId -le 0) { throw 'Process-tree cleanup requires a positive root process id.' }
     $taskKillPath = $null
@@ -211,11 +288,20 @@ function Stop-ProcessTree {
     else {
         $killCommand = Get-Command kill -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $killPath = [IO.Path]::GetFullPath([string]$killCommand.Path)
+        if ($ProcessGroupId -le 0) {
+            $ProcessGroupId = Get-UnixProcessGroupId -ProcessId $RootProcessId
+        }
+        if ($ProcessGroupId -le 0) {
+            throw 'Unix process-tree cleanup requires a positive process-group id.'
+        }
     }
 
     for ($round = 0; $round -lt 3; $round++) {
         $descendants = @(Get-DescendantProcessIds -RootProcessId $RootProcessId)
-        $targets = @($descendants | Sort-Object -Descending)
+        $groupMembers = if ($IsWindows) { @() } else { @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId) }
+        $targets = @($descendants + $groupMembers + $ObservedProcessIds |
+            Where-Object { [int]$_ -gt 0 -and [int]$_ -ne $RootProcessId } |
+            Sort-Object -Unique -Descending)
         if ($IsWindows) {
             foreach ($processId in $targets) {
                 & $taskKillPath /PID $processId /F 2>$null | Out-Null
@@ -224,16 +310,18 @@ function Stop-ProcessTree {
         }
         else {
             $signal = if ($round -eq 2) { '-KILL' } else { '-TERM' }
-            & $killPath $signal "-$RootProcessId" 2>$null | Out-Null
+            & $killPath $signal "-$ProcessGroupId" 2>$null | Out-Null
             foreach ($processId in $targets) {
                 & $killPath $signal ([string]$processId) 2>$null | Out-Null
             }
         }
         Start-Sleep -Milliseconds 100
         $remaining = @(Get-DescendantProcessIds -RootProcessId $RootProcessId)
-        if ($remaining.Count -eq 0) { return }
+        $remainingObserved = @($ObservedProcessIds | Where-Object { Test-ProcessIdExists -ProcessId ([int]$_) })
+        $remainingGroupMembers = if ($IsWindows) { @() } else { @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId) }
+        if ($remaining.Count -eq 0 -and $remainingObserved.Count -eq 0 -and $remainingGroupMembers.Count -eq 0) { return }
     }
-    throw "Could not terminate the complete candidate process tree rooted at process $RootProcessId."
+    throw "Could not terminate the complete candidate process boundary rooted at process $RootProcessId."
 }
 
 function Get-RunnerCommandFileSnapshot {
@@ -647,6 +735,8 @@ function Invoke-NativeChecked {
     $runnerCommandFileIsolationStarted = $false
     $childProcess = $null
     $childProcessId = 0
+    $childProcessGroupId = 0
+    $observedDescendantProcessIds = [Collections.Generic.HashSet[int]]::new()
     $processTreeStopped = $false
     try {
         if ($ProtectRunnerCommandFiles) {
@@ -677,8 +767,20 @@ function Invoke-NativeChecked {
             }
         }
         if ($TerminateProcessTree) {
+            $nativeCommand = $Command
+            $nativeArguments = @($Arguments)
+            if (-not $IsWindows) {
+                $setsidCommand = Get-Command setsid -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $setsidPath = [IO.Path]::GetFullPath([string]$setsidCommand.Path)
+                if (-not (Test-Path -LiteralPath $setsidPath -PathType Leaf)) {
+                    throw "$Context process-group launcher is missing: $setsidPath"
+                }
+                Assert-NoReparseAncestors -Path $setsidPath -Context "$Context process-group launcher"
+                $nativeCommand = $setsidPath
+                $nativeArguments = @($Command) + @($Arguments)
+            }
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
-            $startInfo.FileName = $Command
+            $startInfo.FileName = $nativeCommand
             $startInfo.UseShellExecute = $false
             $startInfo.CreateNoWindow = $true
             $startInfo.RedirectStandardOutput = $true
@@ -688,27 +790,42 @@ function Invoke-NativeChecked {
             }
             $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
             if ($null -ne $argumentListProperty) {
-                foreach ($argument in $Arguments) {
+                foreach ($argument in $nativeArguments) {
                     [void]$startInfo.ArgumentList.Add([string]$argument)
                 }
             }
             else {
-                $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $Arguments
+                $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $nativeArguments
             }
             $startInfo.WorkingDirectory = [string](Get-Location).Path
             $childProcess = [Diagnostics.Process]::new()
             $childProcess.StartInfo = $startInfo
             if (-not $childProcess.Start()) { throw "$Context process could not be started: $Command" }
             $childProcessId = $childProcess.Id
+            if (-not $IsWindows) {
+                $childProcessGroupId = Get-UnixProcessGroupId -ProcessId $childProcessId
+                $parentProcessGroupId = Get-UnixProcessGroupId -ProcessId $PID
+                if ($childProcessGroupId -ne $childProcessId -or $childProcessGroupId -eq $parentProcessGroupId) {
+                    throw "$Context process was not placed in a dedicated Unix process group."
+                }
+            }
             $stdoutTask = $childProcess.StandardOutput.ReadToEndAsync()
             $stderrTask = $childProcess.StandardError.ReadToEndAsync()
             if ($PSBoundParameters.ContainsKey('StandardInput')) {
                 $childProcess.StandardInput.Write($StandardInput)
                 $childProcess.StandardInput.Close()
             }
-            $childProcess.WaitForExit()
-            Stop-ProcessTree -RootProcessId $childProcessId
+            Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIds $observedDescendantProcessIds -ProcessGroupId $childProcessGroupId
+            while (-not $childProcess.HasExited) {
+                [void]$childProcess.WaitForExit(100)
+                Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIds $observedDescendantProcessIds -ProcessGroupId $childProcessGroupId
+            }
+            Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIds $observedDescendantProcessIds -ProcessGroupId $childProcessGroupId
+            Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ObservedProcessIds @($observedDescendantProcessIds)
             $processTreeStopped = $true
+            if (-not $childProcess.WaitForExit(5000)) {
+                throw "$Context process did not terminate after process-boundary cleanup."
+            }
             if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
                 throw "$Context left redirected output handles open after process-tree cleanup."
             }
@@ -738,7 +855,7 @@ function Invoke-NativeChecked {
     finally {
         try {
             if ($TerminateProcessTree -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $processTreeStopped) {
-                Stop-ProcessTree -RootProcessId $childProcessId
+                Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ObservedProcessIds @($observedDescendantProcessIds)
                 $processTreeStopped = $true
             }
         }

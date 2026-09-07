@@ -134,6 +134,15 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'ProtectRunnerCommandFiles'
         $script:Validator | Should -Match 'Stop-ProcessTree'
         $script:Validator | Should -Match 'Get-DescendantProcessIds'
+        $script:Validator | Should -Match 'Get-UnixProcessGroupId'
+        $script:Validator | Should -Match 'Get-UnixProcessGroupProcessIds'
+        $script:Validator | Should -Match 'Add-ObservedProcessIds'
+        $script:Validator | Should -Match 'setsid'
+        $script:Validator | Should -Match 'WaitForExit\(100\)'
+        $observedProcessIndex = $script:Validator.IndexOf('Add-ObservedProcessIds -RootProcessId')
+        $timedWaitIndex = $script:Validator.IndexOf('WaitForExit(100)')
+        $observedProcessIndex | Should -BeGreaterThan -1
+        $timedWaitIndex | Should -BeGreaterThan $observedProcessIndex
         $script:Validator | Should -Match 'Assert-RunnerCommandFilesUnchanged'
         $script:Validator | Should -Match 'standard_v1_evidence_sha256'
         $script:Validator | Should -Not -Match 'pesterResultPath'
