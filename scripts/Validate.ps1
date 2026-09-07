@@ -967,10 +967,18 @@ if ($pesterResultLines.Count -ne 1) {
     throw 'Isolated Pester exited without exactly one supervisor-owned completion result.'
 }
 try {
-    $pesterResult = $pesterResultLines[0].Substring($pesterResultMarker.Length) | ConvertFrom-Json -Depth 20
+    $pesterResultJson = $pesterResultLines[0].Substring($pesterResultMarker.Length)
+    $pesterResultDocument = [System.Text.Json.JsonDocument]::Parse($pesterResultJson)
+    try {
+        Assert-NoDuplicateJsonProperties -Element $pesterResultDocument.RootElement -Context 'Isolated Pester result'
+    }
+    finally {
+        $pesterResultDocument.Dispose()
+    }
+    $pesterResult = $pesterResultJson | ConvertFrom-Json -Depth 20
 }
 catch {
-    throw "Isolated Pester result is not valid JSON: $($_.Exception.Message)"
+    throw "Isolated Pester result is not valid unambiguous JSON: $($_.Exception.Message)"
 }
 if ($pesterResult.result -cne 'passed' -or
     $pesterResult.pesterVersion -cne [string]$receipts.pester.resolvedVersion -or
