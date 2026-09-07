@@ -696,7 +696,9 @@ if ($repositoryReport.result -cne 'passed' -or [int]$repositoryReport.activeSkil
 foreach ($skillId in $skillIds) {
     $before = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     $after = @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    if ($before.Count -ne 1 -or $after.Count -ne 1 -or $before[0].contentSha256 -cne $after[0].contentSha256) {
+    if ($before.Count -ne 1 -or $after.Count -ne 1 -or
+        $before[0].contentSha256 -cne $after[0].contentSha256 -or
+        $before[0].rawSha256 -cne $after[0].rawSha256) {
         throw "Candidate Skill '$skillId' changed between integrity verification and repository validation."
     }
 }
@@ -881,7 +883,9 @@ if ($postPesterRepositoryReport.result -cne 'passed' -or [int]$postPesterReposit
 foreach ($skillId in $skillIds) {
     $before = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     $after = @($postPesterRepositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    if ($before.Count -ne 1 -or $after.Count -ne 1 -or $before[0].contentSha256 -cne $after[0].contentSha256) {
+    if ($before.Count -ne 1 -or $after.Count -ne 1 -or
+        $before[0].contentSha256 -cne $after[0].contentSha256 -or
+        $before[0].rawSha256 -cne $after[0].rawSha256) {
         throw "Candidate Skill '$skillId' changed during repository tests."
     }
 }
