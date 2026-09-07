@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  checks: write
 
 jobs:
   repository-contract-windows-powershell:
@@ -23,11 +24,59 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Materialize protected Windows compatibility contract
+        shell: powershell
+        env:
+          TRUSTED_SUPERVISOR_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
+          if ($trustedCommit -notmatch '^[0-9a-f]{40}$') {
+            throw 'The protected supervisor commit must be one lowercase full Git SHA.'
+          }
+          $trustedRoot = Join-Path $env:RUNNER_TEMP 'standard-v1-trusted-windows-contract'
+          if (Test-Path -LiteralPath $trustedRoot) {
+            throw "The protected Windows contract root already exists: $trustedRoot"
+          }
+          [void](New-Item -ItemType Directory -Path $trustedRoot -Force)
+          $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+          $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          $relativePath = 'tests/validate-windows-powershell.ps1'
+          $revision = "${trustedCommit}:$relativePath"
+          $actualBlob = ((& $gitPath rev-parse $revision 2>$null) | Select-Object -First 1).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualBlob -notmatch '^[0-9a-f]{40}$') {
+            throw 'The protected Windows contract is missing from the event-bound supervisor commit.'
+          }
+          $destination = Join-Path $trustedRoot (Split-Path -Leaf $relativePath)
+          $process = [Diagnostics.Process]::new()
+          $process.StartInfo.FileName = $gitPath
+          $process.StartInfo.Arguments = "cat-file blob $revision"
+          $process.StartInfo.UseShellExecute = $false
+          $process.StartInfo.RedirectStandardOutput = $true
+          $process.StartInfo.RedirectStandardError = $true
+          if (-not $process.Start()) { throw 'Could not start Git to materialize the protected Windows contract.' }
+          $stream = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+          try { $process.StandardOutput.BaseStream.CopyTo($stream) }
+          finally { $stream.Dispose() }
+          $stderr = $process.StandardError.ReadToEnd()
+          $process.WaitForExit()
+          if ($process.ExitCode -ne 0) { throw "Git could not materialize the protected Windows contract: $stderr" }
+          $item = Get-Item -LiteralPath $destination -Force
+          if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Protected Windows contract must be a regular non-reparse file.'
+          }
+          $rootItem = Get-Item -LiteralPath $trustedRoot -Force
+          if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Protected Windows contract root must be a regular non-reparse directory.'
+          }
+          "TRUSTED_WINDOWS_CONTRACT=$destination" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Validate Windows PowerShell compatibility
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          & .\tests\validate-windows-powershell.ps1
+          & $env:TRUSTED_WINDOWS_CONTRACT -RepositoryRoot (Get-Location).Path
+          if ($LASTEXITCODE -ne 0) { throw 'The protected Windows PowerShell compatibility contract failed.' }
 
   canonical-validation:
     name: Darktide Translate Standard v1
@@ -196,8 +245,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # These jobs preserve the repository's existing required status contexts while
-  # keeping the canonical Standard v1 gate as the only validation policy.
+  # GitHub attaches pull_request_target workflow jobs to the base commit. Publish
+  # the exact required contexts explicitly against the immutable PR head instead
+  # of relying on base-bound mirror jobs or candidate-controlled workflows.
   repository-contract:
     name: repository-contract
     if: ${{ always() }}
@@ -205,16 +255,9 @@ jobs:
       - canonical-validation
     runs-on: ubuntu-latest
     steps:
-      - name: Mirror canonical Standard v1 result
-        shell: bash
-        run: |
-          set -euo pipefail
-          result='${{ needs['canonical-validation'].result }}'
-          if [[ "$result" != 'success' ]]; then
-            echo "Canonical Standard v1 validation result: $result"
-            exit 1
-          fi
-          echo 'Canonical Standard v1 validation passed.'
+      - name: Deprecated base-bound context
+        run: echo 'This base-bound compatibility context is intentionally retained only for bootstrap transition.'
+
   skill-validator:
     name: skill-validator
     if: ${{ always() }}
@@ -222,16 +265,8 @@ jobs:
       - canonical-validation
     runs-on: ubuntu-latest
     steps:
-      - name: Mirror canonical Standard v1 result
-        shell: bash
-        run: |
-          set -euo pipefail
-          result='${{ needs['canonical-validation'].result }}'
-          if [[ "$result" != 'success' ]]; then
-            echo "Canonical Standard v1 validation result: $result"
-            exit 1
-          fi
-          echo 'Canonical Standard v1 validation passed.'
+      - name: Deprecated base-bound context
+        run: echo 'This base-bound compatibility context is intentionally retained only for bootstrap transition.'
 
   skill-tools:
     name: skill-tools
@@ -240,13 +275,48 @@ jobs:
       - canonical-validation
     runs-on: ubuntu-latest
     steps:
-      - name: Mirror canonical Standard v1 result
+      - name: Deprecated base-bound context
+        run: echo 'This base-bound compatibility context is intentionally retained only for bootstrap transition.'
+
+  publish-head-required-checks:
+    name: publish head-bound required checks
+    if: ${{ always() }}
+    needs:
+      - repository-contract-windows-powershell
+      - canonical-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Publish head-bound required checks
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          WINDOWS_RESULT: ${{ needs['repository-contract-windows-powershell'].result }}
+          CANONICAL_RESULT: ${{ needs['canonical-validation'].result }}
         run: |
           set -euo pipefail
-          result='${{ needs['canonical-validation'].result }}'
-          if [[ "$result" != 'success' ]]; then
-            echo "Canonical Standard v1 validation result: $result"
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'The required-check publisher did not receive one full candidate SHA.' >&2
             exit 1
           fi
-          echo 'Canonical Standard v1 validation passed.'
+          conclusion='failure'
+          if [[ "$WINDOWS_RESULT" == 'success' && "$CANONICAL_RESULT" == 'success' ]]; then
+            conclusion='success'
+          fi
+          details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          for check_name in \
+            'repository-contract' \
+            'repository-contract (Windows PowerShell 5.1)' \
+            'skill-validator' \
+            'skill-tools' \
+            'Darktide Translate Standard v1'; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \
+              -f name="$check_name" \
+              -f head_sha="$HEAD_SHA" \
+              -f status=completed \
+              -f conclusion="$conclusion" \
+              -f details_url="$details_url" >/dev/null
+          done

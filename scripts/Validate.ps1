@@ -18,6 +18,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:IsWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+$script:IsLinuxHost = $false
+$isLinuxVariable = Get-Variable -Name IsLinux -ErrorAction SilentlyContinue
+if ($null -ne $isLinuxVariable) { $script:IsLinuxHost = [bool]$isLinuxVariable.Value }
+$script:IsSupportedProcessBoundaryHost = $script:IsWindowsHost -or $script:IsLinuxHost
 
 function Assert-NoDuplicateJsonProperties {
     param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement] $Element, [string] $Context = '$')
@@ -146,8 +151,11 @@ function Get-DescendantProcessIds {
     param(
         [Parameter(Mandatory = $true)][int] $RootProcessId
     )
+    if (-not $script:IsSupportedProcessBoundaryHost) {
+        throw 'Process-tree enumeration is supported only on Windows and Linux hosts.'
+    }
     $processes = @()
-    if ($IsWindows) {
+    if ($script:IsWindowsHost) {
         try {
             $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | ForEach-Object {
                 [pscustomobject]@{
@@ -164,17 +172,13 @@ function Get-DescendantProcessIds {
         foreach ($entry in @(Get-ChildItem -LiteralPath '/proc' -Directory -ErrorAction SilentlyContinue)) {
             if ([string]$entry.Name -notmatch '^[0-9]+$') { continue }
             try {
-                $stat = [IO.File]::ReadAllText((Join-Path $entry.FullName 'stat'))
-            }
-            catch {
-                continue
-            }
-            if ($stat -cmatch '^[0-9]+\s+\(.*\)\s+\S+\s+(?<parentProcessId>[0-9]+)\s') {
+                $info = Get-UnixProcessInfo -ProcessId ([int]$entry.Name)
                 $processes += [pscustomobject]@{
                     processId = [int]$entry.Name
-                    parentProcessId = [int]$Matches.parentProcessId
+                    parentProcessId = [int]$info.parentProcessId
                 }
             }
+            catch { continue }
         }
     }
 
@@ -199,38 +203,65 @@ function Get-UnixProcessGroupId {
     param(
         [Parameter(Mandatory = $true)][int] $ProcessId
     )
-    if ($IsWindows) { return 0 }
-    if ($ProcessId -le 0) { throw 'Unix process-group inspection requires a positive process id.' }
+    if ($script:IsWindowsHost) { return 0 }
+    $info = Get-UnixProcessInfo -ProcessId $ProcessId
+    return [int]$info.processGroupId
+}
+
+function Get-UnixProcessInfo {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId
+    )
+    if (-not $script:IsLinuxHost) {
+        throw 'Unix process inspection requires a Linux host with procfs.'
+    }
+    if ($ProcessId -le 0) { throw 'Unix process inspection requires a positive process id.' }
     $statPath = Join-Path '/proc' "$ProcessId/stat"
     try {
         $stat = [IO.File]::ReadAllText($statPath)
     }
     catch {
-        throw "Could not inspect Unix process group for process ${ProcessId}: $($_.Exception.Message)"
+        throw "Could not inspect Unix process ${ProcessId}: $($_.Exception.Message)"
     }
-    if ($stat -notmatch '^[0-9]+\s+\(.*\)\s+\S+\s+[0-9]+\s+(?<processGroupId>[0-9]+)\s') {
-        throw "Could not parse Unix process group for process $ProcessId."
+    $closeParen = $stat.LastIndexOf(')')
+    if ($closeParen -lt 0) {
+        throw "Could not parse Unix process ${ProcessId}: the command name is incomplete."
     }
-    return [int]$Matches.processGroupId
+    $fields = @([regex]::Split($stat.Substring($closeParen + 1).Trim(), '\s+'))
+    # The fields start at proc(5) field 3 (state). Field 5 is the process
+    # group and field 22 is the kernel process start time.
+    if ($fields.Count -lt 20 -or
+        [string]$fields[0] -notmatch '^\S$' -or
+        [string]$fields[1] -notmatch '^[0-9]+$' -or
+        [string]$fields[2] -notmatch '^[0-9]+$' -or
+        [string]$fields[19] -notmatch '^[0-9]+$') {
+        throw "Could not parse Unix process metadata for process $ProcessId."
+    }
+    return [pscustomobject][ordered]@{
+        processId = $ProcessId
+        parentProcessId = [int]$fields[1]
+        processGroupId = [int]$fields[2]
+        startTime = [string]$fields[19]
+    }
 }
 
 function Get-UnixProcessGroupProcessIds {
     param(
         [Parameter(Mandatory = $true)][int] $ProcessGroupId
     )
-    if ($IsWindows) { return @() }
+    if ($script:IsWindowsHost) { return @() }
+    if (-not $script:IsLinuxHost) { throw 'Unix process-group enumeration requires a Linux host with procfs.' }
     if ($ProcessGroupId -le 0) { throw 'Unix process-group enumeration requires a positive process-group id.' }
     $members = [Collections.Generic.List[int]]::new()
     foreach ($entry in @(Get-ChildItem -LiteralPath '/proc' -Directory -ErrorAction SilentlyContinue)) {
         if ([string]$entry.Name -notmatch '^[0-9]+$') { continue }
         try {
-            $stat = [IO.File]::ReadAllText((Join-Path $entry.FullName 'stat'))
+            $info = Get-UnixProcessInfo -ProcessId ([int]$entry.Name)
         }
         catch {
             continue
         }
-        if ($stat -cmatch '^[0-9]+\s+\(.*\)\s+\S+\s+[0-9]+\s+(?<processGroupId>[0-9]+)\s' -and
-            [int]$Matches.processGroupId -eq $ProcessGroupId) {
+        if ($info.processGroupId -eq $ProcessGroupId) {
             [void]$members.Add([int]$entry.Name)
         }
     }
@@ -242,7 +273,7 @@ function Test-ProcessIdExists {
         [Parameter(Mandatory = $true)][int] $ProcessId
     )
     if ($ProcessId -le 0) { return $false }
-    if ($IsWindows) {
+    if ($script:IsWindowsHost) {
         try {
             Get-Process -Id $ProcessId -ErrorAction Stop | Out-Null
             return $true
@@ -251,21 +282,154 @@ function Test-ProcessIdExists {
             return $false
         }
     }
+    if (-not $script:IsLinuxHost) { throw 'Process identity inspection requires a supported Windows or Linux host.' }
     return Test-Path -LiteralPath (Join-Path '/proc' ([string]$ProcessId)) -PathType Container
+}
+
+function Get-ProcessIdentity {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId
+    )
+    if ($ProcessId -le 0) { throw 'Process identity inspection requires a positive process id.' }
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    try {
+        $startTime = $process.StartTime.ToUniversalTime().Ticks
+        return 'start-time:{0}' -f $startTime
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Test-ProcessIdentity {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [Parameter(Mandatory = $true)][string] $Identity
+    )
+    try {
+        return (Get-ProcessIdentity -ProcessId $ProcessId) -ceq $Identity
+    }
+    catch {
+        return $false
+    }
+}
+
+function Enable-UnixChildSubreaper {
+    if ($script:IsWindowsHost) { return }
+    if (-not $script:IsLinuxHost) { throw 'The Unix child subreaper is supported only on Linux.' }
+    $nativeType = 'Codex.Validation.UnixProcessBoundary' -as [type]
+    if ($null -eq $nativeType) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Codex.Validation {
+    public static class UnixProcessBoundary {
+        [DllImport("libc.so.6", EntryPoint = "prctl", SetLastError = true)]
+        private static extern int SetProcessControl(int option, ulong arg2, ulong arg3, ulong arg4, ulong arg5);
+
+        [DllImport("libc.so.6", EntryPoint = "prctl", SetLastError = true)]
+        private static extern int GetProcessControl(int option, out int arg2, ulong arg3, ulong arg4, ulong arg5);
+
+        public static int SetChildSubreaper() {
+            return SetProcessControl(36, 1, 0, 0, 0);
+        }
+
+        public static int GetChildSubreaper(out int enabled) {
+            return GetProcessControl(37, out enabled, 0, 0, 0);
+        }
+    }
+}
+'@ -ErrorAction Stop
+        $nativeType = 'Codex.Validation.UnixProcessBoundary' -as [type]
+    }
+    if ($null -eq $nativeType) {
+        throw 'The Unix child-subreaper interop type could not be loaded.'
+    }
+    $setResult = $nativeType::SetChildSubreaper()
+    if ($setResult -ne 0) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Could not enable the Unix child subreaper (errno $errorCode)."
+    }
+    $enabled = 0
+    $getResult = $nativeType::GetChildSubreaper([ref]$enabled)
+    if ($getResult -ne 0 -or $enabled -ne 1) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Unix child-subreaper verification failed (errno $errorCode, enabled $enabled)."
+    }
+}
+
+function Wait-ForUnixProcessGroupId {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [Parameter(Mandatory = $true)][int] $ParentProcessGroupId,
+        [Parameter()][int] $TimeoutMilliseconds = 5000
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Test-ProcessIdExists -ProcessId $ProcessId)) { return 0 }
+        try {
+            $groupId = Get-UnixProcessGroupId -ProcessId $ProcessId
+            if ($groupId -gt 0 -and $groupId -ne $ParentProcessGroupId) { return $groupId }
+        }
+        catch { }
+        Start-Sleep -Milliseconds 25
+    }
+    throw 'The isolated Linux process did not establish a distinct process group before the bounded readiness timeout.'
+}
+
+function Add-ProcessIdentityToObservation {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [Parameter(Mandatory = $true)] $ObservedProcessIdentities
+    )
+    if ($ProcessId -le 0 -or $ObservedProcessIdentities.ContainsKey($ProcessId)) { return }
+    if (-not (Test-ProcessIdExists -ProcessId $ProcessId)) { return }
+    try {
+        $identity = Get-ProcessIdentity -ProcessId $ProcessId
+    }
+    catch {
+        if (Test-ProcessIdExists -ProcessId $ProcessId) {
+            throw ("Could not bind candidate process identity for process " + $ProcessId + ": " + $_.Exception.Message)
+        }
+        return
+    }
+    [void]$ObservedProcessIdentities.Add($ProcessId, [string]$identity)
 }
 
 function Add-ObservedProcessIds {
     param(
         [Parameter(Mandatory = $true)][int] $RootProcessId,
-        [Parameter(Mandatory = $true)] $ObservedProcessIds,
-        [Parameter()][int] $ProcessGroupId = 0
+        [Parameter(Mandatory = $true)] $ObservedProcessIdentities,
+        [Parameter()][int] $ProcessGroupId = 0,
+        [Parameter()][int] $SupervisorProcessId = 0,
+        [Parameter()][AllowNull()] $BaselineSupervisorProcessIdentities
     )
-    foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
-        if ($processId -ne $RootProcessId) { [void]$ObservedProcessIds.Add([int]$processId) }
+    if (Test-ProcessIdExists -ProcessId $RootProcessId) {
+        foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
+            if ($processId -ne $RootProcessId) {
+                Add-ProcessIdentityToObservation -ProcessId ([int]$processId) -ObservedProcessIdentities $ObservedProcessIdentities
+            }
+        }
     }
-    if (-not $IsWindows -and $ProcessGroupId -gt 0) {
+    if ($script:IsLinuxHost -and $ProcessGroupId -gt 0) {
         foreach ($processId in @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId)) {
-            if ($processId -ne $RootProcessId) { [void]$ObservedProcessIds.Add([int]$processId) }
+            if ($processId -ne $RootProcessId) {
+                Add-ProcessIdentityToObservation -ProcessId ([int]$processId) -ObservedProcessIdentities $ObservedProcessIdentities
+            }
+        }
+    }
+    if ($SupervisorProcessId -gt 0 -and $SupervisorProcessId -ne $RootProcessId) {
+        foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $SupervisorProcessId)) {
+            if ($processId -eq $RootProcessId) { continue }
+            $isBaseline = $false
+            if ($null -ne $BaselineSupervisorProcessIdentities -and
+                $BaselineSupervisorProcessIdentities.ContainsKey([int]$processId)) {
+                $isBaseline = Test-ProcessIdentity -ProcessId ([int]$processId) -Identity ([string]$BaselineSupervisorProcessIdentities[[int]$processId])
+            }
+            if (-not $isBaseline) {
+                Add-ProcessIdentityToObservation -ProcessId ([int]$processId) -ObservedProcessIdentities $ObservedProcessIdentities
+            }
         }
     }
 }
@@ -274,12 +438,16 @@ function Stop-ProcessTree {
     param(
         [Parameter(Mandatory = $true)][int] $RootProcessId,
         [Parameter()][int] $ProcessGroupId = 0,
-        [Parameter()][AllowEmptyCollection()][int[]] $ObservedProcessIds = @()
+        [Parameter()][AllowNull()][string] $RootProcessIdentity,
+        [Parameter(Mandatory = $true)] $ObservedProcessIdentities
     )
     if ($RootProcessId -le 0) { throw 'Process-tree cleanup requires a positive root process id.' }
+    if (-not $script:IsSupportedProcessBoundaryHost) {
+        throw 'Process-tree cleanup is supported only on Windows and Linux hosts.'
+    }
     $taskKillPath = $null
     $killPath = $null
-    if ($IsWindows) {
+    if ($script:IsWindowsHost) {
         $taskKillPath = Join-Path $env:SystemRoot 'System32/taskkill.exe'
         if (-not (Test-Path -LiteralPath $taskKillPath -PathType Leaf)) {
             throw "Windows process-tree cleanup command is missing: $taskKillPath"
@@ -288,38 +456,83 @@ function Stop-ProcessTree {
     else {
         $killCommand = Get-Command kill -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $killPath = [IO.Path]::GetFullPath([string]$killCommand.Path)
-        if ($ProcessGroupId -le 0) {
+        if ($ProcessGroupId -le 0 -and (Test-ProcessIdExists -ProcessId $RootProcessId)) {
             $ProcessGroupId = Get-UnixProcessGroupId -ProcessId $RootProcessId
-        }
-        if ($ProcessGroupId -le 0) {
-            throw 'Unix process-tree cleanup requires a positive process-group id.'
         }
     }
 
     for ($round = 0; $round -lt 3; $round++) {
-        $descendants = @(Get-DescendantProcessIds -RootProcessId $RootProcessId)
-        $groupMembers = if ($IsWindows) { @() } else { @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId) }
-        $targets = @($descendants + $groupMembers + $ObservedProcessIds |
-            Where-Object { [int]$_ -gt 0 -and [int]$_ -ne $RootProcessId } |
-            Sort-Object -Unique -Descending)
-        if ($IsWindows) {
+        $rootIsCandidate = if ([string]::IsNullOrWhiteSpace($RootProcessIdentity)) {
+            Test-ProcessIdExists -ProcessId $RootProcessId
+        }
+        else {
+            Test-ProcessIdentity -ProcessId $RootProcessId -Identity $RootProcessIdentity
+        }
+        if ($rootIsCandidate) {
+            Add-ObservedProcessIds -RootProcessId $RootProcessId -ObservedProcessIdentities $ObservedProcessIdentities -ProcessGroupId $ProcessGroupId
+        }
+        $groupMembers = if ($script:IsWindowsHost -or $ProcessGroupId -le 0) { @() } else { @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId) }
+        foreach ($processId in @($groupMembers)) {
+            if ([int]$processId -ne $RootProcessId) {
+                Add-ProcessIdentityToObservation -ProcessId ([int]$processId) -ObservedProcessIdentities $ObservedProcessIdentities
+            }
+        }
+        $targets = @($ObservedProcessIdentities.Keys | Where-Object {
+            [int]$_ -gt 0 -and [int]$_ -ne $RootProcessId -and
+            (Test-ProcessIdentity -ProcessId ([int]$_) -Identity ([string]$ObservedProcessIdentities[[int]$_]))
+        } | Sort-Object -Unique -Descending)
+        if ($script:IsWindowsHost) {
             foreach ($processId in $targets) {
                 & $taskKillPath /PID $processId /F 2>$null | Out-Null
             }
-            & $taskKillPath /PID $RootProcessId /T /F 2>$null | Out-Null
+            if ($rootIsCandidate) {
+                & $taskKillPath /PID $RootProcessId /T /F 2>$null | Out-Null
+            }
         }
         else {
             $signal = if ($round -eq 2) { '-KILL' } else { '-TERM' }
-            & $killPath $signal "-$ProcessGroupId" 2>$null | Out-Null
+            $groupLeaderOwnsGroup = $false
+            if ($rootIsCandidate -and $ProcessGroupId -gt 0) {
+                try {
+                    $groupLeaderOwnsGroup = (Get-UnixProcessGroupId -ProcessId $RootProcessId) -eq $ProcessGroupId
+                }
+                catch {
+                    $groupLeaderOwnsGroup = $false
+                }
+            }
+            if ($groupLeaderOwnsGroup) {
+                & $killPath $signal "-$ProcessGroupId" 2>$null | Out-Null
+            }
+            if ($rootIsCandidate -and -not $groupLeaderOwnsGroup) {
+                & $killPath $signal ([string]$RootProcessId) 2>$null | Out-Null
+            }
             foreach ($processId in $targets) {
                 & $killPath $signal ([string]$processId) 2>$null | Out-Null
             }
         }
         Start-Sleep -Milliseconds 100
-        $remaining = @(Get-DescendantProcessIds -RootProcessId $RootProcessId)
-        $remainingObserved = @($ObservedProcessIds | Where-Object { Test-ProcessIdExists -ProcessId ([int]$_) })
-        $remainingGroupMembers = if ($IsWindows) { @() } else { @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId) }
-        if ($remaining.Count -eq 0 -and $remainingObserved.Count -eq 0 -and $remainingGroupMembers.Count -eq 0) { return }
+        if ($rootIsCandidate) {
+            Add-ObservedProcessIds -RootProcessId $RootProcessId -ObservedProcessIdentities $ObservedProcessIdentities -ProcessGroupId $ProcessGroupId
+        }
+        $remainingRoot = if ([string]::IsNullOrWhiteSpace($RootProcessIdentity)) {
+            Test-ProcessIdExists -ProcessId $RootProcessId
+        }
+        else {
+            Test-ProcessIdentity -ProcessId $RootProcessId -Identity $RootProcessIdentity
+        }
+        $remainingObserved = @($ObservedProcessIdentities.Keys | Where-Object {
+            Test-ProcessIdentity -ProcessId ([int]$_) -Identity ([string]$ObservedProcessIdentities[[int]$_])
+        })
+        $remainingGroupMembers = if ($script:IsWindowsHost -or $ProcessGroupId -le 0) { @() } else { @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId) }
+        $unboundGroupMembers = @($remainingGroupMembers | Where-Object {
+            [int]$_ -ne $RootProcessId -and
+            (-not $ObservedProcessIdentities.ContainsKey([int]$_) -or
+                -not (Test-ProcessIdentity -ProcessId ([int]$_) -Identity ([string]$ObservedProcessIdentities[[int]$_])))
+        })
+        if ($remainingGroupMembers.Count -gt 0 -and $unboundGroupMembers.Count -gt 0) {
+            throw 'Could not establish process identity for every candidate process-group member.'
+        }
+        if (-not $remainingRoot -and $remainingObserved.Count -eq 0) { return }
     }
     throw "Could not terminate the complete candidate process boundary rooted at process $RootProcessId."
 }
@@ -736,7 +949,9 @@ function Invoke-NativeChecked {
     $childProcess = $null
     $childProcessId = 0
     $childProcessGroupId = 0
-    $observedDescendantProcessIds = [Collections.Generic.HashSet[int]]::new()
+    $childProcessIdentity = ''
+    $observedProcessIdentities = [Collections.Generic.Dictionary[int,string]]::new()
+    $baselineSupervisorProcessIdentities = [Collections.Generic.Dictionary[int,string]]::new()
     $processTreeStopped = $false
     try {
         if ($ProtectRunnerCommandFiles) {
@@ -767,18 +982,38 @@ function Invoke-NativeChecked {
             }
         }
         if ($TerminateProcessTree) {
+            if (-not $script:IsSupportedProcessBoundaryHost) {
+                throw "$Context process isolation requires a supported Windows or Linux host."
+            }
+            if ($script:IsLinuxHost) {
+                Enable-UnixChildSubreaper
+            }
+            foreach ($supervisorProcessId in @(Get-DescendantProcessIds -RootProcessId $PID)) {
+                Add-ProcessIdentityToObservation -ProcessId ([int]$supervisorProcessId) -ObservedProcessIdentities $baselineSupervisorProcessIdentities
+            }
             $nativeCommand = $Command
             $nativeArguments = @($Arguments)
-            if (-not $IsWindows) {
+            if ($script:IsLinuxHost) {
                 $setsidCommand = Get-Command setsid -CommandType Application -ErrorAction Stop | Select-Object -First 1
                 $setsidPath = [IO.Path]::GetFullPath([string]$setsidCommand.Path)
                 if (-not (Test-Path -LiteralPath $setsidPath -PathType Leaf)) {
                     throw "$Context process-group launcher is missing: $setsidPath"
                 }
                 Assert-NoReparseAncestors -Path $setsidPath -Context "$Context process-group launcher"
+                $unshareCommand = Get-Command unshare -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $unsharePath = [IO.Path]::GetFullPath([string]$unshareCommand.Path)
+                if (-not (Test-Path -LiteralPath $unsharePath -PathType Leaf)) {
+                    throw "$Context non-escapable Linux process namespace launcher is missing: $unsharePath"
+                }
+                Assert-NoReparseAncestors -Path $unsharePath -Context "$Context process namespace launcher"
                 $nativeCommand = $setsidPath
-                $nativeArguments = @($Command) + @($Arguments)
+                $nativeArguments = @(
+                    $unsharePath,
+                    '--user', '--map-root-user', '--mount', '--pid', '--fork', '--mount-proc', '--kill-child', '--',
+                    $Command
+                ) + @($Arguments)
             }
+            $parentProcessGroupId = if ($script:IsLinuxHost) { Get-UnixProcessGroupId -ProcessId $PID } else { 0 }
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
             $startInfo.FileName = $nativeCommand
             $startInfo.UseShellExecute = $false
@@ -802,11 +1037,18 @@ function Invoke-NativeChecked {
             $childProcess.StartInfo = $startInfo
             if (-not $childProcess.Start()) { throw "$Context process could not be started: $Command" }
             $childProcessId = $childProcess.Id
-            if (-not $IsWindows) {
-                $childProcessGroupId = Get-UnixProcessGroupId -ProcessId $childProcessId
-                $parentProcessGroupId = Get-UnixProcessGroupId -ProcessId $PID
-                if ($childProcessGroupId -ne $childProcessId -or $childProcessGroupId -eq $parentProcessGroupId) {
-                    throw "$Context process was not placed in a dedicated Unix process group."
+            if (Test-ProcessIdExists -ProcessId $childProcessId) {
+                try {
+                    $childProcessIdentity = Get-ProcessIdentity -ProcessId $childProcessId
+                }
+                catch {
+                    if (Test-ProcessIdExists -ProcessId $childProcessId) { throw }
+                }
+            }
+            if ($script:IsLinuxHost) {
+                $childProcessGroupId = Wait-ForUnixProcessGroupId -ProcessId $childProcessId -ParentProcessGroupId $parentProcessGroupId
+                if ($childProcessGroupId -le 0 -and -not $childProcess.HasExited) {
+                    throw "$Context process was not placed in a dedicated Linux process group."
                 }
             }
             $stdoutTask = $childProcess.StandardOutput.ReadToEndAsync()
@@ -815,13 +1057,13 @@ function Invoke-NativeChecked {
                 $childProcess.StandardInput.Write($StandardInput)
                 $childProcess.StandardInput.Close()
             }
-            Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIds $observedDescendantProcessIds -ProcessGroupId $childProcessGroupId
+            Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             while (-not $childProcess.HasExited) {
                 [void]$childProcess.WaitForExit(100)
-                Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIds $observedDescendantProcessIds -ProcessGroupId $childProcessGroupId
+                Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             }
-            Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIds $observedDescendantProcessIds -ProcessGroupId $childProcessGroupId
-            Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ObservedProcessIds @($observedDescendantProcessIds)
+            Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
+            Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities
             $processTreeStopped = $true
             if (-not $childProcess.WaitForExit(5000)) {
                 throw "$Context process did not terminate after process-boundary cleanup."
@@ -855,7 +1097,7 @@ function Invoke-NativeChecked {
     finally {
         try {
             if ($TerminateProcessTree -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $processTreeStopped) {
-                Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ObservedProcessIds @($observedDescendantProcessIds)
+                Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities
                 $processTreeStopped = $true
             }
         }
@@ -957,14 +1199,19 @@ if (-not [string]::IsNullOrWhiteSpace($BaseCommit)) {
 
 $adapterPath = Join-Path $repoRoot 'config/standard-v1.json'
 $adapter = Read-JsonFile -Path $adapterPath -Context 'Standard v1 repository adapter'
+$approvedAuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
+$approvedAuthorityCommit = '5ff96a358a51788a3764b27c31def842d5aee55d'
+$approvedAuthorityArchiveSha256 = '36aa50ec00697dd5b06c83aef9a591f0f4f4a553a8ecc5b165308de908161d80'
 if ($adapter.schemaVersion -ne 1 -or $adapter.standardVersion -cne 'v1' -or $adapter.deviations -cne 'None') {
     throw 'Standard v1 repository adapter identity or deviation contract is invalid.'
 }
-if ($adapter.authority.repository -cne 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git' -or
-    $adapter.authority.commit -notmatch '^[0-9a-f]{40}$') {
-    throw 'Standard authority repository or immutable commit is invalid.'
+if ($adapter.authority.repository -cne $approvedAuthorityRepository -or
+    $adapter.authority.commit -cne $approvedAuthorityCommit -or
+    $adapter.authority.archiveUrl -cne "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/$approvedAuthorityCommit" -or
+    $adapter.authority.archiveSha256 -cne $approvedAuthorityArchiveSha256) {
+    throw 'Standard authority binding does not match the base-owned approved snapshot.'
 }
-$expectedArchiveUrl = "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/$($adapter.authority.commit)"
+$expectedArchiveUrl = "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/$approvedAuthorityCommit"
 if ($adapter.authority.archiveUrl -cne $expectedArchiveUrl) { throw 'Standard authority archive URL is not the exact approved immutable codeload path.' }
 Assert-Sha256 -Value $adapter.authority.archiveSha256 -Context 'Authority archive identity'
 
@@ -1330,7 +1577,7 @@ Write-Output ($resultMarker + ($summary | ConvertTo-Json -Depth 20 -Compress))
 '@
 [IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
-$powerShellExecutableName = if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }
+$powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
 $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
 if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
 Assert-NoReparseAncestors -Path $powerShellPath -Context 'PowerShell child executable'
