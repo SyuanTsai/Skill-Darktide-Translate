@@ -147,6 +147,14 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'AssignProcess'
         $script:Validator | Should -Match 'TerminateProcessHandle'
         $script:Validator | Should -Match 'WindowsJobHandle'
+        $script:Validator | Should -Match 'TimeoutMilliseconds'
+        $script:Validator | Should -Match 'bounded candidate execution timeout'
+        $script:Validator | Should -Match 'EventWaitHandle'
+        $script:Validator | Should -Match 'CODEX_VALIDATION_RESUME_EVENT'
+        $windowsAssignmentIndex = $script:Validator.IndexOf('Assign-WindowsProcessToJob -JobHandle $windowsJobHandle')
+        $windowsReleaseIndex = $script:Validator.IndexOf('$windowsResumeEvent.Set()')
+        $windowsAssignmentIndex | Should -BeGreaterThan -1
+        $windowsReleaseIndex | Should -BeGreaterThan $windowsAssignmentIndex
         $script:Validator | Should -Not -Match 'taskkill'
         $script:Validator | Should -Not -Match '\$killPath'
         $script:Validator | Should -Match 'function Enable-UnixChildSubreaper'
