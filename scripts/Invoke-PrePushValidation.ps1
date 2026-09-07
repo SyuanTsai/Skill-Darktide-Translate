@@ -18,11 +18,16 @@ $arguments = @{
 }
 $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
 if ([string]::IsNullOrWhiteSpace($BaseCommit)) {
-    $BaseCommit = ([string](@(
-        & $gitCommand.Path -c "safe.directory=$repoRoot" -C $repoRoot rev-parse --verify --end-of-options 'HEAD^{}' 2>$null
-    ) | Select-Object -First 1)).Trim()
-    if ($LASTEXITCODE -ne 0 -or $BaseCommit -notmatch '^[0-9a-f]{40}$') {
-        throw 'Pre-push validation requires an explicit BaseCommit or a distinct committed parent of HEAD.'
+    $parentOutput = @(
+        & $gitCommand.Path -c "safe.directory=$repoRoot" -C $repoRoot rev-parse --verify --end-of-options 'HEAD^' 2>$null
+    )
+    if ($LASTEXITCODE -eq 0 -and $parentOutput.Count -eq 1 -and [string]$parentOutput[0] -match '^[0-9a-f]{40}$') {
+        $BaseCommit = ([string]$parentOutput[0]).Trim()
+    }
+    else {
+        # A root commit has no parent; let Validate.ps1 use its complete-tree
+        # fail-closed path instead of peeling HEAD back to itself.
+        $BaseCommit = ''
     }
 }
 $arguments.BaseCommit = $BaseCommit
