@@ -52,6 +52,7 @@ function Test-PortableReparseItem {
     }
 
     if (& $inspectProviderItem $Item) { return $true }
+    if ($null -ne $Item) { return $false }
 
     # FileInfo/DirectoryInfo.LinkTarget reads the directory entry itself and does
     # not follow a symlink. Walk lexical ancestors so a missing child below a

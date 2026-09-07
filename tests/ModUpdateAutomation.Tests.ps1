@@ -40,6 +40,15 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
     }
 
+    # Scenario: A tree iterator passes the provider's authoritative directory entry.
+    # Purpose: Avoid repeating an ancestor walk for every existing item while keeping
+    # the missing-path fallback responsible for detecting broken-link ancestors.
+    It 'UnitT106_SkipsRedundantAncestorWalkForAnAuthoritativeItem' {
+        $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
+        $pathSafety = Get-Content -LiteralPath $pathSafetyPath -Raw
+        $pathSafety | Should -Match '\$inspectProviderItem \$Item\) \{ return \$true \}\s*if \(\$null -ne \$Item\) \{ return \$false \}'
+    }
+
     # Scenario: A caller invokes a single stage or resumes the same run.
     # Purpose: Preserve the fixed command surface, structured JSON, timing, state, and idempotency contracts.
     It 'UnitT110_DeclaresTheFixedResumableStageContract' {
