@@ -521,6 +521,427 @@ namespace Codex.Validation {
     return $nativeType
 }
 
+function Get-WindowsSuspendedProcessBoundaryType {
+    # The interop type also owns the cross-platform bounded output reader. The
+    # Windows-only process-start entry point is called only on Windows.
+    $nativeType = 'Codex.Validation.WindowsSuspendedProcessBoundary' -as [type]
+    if ($null -eq $nativeType) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
+
+namespace Codex.Validation {
+    public sealed class BoundedProcessOutputResult {
+        public string Text { get; private set; }
+        public bool Truncated { get; private set; }
+        public long TotalCharacters { get; private set; }
+
+        internal BoundedProcessOutputResult(string text, bool truncated, long totalCharacters) {
+            Text = text;
+            Truncated = truncated;
+            TotalCharacters = totalCharacters;
+        }
+    }
+
+    public sealed class WindowsSuspendedProcess : IDisposable {
+        private IntPtr processHandle;
+        private IntPtr threadHandle;
+        private bool disposed;
+
+        public int Id { get; private set; }
+        public IntPtr ProcessHandle { get { return processHandle; } }
+        public StreamWriter StandardInput { get; private set; }
+        public StreamReader StandardOutput { get; private set; }
+        public StreamReader StandardError { get; private set; }
+
+        internal WindowsSuspendedProcess(
+            ProcessInformation processInformation,
+            IntPtr standardInputWrite,
+            IntPtr standardOutputRead,
+            IntPtr standardErrorRead) {
+            processHandle = processInformation.ProcessHandle;
+            threadHandle = processInformation.ThreadHandle;
+            Id = processInformation.ProcessId;
+            StandardInput = standardInputWrite == IntPtr.Zero
+                ? null
+                : new StreamWriter(
+                    new FileStream(new SafeFileHandle(standardInputWrite, true), FileAccess.Write, 4096, false),
+                    new UTF8Encoding(false));
+            StandardOutput = new StreamReader(
+                new FileStream(new SafeFileHandle(standardOutputRead, true), FileAccess.Read, 4096, false),
+                new UTF8Encoding(false), false, 4096);
+            StandardError = new StreamReader(
+                new FileStream(new SafeFileHandle(standardErrorRead, true), FileAccess.Read, 4096, false),
+                new UTF8Encoding(false), false, 4096);
+        }
+
+        public bool HasExited {
+            get {
+                EnsureNotDisposed();
+                return WaitForSingleObject(processHandle, 0) == 0;
+            }
+        }
+
+        public bool WaitForExit(int milliseconds) {
+            EnsureNotDisposed();
+            uint timeout = milliseconds < 0 ? 0xffffffffU : (uint)milliseconds;
+            return WaitForSingleObject(processHandle, timeout) == 0;
+        }
+
+        public int ExitCode {
+            get {
+                EnsureNotDisposed();
+                uint exitCode;
+                if (!GetExitCodeProcess(processHandle, out exitCode)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetExitCodeProcess failed.");
+                }
+                return unchecked((int)exitCode);
+            }
+        }
+
+        public bool Resume() {
+            EnsureNotDisposed();
+            if (threadHandle == IntPtr.Zero) { return false; }
+            uint previousSuspendCount = ResumeThread(threadHandle);
+            if (previousSuspendCount == 0xffffffffU) { return false; }
+            CloseHandle(threadHandle);
+            threadHandle = IntPtr.Zero;
+            return true;
+        }
+
+        public bool Terminate() {
+            EnsureNotDisposed();
+            return TerminateProcess(processHandle, 1);
+        }
+
+        private void EnsureNotDisposed() {
+            if (disposed || processHandle == IntPtr.Zero) {
+                throw new ObjectDisposedException("WindowsSuspendedProcess");
+            }
+        }
+
+        public void Dispose() {
+            if (disposed) { return; }
+            disposed = true;
+            if (StandardInput != null) { StandardInput.Dispose(); }
+            if (StandardOutput != null) { StandardOutput.Dispose(); }
+            if (StandardError != null) { StandardError.Dispose(); }
+            if (threadHandle != IntPtr.Zero) {
+                CloseHandle(threadHandle);
+                threadHandle = IntPtr.Zero;
+            }
+            if (processHandle != IntPtr.Zero) {
+                CloseHandle(processHandle);
+                processHandle = IntPtr.Zero;
+            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr threadHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr processHandle, out uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr processHandle, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+    }
+
+    public sealed class ProcessInformation {
+        public IntPtr ProcessHandle;
+        public IntPtr ThreadHandle;
+        public int ProcessId;
+        public int ThreadId;
+    }
+
+    public static class WindowsSuspendedProcessBoundary {
+        private const uint CreateSuspended = 0x00000004;
+        private const uint CreateUnicodeEnvironment = 0x00000400;
+        private const uint CreateNoWindow = 0x08000000;
+        private const uint StartfUseStdHandles = 0x00000100;
+        private const uint HandleFlagInherit = 0x00000001;
+        private const uint WaitObject0 = 0x00000000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes {
+            public int Length;
+            public IntPtr SecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StartupInfo {
+            public int Size;
+            public IntPtr Reserved;
+            public IntPtr Desktop;
+            public IntPtr Title;
+            public int X;
+            public int Y;
+            public int XSize;
+            public int YSize;
+            public int XCountChars;
+            public int YCountChars;
+            public int FillAttribute;
+            public uint Flags;
+            public short ShowWindow;
+            public short Reserved2;
+            public IntPtr Reserved2Data;
+            public IntPtr StandardInput;
+            public IntPtr StandardOutput;
+            public IntPtr StandardError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeProcessInformation {
+            public IntPtr ProcessHandle;
+            public IntPtr ThreadHandle;
+            public int ProcessId;
+            public int ThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreatePipe(
+            out IntPtr readHandle,
+            out IntPtr writeHandle,
+            ref SecurityAttributes attributes,
+            int size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetHandleInformation(
+            IntPtr handle,
+            uint mask,
+            uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateProcessW(
+            string applicationName,
+            StringBuilder commandLine,
+            IntPtr processAttributes,
+            IntPtr threadAttributes,
+            bool inheritHandles,
+            uint creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref StartupInfo startupInfo,
+            out NativeProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static WindowsSuspendedProcess Start(
+            string fileName,
+            string[] arguments,
+            string workingDirectory,
+            IDictionary environment,
+            bool useStandardInput) {
+            if (String.IsNullOrWhiteSpace(fileName)) { throw new ArgumentException("fileName"); }
+            if (String.IsNullOrWhiteSpace(workingDirectory)) { throw new ArgumentException("workingDirectory"); }
+
+            IntPtr childStandardInput = IntPtr.Zero;
+            IntPtr parentStandardInput = IntPtr.Zero;
+            IntPtr parentStandardOutput = IntPtr.Zero;
+            IntPtr childStandardOutput = IntPtr.Zero;
+            IntPtr parentStandardError = IntPtr.Zero;
+            IntPtr childStandardError = IntPtr.Zero;
+            IntPtr environmentBlock = IntPtr.Zero;
+            NativeProcessInformation nativeProcessInformation = new NativeProcessInformation();
+            WindowsSuspendedProcess result = null;
+            try {
+                SecurityAttributes pipeAttributes = new SecurityAttributes {
+                    Length = Marshal.SizeOf(typeof(SecurityAttributes)),
+                    SecurityDescriptor = IntPtr.Zero,
+                    InheritHandle = true
+                };
+                ThrowIfFalse(CreatePipe(out childStandardInput, out parentStandardInput, ref pipeAttributes, 0), "CreatePipe(stdin)");
+                ThrowIfFalse(CreatePipe(out parentStandardOutput, out childStandardOutput, ref pipeAttributes, 0), "CreatePipe(stdout)");
+                ThrowIfFalse(CreatePipe(out parentStandardError, out childStandardError, ref pipeAttributes, 0), "CreatePipe(stderr)");
+                ThrowIfFalse(SetHandleInformation(parentStandardInput, HandleFlagInherit, 0), "SetHandleInformation(stdin)");
+                ThrowIfFalse(SetHandleInformation(parentStandardOutput, HandleFlagInherit, 0), "SetHandleInformation(stdout)");
+                ThrowIfFalse(SetHandleInformation(parentStandardError, HandleFlagInherit, 0), "SetHandleInformation(stderr)");
+
+                if (!useStandardInput) {
+                    CloseHandle(parentStandardInput);
+                    parentStandardInput = IntPtr.Zero;
+                }
+
+                StartupInfo startupInfo = new StartupInfo {
+                    Size = Marshal.SizeOf(typeof(StartupInfo)),
+                    Flags = StartfUseStdHandles,
+                    StandardInput = childStandardInput,
+                    StandardOutput = childStandardOutput,
+                    StandardError = childStandardError
+                };
+                string environmentText = BuildEnvironment(environment);
+                environmentBlock = Marshal.StringToHGlobalUni(environmentText);
+                StringBuilder commandLine = new StringBuilder(BuildCommandLine(fileName, arguments));
+                ThrowIfFalse(CreateProcessW(
+                    fileName,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    true,
+                    CreateSuspended | CreateUnicodeEnvironment | CreateNoWindow,
+                    environmentBlock,
+                    workingDirectory,
+                    ref startupInfo,
+                    out nativeProcessInformation), "CreateProcessW");
+
+                CloseHandle(childStandardInput); childStandardInput = IntPtr.Zero;
+                CloseHandle(childStandardOutput); childStandardOutput = IntPtr.Zero;
+                CloseHandle(childStandardError); childStandardError = IntPtr.Zero;
+                result = new WindowsSuspendedProcess(
+                    new ProcessInformation {
+                        ProcessHandle = nativeProcessInformation.ProcessHandle,
+                        ThreadHandle = nativeProcessInformation.ThreadHandle,
+                        ProcessId = nativeProcessInformation.ProcessId,
+                        ThreadId = nativeProcessInformation.ThreadId
+                    },
+                    parentStandardInput,
+                    parentStandardOutput,
+                    parentStandardError);
+                nativeProcessInformation.ProcessHandle = IntPtr.Zero;
+                nativeProcessInformation.ThreadHandle = IntPtr.Zero;
+                parentStandardInput = IntPtr.Zero;
+                parentStandardOutput = IntPtr.Zero;
+                parentStandardError = IntPtr.Zero;
+                return result;
+            }
+            finally {
+                CloseIfPresent(childStandardInput);
+                CloseIfPresent(childStandardOutput);
+                CloseIfPresent(childStandardError);
+                CloseIfPresent(parentStandardInput);
+                CloseIfPresent(parentStandardOutput);
+                CloseIfPresent(parentStandardError);
+                CloseIfPresent(nativeProcessInformation.ProcessHandle);
+                CloseIfPresent(nativeProcessInformation.ThreadHandle);
+                if (environmentBlock != IntPtr.Zero) { Marshal.FreeHGlobal(environmentBlock); }
+            }
+        }
+
+        public static Task<BoundedProcessOutputResult> ReadBoundedAsync(TextReader reader, int maximumCharacters) {
+            return Task.Run(() => ReadBounded(reader, maximumCharacters));
+        }
+
+        private static BoundedProcessOutputResult ReadBounded(TextReader reader, int maximumCharacters) {
+            if (reader == null) { throw new ArgumentNullException("reader"); }
+            if (maximumCharacters < 1) { throw new ArgumentOutOfRangeException("maximumCharacters"); }
+            char[] buffer = new char[8192];
+            StringBuilder captured = new StringBuilder(Math.Min(maximumCharacters, 65536));
+            long totalCharacters = 0;
+            bool truncated = false;
+            int read;
+            while ((read = reader.Read(buffer, 0, buffer.Length)) > 0) {
+                totalCharacters += read;
+                int remaining = maximumCharacters - captured.Length;
+                if (remaining > 0) {
+                    int take = Math.Min(remaining, read);
+                    captured.Append(buffer, 0, take);
+                    if (take < read) { truncated = true; }
+                }
+                else {
+                    truncated = true;
+                }
+            }
+            return new BoundedProcessOutputResult(captured.ToString(), truncated, totalCharacters);
+        }
+
+        private static string BuildEnvironment(IDictionary environment) {
+            List<string> entries = new List<string>();
+            if (environment != null) {
+                foreach (DictionaryEntry entry in environment) {
+                    string name = Convert.ToString(entry.Key);
+                    string value = entry.Value == null ? String.Empty : Convert.ToString(entry.Value);
+                    if (String.IsNullOrEmpty(name) || name.IndexOf('\0') >= 0 || name[0] == '=') {
+                        throw new ArgumentException("Invalid environment variable name.");
+                    }
+                    if (value.IndexOf('\0') >= 0) {
+                        throw new ArgumentException("Invalid environment variable value.");
+                    }
+                    entries.Add(name + "=" + value);
+                }
+            }
+            entries.Sort(StringComparer.OrdinalIgnoreCase);
+            StringBuilder block = new StringBuilder();
+            foreach (string entry in entries) { block.Append(entry).Append('\0'); }
+            block.Append('\0');
+            return block.ToString();
+        }
+
+        private static string BuildCommandLine(string fileName, string[] arguments) {
+            StringBuilder commandLine = new StringBuilder(QuoteArgument(fileName));
+            if (arguments != null) {
+                foreach (string argument in arguments) {
+                    commandLine.Append(' ').Append(QuoteArgument(argument ?? String.Empty));
+                }
+            }
+            return commandLine.ToString();
+        }
+
+        private static string QuoteArgument(string argument) {
+            StringBuilder result = new StringBuilder();
+            result.Append('"');
+            int backslashes = 0;
+            foreach (char character in argument) {
+                if (character == '\\') { backslashes++; continue; }
+                if (character == '"') {
+                    result.Append('\\', backslashes * 2 + 1).Append('"');
+                    backslashes = 0;
+                    continue;
+                }
+                result.Append('\\', backslashes);
+                backslashes = 0;
+                result.Append(character);
+            }
+            result.Append('\\', backslashes * 2).Append('"');
+            return result.ToString();
+        }
+
+        private static void ThrowIfFalse(bool value, string operation) {
+            if (!value) { throw new Win32Exception(Marshal.GetLastWin32Error(), operation + " failed."); }
+        }
+
+        private static void CloseIfPresent(IntPtr handle) {
+            if (handle != IntPtr.Zero) { CloseHandle(handle); }
+        }
+    }
+}
+'@ -ErrorAction Stop
+        $nativeType = 'Codex.Validation.WindowsSuspendedProcessBoundary' -as [type]
+    }
+    if ($null -eq $nativeType) {
+        throw 'The suspended Windows process boundary interop type could not be loaded.'
+    }
+    return $nativeType
+}
+
+function Start-WindowsSuspendedProcess {
+    param(
+        [Parameter(Mandatory = $true)][string] $FileName,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
+        [Parameter(Mandatory = $true)] [Collections.IDictionary] $EnvironmentVariables,
+        [Parameter(Mandatory = $true)][bool] $UseStandardInput
+    )
+    $nativeType = Get-WindowsSuspendedProcessBoundaryType
+    return $nativeType::Start($FileName, $Arguments, $WorkingDirectory, $EnvironmentVariables, $UseStandardInput)
+}
+
 function New-WindowsKillOnCloseJob {
     param([Parameter(Mandatory = $true)][string] $Context)
     # The handle's creation time is checked before TerminateProcess is called
@@ -536,11 +957,12 @@ function New-WindowsKillOnCloseJob {
 function Assign-WindowsProcessToJob {
     param(
         [Parameter(Mandatory = $true)][IntPtr] $JobHandle,
-        [Parameter(Mandatory = $true)][Diagnostics.Process] $Process,
+        [Parameter(Mandatory = $true)][object] $Process,
         [Parameter(Mandatory = $true)][string] $Context
     )
     $nativeType = Get-WindowsProcessBoundaryType
-    if (-not $nativeType::AssignProcess($JobHandle, $Process.Handle)) {
+    $processHandle = if ($Process -is [Diagnostics.Process]) { $Process.Handle } else { [IntPtr]$Process.ProcessHandle }
+    if (-not $nativeType::AssignProcess($JobHandle, $processHandle)) {
         $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw "$Context could not assign the child to its Windows Job Object (Win32 error $errorCode)."
     }
@@ -1317,6 +1739,10 @@ function Invoke-NativeChecked {
     $windowsJobHandle = [IntPtr]::Zero
     $windowsResumeEvent = $null
     $windowsResumeEventSignaled = $false
+    $stdoutTask = $null
+    $stderrTask = $null
+    $maxProcessOutputCharacters = 4 * 1024 * 1024
+    $windowsResumeEventReleaseEligible = $false
     try {
         if ($ProtectRunnerCommandFiles) {
             $runnerCommandFileSnapshot = Get-RunnerCommandFileSnapshot -Names $runnerCommandFileNames
@@ -1471,9 +1897,18 @@ finally {
                 $startInfo.EnvironmentVariables['CODEX_VALIDATION_RESUME_EVENT'] = $eventName
                 $startInfo.EnvironmentVariables['CODEX_VALIDATION_HAS_STANDARD_INPUT'] = if ($PSBoundParameters.ContainsKey('StandardInput')) { '1' } else { '0' }
             }
-            $childProcess = [Diagnostics.Process]::new()
-            $childProcess.StartInfo = $startInfo
-            if (-not $childProcess.Start()) { throw "$Context process could not be started: $Command" }
+            $nativeEnvironmentVariables = @{}
+            foreach ($environmentName in @($startInfo.EnvironmentVariables.Keys)) {
+                $nativeEnvironmentVariables[[string]$environmentName] = [string]$startInfo.EnvironmentVariables[$environmentName]
+            }
+            if ($script:IsWindowsHost) {
+                $childProcess = Start-WindowsSuspendedProcess -FileName $nativeCommand -Arguments $nativeArguments -WorkingDirectory $startInfo.WorkingDirectory -EnvironmentVariables $nativeEnvironmentVariables -UseStandardInput ($PSBoundParameters.ContainsKey('StandardInput'))
+            }
+            else {
+                $childProcess = [Diagnostics.Process]::new()
+                $childProcess.StartInfo = $startInfo
+                if (-not $childProcess.Start()) { throw "$Context process could not be started: $Command" }
+            }
             $childProcessId = $childProcess.Id
             if ($script:IsWindowsHost) {
                 Assign-WindowsProcessToJob -JobHandle $windowsJobHandle -Process $childProcess -Context $Context
@@ -1489,14 +1924,23 @@ finally {
             if ((Test-ProcessIdExists -ProcessId $childProcessId) -and [string]::IsNullOrWhiteSpace($childProcessIdentity)) {
                 throw "$Context could not bind the child process identity before execution."
             }
+            if ($script:IsWindowsHost) {
+                $windowsResumeEventReleaseEligible = $true
+            }
             if ($script:IsLinuxHost) {
                 $childProcessGroupId = Wait-ForUnixProcessGroupId -ProcessId $childProcessId -ParentProcessGroupId $parentProcessGroupId
                 if ($childProcessGroupId -le 0 -and -not $childProcess.HasExited) {
                     throw "$Context process was not placed in a dedicated Linux process group."
                 }
             }
-            $stdoutTask = $childProcess.StandardOutput.ReadToEndAsync()
-            $stderrTask = $childProcess.StandardError.ReadToEndAsync()
+            $outputBoundaryType = Get-WindowsSuspendedProcessBoundaryType
+            $stdoutTask = $outputBoundaryType::ReadBoundedAsync($childProcess.StandardOutput, $maxProcessOutputCharacters)
+            $stderrTask = $outputBoundaryType::ReadBoundedAsync($childProcess.StandardError, $maxProcessOutputCharacters)
+            if ($script:IsWindowsHost) {
+                if (-not $childProcess.Resume()) {
+                    throw "$Context could not resume the suspended Windows process after Job Object assignment."
+                }
+            }
             if ($PSBoundParameters.ContainsKey('StandardInput')) {
                 $childProcess.StandardInput.Write($StandardInput)
                 $childProcess.StandardInput.Close()
@@ -1525,8 +1969,13 @@ finally {
             if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
                 throw "$Context left redirected output handles open after process-tree cleanup."
             }
-            $stdoutText = $stdoutTask.GetAwaiter().GetResult()
-            $stderrText = $stderrTask.GetAwaiter().GetResult()
+            $stdoutResult = $stdoutTask.GetAwaiter().GetResult()
+            $stderrResult = $stderrTask.GetAwaiter().GetResult()
+            if ($stdoutResult.Truncated -or $stderrResult.Truncated) {
+                throw "$Context exceeded the bounded native-process output limit of $maxProcessOutputCharacters characters per stream."
+            }
+            $stdoutText = [string]$stdoutResult.Text
+            $stderrText = [string]$stderrResult.Text
             $exitCode = $childProcess.ExitCode
         }
         else {
@@ -1550,9 +1999,11 @@ finally {
     }
     finally {
         try {
-            if ($null -ne $windowsResumeEvent -and -not $windowsResumeEventSignaled) {
-                [void]$windowsResumeEvent.Set()
-                $windowsResumeEventSignaled = $true
+            if ($script:IsWindowsHost -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $windowsResumeEventReleaseEligible) {
+                $terminated = $childProcess.Terminate()
+                if (-not $terminated -and -not $childProcess.HasExited) {
+                    throw "$Context could not terminate the unassigned suspended Windows process safely."
+                }
             }
             if ($TerminateProcessTree -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $processTreeStopped) {
                 Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
