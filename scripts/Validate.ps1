@@ -730,17 +730,77 @@ foreach ($routeCase in $routeCases) {
     }
 }
 
+# Candidate tests are untrusted code. Run them in a child PowerShell process so
+# a test cannot terminate this validator before the post-test integrity checks.
+$pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
+$pesterResultPath = Join-Path $runRoot 'pester-result.json'
+$pesterRunnerScript = @'
+#requires -Version 7.0
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string] $TestsRoot,
+    [Parameter(Mandatory = $true)][string] $PesterModulePath,
+    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
+    [Parameter(Mandatory = $true)][string] $OutputPath
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$testsRoot = [IO.Path]::GetFullPath($TestsRoot)
+$pesterModulePath = [IO.Path]::GetFullPath($PesterModulePath)
+$outputPath = [IO.Path]::GetFullPath($OutputPath)
+if (-not (Test-Path -LiteralPath $testsRoot -PathType Container)) { throw "Pester tests root is missing: $testsRoot" }
+if (-not (Test-Path -LiteralPath $pesterModulePath -PathType Leaf)) { throw "Pester module manifest is missing: $pesterModulePath" }
+
 Remove-Module Pester -Force -ErrorAction SilentlyContinue
-Import-Module $pesterModulePath -Force -ErrorAction Stop
+Import-Module -Name $pesterModulePath -Force -ErrorAction Stop
 $loadedPester = Get-Module Pester | Select-Object -First 1
-if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne [string]$receipts.pester.resolvedVersion) {
-    throw 'The exact frozen Pester module was not imported.'
+if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPesterVersion) {
+    throw 'The exact frozen Pester module was not imported in the isolated test process.'
 }
-$pesterResult = Invoke-Pester -Path (Join-Path $repoRoot 'tests') -PassThru
-if ($null -eq $pesterResult -or [int64]$pesterResult.TotalCount -le 0 -or [int64]$pesterResult.FailedCount -ne 0 -or
+$result = Invoke-Pester -Path $testsRoot -PassThru
+if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
+    [int64]$result.SkippedCount -ne 0 -or
+    [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
+    throw 'Pester repository regression did not complete successfully.'
+}
+
+$summary = [ordered]@{
+    result = 'passed'
+    pesterVersion = [string]$loadedPester.Version
+    totalCount = [int64]$result.TotalCount
+    passedCount = [int64]$result.PassedCount
+    failedCount = [int64]$result.FailedCount
+    skippedCount = [int64]$result.SkippedCount
+}
+$outputDirectory = Split-Path -Parent $outputPath
+if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) { [void](New-Item -ItemType Directory -Path $outputDirectory -Force) }
+[IO.File]::WriteAllText($outputPath, ($summary | ConvertTo-Json -Depth 20) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+'@
+[IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
+$powerShellExecutableName = if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }
+$powerShellPath = Join-Path $PSHOME $powerShellExecutableName
+if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
+Assert-NoReparseAncestors -Path $powerShellPath -Context 'PowerShell child executable'
+[void](Invoke-NativeChecked -Command $powerShellPath -Arguments @(
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', $pesterRunnerPath,
+    '-TestsRoot', (Join-Path $repoRoot 'tests'),
+    '-PesterModulePath', $pesterModulePath,
+    '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion,
+    '-OutputPath', $pesterResultPath
+) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot)
+if (-not (Test-Path -LiteralPath $pesterResultPath -PathType Leaf)) {
+    throw 'Isolated Pester exited without a candidate-bound result report.'
+}
+$pesterResult = Read-JsonFile -Path $pesterResultPath -Context 'Isolated Pester result'
+if ($pesterResult.result -cne 'passed' -or
+    $pesterResult.pesterVersion -cne [string]$receipts.pester.resolvedVersion -or
+    [int64]$pesterResult.TotalCount -le 0 -or [int64]$pesterResult.FailedCount -ne 0 -or
     [int64]$pesterResult.SkippedCount -ne 0 -or
     [int64]$pesterResult.PassedCount + [int64]$pesterResult.SkippedCount -ne [int64]$pesterResult.TotalCount) {
-    throw 'Pester repository regression did not complete successfully.'
+    throw 'Isolated Pester repository regression result was missing, mismatched, or incomplete.'
 }
 
 $postPesterRepositoryReportPath = Join-Path $runRoot 'repository-validation-post-pester.json'

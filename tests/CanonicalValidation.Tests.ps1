@@ -119,11 +119,16 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match '\[switch\] \$EnableSemanticScan'
         $script:Validator | Should -Match '\$semanticTriggered = \[bool\]\$EnableSemanticScan -and'
         $script:Validator | Should -Match 'repository-validation-post-pester'
+        $script:Validator | Should -Match 'pesterRunnerPath'
+        $script:Validator | Should -Match 'Invoke-NativeChecked -Command \$powerShellPath'
+        $script:Validator | Should -Match "'-NoProfile'"
         $script:Validator | Should -Match "'route'"
         $script:Validator | Should -Match 'skill-tools route did not return exactly one result'
         $script:Validator | Should -Match '\$routeResults = @\(Read-JsonFile'
         $script:Validator | Should -Not -Match '\$routeResults -isnot \[array\]'
         $script:Validator | Should -Not -Match 'semantic.*continue|continue.*semantic'
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/validate.yml') -Raw
+        $workflow | Should -Match 'github\.run_attempt'
     }
 
     It 'keeps required CI free of implicit LLM credentials and skipped tests' {
