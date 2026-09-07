@@ -1338,12 +1338,7 @@ function Normalize-GitCaseVariantWorktreePaths {
             -Label 'Canonical install destination' -AllowMissing
         $sourceFullPath = [IO.Path]::GetFullPath($source)
         $destinationFullPath = [IO.Path]::GetFullPath($destination)
-        $physicalPathComparison = if ([OperatingSystem]::IsWindows()) {
-            [StringComparison]::OrdinalIgnoreCase
-        }
-        else {
-            [StringComparison]::Ordinal
-        }
+        $physicalPathComparison = Get-PortablePathComparison -Paths @($sourceFullPath, $destinationFullPath)
         if ([string]::Equals($sourceFullPath, $destinationFullPath, $physicalPathComparison)) {
             continue
         }

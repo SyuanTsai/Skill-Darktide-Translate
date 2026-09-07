@@ -174,6 +174,22 @@ function Get-GitBlobSha256 {
     }
 }
 
+function Get-RawFileSha256 {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Read-SkillFrontmatter {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -501,7 +517,17 @@ function Get-ContentInventory {
             throw "Skill '$SkillId' working-tree content is not bound to its Git index entry '$path'."
         }
         $sha256 = Get-GitBlobSha256 -GitPath $git.Path -RepositoryRoot $RepositoryRoot -ObjectId $tracked[$path].objectId
-        $files += [pscustomobject][ordered]@{ path = $path; mode = $tracked[$path].mode; sha256 = $sha256 }
+        # Git's --path hash intentionally honors the repository's normal text
+        # normalization. Keep a second raw-byte identity that is independent
+        # of .git/config and .gitattributes so post-test evidence can detect a
+        # filter that makes substituted bytes look like the indexed blob.
+        $rawSha256 = Get-RawFileSha256 -Path $pathToFile[$path].FullName
+        $files += [pscustomobject][ordered]@{
+            path = $path
+            mode = $tracked[$path].mode
+            sha256 = $sha256
+            rawSha256 = $rawSha256
+        }
         [void]$canonical.Append($path).Append("`t").Append($tracked[$path].mode).Append("`t").Append($sha256).Append("`n")
     }
     $hasher = [Security.Cryptography.SHA256]::Create()

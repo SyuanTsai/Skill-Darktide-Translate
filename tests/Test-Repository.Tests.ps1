@@ -31,6 +31,16 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         $first.skills[0].contentSha256 | Should -Match '^[0-9a-f]{64}$'
     }
 
+    It 'records raw working-tree byte identities independently of Git filters' {
+        $result = & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot | Select-Object -Last 1 | ConvertFrom-Json
+        $file = @($result.skills[0].files | Where-Object path -CEq 'SKILL.md')[0]
+        $file.rawSha256 | Should -Match '^[0-9a-f]{64}$'
+        $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
+        $validator | Should -Match 'function Get-RawFileSha256'
+        $supervisor = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Validate.ps1') -Raw
+        $supervisor | Should -Match '\$before\[0\]\.rawSha256 -cne \$after\[0\]\.rawSha256'
+    }
+
     It 'binds Git file modes into the per-Skill content identity' {
         $before = & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot | Select-Object -Last 1 | ConvertFrom-Json
         & $script:GitPath -C $script:FixtureRoot update-index --chmod=+x -- "skills/$($script:SkillId)/SKILL.md"

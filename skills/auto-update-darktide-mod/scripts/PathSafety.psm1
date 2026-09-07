@@ -101,7 +101,6 @@ function Get-WindowsPathCaseSensitivity {
     # This comparison only terminates the lexical ancestor walk; it does not
     # authorize containment. The authorization result is returned by the
     # filesystem case-sensitivity queries below.
-    $pathComparison = [StringComparison]::OrdinalIgnoreCase
     for ($depth = 0; $depth -lt 2048; $depth++) {
         $directory = [IO.DirectoryInfo]::new($probe)
         if ($directory.Exists) {
