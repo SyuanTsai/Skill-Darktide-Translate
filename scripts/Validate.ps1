@@ -711,8 +711,11 @@ foreach ($routeCase in $routeCases) {
     ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot
     $routePath = Join-Path $runRoot ("skill-tools-route-{0}.json" -f ([guid]::NewGuid().ToString('N')))
     [IO.File]::WriteAllText($routePath, $routeOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    $routeResults = Read-JsonFile -Path $routePath -Context "skill-tools route report for '$($routeCase.query)'"
-    if ($routeResults -isnot [array] -or @($routeResults).Count -ne 1) {
+    # PowerShell unwraps a one-item JSON array during assignment. Normalize the
+    # result before enforcing the contract so a valid top-k=1 result is not
+    # mistaken for a non-array value on the hosted runner.
+    $routeResults = @(Read-JsonFile -Path $routePath -Context "skill-tools route report for '$($routeCase.query)'")
+    if ($routeResults.Count -ne 1) {
         throw "skill-tools route did not return exactly one result for '$($routeCase.query)'."
     }
     $routeSkill = Get-RequiredProperty -Object @($routeResults)[0] -Name 'skill' -Context 'skill-tools route result'
