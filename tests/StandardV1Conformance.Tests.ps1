@@ -50,6 +50,8 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $validator | Should -Match 'skill-tools'
         $validator | Should -Match 'Invoke-Pester'
         $validator | Should -Match '\[string\] \$BaseCommit'
+        $validator | Should -Match 'repositoryValidatorBytes'
+        $validator | Should -Match 'postPesterRepositoryValidatorPath'
     }
 
     It 'routes CI through the same canonical validator without a second policy workflow' {
