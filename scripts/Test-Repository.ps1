@@ -154,7 +154,7 @@ function Get-GitBlobSha256 {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    foreach ($argument in @('-c', "safe.directory=$RepositoryRoot", '-C', $RepositoryRoot, 'cat-file', 'blob', $ObjectId)) {
+    foreach ($argument in @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot", '-C', $RepositoryRoot, 'cat-file', 'blob', $ObjectId)) {
         [void]$startInfo.ArgumentList.Add($argument)
     }
     $process = [Diagnostics.Process]::new()
@@ -479,7 +479,7 @@ function Get-ContentInventory {
     if ($pathToFile.Count -eq 0) { throw "Skill '$SkillId' has an empty package inventory." }
 
     $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot")
+    $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
     $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     $gitOutput = [string]((& $git.Path @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- "skills/$SkillId") -join '')
     if ($LASTEXITCODE -ne 0) { throw "Git inventory lookup failed for '$SkillId'." }
