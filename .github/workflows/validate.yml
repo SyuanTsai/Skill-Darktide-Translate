@@ -40,6 +40,68 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Materialize protected validation supervisor
+        shell: pwsh
+        env:
+          TRUSTED_SUPERVISOR_COMMIT: 'b6c487aa38ba07c868ef83cac48ee559a5a73ec8'
+          TRUSTED_VALIDATE_BLOB: 'af54a07d23db7e7ad894595356c6bb25484002ff'
+          TRUSTED_REPOSITORY_VALIDATOR_BLOB: 'a071921f52cbb83754c9355f1cab8773e124edad'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
+          if ($trustedCommit -notmatch '^[0-9a-f]{40}$') {
+            throw 'The protected supervisor commit must be one lowercase full Git SHA.'
+          }
+          $trustedRoot = Join-Path $env:RUNNER_TEMP 'standard-v1-trusted-supervisor'
+          if (Test-Path -LiteralPath $trustedRoot) {
+            throw "The protected supervisor root already exists: $trustedRoot"
+          }
+          $trustedScriptsRoot = Join-Path $trustedRoot 'scripts'
+          [void](New-Item -ItemType Directory -Path $trustedScriptsRoot -Force)
+          $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+          $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          $files = @(
+            [pscustomobject]@{ RelativePath = 'scripts/Validate.ps1'; Blob = [string]$env:TRUSTED_VALIDATE_BLOB },
+            [pscustomobject]@{ RelativePath = 'scripts/Test-Repository.ps1'; Blob = [string]$env:TRUSTED_REPOSITORY_VALIDATOR_BLOB }
+          )
+          foreach ($file in $files) {
+            if ($file.Blob -notmatch '^[0-9a-f]{40}$') {
+              throw "The protected supervisor blob for '$($file.RelativePath)' is invalid."
+            }
+            $revision = "${trustedCommit}:$($file.RelativePath)"
+            $actualBlob = ((& $gitPath rev-parse $revision 2>$null) | Select-Object -First 1).Trim()
+            if ($LASTEXITCODE -ne 0 -or $actualBlob -cne $file.Blob) {
+              throw "The protected supervisor blob for '$($file.RelativePath)' does not match its reviewed commit."
+            }
+            $destination = Join-Path $trustedRoot $file.RelativePath
+            $process = [Diagnostics.Process]::new()
+            $process.StartInfo.FileName = $gitPath
+            $process.StartInfo.UseShellExecute = $false
+            $process.StartInfo.RedirectStandardOutput = $true
+            $process.StartInfo.RedirectStandardError = $true
+            [void]$process.StartInfo.ArgumentList.Add('cat-file')
+            [void]$process.StartInfo.ArgumentList.Add('blob')
+            [void]$process.StartInfo.ArgumentList.Add($revision)
+            if (-not $process.Start()) { throw "Could not start Git to materialize '$($file.RelativePath)'." }
+            $stream = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            try { $process.StandardOutput.BaseStream.CopyTo($stream) }
+            finally { $stream.Dispose() }
+            $stderr = $process.StandardError.ReadToEnd()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) {
+              throw "Git could not materialize the protected supervisor '$($file.RelativePath)': $stderr"
+            }
+            $item = Get-Item -LiteralPath $destination -Force
+            if (-not $item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Protected supervisor file '$($file.RelativePath)' is a reparse point."
+            }
+          }
+          $rootItem = Get-Item -LiteralPath $trustedRoot -Force
+          if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Protected supervisor root must be a regular non-reparse directory.'
+          }
+          "TRUSTED_SUPERVISOR_ROOT=$trustedRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Set up approved Go runtime
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -93,7 +155,8 @@ jobs:
             Write-Warning 'The event base is not one full commit SHA; running the validator without a comparison base.'
           }
           $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
-          & ./scripts/Validate.ps1 -ArtifactsRoot $env:RUNNER_TEMP -BaseCommit $baseCommit -ExpectedGoRuntimeVersion $env:STANDARD_GO_RUNTIME_VERSION -OutputPath $outputPath
+          $trustedValidator = Join-Path $env:TRUSTED_SUPERVISOR_ROOT 'scripts/Validate.ps1'
+          & $trustedValidator -RepositoryRoot (Get-Location).Path -ArtifactsRoot $env:RUNNER_TEMP -BaseCommit $baseCommit -ExpectedGoRuntimeVersion $env:STANDARD_GO_RUNTIME_VERSION -OutputPath $outputPath
 
       - name: Validate GitHub CLI Agent Skills publication
         if: ${{ success() }}
