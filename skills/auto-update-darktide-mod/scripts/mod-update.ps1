@@ -189,35 +189,63 @@ function Copy-FileWithHeartbeat {
 }
 
 function Remove-DirectoryTreeWithHeartbeat {
-    param([Parameter(Mandatory)][string] $Path)
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Root
+    )
     Update-ActiveReservationHeartbeat -Force
     Update-ActiveSharedCoordinationHeartbeat -Force
-    $root = [IO.Path]::GetFullPath($Path)
-    $directories = [Collections.Generic.List[string]]::new()
-    foreach ($item in Get-ChildItem -LiteralPath $root -Recurse -Force) {
-        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label 'removal tree') {
-            throw 'Refusing heartbeat-aware removal of a tree containing a reparse point.'
+    $removalRoot = [IO.Path]::GetFullPath($Path)
+    $containmentRoot = [IO.Path]::GetFullPath($Root)
+
+    # Move the verified tree to a same-parent quarantine name before deleting
+    # children. A directory rename is atomic on one volume and means a later
+    # replacement at the original path cannot redirect the deletion.
+    $null = Assert-NoReparseTree -Path $removalRoot -Root $containmentRoot -Label 'removal tree before quarantine'
+    $parent = [IO.DirectoryInfo]::new($removalRoot).Parent
+    if ($null -eq $parent) { throw 'Unable to quarantine the removal tree without a parent directory.' }
+    $quarantine = Join-Path $parent.FullName ('.codex-removal-' + [guid]::NewGuid().ToString('N'))
+    [IO.Directory]::Move($removalRoot, $quarantine)
+    try {
+        $null = Assert-NoReparseTree -Path $quarantine -Root $containmentRoot -Label 'quarantined removal tree'
+        $directories = [Collections.Generic.List[string]]::new()
+        foreach ($item in Get-ChildItem -LiteralPath $quarantine -Recurse -Force) {
+            # Revalidate the complete current path immediately before each
+            # destructive operation; the provider object came from an earlier
+            # enumeration and is not itself a deletion handle.
+            $null = Assert-NoReparsePath -Path $item.FullName -Root $quarantine -Label 'quarantined removal entry'
+            if ($item.PSIsContainer) { $directories.Add($item.FullName) }
+            else {
+                if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) { [IO.File]::SetAttributes($item.FullName, [IO.FileAttributes]::Normal) }
+                [IO.File]::Delete($item.FullName)
+            }
+            Update-ActiveReservationHeartbeat
+            Update-ActiveSharedCoordinationHeartbeat
         }
-        if ($item.PSIsContainer) { $directories.Add($item.FullName) }
-        else {
-            if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) { [IO.File]::SetAttributes($item.FullName, [IO.FileAttributes]::Normal) }
-            [IO.File]::Delete($item.FullName)
+
+        foreach ($directory in @($directories | Sort-Object { $_.Length } -Descending)) {
+            $null = Assert-NoReparsePath -Path $directory -Root $quarantine -Label 'quarantined removal directory'
+            [IO.File]::SetAttributes($directory, [IO.FileAttributes]::Directory)
+            [IO.Directory]::Delete($directory)
+            Update-ActiveReservationHeartbeat
+            Update-ActiveSharedCoordinationHeartbeat
         }
-        Update-ActiveReservationHeartbeat
-        Update-ActiveSharedCoordinationHeartbeat
+        $null = Assert-NoReparsePath -Path $quarantine -Root $containmentRoot -Label 'quarantined removal root'
+        Update-ActiveReservationHeartbeat -Force
+        Update-ActiveSharedCoordinationHeartbeat -Force
+        [IO.File]::SetAttributes($quarantine, [IO.FileAttributes]::Directory)
+        [IO.Directory]::Delete($quarantine)
+        Update-ActiveReservationHeartbeat -Force
+        Update-ActiveSharedCoordinationHeartbeat -Force
     }
-    foreach ($directory in @($directories | Sort-Object { $_.Length } -Descending)) {
-        [IO.File]::SetAttributes($directory, [IO.FileAttributes]::Directory)
-        [IO.Directory]::Delete($directory)
-        Update-ActiveReservationHeartbeat
-        Update-ActiveSharedCoordinationHeartbeat
+    catch {
+        # Preserve recoverability if revalidation fails. Never delete or replace
+        # a path that an external process recreated while the tree was quarantined.
+        if (-not (Test-Path -LiteralPath $removalRoot) -and (Test-Path -LiteralPath $quarantine)) {
+            try { [IO.Directory]::Move($quarantine, $removalRoot) } catch { }
+        }
+        throw
     }
-    Update-ActiveReservationHeartbeat -Force
-    Update-ActiveSharedCoordinationHeartbeat -Force
-    [IO.File]::SetAttributes($root, [IO.FileAttributes]::Directory)
-    [IO.Directory]::Delete($root)
-    Update-ActiveReservationHeartbeat -Force
-    Update-ActiveSharedCoordinationHeartbeat -Force
 }
 
 function ConvertTo-InvariantString {
@@ -3408,7 +3436,7 @@ function Invoke-Install {
         $resolvedMods = [IO.Path]::GetFullPath($modsRoot) + [IO.Path]::DirectorySeparatorChar
         if (-not $resolvedTarget.StartsWith($resolvedMods, (Get-PortablePathComparison -Paths @($resolvedMods, $resolvedTarget)))) { throw 'Refusing broad install deletion.' }
         $null = Assert-NoReparseTree -Path $resolvedTarget -Root ([string]$State.worktreePath) -Label 'Existing MOD install tree before removal'
-        Remove-DirectoryTreeWithHeartbeat -Path $resolvedTarget
+        Remove-DirectoryTreeWithHeartbeat -Path $resolvedTarget -Root ([string]$State.worktreePath)
     }
     Copy-DirectoryBytes -Source $source -Destination $target
     $null = Assert-NoReparseTree -Path $target -Root ([string]$State.worktreePath) -Label 'Installed MOD tree'

@@ -198,6 +198,10 @@ function Test-PortableReparseItem {
     # not follow a symlink. Walk lexical ancestors so a missing child below a
     # symlink is still rejected before it can be treated as ordinary absence.
     $probe = [IO.Path]::GetFullPath($Path)
+    # This comparison only terminates the lexical ancestor walk; it does not
+    # authorize containment. Containment is established by the caller's
+    # boundary-aware path checks.
+    $pathComparison = [StringComparison]::OrdinalIgnoreCase
     for ($depth = 0; $depth -lt 2048; $depth++) {
         foreach ($info in @([IO.FileInfo]::new($probe), [IO.DirectoryInfo]::new($probe))) {
             try {
