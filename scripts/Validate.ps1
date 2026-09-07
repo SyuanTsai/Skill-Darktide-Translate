@@ -472,9 +472,11 @@ function Stop-ProcessTree {
             Add-ObservedProcessIds -RootProcessId $RootProcessId -ObservedProcessIdentities $ObservedProcessIdentities -ProcessGroupId $ProcessGroupId
         }
         $groupMembers = if ($script:IsWindowsHost -or $ProcessGroupId -le 0) { @() } else { @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId) }
-        foreach ($processId in @($groupMembers)) {
-            if ([int]$processId -ne $RootProcessId) {
-                Add-ProcessIdentityToObservation -ProcessId ([int]$processId) -ObservedProcessIdentities $ObservedProcessIdentities
+        if ($rootIsCandidate) {
+            foreach ($processId in @($groupMembers)) {
+                if ([int]$processId -ne $RootProcessId) {
+                    Add-ProcessIdentityToObservation -ProcessId ([int]$processId) -ObservedProcessIdentities $ObservedProcessIdentities
+                }
             }
         }
         $targets = @($ObservedProcessIdentities.Keys | Where-Object {
