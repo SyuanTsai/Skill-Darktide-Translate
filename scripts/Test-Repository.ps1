@@ -599,6 +599,11 @@ if (Test-Path -LiteralPath $managedProjectionRoot) {
             throw "Managed .agents/skills projection content changed during validation for '$($entry.targetPath)'."
         }
     }
+    # The final pathname reads above are still outside the preceding snapshot.
+    # Re-scan once more after the last hash so a replacement or reparse swap
+    # between the rehash and success cannot be hidden by the final check.
+    $projectionSnapshotAfterFinalHash = @(Get-ManagedProjectionSnapshot -Root $managedProjectionRoot)
+    Assert-ManagedProjectionSnapshotUnchanged -Before $projectionSnapshotAfterHash -After $projectionSnapshotAfterFinalHash
 }
 
 $adapter = Read-StrictJson -Path (Join-Path $repoRoot 'config/standard-v1.json')

@@ -68,10 +68,11 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*Required JSON file is missing*ai-instructions.manifest.json*'
 
         $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
-        $validator | Should -Match 'Get-ChildItem -LiteralPath \$managedProjectionRoot -Recurse -Force'
+        $validator | Should -Match 'Get-ChildItem -LiteralPath \$Root -Recurse -Force'
         $validator | Should -Match 'function Get-ManagedProjectionSnapshot'
         $validator | Should -Match '\$projectionSnapshotAfterHash\s*=\s*@\('
         $validator | Should -Match 'Assert-ManagedProjectionSnapshotUnchanged'
+        $validator | Should -Match '\$projectionSnapshotAfterFinalHash\s*=\s*@\('
         $validator | Should -Match 'Managed \.agents/skills projection contains a reparse entry'
     }
 
