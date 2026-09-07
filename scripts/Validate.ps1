@@ -73,7 +73,15 @@ function Get-RequiredProperty {
     if ($Object -isnot [pscustomobject] -or $null -eq $Object.PSObject.Properties[$Name]) {
         throw "$Context is missing required property '$Name'."
     }
-    return ,$Object.PSObject.Properties[$Name].Value
+    # Keep scalar JSON properties scalar while preserving array-valued properties
+    # as one pipeline object for callers that validate their exact array shape.
+    $propertyValue = $Object.PSObject.Properties[$Name].Value
+    if ($propertyValue -is [array]) {
+        Write-Output -NoEnumerate $propertyValue
+    }
+    else {
+        return $propertyValue
+    }
 }
 
 function Assert-SkillInventoryUnchanged {
