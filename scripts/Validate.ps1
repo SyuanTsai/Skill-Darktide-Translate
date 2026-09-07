@@ -71,6 +71,63 @@ function Get-RequiredProperty {
     return ,$Object.PSObject.Properties[$Name].Value
 }
 
+function Assert-SkillInventoryUnchanged {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Before,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $After,
+        [Parameter(Mandatory = $true)][string] $SkillId,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if ($Before.Count -ne 1 -or $After.Count -ne 1) {
+        throw "$Context for Skill '$SkillId' did not return exactly one before/after inventory."
+    }
+
+    $beforeSkill = $Before[0]
+    $afterSkill = $After[0]
+    $beforeContentSha256 = Get-RequiredProperty -Object $beforeSkill -Name 'contentSha256' -Context "$Context before inventory for '$SkillId'"
+    $afterContentSha256 = Get-RequiredProperty -Object $afterSkill -Name 'contentSha256' -Context "$Context after inventory for '$SkillId'"
+    Assert-Sha256 -Value $beforeContentSha256 -Context "$Context before content hash for '$SkillId'"
+    Assert-Sha256 -Value $afterContentSha256 -Context "$Context after content hash for '$SkillId'"
+    if ([string]$beforeContentSha256 -cne [string]$afterContentSha256) {
+        throw "Candidate Skill '$SkillId' content identity changed $Context."
+    }
+
+    $beforeFiles = @((Get-RequiredProperty -Object $beforeSkill -Name 'files' -Context "$Context before inventory for '$SkillId'"))
+    $afterFiles = @((Get-RequiredProperty -Object $afterSkill -Name 'files' -Context "$Context after inventory for '$SkillId'"))
+    if ($beforeFiles.Count -ne $afterFiles.Count -or $beforeFiles.Count -eq 0) {
+        throw "Candidate Skill '$SkillId' file inventory changed $Context."
+    }
+
+    $afterFilesByPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($afterFile in $afterFiles) {
+        $afterPath = Get-RequiredProperty -Object $afterFile -Name 'path' -Context "$Context after file inventory for '$SkillId'"
+        if ($afterPath -isnot [string] -or [string]::IsNullOrWhiteSpace($afterPath) -or
+            -not $afterFilesByPath.TryAdd([string]$afterPath, $afterFile)) {
+            throw "Candidate Skill '$SkillId' has a duplicate or invalid file path $Context."
+        }
+    }
+
+    $beforePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($beforeFile in $beforeFiles) {
+        $beforePath = Get-RequiredProperty -Object $beforeFile -Name 'path' -Context "$Context before file inventory for '$SkillId'"
+        if ($beforePath -isnot [string] -or [string]::IsNullOrWhiteSpace($beforePath) -or
+            -not $beforePaths.Add([string]$beforePath)) {
+            throw "Candidate Skill '$SkillId' has a duplicate or invalid file path before $Context."
+        }
+        $afterFile = $null
+        if (-not $afterFilesByPath.TryGetValue([string]$beforePath, [ref]$afterFile)) {
+            throw "Candidate Skill '$SkillId' file '$beforePath' is missing after $Context."
+        }
+        $beforeRawSha256 = Get-RequiredProperty -Object $beforeFile -Name 'rawSha256' -Context "$Context before file '$beforePath' for '$SkillId'"
+        $afterRawSha256 = Get-RequiredProperty -Object $afterFile -Name 'rawSha256' -Context "$Context after file '$beforePath' for '$SkillId'"
+        Assert-Sha256 -Value $beforeRawSha256 -Context "$Context before raw hash for '$SkillId/$beforePath'"
+        Assert-Sha256 -Value $afterRawSha256 -Context "$Context after raw hash for '$SkillId/$beforePath'"
+        if ([string]$beforeRawSha256 -cne [string]$afterRawSha256) {
+            throw "Candidate Skill '$SkillId' file '$beforePath' changed raw bytes $Context."
+        }
+    }
+}
+
 function Get-ValidationSecurityAction {
     param(
         [Parameter(Mandatory = $true)] $Policy,
@@ -370,11 +427,45 @@ function Invoke-NativeChecked {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
         [Parameter(Mandatory = $true)][string] $Context,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
-        [Parameter()][AllowNull()][string] $StandardInput
+        [Parameter()][AllowNull()][string] $StandardInput,
+        [Parameter()][switch] $IsolateRunnerCommandFiles
     )
     if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) { throw "$Context executable is missing: $Command" }
     $stderrPath = Join-Path $DiagnosticRoot ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    $runnerCommandFileNames = @(
+        'GITHUB_ENV',
+        'GITHUB_PATH',
+        'GITHUB_OUTPUT',
+        'GITHUB_STATE',
+        'GITHUB_STEP_SUMMARY'
+    )
+    $previousRunnerCommandFileValues = [ordered]@{}
+    $runnerCommandFileIsolationStarted = $false
     try {
+        if ($IsolateRunnerCommandFiles) {
+            $runnerCommandFileIsolationStarted = $true
+            foreach ($name in $runnerCommandFileNames) {
+                $previousRunnerCommandFileValues[$name] = [Environment]::GetEnvironmentVariable(
+                    $name,
+                    [EnvironmentVariableTarget]::Process
+                )
+                $isolatedPath = Join-Path $DiagnosticRoot ("isolated-{0}-{1}.txt" -f $name.ToLowerInvariant(), [guid]::NewGuid().ToString('N'))
+                $isolatedStream = [IO.File]::Open(
+                    $isolatedPath,
+                    [IO.FileMode]::CreateNew,
+                    [IO.FileAccess]::Write,
+                    [IO.FileShare]::Read
+                )
+                try {
+                    $isolatedStream.Flush($true)
+                }
+                finally {
+                    $isolatedStream.Dispose()
+                }
+                Assert-NoReparseAncestors -Path $isolatedPath -Context "Isolated $name command file"
+                [Environment]::SetEnvironmentVariable($name, $isolatedPath, [EnvironmentVariableTarget]::Process)
+            }
+        }
         $stdout = if ($PSBoundParameters.ContainsKey('StandardInput')) {
             $StandardInput | & $Command @Arguments 2> $stderrPath
         }
@@ -390,6 +481,17 @@ function Invoke-NativeChecked {
         return $stdoutText
     }
     finally {
+        if ($runnerCommandFileIsolationStarted) {
+            foreach ($name in $runnerCommandFileNames) {
+                if ($previousRunnerCommandFileValues.Contains($name)) {
+                    [Environment]::SetEnvironmentVariable(
+                        $name,
+                        $previousRunnerCommandFileValues[$name],
+                        [EnvironmentVariableTarget]::Process
+                    )
+                }
+            }
+        }
         if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
     }
 }
@@ -401,7 +503,7 @@ function Test-SecurityRelevantSkillChange {
         # the supplemental semantic-scan trigger decision.
         return $true
     }
-    $gitOutput = [string]((& $GitPath -c "safe.directory=$RepositoryRoot" -C $RepositoryRoot diff --find-renames=100% --name-status -z "$BaseCommit...HEAD") -join '')
+    $gitOutput = [string]((& $GitPath -c "safe.directory=$RepositoryRoot" -c "core.worktree=$RepositoryRoot" -C $RepositoryRoot diff --find-renames=100% --name-status -z "$BaseCommit...HEAD") -join '')
     if ($LASTEXITCODE -ne 0) { throw "Could not compare candidate with base commit '$BaseCommit'." }
     $tokens = @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })
     for ($index = 0; $index -lt $tokens.Count; $index++) {
@@ -447,7 +549,7 @@ finally {
 }
 $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
 $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
-$gitConfigArguments = @('-c', "safe.directory=$repoRoot")
+$gitConfigArguments = @('-c', "safe.directory=$repoRoot", '-c', "core.worktree=$repoRoot")
 
 $candidateCommit = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
 if ($LASTEXITCODE -ne 0 -or $candidateCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Candidate must be an immutable Git commit.' }
@@ -696,11 +798,7 @@ if ($repositoryReport.result -cne 'passed' -or [int]$repositoryReport.activeSkil
 foreach ($skillId in $skillIds) {
     $before = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     $after = @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    if ($before.Count -ne 1 -or $after.Count -ne 1 -or
-        $before[0].contentSha256 -cne $after[0].contentSha256 -or
-        $before[0].rawSha256 -cne $after[0].rawSha256) {
-        throw "Candidate Skill '$skillId' changed between integrity verification and repository validation."
-    }
+    Assert-SkillInventoryUnchanged -Before $before -After $after -SkillId $skillId -Context 'between integrity verification and repository validation'
 }
 $diffArguments = if (-not [string]::IsNullOrWhiteSpace($BaseCommit)) {
     @($gitConfigArguments + @('-C', $repoRoot, 'diff', '--check', "$BaseCommit...HEAD"))
@@ -760,10 +858,51 @@ foreach ($routeCase in $routeCases) {
     }
 }
 
+# The optional semantic scanner is bound and executed before candidate Pester
+# code can modify any run-owned tool or report path. Its output remains part of
+# the final supervisor-owned summary, while post-Pester checks bind the final
+# candidate state.
+$semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
+$semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
+$semanticReports = @()
+if ($semanticTriggered) {
+    $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector semantic scanner'
+    foreach ($skillId in $skillIds) {
+        $skillRoot = Join-Path $repoRoot "skills/$skillId"
+        $expectedInventoryPaths = @(
+            @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
+                ForEach-Object { [string]$_.path }
+        )
+        $semanticPath = Join-Path $runRoot "skillspector-semantic-$skillId.json"
+        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot)
+        $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
+        try {
+            $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
+        }
+        catch {
+            throw "Triggered SkillSpector semantic scan did not complete for '$skillId': $($_.Exception.Message)"
+        }
+        foreach ($issue in $semanticIssues) {
+            $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector semantic issue'
+            if ($reportedSeverity -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedSeverity)) {
+                throw "SkillSpector semantic scan returned an issue without severity for '$skillId'."
+            }
+            $finding = ConvertTo-ValidationSecurityFinding -Policy $validationSecurityGate -ReportedSeverity ([string]$reportedSeverity) -Stage 'conditional-semantic-scan' -SkillId $skillId -Issue $issue
+            $securityFindings += $finding
+            switch ([string]$finding.action) {
+                'BLOCK' { $securityBlockers += $finding }
+                'HUMAN_REVIEW_REQUIRED' { $securityHumanReview += $finding; $securityBlockers += $finding }
+                'RECORD_AND_TRACK' { $securityTracked += $finding }
+                default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
+            }
+        }
+        $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); findings = $semanticIssues.Count }
+    }
+}
+
 # Candidate tests are untrusted code. Run them in a child PowerShell process so
 # a test cannot terminate this validator before the post-test integrity checks.
 $pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
-$pesterResultPath = Join-Path $runRoot 'pester-result.json'
 $pesterRunnerScript = @'
 #requires -Version 7.0
 [CmdletBinding()]
@@ -820,19 +959,27 @@ $pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
     '-TestsRoot', (Join-Path $repoRoot 'tests'),
     '-PesterModulePath', $pesterModulePath,
     '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
-) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker
+) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker -IsolateRunnerCommandFiles
 $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
     $_.StartsWith($pesterResultMarker, [StringComparison]::Ordinal)
 })
 if ($pesterResultLines.Count -ne 1) {
     throw 'Isolated Pester exited without exactly one supervisor-owned completion result.'
 }
-[IO.File]::WriteAllText(
-    $pesterResultPath,
-    $pesterResultLines[0].Substring($pesterResultMarker.Length) + [Environment]::NewLine,
-    [Text.UTF8Encoding]::new($false)
-)
-$pesterResult = Read-JsonFile -Path $pesterResultPath -Context 'Isolated Pester result'
+try {
+    $pesterResultJson = $pesterResultLines[0].Substring($pesterResultMarker.Length)
+    $pesterResultDocument = [System.Text.Json.JsonDocument]::Parse($pesterResultJson)
+    try {
+        Assert-NoDuplicateJsonProperties -Element $pesterResultDocument.RootElement -Context 'Isolated Pester result'
+    }
+    finally {
+        $pesterResultDocument.Dispose()
+    }
+    $pesterResult = $pesterResultJson | ConvertFrom-Json -Depth 20
+}
+catch {
+    throw "Isolated Pester result is not valid unambiguous JSON: $($_.Exception.Message)"
+}
 if ($pesterResult.result -cne 'passed' -or
     $pesterResult.pesterVersion -cne [string]$receipts.pester.resolvedVersion -or
     [int64]$pesterResult.TotalCount -le 0 -or [int64]$pesterResult.FailedCount -ne 0 -or
@@ -883,67 +1030,13 @@ if ($postPesterRepositoryReport.result -cne 'passed' -or [int]$postPesterReposit
 foreach ($skillId in $skillIds) {
     $before = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     $after = @($postPesterRepositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    if ($before.Count -ne 1 -or $after.Count -ne 1 -or
-        $before[0].contentSha256 -cne $after[0].contentSha256 -or
-        $before[0].rawSha256 -cne $after[0].rawSha256) {
-        throw "Candidate Skill '$skillId' changed during repository tests."
-    }
+    Assert-SkillInventoryUnchanged -Before $before -After $after -SkillId $skillId -Context 'during repository tests'
 }
 $postPesterDirty = @(& $gitPath @gitConfigArguments -C $repoRoot status --porcelain=v1 --untracked-files=all)
 if ($LASTEXITCODE -ne 0 -or $postPesterDirty.Count -ne 0) {
     throw 'Candidate changed during repository tests; post-Pester evidence is not bound to a clean commit.'
 }
 $repositoryReport = $postPesterRepositoryReport
-
-# Standard CI is deliberately credential-free and deterministic. The LLM-backed
-# SkillSpector stage is an explicit supplemental review, never an implicit network
-# dependency of the required gate. Static findings remain governed above and
-# still block according to the central security policy.
-$semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
-$semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
-$semanticReports = @()
-if ($semanticTriggered) {
-    # Candidate Pester code runs before this stage and can write to run-owned
-    # tool directories. Rebind the scanner path and receipt hash immediately
-    # before semantic execution so a test cannot substitute the scanner.
-    $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector semantic scanner'
-    foreach ($skillId in $skillIds) {
-        $skillRoot = Join-Path $repoRoot "skills/$skillId"
-        $expectedInventoryPaths = @(
-            @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
-                ForEach-Object { [string]$_.path }
-        )
-        $semanticPath = Join-Path $runRoot "skillspector-semantic-$skillId.json"
-        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot)
-        $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
-        try {
-            $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
-        }
-        catch {
-            throw "Triggered SkillSpector semantic scan did not complete for '$skillId': $($_.Exception.Message)"
-        }
-        foreach ($issue in $semanticIssues) {
-            $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector semantic issue'
-            if ($reportedSeverity -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedSeverity)) {
-                throw "SkillSpector semantic scan returned an issue without severity for '$skillId'."
-            }
-            $finding = ConvertTo-ValidationSecurityFinding `
-                -Policy $validationSecurityGate `
-                -ReportedSeverity ([string]$reportedSeverity) `
-                -Stage 'conditional-semantic-scan' `
-                -SkillId $skillId `
-                -Issue $issue
-            $securityFindings += $finding
-            switch ([string]$finding.action) {
-                'BLOCK' { $securityBlockers += $finding }
-                'HUMAN_REVIEW_REQUIRED' { $securityHumanReview += $finding; $securityBlockers += $finding }
-                'RECORD_AND_TRACK' { $securityTracked += $finding }
-                default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
-            }
-        }
-        $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); findings = $semanticIssues.Count }
-    }
-}
 
 $summary = [pscustomobject][ordered]@{
     schemaVersion = 1
@@ -1015,7 +1108,58 @@ if (-not [string]::IsNullOrWhiteSpace($summaryDirectory)) {
     Assert-NoReparseAncestors -Path $summaryDirectory -Context 'Conformance output directory'
 }
 if (Test-Path -LiteralPath $summaryPath) { throw 'Conformance output path already exists; evidence must not overwrite prior content.' }
-[IO.File]::WriteAllText($summaryPath, $summaryJson + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+$summaryEncoding = [Text.UTF8Encoding]::new($false)
+$summaryText = $summaryJson + [Environment]::NewLine
+$summaryBytes = $summaryEncoding.GetBytes($summaryText)
+$summaryHasher = [Security.Cryptography.SHA256]::Create()
+try {
+    $summarySha256 = ([BitConverter]::ToString($summaryHasher.ComputeHash($summaryBytes)) -replace '-', '').ToLowerInvariant()
+}
+finally {
+    $summaryHasher.Dispose()
+}
+try {
+    $summaryStream = [IO.File]::Open(
+        $summaryPath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::Read
+    )
+    try {
+        $summaryStream.Write($summaryBytes, 0, $summaryBytes.Length)
+        $summaryStream.Flush($true)
+    }
+    finally {
+        $summaryStream.Dispose()
+    }
+}
+catch {
+    throw "Could not create supervisor-owned conformance evidence: $($_.Exception.Message)"
+}
+Assert-NoReparseAncestors -Path $summaryPath -Context 'Conformance output'
+$writtenSummaryBytes = [IO.File]::ReadAllBytes($summaryPath)
+$readbackHasher = [Security.Cryptography.SHA256]::Create()
+try {
+    $writtenSummarySha256 = ([BitConverter]::ToString($readbackHasher.ComputeHash($writtenSummaryBytes)) -replace '-', '').ToLowerInvariant()
+}
+finally {
+    $readbackHasher.Dispose()
+}
+if ($writtenSummarySha256 -cne $summarySha256) {
+    throw 'Conformance evidence changed during immediate readback.'
+}
+$githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
+if (-not [string]::IsNullOrWhiteSpace($githubOutputPath)) {
+    if (-not (Test-Path -LiteralPath $githubOutputPath -PathType Leaf)) {
+        throw "GitHub output command file is missing: $githubOutputPath"
+    }
+    Assert-NoReparseAncestors -Path $githubOutputPath -Context 'GitHub output command file'
+    [IO.File]::AppendAllText(
+        $githubOutputPath,
+        "standard_v1_evidence_sha256=$summarySha256$([Environment]::NewLine)",
+        $summaryEncoding
+    )
+}
 if (@($securityBlockers).Count -gt 0) {
     Write-Host "Darktide Translate Standard v1 canonical validation blocked by the central security gate. Evidence: $summaryPath"
 }

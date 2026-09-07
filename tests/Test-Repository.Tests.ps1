@@ -38,7 +38,9 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
         $validator | Should -Match 'function Get-RawFileSha256'
         $supervisor = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Validate.ps1') -Raw
-        $supervisor | Should -Match '\$before\[0\]\.rawSha256 -cne \$after\[0\]\.rawSha256'
+        $supervisor | Should -Match 'function Assert-SkillInventoryUnchanged'
+        $supervisor | Should -Match 'rawSha256'
+        $supervisor | Should -Match 'core\.worktree'
     }
 
     It 'binds Git file modes into the per-Skill content identity' {

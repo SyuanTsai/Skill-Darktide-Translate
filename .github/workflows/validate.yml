@@ -117,6 +117,7 @@ jobs:
           "STANDARD_GO_RUNTIME_VERSION=$($Matches.version)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Run canonical Standard v1 validation
+        id: canonical-validation
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -153,6 +154,25 @@ jobs:
           $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
           $trustedValidator = Join-Path $env:TRUSTED_SUPERVISOR_ROOT 'scripts/Validate.ps1'
           & $trustedValidator -RepositoryRoot (Get-Location).Path -ArtifactsRoot $env:RUNNER_TEMP -BaseCommit $baseCommit -ExpectedGoRuntimeVersion $env:STANDARD_GO_RUNTIME_VERSION -OutputPath $outputPath
+
+      - name: Verify canonical validation evidence
+        if: ${{ success() }}
+        shell: pwsh
+        env:
+          EXPECTED_EVIDENCE_SHA256: ${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EXPECTED_EVIDENCE_SHA256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'Canonical validation did not emit one lowercase evidence SHA-256 output.'
+          }
+          $evidencePath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
+          if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) {
+            throw "Canonical validation evidence is missing: $evidencePath"
+          }
+          $actualEvidenceSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToLowerInvariant()
+          if ($actualEvidenceSha256 -cne $env:EXPECTED_EVIDENCE_SHA256) {
+            throw 'Canonical validation evidence changed after the validator returned.'
+          }
 
       - name: Validate GitHub CLI Agent Skills publication
         if: ${{ success() }}

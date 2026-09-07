@@ -129,6 +129,9 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'repository-validation-post-pester'
         $script:Validator | Should -Match 'supervisor-owned completion result'
         $script:Validator | Should -Match 'StandardInput \$pesterResultMarker'
+        $script:Validator | Should -Match 'IsolateRunnerCommandFiles'
+        $script:Validator | Should -Match 'standard_v1_evidence_sha256'
+        $script:Validator | Should -Not -Match 'pesterResultPath'
         $script:Validator | Should -Not -Match ([regex]::Escape("'-OutputPath', `$pesterResultPath"))
         $script:Validator | Should -Match 'postPesterCandidateCommit'
         $script:Validator | Should -Match 'postPesterTree'
@@ -144,6 +147,10 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match '\$routeResults = @\(Read-JsonFile'
         $script:Validator | Should -Not -Match '\$routeResults -isnot \[array\]'
         $script:Validator | Should -Not -Match 'semantic.*continue|continue.*semantic'
+        $semanticIndex = $script:Validator.IndexOf('$semanticTriggerCandidate')
+        $pesterIndex = $script:Validator.IndexOf('$pesterRunnerPath')
+        $semanticIndex | Should -BeGreaterThan -1
+        $pesterIndex | Should -BeGreaterThan $semanticIndex
         $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/validate.yml') -Raw
         $workflow | Should -Match 'github\.run_attempt'
         $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
@@ -153,6 +160,9 @@ Describe 'Canonical Standard v1 validation adapter' {
         $workflow | Should -Match '\$actualBlob = .*rev-parse \$revision'
         $workflow | Should -Match 'TRUSTED_SUPERVISOR_ROOT'
         $workflow | Should -Match '\$trustedValidator = Join-Path \$env:TRUSTED_SUPERVISOR_ROOT'
+        $workflow | Should -Match 'id: canonical-validation'
+        $workflow | Should -Match 'Verify canonical validation evidence'
+        $workflow | Should -Match 'standard_v1_evidence_sha256'
         $workflow | Should -Not -Match '(?m)^\s*& \.\/scripts\/Validate\.ps1'
     }
 
