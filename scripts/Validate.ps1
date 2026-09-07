@@ -1610,8 +1610,15 @@ function Get-InstalledDirectoryClosureSha256 {
     $root = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "$Context install root is missing: $root" }
     Assert-NoReparseAncestors -Path $root -Context "$Context install root"
-    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force | Sort-Object FullName)
-    if ($files.Count -eq 0) { throw "$Context install root is empty: $root" }
+    $entries = @(Get-ChildItem -LiteralPath $root -Recurse -Force | Sort-Object FullName)
+    if ($entries.Count -eq 0) { throw "$Context install root is empty: $root" }
+    foreach ($entry in $entries) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Context installed closure contains a reparse-backed entry: $($entry.FullName)"
+        }
+    }
+    $files = @($entries | Where-Object { -not $_.PSIsContainer })
+    if ($files.Count -eq 0) { throw "$Context install root contains no regular files: $root" }
     $canonical = [Text.StringBuilder]::new()
     foreach ($file in $files) {
         if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
