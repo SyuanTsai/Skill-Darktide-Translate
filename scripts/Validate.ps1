@@ -322,6 +322,288 @@ function Test-ProcessIdentity {
     }
 }
 
+function Stop-UnixProcessByIdentity {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [Parameter(Mandatory = $true)][string] $Identity,
+        [Parameter(Mandatory = $true)][int] $Signal
+    )
+    if ($ProcessId -le 0 -or [string]::IsNullOrWhiteSpace($Identity) -or $Signal -le 0) {
+        return $false
+    }
+    $nativeType = 'Codex.Validation.UnixProcessBoundary' -as [type]
+    if ($null -eq $nativeType) {
+        Enable-UnixChildSubreaper
+        $nativeType = 'Codex.Validation.UnixProcessBoundary' -as [type]
+    }
+    if ($null -eq $nativeType) {
+        throw 'The Unix pidfd interop type could not be loaded.'
+    }
+    # Open a pidfd before the final identity check so signaling remains bound
+    # to the observed process instance even if its numeric PID is reused.
+    $fileDescriptor = -1
+    if (-not (Test-ProcessIdentity -ProcessId $ProcessId -Identity $Identity)) {
+        return $true
+    }
+    $fileDescriptor = $nativeType::OpenProcessFileDescriptor($ProcessId)
+    if ($fileDescriptor -lt 0) {
+        if (-not (Test-ProcessIdentity -ProcessId $ProcessId -Identity $Identity)) {
+            return $true
+        }
+        return $false
+    }
+    try {
+        try {
+            $actualIdentity = Get-ProcessIdentity -ProcessId $ProcessId
+        }
+        catch {
+            return (-not (Test-ProcessIdentity -ProcessId $ProcessId -Identity $Identity))
+        }
+        if ($actualIdentity -cne $Identity) {
+            return $false
+        }
+        $result = $nativeType::SendProcessSignal($fileDescriptor, $Signal)
+        if ($result -eq 0) {
+            return $true
+        }
+        return (-not (Test-ProcessIdentity -ProcessId $ProcessId -Identity $Identity))
+    }
+    finally {
+        [void]$nativeType::CloseProcessFileDescriptor($fileDescriptor)
+    }
+}
+
+function Get-WindowsProcessBoundaryType {
+    if (-not $script:IsWindowsHost) {
+        throw 'The Windows process boundary is supported only on Windows hosts.'
+    }
+    $nativeType = 'Codex.Validation.WindowsProcessBoundary' -as [type]
+    if ($null -eq $nativeType) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Codex.Validation {
+    public static class WindowsProcessBoundary {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoCounters {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BasicLimitInformation {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ExtendedLimitInformation {
+            public BasicLimitInformation BasicLimitInformation;
+            public IoCounters IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeFileTime {
+            public uint LowDateTime;
+            public uint HighDateTime;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(
+            IntPtr jobHandle,
+            int jobObjectInformationClass,
+            IntPtr jobObjectInformation,
+            uint jobObjectInformationLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr jobHandle, IntPtr processHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr jobHandle, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(
+            IntPtr processHandle,
+            out NativeFileTime creationTime,
+            out NativeFileTime exitTime,
+            out NativeFileTime kernelTime,
+            out NativeFileTime userTime);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr processHandle, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static IntPtr CreateKillOnCloseJob() {
+            IntPtr jobHandle = CreateJobObject(IntPtr.Zero, null);
+            if (jobHandle == IntPtr.Zero) {
+                return IntPtr.Zero;
+            }
+            ExtendedLimitInformation information = new ExtendedLimitInformation();
+            information.BasicLimitInformation.LimitFlags = 0x00002000;
+            int informationLength = Marshal.SizeOf(typeof(ExtendedLimitInformation));
+            IntPtr informationBuffer = Marshal.AllocHGlobal(informationLength);
+            try {
+                Marshal.StructureToPtr(information, informationBuffer, false);
+                if (!SetInformationJobObject(jobHandle, 9, informationBuffer, (uint)informationLength)) {
+                    CloseHandle(jobHandle);
+                    return IntPtr.Zero;
+                }
+                return jobHandle;
+            }
+            finally {
+                Marshal.FreeHGlobal(informationBuffer);
+            }
+        }
+
+        public static bool AssignProcess(IntPtr jobHandle, IntPtr processHandle) {
+            return AssignProcessToJobObject(jobHandle, processHandle);
+        }
+
+        public static bool TerminateJob(IntPtr jobHandle, uint exitCode) {
+            return TerminateJobObject(jobHandle, exitCode);
+        }
+
+        public static IntPtr OpenProcessForTermination(int processId) {
+            return OpenProcess(0x00100401, false, (uint)processId);
+        }
+
+        public static long GetProcessCreationTimeTicks(IntPtr processHandle) {
+            NativeFileTime creationTime;
+            NativeFileTime exitTime;
+            NativeFileTime kernelTime;
+            NativeFileTime userTime;
+            if (!GetProcessTimes(processHandle, out creationTime, out exitTime, out kernelTime, out userTime)) {
+                return -1;
+            }
+            long fileTime = ((long)creationTime.HighDateTime << 32) | (long)creationTime.LowDateTime;
+            return DateTime.FromFileTimeUtc(fileTime).Ticks;
+        }
+
+        public static bool TerminateProcessHandle(IntPtr processHandle, uint exitCode) {
+            return TerminateProcess(processHandle, exitCode);
+        }
+
+        public static bool Close(IntPtr handle) {
+            return CloseHandle(handle);
+        }
+    }
+}
+'@ -ErrorAction Stop
+        $nativeType = 'Codex.Validation.WindowsProcessBoundary' -as [type]
+    }
+    if ($null -eq $nativeType) {
+        throw 'The Windows process boundary interop type could not be loaded.'
+    }
+    return $nativeType
+}
+
+function New-WindowsKillOnCloseJob {
+    param([Parameter(Mandatory = $true)][string] $Context)
+    # The handle's creation time is checked before TerminateProcess is called
+    # on that same handle; no numeric PID is reused for the signal operation.
+    $nativeType = Get-WindowsProcessBoundaryType
+    $jobHandle = $nativeType::CreateKillOnCloseJob()
+    if ($jobHandle -eq [IntPtr]::Zero) {
+        throw "$Context could not create a kill-on-close Windows Job Object."
+    }
+    return $jobHandle
+}
+
+function Assign-WindowsProcessToJob {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr] $JobHandle,
+        [Parameter(Mandatory = $true)][Diagnostics.Process] $Process,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $nativeType = Get-WindowsProcessBoundaryType
+    if (-not $nativeType::AssignProcess($JobHandle, $Process.Handle)) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "$Context could not assign the child to its Windows Job Object (Win32 error $errorCode)."
+    }
+}
+
+function Stop-WindowsProcessByIdentity {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [Parameter(Mandatory = $true)][string] $Identity
+    )
+    if ($ProcessId -le 0 -or [string]::IsNullOrWhiteSpace($Identity)) {
+        return $false
+    }
+    $prefix = 'start-time:'
+    if (-not $Identity.StartsWith($prefix, [StringComparison]::Ordinal)) {
+        return $false
+    }
+    try {
+        $expectedTicks = [long]::Parse(
+            $Identity.Substring($prefix.Length),
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+    catch {
+        return $false
+    }
+    $nativeType = Get-WindowsProcessBoundaryType
+    $processHandle = $nativeType::OpenProcessForTermination($ProcessId)
+    if ($processHandle -eq [IntPtr]::Zero) {
+        return (-not (Test-ProcessIdExists -ProcessId $ProcessId))
+    }
+    try {
+        $actualTicks = $nativeType::GetProcessCreationTimeTicks($processHandle)
+        if ($actualTicks -lt 0 -or $actualTicks -ne $expectedTicks) {
+            return $false
+        }
+        if ($nativeType::TerminateProcessHandle($processHandle, 1)) {
+            return $true
+        }
+        return (-not (Test-ProcessIdentity -ProcessId $ProcessId -Identity $Identity))
+    }
+    finally {
+        [void]$nativeType::Close($processHandle)
+    }
+}
+
+function Stop-WindowsProcessJob {
+    param([Parameter(Mandatory = $true)][IntPtr] $JobHandle)
+    $nativeType = Get-WindowsProcessBoundaryType
+    if (-not $nativeType::TerminateJob($JobHandle, 1)) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Could not terminate the candidate Windows Job Object (Win32 error $errorCode)."
+    }
+}
+
+function Close-WindowsProcessJob {
+    param([Parameter(Mandatory = $true)][IntPtr] $JobHandle)
+    if ($JobHandle -eq [IntPtr]::Zero) { return }
+    $nativeType = Get-WindowsProcessBoundaryType
+    [void]$nativeType::Close($JobHandle)
+}
+
+
 function Enable-UnixChildSubreaper {
     if ($script:IsWindowsHost) { return }
     if (-not $script:IsLinuxHost) { throw 'The Unix child subreaper is supported only on Linux.' }
@@ -345,6 +627,27 @@ namespace Codex.Validation {
 
         public static int GetChildSubreaper(out int enabled) {
             return GetProcessControl(37, out enabled, 0, 0, 0);
+        }
+
+        [DllImport("libc.so.6", EntryPoint = "syscall", SetLastError = true)]
+        private static extern long InvokePidfdOpen(long syscallNumber, int processId, uint flags);
+
+        [DllImport("libc.so.6", EntryPoint = "syscall", SetLastError = true)]
+        private static extern long InvokePidfdSendSignal(long syscallNumber, int processFileDescriptor, int signal, IntPtr signalInfo, uint flags);
+
+        [DllImport("libc.so.6", EntryPoint = "close", SetLastError = true)]
+        private static extern int CloseFileDescriptor(int fileDescriptor);
+
+        public static int OpenProcessFileDescriptor(int processId) {
+            return (int)InvokePidfdOpen(434, processId, 0);
+        }
+
+        public static int SendProcessSignal(int processFileDescriptor, int signal) {
+            return (int)InvokePidfdSendSignal(424, processFileDescriptor, signal, IntPtr.Zero, 0);
+        }
+
+        public static int CloseProcessFileDescriptor(int processFileDescriptor) {
+            return CloseFileDescriptor(processFileDescriptor);
         }
     }
 }
@@ -447,23 +750,17 @@ function Stop-ProcessTree {
         [Parameter(Mandatory = $true)][int] $RootProcessId,
         [Parameter()][int] $ProcessGroupId = 0,
         [Parameter()][AllowNull()][string] $RootProcessIdentity,
-        [Parameter(Mandatory = $true)] $ObservedProcessIdentities
+        [Parameter(Mandatory = $true)] $ObservedProcessIdentities,
+        [Parameter()][IntPtr] $WindowsJobHandle = [IntPtr]::Zero
     )
     if ($RootProcessId -le 0) { throw 'Process-tree cleanup requires a positive root process id.' }
     if (-not $script:IsSupportedProcessBoundaryHost) {
         throw 'Process-tree cleanup is supported only on Windows and Linux hosts.'
     }
-    $taskKillPath = $null
-    $killPath = $null
     if ($script:IsWindowsHost) {
-        $taskKillPath = Join-Path $env:SystemRoot 'System32/taskkill.exe'
-        if (-not (Test-Path -LiteralPath $taskKillPath -PathType Leaf)) {
-            throw "Windows process-tree cleanup command is missing: $taskKillPath"
-        }
+        [void](Get-WindowsProcessBoundaryType)
     }
-    else {
-        $killCommand = Get-Command kill -CommandType Application -ErrorAction Stop | Select-Object -First 1
-        $killPath = [IO.Path]::GetFullPath([string]$killCommand.Path)
+    elseif ($script:IsLinuxHost) {
         if ($ProcessGroupId -le 0 -and (Test-ProcessIdExists -ProcessId $RootProcessId)) {
             $ProcessGroupId = Get-UnixProcessGroupId -ProcessId $RootProcessId
         }
@@ -492,32 +789,33 @@ function Stop-ProcessTree {
             (Test-ProcessIdentity -ProcessId ([int]$_) -Identity ([string]$ObservedProcessIdentities[[int]$_]))
         } | Sort-Object -Unique -Descending)
         if ($script:IsWindowsHost) {
+            if ($WindowsJobHandle -ne [IntPtr]::Zero -and $round -eq 0) {
+                Stop-WindowsProcessJob -JobHandle $WindowsJobHandle
+            }
             foreach ($processId in $targets) {
-                & $taskKillPath /PID $processId /F 2>$null | Out-Null
+                [void](Stop-WindowsProcessByIdentity -ProcessId ([int]$processId) -Identity ([string]$ObservedProcessIdentities[[int]$processId]))
             }
             if ($rootIsCandidate) {
-                & $taskKillPath /PID $RootProcessId /T /F 2>$null | Out-Null
+                if ([string]::IsNullOrWhiteSpace($RootProcessIdentity)) {
+                    if ($WindowsJobHandle -eq [IntPtr]::Zero) {
+                        throw 'Could not safely terminate the candidate Windows root without a bound process identity or Job Object.'
+                    }
+                }
+                else {
+                    [void](Stop-WindowsProcessByIdentity -ProcessId $RootProcessId -Identity $RootProcessIdentity)
+                }
             }
         }
         else {
-            $signal = if ($round -eq 2) { '-KILL' } else { '-TERM' }
-            $groupLeaderOwnsGroup = $false
-            if ($rootIsCandidate -and $ProcessGroupId -gt 0) {
-                try {
-                    $groupLeaderOwnsGroup = (Get-UnixProcessGroupId -ProcessId $RootProcessId) -eq $ProcessGroupId
+            $signalNumber = if ($round -eq 2) { 9 } else { 15 }
+            if ($rootIsCandidate) {
+                if ([string]::IsNullOrWhiteSpace($RootProcessIdentity)) {
+                    throw 'Could not safely terminate the candidate Linux root without a bound process identity.'
                 }
-                catch {
-                    $groupLeaderOwnsGroup = $false
-                }
-            }
-            if ($groupLeaderOwnsGroup) {
-                & $killPath $signal "-$ProcessGroupId" 2>$null | Out-Null
-            }
-            if ($rootIsCandidate -and -not $groupLeaderOwnsGroup) {
-                & $killPath $signal ([string]$RootProcessId) 2>$null | Out-Null
+                [void](Stop-UnixProcessByIdentity -ProcessId $RootProcessId -Identity $RootProcessIdentity -Signal $signalNumber)
             }
             foreach ($processId in $targets) {
-                & $killPath $signal ([string]$processId) 2>$null | Out-Null
+                [void](Stop-UnixProcessByIdentity -ProcessId ([int]$processId) -Identity ([string]$ObservedProcessIdentities[[int]$processId]) -Signal $signalNumber)
             }
         }
         Start-Sleep -Milliseconds 100
@@ -963,6 +1261,7 @@ function Invoke-NativeChecked {
     $observedProcessIdentities = [Collections.Generic.Dictionary[int,string]]::new()
     $baselineSupervisorProcessIdentities = [Collections.Generic.Dictionary[int,string]]::new()
     $processTreeStopped = $false
+    $windowsJobHandle = [IntPtr]::Zero
     try {
         if ($ProtectRunnerCommandFiles) {
             $runnerCommandFileSnapshot = Get-RunnerCommandFileSnapshot -Names $runnerCommandFileNames
@@ -1000,6 +1299,11 @@ function Invoke-NativeChecked {
             }
             foreach ($supervisorProcessId in @(Get-DescendantProcessIds -RootProcessId $PID)) {
                 Add-ProcessIdentityToObservation -ProcessId ([int]$supervisorProcessId) -ObservedProcessIdentities $baselineSupervisorProcessIdentities
+            }
+            if ($script:IsWindowsHost) {
+                # Create containment before Process.Start so detached descendants
+                # remain in the kill-on-close boundary after the root exits.
+                $windowsJobHandle = New-WindowsKillOnCloseJob -Context $Context
             }
             $nativeCommand = $Command
             $nativeArguments = @($Arguments)
@@ -1047,6 +1351,9 @@ function Invoke-NativeChecked {
             $childProcess.StartInfo = $startInfo
             if (-not $childProcess.Start()) { throw "$Context process could not be started: $Command" }
             $childProcessId = $childProcess.Id
+            if ($script:IsWindowsHost) {
+                Assign-WindowsProcessToJob -JobHandle $windowsJobHandle -Process $childProcess -Context $Context
+            }
             if (Test-ProcessIdExists -ProcessId $childProcessId) {
                 try {
                     $childProcessIdentity = Get-ProcessIdentity -ProcessId $childProcessId
@@ -1054,6 +1361,9 @@ function Invoke-NativeChecked {
                 catch {
                     if (Test-ProcessIdExists -ProcessId $childProcessId) { throw }
                 }
+            }
+            if ((Test-ProcessIdExists -ProcessId $childProcessId) -and [string]::IsNullOrWhiteSpace($childProcessIdentity)) {
+                throw "$Context could not bind the child process identity before execution."
             }
             if ($script:IsLinuxHost) {
                 $childProcessGroupId = Wait-ForUnixProcessGroupId -ProcessId $childProcessId -ParentProcessGroupId $parentProcessGroupId
@@ -1073,7 +1383,7 @@ function Invoke-NativeChecked {
                 Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             }
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
-            Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities
+            Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
             $processTreeStopped = $true
             if (-not $childProcess.WaitForExit(5000)) {
                 throw "$Context process did not terminate after process-boundary cleanup."
@@ -1107,11 +1417,15 @@ function Invoke-NativeChecked {
     finally {
         try {
             if ($TerminateProcessTree -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $processTreeStopped) {
-                Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities
+                Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
                 $processTreeStopped = $true
             }
         }
         finally {
+            if ($windowsJobHandle -ne [IntPtr]::Zero) {
+                Close-WindowsProcessJob -JobHandle $windowsJobHandle
+                $windowsJobHandle = [IntPtr]::Zero
+            }
             if ($runnerCommandFileIsolationStarted) {
                 foreach ($name in $runnerCommandFileNames) {
                     if ($previousRunnerCommandFileValues.Contains($name)) {
