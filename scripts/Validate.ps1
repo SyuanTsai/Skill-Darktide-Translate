@@ -1709,6 +1709,75 @@ function Assert-ExternalReceiptFile {
     return $path
 }
 
+function New-ContainedProcessEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot
+    )
+    $allowedNames = @(
+        'PATH', 'PATHEXT', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PSHOME', 'PSModulePath',
+        'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TMP', 'TEMP', 'TMPDIR',
+        'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+        'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TERM_PROGRAM', 'COLORTERM',
+        'CI', 'NO_COLOR', 'FORCE_COLOR', 'PWSH_DISTRIBUTION_CHANNEL', 'POWERSHELL_DISTRIBUTION_CHANNEL',
+        'GITHUB_ACTIONS', 'GITHUB_ACTION', 'GITHUB_ACTION_PATH', 'GITHUB_ACTION_REPOSITORY',
+        'GITHUB_ACTION_REF', 'GITHUB_ACTOR', 'GITHUB_BASE_REF', 'GITHUB_ENV', 'GITHUB_EVENT_NAME',
+        'GITHUB_EVENT_PATH', 'GITHUB_GRAPHQL_URL', 'GITHUB_HEAD_REF', 'GITHUB_JOB', 'GITHUB_OUTPUT',
+        'GITHUB_PATH', 'GITHUB_REF', 'GITHUB_REF_NAME', 'GITHUB_REF_PROTECTED', 'GITHUB_REF_TYPE',
+        'GITHUB_REPOSITORY', 'GITHUB_REPOSITORY_ID', 'GITHUB_REPOSITORY_OWNER',
+        'GITHUB_REPOSITORY_OWNER_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_RUN_ID', 'GITHUB_RUN_NUMBER',
+        'GITHUB_SERVER_URL', 'GITHUB_SHA', 'GITHUB_STATE', 'GITHUB_STEP_SUMMARY', 'GITHUB_WORKFLOW',
+        'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_WORKSPACE', 'RUNNER_ARCH', 'RUNNER_DEBUG',
+        'RUNNER_NAME', 'RUNNER_OS', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE', 'RUNNER_TRACKING_ID',
+        'RUNNER_WORKSPACE', 'ImageOS', 'ImageVersion',
+        'CODEX_VALIDATION_NATIVE_PAYLOAD', 'CODEX_VALIDATION_RESUME_EVENT', 'CODEX_VALIDATION_HAS_STANDARD_INPUT'
+    )
+    $environment = [ordered]@{}
+    foreach ($name in $allowedNames) {
+        $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
+        if ($null -ne $value) {
+            $environment[$name] = [string]$value
+        }
+    }
+    # Candidate processes receive run-owned temporary/configuration locations,
+    # never the runner's user profile or shared temp roots. Secrets and mutable
+    # package-manager configuration are intentionally absent from the allowlist.
+    $containmentRoot = Join-Path $DiagnosticRoot ("native-environment-{0}" -f [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $containmentRoot -Force)
+    $containmentItem = Get-Item -LiteralPath $containmentRoot -Force
+    if (-not $containmentItem.PSIsContainer -or ($containmentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Contained native-process environment root must be a regular non-reparse directory.'
+    }
+    Assert-NoReparseAncestors -Path $containmentRoot -Context 'Contained native-process environment root'
+    $homePath = Join-Path $containmentRoot 'home'
+    $tempPath = Join-Path $containmentRoot 'temp'
+    $configPath = Join-Path $containmentRoot 'config'
+    $cachePath = Join-Path $containmentRoot 'cache'
+    $dataPath = Join-Path $containmentRoot 'data'
+    foreach ($path in @($homePath, $tempPath, $configPath, $cachePath, $dataPath)) {
+        [void](New-Item -ItemType Directory -Path $path -Force)
+        $item = Get-Item -LiteralPath $path -Force
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Contained native-process environment path is not a regular non-reparse directory: $path"
+        }
+        Assert-NoReparseAncestors -Path $path -Context 'Contained native-process environment path'
+    }
+    $environment['HOME'] = $homePath
+    $environment['USERPROFILE'] = $homePath
+    $environment['TMP'] = $tempPath
+    $environment['TEMP'] = $tempPath
+    $environment['TMPDIR'] = $tempPath
+    $environment['XDG_CONFIG_HOME'] = $configPath
+    $environment['XDG_CACHE_HOME'] = $cachePath
+    $environment['XDG_DATA_HOME'] = $dataPath
+    $environment['RUNNER_TEMP'] = $tempPath
+    $environment.Remove('GITHUB_TOKEN')
+    $environment.Remove('GH_TOKEN')
+    $environment.Remove('ACTIONS_RUNTIME_TOKEN')
+    $environment.Remove('ACTIONS_ID_TOKEN_REQUEST_TOKEN')
+    $environment.Remove('ACTIONS_ID_TOKEN_REQUEST_URL')
+    return $environment
+}
+
 function Invoke-NativeChecked {
     param(
         [Parameter(Mandatory = $true)][string] $Command,
@@ -1808,11 +1877,48 @@ function Invoke-NativeChecked {
                     throw "$Context non-escapable Linux process namespace launcher is missing: $unsharePath"
                 }
                 Assert-NoReparseAncestors -Path $unsharePath -Context "$Context process namespace launcher"
+                $shellCommand = Get-Command sh -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $shellPath = [IO.Path]::GetFullPath([string]$shellCommand.Path)
+                if (-not (Test-Path -LiteralPath $shellPath -PathType Leaf)) {
+                    throw "$Context trusted Linux shell is missing: $shellPath"
+                }
+                Assert-NoReparseAncestors -Path $shellPath -Context "$Context trusted Linux shell"
+                $mountCommand = Get-Command mount -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $mountPath = [IO.Path]::GetFullPath([string]$mountCommand.Path)
+                if (-not (Test-Path -LiteralPath $mountPath -PathType Leaf)) {
+                    throw "$Context trusted Linux mount utility is missing: $mountPath"
+                }
+                Assert-NoReparseAncestors -Path $mountPath -Context "$Context trusted Linux mount utility"
                 $nativeCommand = $setsidPath
+                $maskHostSocketsScript = @'
+set -eu
+mount_path="$1"
+shift
+"$mount_path" --make-rprivate /
+for socket_path in \
+    /run/docker.sock \
+    /var/run/docker.sock \
+    /run/docker/engine.sock \
+    /var/run/docker/engine.sock \
+    /run/podman/podman.sock \
+    /var/run/podman/podman.sock \
+    /run/containerd/containerd.sock \
+    /var/run/containerd/containerd.sock \
+    /run/buildkit/buildkitd.sock \
+    /var/run/buildkit/buildkitd.sock \
+    /run/user/*/docker.sock \
+    /var/run/user/*/docker.sock
+do
+    if [ -S "$socket_path" ]; then
+        "$mount_path" --bind /dev/null "$socket_path"
+    fi
+done
+exec "$@"
+'@
                 $nativeArguments = @(
                     $unsharePath,
                     '--user', '--map-root-user', '--mount', '--pid', '--fork', '--mount-proc', '--kill-child', '--',
-                    $Command
+                    $shellPath, '-c', $maskHostSocketsScript, '--', $mountPath, $Command
                 ) + @($Arguments)
             }
             elseif ($script:IsWindowsHost) {
@@ -1888,6 +1994,18 @@ finally {
             $startInfo.RedirectStandardError = $true
             if ($PSBoundParameters.ContainsKey('StandardInput')) {
                 $startInfo.RedirectStandardInput = $true
+            }
+            $nativeEnvironmentVariables = if ($TerminateProcessTree) {
+                New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
+            }
+            else {
+                $null
+            }
+            if ($null -ne $nativeEnvironmentVariables) {
+                $startInfo.EnvironmentVariables.Clear()
+                foreach ($environmentName in @($nativeEnvironmentVariables.Keys)) {
+                    $startInfo.EnvironmentVariables[[string]$environmentName] = [string]$nativeEnvironmentVariables[$environmentName]
+                }
             }
             $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
             if ($null -ne $argumentListProperty) {
@@ -2306,14 +2424,14 @@ foreach ($skillId in $skillIds) {
     $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot
+    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $validatorReportPath = Join-Path $runRoot "skill-validator-$skillId.json"
     [IO.File]::WriteAllText($validatorReportPath, $validatorOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $validatorReport = Read-JsonFile -Path $validatorReportPath -Context "skill-validator package validation report for $skillId"
     Assert-SkillValidatorReport -Report $validatorReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
     $skillValidatorReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($validatorReportPath) }
 
-    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot
+    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $checkReportPath = Join-Path $runRoot "skill-validator-check-$skillId.json"
     [IO.File]::WriteAllText($checkReportPath, $checkOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $checkReport = Read-JsonFile -Path $checkReportPath -Context "skill-validator full check report for $skillId"
@@ -2328,7 +2446,7 @@ foreach ($skillId in $skillIds) {
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
     $reportPath = Join-Path $runRoot "skillspector-static-$skillId.json"
-    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot)
+    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
     $report = Read-JsonFile -Path $reportPath -Context "SkillSpector static report for $skillId"
     $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
     foreach ($issue in $issues) {
@@ -2387,7 +2505,7 @@ foreach ($skillId in $skillIds) {
         @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
             ForEach-Object { [string]$_.path }
     )
-    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot
+    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $toolsReportPath = Join-Path $runRoot "skill-tools-$skillId.sarif.json"
     [IO.File]::WriteAllText($toolsReportPath, $toolsOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $toolsReport = Read-JsonFile -Path $toolsReportPath -Context "skill-tools report for $skillId"
@@ -2402,7 +2520,7 @@ $routeCases = @(
 foreach ($routeCase in $routeCases) {
     $routeOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @(
         $skillToolsEntryPoint, 'route', [string]$routeCase.query, '--skills', $skillsRoot, '--top-k', '1', '--format', 'json'
-    ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot
+    ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $routePath = Join-Path $runRoot ("skill-tools-route-{0}.json" -f ([guid]::NewGuid().ToString('N')))
     [IO.File]::WriteAllText($routePath, $routeOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     # PowerShell unwraps a one-item JSON array during assignment. Normalize the
@@ -2444,7 +2562,7 @@ if ($semanticTriggered) {
                 ForEach-Object { [string]$_.path }
         )
         $semanticPath = Join-Path $runRoot "skillspector-semantic-$skillId.json"
-        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot)
+        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
         $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
         try {
             $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
