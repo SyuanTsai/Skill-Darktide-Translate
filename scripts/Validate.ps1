@@ -1778,6 +1778,55 @@ function New-ContainedProcessEnvironment {
     return $environment
 }
 
+function Get-RepositoryRawSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot
+    )
+    $root = [IO.Path]::GetFullPath($RepositoryRoot)
+    $topLevel = @(Get-ChildItem -LiteralPath $root -Force)
+    $items = foreach ($entry in $topLevel) {
+        if ([string]$entry.Name -ceq '.git') {
+            continue
+        }
+        $entry
+        if ($entry.PSIsContainer) {
+            Get-ChildItem -LiteralPath $entry.FullName -Recurse -Force
+        }
+    }
+    $snapshot = foreach ($item in @($items)) {
+        $relativePath = [IO.Path]::GetRelativePath($root, $item.FullName).Replace([IO.Path]::DirectorySeparatorChar, '/')
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Repository contains a reparse entry while taking the raw snapshot: $relativePath"
+        }
+        [pscustomobject][ordered]@{
+            path = $relativePath
+            isContainer = [bool]$item.PSIsContainer
+            length = if ($item.PSIsContainer) { [int64]-1 } else { [int64]$item.Length }
+            rawSha256 = if ($item.PSIsContainer) { '' } else { (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash.ToLowerInvariant() }
+        }
+    }
+    @($snapshot | Sort-Object -Property path)
+}
+
+function Assert-RepositoryRawSnapshotUnchanged {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Before,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $After
+    )
+    if ($Before.Count -ne $After.Count) {
+        throw 'Candidate repository filesystem changed during repository tests.'
+    }
+    for ($index = 0; $index -lt $Before.Count; $index++) {
+        $beforeEntry = $Before[$index]
+        $afterEntry = $After[$index]
+        foreach ($propertyName in @('path', 'isContainer', 'length', 'rawSha256')) {
+            if ([string]$beforeEntry.$propertyName -cne [string]$afterEntry.$propertyName) {
+                throw "Candidate repository entry '$($beforeEntry.path)' changed during repository tests."
+            }
+        }
+    }
+}
+
 function Invoke-NativeChecked {
     param(
         [Parameter(Mandatory = $true)][string] $Command,
@@ -2224,6 +2273,21 @@ $dirty = @(& $gitPath @gitConfigArguments -C $repoRoot status --porcelain=v1 --u
 if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
     throw 'Canonical validation requires a clean candidate commit; commit or remove every tracked/untracked change first.'
 }
+$gitIndexOutput = @(& $gitPath @gitConfigArguments -C $repoRoot rev-parse --git-path index 2>$null)
+if ($LASTEXITCODE -ne 0 -or $gitIndexOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$gitIndexOutput[0])) {
+    throw 'Could not resolve the candidate Git index path before repository tests.'
+}
+$gitIndexPath = [string]$gitIndexOutput[0]
+if (-not [IO.Path]::IsPathRooted($gitIndexPath)) {
+    $gitIndexPath = Join-Path $repoRoot $gitIndexPath
+}
+$gitIndexPath = [IO.Path]::GetFullPath($gitIndexPath)
+if (-not (Test-Path -LiteralPath $gitIndexPath -PathType Leaf)) {
+    throw "Candidate Git index is missing before repository tests: $gitIndexPath"
+}
+Assert-NoReparseAncestors -Path $gitIndexPath -Context 'Candidate Git index'
+$prePesterGitIndexSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitIndexPath).Hash.ToLowerInvariant()
+$prePesterRepositoryRawSnapshot = @(Get-RepositoryRawSnapshot -RepositoryRoot $repoRoot)
 $resolvedBaseCommit = ''
 if (-not [string]::IsNullOrWhiteSpace($BaseCommit)) {
     $baseRevision = "$BaseCommit^{commit}"
@@ -2723,11 +2787,16 @@ $postPesterTree = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-pa
 if ($LASTEXITCODE -ne 0 -or $postPesterTree -cne $candidateTree) {
     throw 'Candidate Git tree changed during repository tests.'
 }
-$postPesterIndexState = @(& $gitPath @gitConfigArguments -C $repoRoot ls-files -v)
-if ($LASTEXITCODE -ne 0 -or @($postPesterIndexState | Where-Object { [string]$_ -notmatch '^H ' }).Count -ne 0) {
-    throw 'Candidate Git index contains assume-unchanged or other non-normal entries after repository tests.'
+$postPesterIndexItem = Get-Item -LiteralPath $gitIndexPath -Force -ErrorAction SilentlyContinue
+if ($null -eq $postPesterIndexItem -or $postPesterIndexItem.PSIsContainer -or
+    ($postPesterIndexItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw 'Candidate Git index was removed or replaced with a non-regular entry during repository tests.'
 }
-$postPesterRepositoryJson = & $postPesterRepositoryValidatorScript -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath | Select-Object -Last 1
+$postPesterGitIndexSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitIndexPath).Hash.ToLowerInvariant()
+if ($postPesterGitIndexSha256 -cne $prePesterGitIndexSha256) {
+    throw 'Candidate Git index changed during repository tests.'
+}
+$postPesterRepositoryJson = & $postPesterRepositoryValidatorScript -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath -NoFilters | Select-Object -Last 1
 $postPesterRepositoryReport = $postPesterRepositoryJson | ConvertFrom-Json -Depth 100
 if ($postPesterRepositoryReport.result -cne 'passed' -or [int]$postPesterRepositoryReport.activeSkillCount -ne $skillIds.Count) {
     throw 'Post-Pester repository validation did not cover the exact active Skill inventory.'
@@ -2737,10 +2806,8 @@ foreach ($skillId in $skillIds) {
     $after = @($postPesterRepositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })
     Assert-SkillInventoryUnchanged -Before $before -After $after -SkillId $skillId -Context 'during repository tests'
 }
-$postPesterDirty = @(& $gitPath @gitConfigArguments -C $repoRoot status --porcelain=v1 --untracked-files=all)
-if ($LASTEXITCODE -ne 0 -or $postPesterDirty.Count -ne 0) {
-    throw 'Candidate changed during repository tests; post-Pester evidence is not bound to a clean commit.'
-}
+$postPesterRepositoryRawSnapshot = @(Get-RepositoryRawSnapshot -RepositoryRoot $repoRoot)
+Assert-RepositoryRawSnapshotUnchanged -Before $prePesterRepositoryRawSnapshot -After $postPesterRepositoryRawSnapshot
 $repositoryReport = $postPesterRepositoryReport
 
 $summary = [pscustomobject][ordered]@{
