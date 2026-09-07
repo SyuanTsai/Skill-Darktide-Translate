@@ -3,9 +3,9 @@
   "standardVersion": "v1",
   "authority": {
     "repository": "https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git",
-    "commit": "96f3f7f547e0094d66f088f6d092be2910855bfa",
-    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/96f3f7f547e0094d66f088f6d092be2910855bfa",
-    "archiveSha256": "ba090e8f87166f94028d9fb3a9eb2cb3058097eb6f37cc2262c71a9d4c012fab",
+    "commit": "5ff96a358a51788a3764b27c31def842d5aee55d",
+    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/5ff96a358a51788a3764b27c31def842d5aee55d",
+    "archiveSha256": "36aa50ec00697dd5b06c83aef9a591f0f4f4a553a8ecc5b165308de908161d80",
     "files": [
       {
         "path": "docs/standards/README.md",
@@ -61,7 +61,7 @@
       },
       {
         "path": "scripts/Resolve-StandardValidationTool.ps1",
-        "sha256": "94745e590539f7b41fc84990abedf4daa1d6bce38705fd8e81555ce962f979f0"
+        "sha256": "84e1b8732f4b71a69c283aad93ac7ce699c39d69d55fdfbef71e781cacff94de"
       }
     ]
   },
