@@ -186,7 +186,10 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Not -Match ([regex]::Escape("'-OutputPath', `$pesterResultPath"))
         $script:Validator | Should -Match 'postPesterCandidateCommit'
         $script:Validator | Should -Match 'postPesterTree'
-        $script:Validator | Should -Match 'ls-files -v'
+        $script:Validator | Should -Match 'prePesterGitIndexSha256'
+        $script:Validator | Should -Match 'Get-RepositoryRawSnapshot'
+        $script:Validator | Should -Match 'Assert-RepositoryRawSnapshotUnchanged'
+        $script:Validator | Should -Match 'postPesterRepositoryRawSnapshot'
         $script:Validator | Should -Match 'SkillSpector semantic scanner'
         $script:Validator | Should -Match 'Assert-ReceiptFile -Receipt \$receipts\.skillspector'
         $script:Validator | Should -Match 'Assert-ReceiptInstalledClosure'
@@ -238,5 +241,7 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'SkippedCount -ne 0'
         $repositoryValidator = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Test-Repository.ps1') -Raw
         $repositoryValidator | Should -Match 'rawSha256'
+        $repositoryValidator | Should -Match '\[switch\] \$NoFilters'
+        $repositoryValidator | Should -Match 'NoFilters:\$NoFilters'
     }
 }
