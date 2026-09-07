@@ -841,33 +841,23 @@ if ($pesterResult.result -cne 'passed' -or
 
 # Candidate Pester code runs with the runner account and may replace files in
 # the run-owned or supervisor roots. Never invoke the original path again
-# after that untrusted process. Re-materialize the validator from the bytes
-# captured before Pester into a fresh run-owned directory and bind its hash
-# before using it for post-test evidence.
-Assert-NoReparseAncestors -Path $runRoot -Context 'Post-Pester validator parent'
-$postPesterValidatorRoot = Join-Path $runRoot ("post-pester-validator-{0}" -f ([guid]::NewGuid().ToString('N')))
-if (Test-Path -LiteralPath $postPesterValidatorRoot) {
-    throw 'Post-Pester validator root unexpectedly already exists.'
-}
-[void](New-Item -ItemType Directory -Path $postPesterValidatorRoot)
-Assert-NoReparseAncestors -Path $postPesterValidatorRoot -Context 'Post-Pester validator root'
-$postPesterRepositoryValidatorPath = Join-Path $postPesterValidatorRoot 'Test-Repository.ps1'
-$validatorStream = [IO.File]::Open(
-    $postPesterRepositoryValidatorPath,
-    [IO.FileMode]::CreateNew,
-    [IO.FileAccess]::Write,
-    [IO.FileShare]::Read
-)
+# after that untrusted process. Keep the trusted bytes in memory and execute
+# a scriptblock created directly from that pre-test snapshot; this avoids
+# reopening any candidate-writable pathname for post-test evidence.
+$postPesterValidatorHasher = [Security.Cryptography.SHA256]::Create()
 try {
-    $validatorStream.Write($repositoryValidatorBytes, 0, $repositoryValidatorBytes.Length)
+    $postPesterValidatorHash = ([BitConverter]::ToString($postPesterValidatorHasher.ComputeHash($repositoryValidatorBytes)) -replace '-', '').ToLowerInvariant()
 }
 finally {
-    $validatorStream.Dispose()
+    $postPesterValidatorHasher.Dispose()
 }
-Assert-NoReparseAncestors -Path $postPesterRepositoryValidatorPath -Context 'Post-Pester repository validator'
-$postPesterValidatorHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $postPesterRepositoryValidatorPath).Hash.ToLowerInvariant()
 if ($postPesterValidatorHash -cne $repositoryValidatorHash) {
     throw 'Post-Pester repository validator identity does not match the pre-test trusted bytes.'
+}
+$postPesterRepositoryValidatorText = [Text.UTF8Encoding]::new($false, $true).GetString($repositoryValidatorBytes)
+$postPesterRepositoryValidatorScript = [scriptblock]::Create($postPesterRepositoryValidatorText)
+if ($null -eq $postPesterRepositoryValidatorScript) {
+    throw 'Post-Pester repository validator script could not be created from the pre-test trusted bytes.'
 }
 
 $postPesterRepositoryReportPath = Join-Path $runRoot 'repository-validation-post-pester.json'
@@ -883,7 +873,7 @@ $postPesterIndexState = @(& $gitPath @gitConfigArguments -C $repoRoot ls-files -
 if ($LASTEXITCODE -ne 0 -or @($postPesterIndexState | Where-Object { [string]$_ -notmatch '^H ' }).Count -ne 0) {
     throw 'Candidate Git index contains assume-unchanged or other non-normal entries after repository tests.'
 }
-$postPesterRepositoryJson = & $postPesterRepositoryValidatorPath -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath | Select-Object -Last 1
+$postPesterRepositoryJson = & $postPesterRepositoryValidatorScript -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath | Select-Object -Last 1
 $postPesterRepositoryReport = $postPesterRepositoryJson | ConvertFrom-Json -Depth 100
 if ($postPesterRepositoryReport.result -cne 'passed' -or [int]$postPesterRepositoryReport.activeSkillCount -ne $skillIds.Count) {
     throw 'Post-Pester repository validation did not cover the exact active Skill inventory.'
