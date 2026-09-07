@@ -169,6 +169,12 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'setsid'
         $script:Validator | Should -Match 'unshare'
         $script:Validator | Should -Match '--kill-child'
+        $script:Validator | Should -Match 'maskHostSocketsScript'
+        $script:Validator | Should -Match '--make-rprivate'
+        $script:Validator | Should -Match '/run/docker\.sock'
+        $script:Validator | Should -Match 'function New-ContainedProcessEnvironment'
+        $script:Validator | Should -Match 'EnvironmentVariables\.Clear\(\)'
+        $script:Validator | Should -Match 'ACTIONS_RUNTIME_TOKEN'
         $script:Validator | Should -Match 'WaitForExit\(100\)'
         $observedProcessIndex = $script:Validator.IndexOf('Add-ObservedProcessIds -RootProcessId')
         $timedWaitIndex = $script:Validator.IndexOf('WaitForExit(100)')
