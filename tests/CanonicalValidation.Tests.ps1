@@ -130,6 +130,11 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'supervisor-owned completion result'
         $script:Validator | Should -Match 'StandardInput \$pesterResultMarker'
         $script:Validator | Should -Match 'IsolateRunnerCommandFiles'
+        $script:Validator | Should -Match 'TerminateProcessTree'
+        $script:Validator | Should -Match 'ProtectRunnerCommandFiles'
+        $script:Validator | Should -Match 'Stop-ProcessTree'
+        $script:Validator | Should -Match 'Get-DescendantProcessIds'
+        $script:Validator | Should -Match 'Assert-RunnerCommandFilesUnchanged'
         $script:Validator | Should -Match 'standard_v1_evidence_sha256'
         $script:Validator | Should -Not -Match 'pesterResultPath'
         $script:Validator | Should -Not -Match ([regex]::Escape("'-OutputPath', `$pesterResultPath"))

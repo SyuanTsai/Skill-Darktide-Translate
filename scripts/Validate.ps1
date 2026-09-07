@@ -128,6 +128,204 @@ function Assert-SkillInventoryUnchanged {
     }
 }
 
+function Get-FileByteSha256 {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+    }
+}
+
+function Get-DescendantProcessIds {
+    param(
+        [Parameter(Mandatory = $true)][int] $RootProcessId
+    )
+    $processes = @()
+    if ($IsWindows) {
+        try {
+            $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | ForEach-Object {
+                [pscustomobject]@{
+                    processId = [int]$_.ProcessId
+                    parentProcessId = [int]$_.ParentProcessId
+                }
+            })
+        }
+        catch {
+            throw "Could not enumerate Windows child processes for process-tree cleanup: $($_.Exception.Message)"
+        }
+    }
+    else {
+        foreach ($entry in @(Get-ChildItem -LiteralPath '/proc' -Directory -ErrorAction SilentlyContinue)) {
+            if ([string]$entry.Name -notmatch '^[0-9]+$') { continue }
+            try {
+                $stat = [IO.File]::ReadAllText((Join-Path $entry.FullName 'stat'))
+            }
+            catch {
+                continue
+            }
+            if ($stat -cmatch '^[0-9]+\s+\(.*\)\s+\S+\s+(?<parentProcessId>[0-9]+)\s') {
+                $processes += [pscustomobject]@{
+                    processId = [int]$entry.Name
+                    parentProcessId = [int]$Matches.parentProcessId
+                }
+            }
+        }
+    }
+
+    $frontier = @($RootProcessId)
+    $descendantIds = [Collections.Generic.List[int]]::new()
+    while ($frontier.Count -gt 0) {
+        $next = [Collections.Generic.List[int]]::new()
+        foreach ($process in $processes) {
+            $processId = [int]$process.processId
+            if ($frontier -contains [int]$process.parentProcessId -and
+                -not $descendantIds.Contains($processId)) {
+                [void]$descendantIds.Add($processId)
+                [void]$next.Add($processId)
+            }
+        }
+        $frontier = @($next.ToArray())
+    }
+    return @($descendantIds.ToArray())
+}
+
+function Stop-ProcessTree {
+    param(
+        [Parameter(Mandatory = $true)][int] $RootProcessId
+    )
+    if ($RootProcessId -le 0) { throw 'Process-tree cleanup requires a positive root process id.' }
+    $taskKillPath = $null
+    $killPath = $null
+    if ($IsWindows) {
+        $taskKillPath = Join-Path $env:SystemRoot 'System32/taskkill.exe'
+        if (-not (Test-Path -LiteralPath $taskKillPath -PathType Leaf)) {
+            throw "Windows process-tree cleanup command is missing: $taskKillPath"
+        }
+    }
+    else {
+        $killCommand = Get-Command kill -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $killPath = [IO.Path]::GetFullPath([string]$killCommand.Path)
+    }
+
+    for ($round = 0; $round -lt 3; $round++) {
+        $descendants = @(Get-DescendantProcessIds -RootProcessId $RootProcessId)
+        $targets = @($descendants | Sort-Object -Descending)
+        if ($IsWindows) {
+            foreach ($processId in $targets) {
+                & $taskKillPath /PID $processId /F 2>$null | Out-Null
+            }
+            & $taskKillPath /PID $RootProcessId /T /F 2>$null | Out-Null
+        }
+        else {
+            $signal = if ($round -eq 2) { '-KILL' } else { '-TERM' }
+            & $killPath $signal "-$RootProcessId" 2>$null | Out-Null
+            foreach ($processId in $targets) {
+                & $killPath $signal ([string]$processId) 2>$null | Out-Null
+            }
+        }
+        Start-Sleep -Milliseconds 100
+        $remaining = @(Get-DescendantProcessIds -RootProcessId $RootProcessId)
+        if ($remaining.Count -eq 0) { return }
+    }
+    throw "Could not terminate the complete candidate process tree rooted at process $RootProcessId."
+}
+
+function Get-RunnerCommandFileSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string[]] $Names
+    )
+    $snapshot = [ordered]@{}
+    foreach ($name in $Names) {
+        $path = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            $snapshot[$name] = [pscustomobject][ordered]@{
+                path = ''
+                exists = $false
+                sha256 = ''
+            }
+            continue
+        }
+        $fullPath = [IO.Path]::GetFullPath($path)
+        $exists = Test-Path -LiteralPath $fullPath -PathType Leaf
+        $hash = ''
+        if ($exists) {
+            Assert-NoReparseAncestors -Path $fullPath -Context "Protected $name command file"
+            $hash = Get-FileByteSha256 -Path $fullPath
+        }
+        $snapshot[$name] = [pscustomobject][ordered]@{
+            path = $fullPath
+            exists = [bool]$exists
+            sha256 = $hash
+        }
+    }
+    return $snapshot
+}
+
+function Assert-RunnerCommandFilesUnchanged {
+    param(
+        [Parameter(Mandatory = $true)] $Before,
+        [Parameter(Mandatory = $true)][string[]] $Names
+    )
+    foreach ($name in $Names) {
+        $beforeEntry = $Before[$name]
+        $path = [string]$beforeEntry.path
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        $exists = Test-Path -LiteralPath $path -PathType Leaf
+        if ([bool]$beforeEntry.exists -ne [bool]$exists) {
+            throw "Protected $name command file was created or removed by candidate code."
+        }
+        if ($exists) {
+            Assert-NoReparseAncestors -Path $path -Context "Protected $name command file"
+            $actualHash = Get-FileByteSha256 -Path $path
+            if ($actualHash -cne [string]$beforeEntry.sha256) {
+                throw "Protected $name command file changed while candidate code was running."
+            }
+        }
+    }
+}
+
+function ConvertTo-NativeProcessArgumentString {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Arguments
+    )
+    $rendered = foreach ($argument in $Arguments) {
+        $value = [string]$argument
+        $builder = [Text.StringBuilder]::new()
+        [void]$builder.Append([char]34)
+        $backslashCount = 0
+        for ($index = 0; $index -lt $value.Length; $index++) {
+            $character = $value[$index]
+            if ($character -eq [char]92) {
+                $backslashCount++
+                continue
+            }
+            if ($character -eq [char]34) {
+                [void]$builder.Append([char]92, ($backslashCount * 2) + 1)
+                [void]$builder.Append([char]34)
+                $backslashCount = 0
+                continue
+            }
+            if ($backslashCount -gt 0) {
+                [void]$builder.Append([char]92, $backslashCount)
+                $backslashCount = 0
+            }
+            [void]$builder.Append($character)
+        }
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append([char]92, $backslashCount * 2)
+        }
+        [void]$builder.Append([char]34)
+        $builder.ToString()
+    }
+    return ($rendered -join ' ')
+}
+
 function Get-ValidationSecurityAction {
     param(
         [Parameter(Mandatory = $true)] $Policy,
@@ -428,9 +626,14 @@ function Invoke-NativeChecked {
         [Parameter(Mandatory = $true)][string] $Context,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
         [Parameter()][AllowNull()][string] $StandardInput,
-        [Parameter()][switch] $IsolateRunnerCommandFiles
+        [Parameter()][switch] $IsolateRunnerCommandFiles,
+        [Parameter()][switch] $TerminateProcessTree,
+        [Parameter()][switch] $ProtectRunnerCommandFiles
     )
     if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) { throw "$Context executable is missing: $Command" }
+    if ($ProtectRunnerCommandFiles -and -not $IsolateRunnerCommandFiles) {
+        throw "$Context cannot protect runner command files without isolation."
+    }
     $stderrPath = Join-Path $DiagnosticRoot ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     $runnerCommandFileNames = @(
         'GITHUB_ENV',
@@ -440,8 +643,15 @@ function Invoke-NativeChecked {
         'GITHUB_STEP_SUMMARY'
     )
     $previousRunnerCommandFileValues = [ordered]@{}
+    $runnerCommandFileSnapshot = $null
     $runnerCommandFileIsolationStarted = $false
+    $childProcess = $null
+    $childProcessId = 0
+    $processTreeStopped = $false
     try {
+        if ($ProtectRunnerCommandFiles) {
+            $runnerCommandFileSnapshot = Get-RunnerCommandFileSnapshot -Names $runnerCommandFileNames
+        }
         if ($IsolateRunnerCommandFiles) {
             $runnerCommandFileIsolationStarted = $true
             foreach ($name in $runnerCommandFileNames) {
@@ -466,33 +676,87 @@ function Invoke-NativeChecked {
                 [Environment]::SetEnvironmentVariable($name, $isolatedPath, [EnvironmentVariableTarget]::Process)
             }
         }
-        $stdout = if ($PSBoundParameters.ContainsKey('StandardInput')) {
-            $StandardInput | & $Command @Arguments 2> $stderrPath
+        if ($TerminateProcessTree) {
+            $startInfo = [Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $Command
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            if ($PSBoundParameters.ContainsKey('StandardInput')) {
+                $startInfo.RedirectStandardInput = $true
+            }
+            $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+            if ($null -ne $argumentListProperty) {
+                foreach ($argument in $Arguments) {
+                    [void]$startInfo.ArgumentList.Add([string]$argument)
+                }
+            }
+            else {
+                $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $Arguments
+            }
+            $startInfo.WorkingDirectory = [string](Get-Location).Path
+            $childProcess = [Diagnostics.Process]::new()
+            $childProcess.StartInfo = $startInfo
+            if (-not $childProcess.Start()) { throw "$Context process could not be started: $Command" }
+            $childProcessId = $childProcess.Id
+            $stdoutTask = $childProcess.StandardOutput.ReadToEndAsync()
+            $stderrTask = $childProcess.StandardError.ReadToEndAsync()
+            if ($PSBoundParameters.ContainsKey('StandardInput')) {
+                $childProcess.StandardInput.Write($StandardInput)
+                $childProcess.StandardInput.Close()
+            }
+            $childProcess.WaitForExit()
+            Stop-ProcessTree -RootProcessId $childProcessId
+            $processTreeStopped = $true
+            if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
+                throw "$Context left redirected output handles open after process-tree cleanup."
+            }
+            $stdoutText = $stdoutTask.GetAwaiter().GetResult()
+            $stderrText = $stderrTask.GetAwaiter().GetResult()
+            $exitCode = $childProcess.ExitCode
         }
         else {
-            @(& $Command @Arguments 2> $stderrPath)
+            $stdout = if ($PSBoundParameters.ContainsKey('StandardInput')) {
+                $StandardInput | & $Command @Arguments 2> $stderrPath
+            }
+            else {
+                @(& $Command @Arguments 2> $stderrPath)
+            }
+            $exitCode = $LASTEXITCODE
+            $stdoutText = ($stdout | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+            $stderrText = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -Encoding UTF8 } else { '' }
         }
-        $exitCode = $LASTEXITCODE
-        $stdoutText = ($stdout | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-        $stderrText = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -Encoding UTF8 } else { '' }
+        if ($ProtectRunnerCommandFiles) {
+            Assert-RunnerCommandFilesUnchanged -Before $runnerCommandFileSnapshot -Names $runnerCommandFileNames
+        }
         if ($exitCode -ne 0) {
             throw "$Context exited with code $exitCode.`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText"
         }
         return $stdoutText
     }
     finally {
-        if ($runnerCommandFileIsolationStarted) {
-            foreach ($name in $runnerCommandFileNames) {
-                if ($previousRunnerCommandFileValues.Contains($name)) {
-                    [Environment]::SetEnvironmentVariable(
-                        $name,
-                        $previousRunnerCommandFileValues[$name],
-                        [EnvironmentVariableTarget]::Process
-                    )
-                }
+        try {
+            if ($TerminateProcessTree -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $processTreeStopped) {
+                Stop-ProcessTree -RootProcessId $childProcessId
+                $processTreeStopped = $true
             }
         }
-        if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
+        finally {
+            if ($runnerCommandFileIsolationStarted) {
+                foreach ($name in $runnerCommandFileNames) {
+                    if ($previousRunnerCommandFileValues.Contains($name)) {
+                        [Environment]::SetEnvironmentVariable(
+                            $name,
+                            $previousRunnerCommandFileValues[$name],
+                            [EnvironmentVariableTarget]::Process
+                        )
+                    }
+                }
+            }
+            if ($null -ne $childProcess) { $childProcess.Dispose() }
+            if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
+        }
     }
 }
 
@@ -865,6 +1129,7 @@ foreach ($routeCase in $routeCases) {
 $semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
 $semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
 $semanticReports = @()
+# Required CI remains credential-free and deterministic; semantic scanning is opt-in.
 if ($semanticTriggered) {
     $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector semantic scanner'
     foreach ($skillId in $skillIds) {
@@ -959,7 +1224,7 @@ $pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
     '-TestsRoot', (Join-Path $repoRoot 'tests'),
     '-PesterModulePath', $pesterModulePath,
     '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
-) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker -IsolateRunnerCommandFiles
+) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
 $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
     $_.StartsWith($pesterResultMarker, [StringComparison]::Ordinal)
 })
