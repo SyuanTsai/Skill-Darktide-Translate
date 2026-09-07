@@ -643,11 +643,11 @@ function Get-ValidationSecurityAction {
         [Parameter(Mandatory = $true)][string] $Severity,
         [Parameter(Mandatory = $true)][string] $Context
     )
-    $matches = @($Policy.security.severity | Where-Object { $_.level -ceq $Severity })
-    if ($matches.Count -ne 1 -or $matches[0].action -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$matches[0].action)) {
+    $severityMatches = @($Policy.security.severity | Where-Object { $_.level -ceq $Severity })
+    if ($severityMatches.Count -ne 1 -or $severityMatches[0].action -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$severityMatches[0].action)) {
         throw "$Context has no unique central action for severity '$Severity'."
     }
-    return [string]$matches[0].action
+    return [string]$severityMatches[0].action
 }
 
 function ConvertTo-ValidationSecurityFinding {
