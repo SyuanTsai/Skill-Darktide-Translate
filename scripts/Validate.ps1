@@ -13,7 +13,8 @@ param(
     [string] $BaseCommit,
     [string] $ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION,
     [string] $OutputPath,
-    [switch] $EnableSemanticScan
+    [switch] $EnableSemanticScan,
+    [string[]] $SemanticCredentialNames = @()
 )
 
 Set-StrictMode -Version Latest
@@ -669,9 +670,12 @@ namespace Codex.Validation {
     public static class WindowsSuspendedProcessBoundary {
         private const uint CreateSuspended = 0x00000004;
         private const uint CreateUnicodeEnvironment = 0x00000400;
+        private const uint CreateExtendedStartupInfo = 0x00080000;
         private const uint CreateNoWindow = 0x08000000;
         private const uint StartfUseStdHandles = 0x00000100;
         private const uint HandleFlagInherit = 0x00000001;
+        private const uint ProcThreadAttributeHandleList = 0x00020002;
+        private const int ErrorInsufficientBuffer = 122;
         private const uint WaitObject0 = 0x00000000;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -701,6 +705,12 @@ namespace Codex.Validation {
             public IntPtr StandardInput;
             public IntPtr StandardOutput;
             public IntPtr StandardError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StartupInfoEx {
+            public StartupInfo StartupInfo;
+            public IntPtr AttributeList;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -737,8 +747,30 @@ namespace Codex.Validation {
             uint creationFlags,
             IntPtr environment,
             string currentDirectory,
-            ref StartupInfo startupInfo,
+            ref StartupInfoEx startupInfo,
             out NativeProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool InitializeProcThreadAttributeList(
+            IntPtr attributeList,
+            int attributeCount,
+            uint flags,
+            ref IntPtr size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UpdateProcThreadAttribute(
+            IntPtr attributeList,
+            uint flags,
+            IntPtr attribute,
+            IntPtr value,
+            IntPtr size,
+            IntPtr previousValue,
+            IntPtr returnSize);
+
+        [DllImport("kernel32.dll", SetLastError = false)]
+        private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
@@ -759,6 +791,10 @@ namespace Codex.Validation {
             IntPtr parentStandardError = IntPtr.Zero;
             IntPtr childStandardError = IntPtr.Zero;
             IntPtr environmentBlock = IntPtr.Zero;
+            IntPtr attributeList = IntPtr.Zero;
+            IntPtr attributeListSize = IntPtr.Zero;
+            IntPtr handleList = IntPtr.Zero;
+            bool attributeListInitialized = false;
             NativeProcessInformation nativeProcessInformation = new NativeProcessInformation();
             WindowsSuspendedProcess result = null;
             try {
@@ -779,13 +815,47 @@ namespace Codex.Validation {
                     parentStandardInput = IntPtr.Zero;
                 }
 
-                StartupInfo startupInfo = new StartupInfo {
-                    Size = Marshal.SizeOf(typeof(StartupInfo)),
-                    Flags = StartfUseStdHandles,
-                    StandardInput = childStandardInput,
-                    StandardOutput = childStandardOutput,
-                    StandardError = childStandardError
+                StartupInfoEx startupInfo = new StartupInfoEx {
+                    StartupInfo = new StartupInfo {
+                        Size = Marshal.SizeOf(typeof(StartupInfoEx)),
+                        Flags = StartfUseStdHandles,
+                        StandardInput = childStandardInput,
+                        StandardOutput = childStandardOutput,
+                        StandardError = childStandardError
+                    }
                 };
+                bool initialAttributeListResult = InitializeProcThreadAttributeList(
+                    IntPtr.Zero,
+                    1,
+                    0,
+                    ref attributeListSize);
+                int initialAttributeListError = Marshal.GetLastWin32Error();
+                if (initialAttributeListResult || initialAttributeListError != ErrorInsufficientBuffer || attributeListSize == IntPtr.Zero) {
+                    throw new Win32Exception(initialAttributeListError, "InitializeProcThreadAttributeList(size) failed.");
+                }
+                attributeList = Marshal.AllocHGlobal(attributeListSize);
+                ThrowIfFalse(InitializeProcThreadAttributeList(
+                    attributeList,
+                    1,
+                    0,
+                    ref attributeListSize), "InitializeProcThreadAttributeList");
+                attributeListInitialized = true;
+                IntPtr[] inheritedHandles = new IntPtr[] {
+                    childStandardInput,
+                    childStandardOutput,
+                    childStandardError
+                };
+                handleList = Marshal.AllocHGlobal(new IntPtr(IntPtr.Size * inheritedHandles.Length));
+                Marshal.Copy(inheritedHandles, 0, handleList, inheritedHandles.Length);
+                ThrowIfFalse(UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    (IntPtr)ProcThreadAttributeHandleList,
+                    handleList,
+                    new IntPtr(IntPtr.Size * inheritedHandles.Length),
+                    IntPtr.Zero,
+                    IntPtr.Zero), "UpdateProcThreadAttribute(handle list)");
+                startupInfo.AttributeList = attributeList;
                 string environmentText = BuildEnvironment(environment);
                 environmentBlock = Marshal.StringToHGlobalUni(environmentText);
                 StringBuilder commandLine = new StringBuilder(BuildCommandLine(fileName, arguments));
@@ -795,7 +865,7 @@ namespace Codex.Validation {
                     IntPtr.Zero,
                     IntPtr.Zero,
                     true,
-                    CreateSuspended | CreateUnicodeEnvironment | CreateNoWindow,
+                    CreateSuspended | CreateUnicodeEnvironment | CreateExtendedStartupInfo | CreateNoWindow,
                     environmentBlock,
                     workingDirectory,
                     ref startupInfo,
@@ -830,6 +900,9 @@ namespace Codex.Validation {
                 CloseIfPresent(parentStandardError);
                 CloseIfPresent(nativeProcessInformation.ProcessHandle);
                 CloseIfPresent(nativeProcessInformation.ThreadHandle);
+                if (attributeListInitialized) { DeleteProcThreadAttributeList(attributeList); }
+                if (attributeList != IntPtr.Zero) { Marshal.FreeHGlobal(attributeList); }
+                if (handleList != IntPtr.Zero) { Marshal.FreeHGlobal(handleList); }
                 if (environmentBlock != IntPtr.Zero) { Marshal.FreeHGlobal(environmentBlock); }
             }
         }
@@ -1778,6 +1851,48 @@ function New-ContainedProcessEnvironment {
     return $environment
 }
 
+function Protect-ProcessCredentialEnvironment {
+    param(
+        [Parameter()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
+    )
+    $credentialNamePattern = '(?i)(^|_)(API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIALS?|AUTH)(_|$)'
+    $exactCredentialNames = @(
+        'GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
+        'ACTIONS_ID_TOKEN_REQUEST_URL', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+        'AWS_SESSION_TOKEN', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID',
+        'GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_API_KEY', 'KUBECONFIG', 'DOCKER_HOST',
+        'DOCKER_CONFIG', 'CONTAINER_HOST'
+    )
+    $requestedNames = @($SemanticCredentialNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $requestedSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $semanticEnvironment = [ordered]@{}
+    foreach ($nameValue in $requestedNames) {
+        $name = [string]$nameValue
+        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+            throw "Semantic credential environment variable name is invalid: '$name'."
+        }
+        if (-not $requestedSet.Add($name)) {
+            throw "Semantic credential environment variable '$name' was specified more than once."
+        }
+        $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
+        if ([string]::IsNullOrWhiteSpace([string]$value)) {
+            throw "Requested semantic credential environment variable '$name' is missing or empty."
+        }
+        $semanticEnvironment[$name] = [string]$value
+    }
+    $namesToRemove = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $exactCredentialNames) { [void]$namesToRemove.Add($name) }
+    foreach ($name in @($requestedSet)) { [void]$namesToRemove.Add([string]$name) }
+    foreach ($entry in @(Get-ChildItem Env: -ErrorAction SilentlyContinue)) {
+        $name = [string]$entry.Name
+        if ($name -match $credentialNamePattern) { [void]$namesToRemove.Add($name) }
+    }
+    foreach ($name in @($namesToRemove)) {
+        [Environment]::SetEnvironmentVariable([string]$name, $null, [EnvironmentVariableTarget]::Process)
+    }
+    return $semanticEnvironment
+}
+
 function Get-RepositoryRawSnapshot {
     param(
         [Parameter(Mandatory = $true)][string] $RepositoryRoot
@@ -1834,14 +1949,19 @@ function Invoke-NativeChecked {
         [Parameter(Mandatory = $true)][string] $Context,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
         [Parameter()][AllowNull()][string] $StandardInput,
+        [Parameter()][AllowNull()][Collections.IDictionary] $AdditionalEnvironmentVariables,
         [Parameter()][switch] $IsolateRunnerCommandFiles,
         [Parameter()][switch] $TerminateProcessTree,
         [Parameter()][switch] $ProtectRunnerCommandFiles,
+        [Parameter()][switch] $ApplyLinuxResourceLimits,
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
     )
     if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) { throw "$Context executable is missing: $Command" }
     if ($ProtectRunnerCommandFiles -and -not $IsolateRunnerCommandFiles) {
         throw "$Context cannot protect runner command files without isolation."
+    }
+    if ($null -ne $AdditionalEnvironmentVariables -and -not $TerminateProcessTree) {
+        throw "$Context cannot add environment variables without process containment."
     }
     $stderrPath = Join-Path $DiagnosticRoot ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     $runnerCommandFileNames = @(
@@ -1938,37 +2058,53 @@ function Invoke-NativeChecked {
                     throw "$Context trusted Linux mount utility is missing: $mountPath"
                 }
                 Assert-NoReparseAncestors -Path $mountPath -Context "$Context trusted Linux mount utility"
-                $nativeCommand = $setsidPath
+                $findCommand = Get-Command find -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $findPath = [IO.Path]::GetFullPath([string]$findCommand.Path)
+                if (-not (Test-Path -LiteralPath $findPath -PathType Leaf)) {
+                    throw "$Context trusted Linux find utility is missing: $findPath"
+                }
+                Assert-NoReparseAncestors -Path $findPath -Context "$Context trusted Linux find utility"
+                $prlimitPath = $null
+                if ($ApplyLinuxResourceLimits) {
+                    $prlimitCommand = Get-Command prlimit -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                    $prlimitPath = [IO.Path]::GetFullPath([string]$prlimitCommand.Path)
+                    if (-not (Test-Path -LiteralPath $prlimitPath -PathType Leaf)) {
+                        throw "$Context trusted Linux prlimit utility is missing: $prlimitPath"
+                    }
+                    Assert-NoReparseAncestors -Path $prlimitPath -Context "$Context trusted Linux prlimit utility"
+                }
+                $nativeCommand = if ($ApplyLinuxResourceLimits) { $prlimitPath } else { $setsidPath }
                 $maskHostSocketsScript = @'
 set -eu
 mount_path="$1"
-shift
+find_path="$2"
+shift 2
 "$mount_path" --make-rprivate /
-for socket_path in \
-    /run/docker.sock \
-    /var/run/docker.sock \
-    /run/docker/engine.sock \
-    /var/run/docker/engine.sock \
-    /run/podman/podman.sock \
-    /var/run/podman/podman.sock \
-    /run/containerd/containerd.sock \
-    /var/run/containerd/containerd.sock \
-    /run/buildkit/buildkitd.sock \
-    /var/run/buildkit/buildkitd.sock \
-    /run/user/*/docker.sock \
-    /var/run/user/*/docker.sock
+for socket_root in / /run /var/run /dev /dev/shm /tmp /var/tmp
 do
-    if [ -S "$socket_path" ]; then
-        "$mount_path" --bind /dev/null "$socket_path"
+    if [ -d "$socket_root" ]; then
+        "$find_path" "$socket_root" -xdev -type s -exec "$mount_path" --bind /dev/null '{}' \;
+    fi
+done
+for private_root in /run /tmp /var/tmp /dev/shm
+do
+    if [ -d "$private_root" ]; then
+        "$mount_path" -t tmpfs -o nodev,nosuid,noexec,mode=1777 tmpfs "$private_root"
     fi
 done
 exec "$@"
 '@
-                $nativeArguments = @(
+                $namespaceArguments = @(
                     $unsharePath,
                     '--user', '--map-root-user', '--mount', '--pid', '--fork', '--mount-proc', '--kill-child', '--',
-                    $shellPath, '-c', $maskHostSocketsScript, '--', $mountPath, $Command
+                    $shellPath, '-c', $maskHostSocketsScript, '--', $mountPath, $findPath, $Command
                 ) + @($Arguments)
+                $nativeArguments = if ($ApplyLinuxResourceLimits) {
+                    @('--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--') + @($setsidPath) + @($namespaceArguments)
+                }
+                else {
+                    @($namespaceArguments)
+                }
             }
             elseif ($script:IsWindowsHost) {
                 # Start a trusted gate that waits on a supervisor-owned event.
@@ -2074,6 +2210,16 @@ finally {
             $nativeEnvironmentVariables = @{}
             foreach ($environmentName in @($startInfo.EnvironmentVariables.Keys)) {
                 $nativeEnvironmentVariables[[string]$environmentName] = [string]$startInfo.EnvironmentVariables[$environmentName]
+            }
+            if ($null -ne $AdditionalEnvironmentVariables) {
+                foreach ($environmentName in @($AdditionalEnvironmentVariables.Keys)) {
+                    $name = [string]$environmentName
+                    $value = [string]$AdditionalEnvironmentVariables[$environmentName]
+                    if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or $value.IndexOf([char]0) -ge 0) {
+                        throw "$Context received an invalid additional environment variable name or value."
+                    }
+                    $nativeEnvironmentVariables[$name] = $value
+                }
             }
             if ($script:IsWindowsHost) {
                 $childProcess = Start-WindowsSuspendedProcess `
@@ -2615,6 +2761,7 @@ foreach ($routeCase in $routeCases) {
 # code can modify any run-owned tool or report path. Its output remains part of
 # the final supervisor-owned summary, while post-Pester checks bind the final
 # candidate state.
+$semanticCredentialEnvironment = Protect-ProcessCredentialEnvironment -SemanticCredentialNames $SemanticCredentialNames
 $semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
 $semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
 $semanticReports = @()
@@ -2631,7 +2778,7 @@ if ($semanticTriggered) {
                 ForEach-Object { [string]$_.path }
         )
         $semanticPath = Join-Path $runRoot "skillspector-semantic-$skillId.json"
-        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
+        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -AdditionalEnvironmentVariables $semanticCredentialEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
         $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
         try {
             $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
@@ -2655,6 +2802,10 @@ if ($semanticTriggered) {
         }
         $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); findings = $semanticIssues.Count }
     }
+}
+
+foreach ($name in @($semanticCredentialEnvironment.Keys)) {
+    $semanticCredentialEnvironment[$name] = ''
 }
 
 # Candidate tests are untrusted code. Run them in a child PowerShell process so
@@ -2716,7 +2867,7 @@ $pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
     '-TestsRoot', (Join-Path $repoRoot 'tests'),
     '-PesterModulePath', $pesterModulePath,
     '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
-) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+ ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -ApplyLinuxResourceLimits
 $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
     $_.StartsWith($pesterResultMarker, [StringComparison]::Ordinal)
 })
