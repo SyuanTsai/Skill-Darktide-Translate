@@ -95,7 +95,7 @@ jobs:
             if ([IO.Path]::IsPathRooted([string]$relativePath) -or
                 [string]$relativePath -cmatch '(^|/)\.{1,2}(/|$)' -or
                 [string]$relativePath -cmatch '[\x00\r\n]' -or
-                [string]$relativePath.Contains('\')) {
+                ([string]$relativePath).Contains('\')) {
               throw "Candidate PowerShell path is unsafe: $relativePath"
             }
             $candidatePath = Join-Path (Get-Location).Path ([string]$relativePath)
