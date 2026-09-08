@@ -2960,18 +2960,34 @@ if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.Fai
     throw 'Pester repository regression did not complete successfully.'
 }
 
-$summary = [ordered]@{
+$receipt = [ordered]@{
     result = 'passed'
     pesterVersion = [string]$loadedPester.Version
     totalCount = [int64]$result.TotalCount
     passedCount = [int64]$result.PassedCount
     failedCount = [int64]$result.FailedCount
     skippedCount = [int64]$result.SkippedCount
+    requiredTests = @()
 }
-Write-Output ('SGV1-Pester-Worker:' + ($summary | ConvertTo-Json -Depth 20 -Compress))
+$receiptJson = $receipt | ConvertTo-Json -Depth 20 -Compress
+$receiptIdBytes = [byte[]]::new(16)
+[Security.Cryptography.RandomNumberGenerator]::Fill($receiptIdBytes)
+$receiptId = ([BitConverter]::ToString($receiptIdBytes) -replace '-', '').ToLowerInvariant()
+$receiptPath = Join-Path $PSScriptRoot ("pester-receipt-{0}.json" -f $receiptId)
+$receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
+$receiptStream = [IO.File]::Open($receiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try {
+    $receiptStream.Write($receiptBytes, 0, $receiptBytes.Length)
+    $receiptStream.Flush($true)
+}
+finally {
+    $receiptStream.Dispose()
+}
+Write-Output ('SGV1-Pester-Receipt:' + [IO.Path]::GetFileName($receiptPath))
 '@
 [IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
 $pesterRunnerSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
 $pesterSupervisorPath = Join-Path $runRoot 'invoke-pester-supervisor.ps1'
 $pesterSupervisorScript = @'
@@ -3013,11 +3029,32 @@ foreach ($argument in @(
 if (-not $workerProcess.Start()) {
     throw 'Could not start the isolated Pester worker.'
 }
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+public static class Sgv1BoundedProcessOutput {
+    public static async Task<string> ReadAsync(Stream stream, int limit) {
+        var buffer = new byte[8192];
+        using (var memory = new MemoryStream()) {
+            int read;
+            while ((read = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+                if (memory.Length + read > limit) {
+                    throw new InvalidOperationException("The isolated Pester worker exceeded its bounded output limit.");
+                }
+                memory.Write(buffer, 0, read);
+            }
+            return new UTF8Encoding(false, true).GetString(memory.ToArray());
+        }
+    }
+}
+"@
 try {
     # The marker-bearing supervisor stdin is never inherited by the worker.
     $workerProcess.StandardInput.Close()
-    $workerOutputTask = $workerProcess.StandardOutput.ReadToEndAsync()
-    $workerErrorTask = $workerProcess.StandardError.ReadToEndAsync()
+    $workerOutputTask = [Sgv1BoundedProcessOutput]::ReadAsync($workerProcess.StandardOutput.BaseStream, 4194304)
+    $workerErrorTask = [Sgv1BoundedProcessOutput]::ReadAsync($workerProcess.StandardError.BaseStream, 4194304)
     $workerProcess.WaitForExit()
     $workerExitCode = $workerProcess.ExitCode
     $workerOutput = $workerOutputTask.GetAwaiter().GetResult()
@@ -3032,35 +3069,112 @@ if (-not [string]::IsNullOrWhiteSpace($workerError)) {
 if ($workerExitCode -ne 0) {
     throw "The isolated Pester worker failed with exit code $workerExitCode."
 }
-$workerLines = @($workerOutput -split '\r?\n' | Where-Object {
-    $_.StartsWith('SGV1-Pester-Worker:', [StringComparison]::Ordinal)
+$workerReceiptLines = @($workerOutput -split '\r?\n' | Where-Object {
+    $_.StartsWith('SGV1-Pester-Receipt:', [StringComparison]::Ordinal)
 })
-if ($workerLines.Count -ne 1) {
-    throw 'The isolated Pester worker exited without exactly one trusted completion summary.'
+if ($workerReceiptLines.Count -ne 1) {
+    throw 'The isolated Pester worker exited without exactly one post-test receipt.'
 }
-$workerPayload = $workerLines[0].Substring('SGV1-Pester-Worker:'.Length)
+$receiptName = $workerReceiptLines[0].Substring('SGV1-Pester-Receipt:'.Length)
+if ($receiptName -notmatch '^pester-receipt-[0-9a-f]{32}\.json$') {
+    throw 'The isolated Pester worker returned an invalid post-test receipt name.'
+}
+$receiptRoot = [IO.Path]::GetFullPath((Split-Path -Parent $WorkerPath))
+$receiptPath = [IO.Path]::GetFullPath((Join-Path $receiptRoot $receiptName))
+if (-not $receiptPath.StartsWith($receiptRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'The isolated Pester receipt escaped the run-owned root.'
+}
+$receiptItems = @(Get-ChildItem -LiteralPath $receiptRoot -Filter 'pester-receipt-*.json' -File -Force)
+if ($receiptItems.Count -ne 1 -or [IO.Path]::GetFullPath($receiptItems[0].FullName) -cne $receiptPath) {
+    throw 'The isolated Pester worker did not leave exactly one run-owned post-test receipt.'
+}
+$receiptItem = Get-Item -LiteralPath $receiptPath -Force
+if ($receiptItem.PSIsContainer -or ($receiptItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$receiptItem.Length -gt 1048576) {
+    throw 'The isolated Pester post-test receipt is not a bounded regular file.'
+}
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
+    $statCommand = Get-Command stat -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $previousLcAll = [Environment]::GetEnvironmentVariable('LC_ALL', [EnvironmentVariableTarget]::Process)
+    try {
+        [Environment]::SetEnvironmentVariable('LC_ALL', 'C', [EnvironmentVariableTarget]::Process)
+        $receiptFileType = @(& ([IO.Path]::GetFullPath([string]$statCommand.Path)) -c '%F' -- $receiptPath 2>$null)
+        $receiptStatExitCode = $LASTEXITCODE
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
+    }
+    if ($receiptStatExitCode -ne 0 -or $receiptFileType.Count -ne 1 -or [string]$receiptFileType[0].Trim() -cne 'regular file') {
+        throw 'The isolated Pester post-test receipt is not a regular file according to the trusted filesystem type check.'
+    }
+}
+$receiptText = [IO.File]::ReadAllText($receiptPath, [Text.UTF8Encoding]::new($false, $true))
+$receiptDocument = [System.Text.Json.JsonDocument]::Parse($receiptText)
 try {
-    $workerSummary = $workerPayload | ConvertFrom-Json -Depth 20
+    if ($receiptDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+        throw 'The isolated Pester post-test receipt must have a JSON object root.'
+    }
+    $receiptPropertyNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($property in $receiptDocument.RootElement.EnumerateObject()) {
+        if (-not $receiptPropertyNames.Add($property.Name)) { throw "The isolated Pester post-test receipt contains duplicate property '$($property.Name)'." }
+        if ($property.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+            throw 'The isolated Pester post-test receipt contains an unsupported nested object.'
+        }
+    }
 }
-catch {
-    throw 'The isolated Pester worker completion summary was not valid JSON.'
+finally {
+    $receiptDocument.Dispose()
 }
-if ($null -eq $workerSummary -or $workerSummary.result -cne 'passed') {
-    throw 'The isolated Pester worker did not report a passed completion summary.'
+$receipt = $receiptText | ConvertFrom-Json -Depth 20
+$expectedReceiptProperties = @('result', 'pesterVersion', 'totalCount', 'passedCount', 'failedCount', 'skippedCount', 'requiredTests')
+$actualReceiptProperties = @($receipt.PSObject.Properties | ForEach-Object { [string]$_.Name })
+if (@($expectedReceiptProperties | Where-Object { $actualReceiptProperties -cnotcontains $_ }).Count -gt 0 -or
+    @($actualReceiptProperties | Where-Object { $expectedReceiptProperties -cnotcontains $_ }).Count -gt 0 -or
+    $actualReceiptProperties.Count -ne $expectedReceiptProperties.Count) {
+    throw 'The isolated Pester post-test receipt has an invalid property set.'
 }
-Write-Output ($completionMarker + $workerPayload)
+$requiredPesterTests = @()
+if ($receipt.result -isnot [string] -or $receipt.result -cne 'passed' -or
+    $receipt.pesterVersion -isnot [string] -or $receipt.pesterVersion -cne $ExpectedPesterVersion -or
+    $receipt.totalCount -isnot [int64] -or $receipt.passedCount -isnot [int64] -or
+    $receipt.failedCount -isnot [int64] -or $receipt.skippedCount -isnot [int64]) {
+    throw 'The isolated Pester post-test receipt contains invalid typed result fields.'
+}
+$requiredTests = @($receipt.requiredTests)
+if ($requiredTests.Count -ne $requiredPesterTests.Count) {
+    throw 'The isolated Pester post-test receipt contains an unexpected required-test set.'
+}
+if ([int64]$receipt.totalCount -le 0 -or [int64]$receipt.failedCount -ne 0 -or
+    [int64]$receipt.skippedCount -ne 0 -or
+    [int64]$receipt.passedCount + [int64]$receipt.skippedCount -ne [int64]$receipt.totalCount) {
+    throw 'The isolated Pester post-test receipt reports an incomplete regression run.'
+}
+$workerPayload = [ordered]@{
+    result = 'passed'
+    pesterVersion = [string]$receipt.pesterVersion
+    totalCount = [int64]$receipt.totalCount
+    passedCount = [int64]$receipt.passedCount
+    failedCount = [int64]$receipt.failedCount
+    skippedCount = [int64]$receipt.skippedCount
+    requiredTests = @($requiredPesterTests)
+}
+Write-Output ($completionMarker + ($workerPayload | ConvertTo-Json -Depth 20 -Compress))
 '@
 [IO.File]::WriteAllText($pesterSupervisorPath, $pesterSupervisorScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
 $pesterSupervisorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
 $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
 $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
 if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
 Assert-NoReparseAncestors -Path $powerShellPath -Context 'PowerShell child executable'
+Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
 $pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
 if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
     throw 'Run-owned isolated Pester worker changed before candidate tests.'
 }
+Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
 $pesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
 if ($pesterSupervisorActualSha256 -cne $pesterSupervisorSha256) {
     throw 'Run-owned trusted Pester supervisor changed before candidate tests.'
@@ -3080,10 +3194,14 @@ $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
 if ($pesterResultLines.Count -ne 1) {
     throw 'Isolated Pester exited without exactly one supervisor-owned completion result.'
 }
+Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
 $pesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
 if ($pesterSupervisorActualSha256 -cne $pesterSupervisorSha256) {
     throw 'Run-owned trusted Pester supervisor changed during candidate tests.'
 }
+Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
 $pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
 if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
     throw 'Run-owned isolated Pester worker changed during candidate tests.'
