@@ -208,8 +208,15 @@ function Assert-RegularFileForHash {
                 throw "Trusted Linux stat utility is missing: $($script:TrustedStatPath)"
             }
         }
-        $fileType = @(& $script:TrustedStatPath -c '%F' -- $Item.FullName 2>$null)
-        $statExitCode = $LASTEXITCODE
+        $previousLcAll = [Environment]::GetEnvironmentVariable('LC_ALL', [EnvironmentVariableTarget]::Process)
+        try {
+            [Environment]::SetEnvironmentVariable('LC_ALL', 'C', [EnvironmentVariableTarget]::Process)
+            $fileType = @(& $script:TrustedStatPath -c '%F' -- $Item.FullName 2>$null)
+            $statExitCode = $LASTEXITCODE
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
+        }
         if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
             throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
         }
@@ -766,22 +773,40 @@ function Get-PublisherSkillDiscoveryPaths {
         }
     }
 
-    # GitHub CLI's root-level */SKILL.md convention does not include hidden
-    # directories. The canonical and plugins conventions are enumerated below
-    # with explicit depths; no unrestricted recursive search is used.
+    # GitHub CLI discovers root-level */SKILL.md entries, the canonical
+    # skills/... layouts, {prefix}/skills/... layouts, and the explicit
+    # plugins/{scope}/skills/... layout. Prefixes may be nested, but the
+    # package and optional scope depths below remain bounded to the documented
+    # publisher layouts; arbitrary SKILL.md recursion is never accepted.
     foreach ($entry in @(Get-ChildItem -LiteralPath $RepositoryRoot -Directory -Force)) {
         if ([string]$entry.Name -ceq '.git' -or ([string]$entry.Name).StartsWith('.')) { continue }
         if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Publisher discovery root contains a reparse directory: $($entry.FullName)"
         }
         Add-PublisherSkillPath -Path (Join-Path $entry.FullName 'SKILL.md')
-        $entrySkillsRoot = Join-Path $entry.FullName 'skills'
-        if (Test-Path -LiteralPath $entrySkillsRoot -PathType Container) {
-            $entrySkillsRootItem = Get-Item -LiteralPath $entrySkillsRoot -Force -ErrorAction Stop
-            if (($entrySkillsRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Publisher discovery nested skills root is a reparse directory: $entrySkillsRoot"
-            }
-            foreach ($packageEntry in @(Get-ChildItem -LiteralPath $entrySkillsRoot -Directory -Force)) {
+    }
+
+    $pathComparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        [StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [StringComparison]::Ordinal
+    }
+    $skillsRootFullPath = [IO.Path]::GetFullPath($SkillsRoot)
+    $pendingDirectories = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $RepositoryRoot -Directory -Force)) {
+        if ([string]$entry.Name -ceq '.git' -or ([string]$entry.Name).StartsWith('.')) { continue }
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Publisher discovery root contains a reparse directory: $($entry.FullName)"
+        }
+        $pendingDirectories.Push($entry)
+    }
+    while ($pendingDirectories.Count -gt 0) {
+        $directory = $pendingDirectories.Pop()
+        if ([string]$directory.Name -ceq 'plugins') { continue }
+        if ([string]$directory.Name -ceq 'skills') {
+            if ([IO.Path]::GetFullPath($directory.FullName).Equals($skillsRootFullPath, $pathComparison)) { continue }
+            foreach ($packageEntry in @(Get-ChildItem -LiteralPath $directory.FullName -Directory -Force)) {
                 if ([string]$packageEntry.Name -ceq '.' -or ([string]$packageEntry.Name).StartsWith('.')) { continue }
                 if (($packageEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                     throw "Publisher discovery nested package contains a reparse directory: $($packageEntry.FullName)"
@@ -795,6 +820,14 @@ function Get-PublisherSkillDiscoveryPaths {
                     Add-PublisherSkillPath -Path (Join-Path $scopedPackageEntry.FullName 'SKILL.md')
                 }
             }
+            continue
+        }
+        foreach ($childDirectory in @(Get-ChildItem -LiteralPath $directory.FullName -Directory -Force)) {
+            if ([string]$childDirectory.Name -ceq '.git' -or ([string]$childDirectory.Name).StartsWith('.')) { continue }
+            if (($childDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Publisher discovery prefix contains a reparse directory: $($childDirectory.FullName)"
+            }
+            $pendingDirectories.Push($childDirectory)
         }
     }
 
