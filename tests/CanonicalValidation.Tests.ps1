@@ -182,6 +182,7 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'private_root'
         $script:Validator | Should -Match 'ApplyLinuxResourceLimits'
         $script:Validator | Should -Match '--nproc=256'
+        $script:Validator | Should -Not -Match 'ulimit\s+-u'
         $script:Validator | Should -Match 'function New-ContainedProcessEnvironment'
         $script:Validator | Should -Match 'function Protect-ProcessCredentialEnvironment'
         $script:Validator | Should -Match 'SemanticCredentialNames'
