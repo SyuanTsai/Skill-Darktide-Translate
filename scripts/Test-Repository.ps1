@@ -6,12 +6,15 @@
 param(
     [string] $RepositoryRoot,
     [string] $OutputPath,
+    [string] $TrustedGitPath,
+    [string] $TrustedStatPath,
     [switch] $NoFilters
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:TrustedStatPath = $null
+$script:TrustedStatPath = if ([string]::IsNullOrWhiteSpace($TrustedStatPath)) { $null } else { [IO.Path]::GetFullPath($TrustedStatPath) }
+$script:TrustedGitPath = if ([string]::IsNullOrWhiteSpace($TrustedGitPath)) { $null } else { [IO.Path]::GetFullPath($TrustedGitPath) }
 
 function Assert-ExactPropertySet {
     param(
@@ -512,10 +515,11 @@ function Get-ContentInventory {
     }
     if ($pathToFile.Count -eq 0) { throw "Skill '$SkillId' has an empty package inventory." }
 
-    $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $gitPath = $script:TrustedGitPath
+    if ([string]::IsNullOrWhiteSpace($gitPath)) { throw 'Trusted Git executable was not bound before repository validation.' }
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
     $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    $gitOutput = [string]((& $git.Path @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- "skills/$SkillId") -join '')
+    $gitOutput = [string]((& $gitPath @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- "skills/$SkillId") -join '')
     if ($LASTEXITCODE -ne 0) { throw "Git inventory lookup failed for '$SkillId'." }
     foreach ($record in @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })) {
         if ([string]$record -cnotmatch '^(?<mode>[0-9]{6}) (?<objectId>[0-9a-f]{40}) (?<stage>[0-3])\t(?<path>[^\x00\r\n]+)$') {
@@ -546,13 +550,13 @@ function Get-ContentInventory {
         $repositoryPath = "skills/$SkillId/$path"
         if (-not $NoFilters) {
             $workingObjectId = ([string](@(
-                & $git.Path @gitConfigArguments -C $RepositoryRoot hash-object "--path=$repositoryPath" -- $pathToFile[$path].FullName
+                & $gitPath @gitConfigArguments -C $RepositoryRoot hash-object "--path=$repositoryPath" -- $pathToFile[$path].FullName
             ) | Select-Object -First 1)).Trim()
             if ($LASTEXITCODE -ne 0 -or $workingObjectId -cnotmatch '^[0-9a-f]{40}$' -or $workingObjectId -cne $tracked[$path].objectId) {
                 throw "Skill '$SkillId' working-tree content is not bound to its Git index entry '$path'."
             }
         }
-        $sha256 = Get-GitBlobSha256 -GitPath $git.Path -RepositoryRoot $RepositoryRoot -ObjectId $tracked[$path].objectId
+        $sha256 = Get-GitBlobSha256 -GitPath $gitPath -RepositoryRoot $RepositoryRoot -ObjectId $tracked[$path].objectId
         # Git's --path hash intentionally honors the repository's normal text
         # normalization. Keep a second raw-byte identity that is independent
         # of .git/config and .gitattributes so post-test evidence can detect a
@@ -572,6 +576,23 @@ function Get-ContentInventory {
     }
     finally { $hasher.Dispose() }
     return [pscustomobject][ordered]@{ skillId = $SkillId; contentSha256 = $contentSha256; files = $files }
+}
+
+if ($null -eq $script:TrustedGitPath) {
+    $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $script:TrustedGitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+}
+if (-not (Test-Path -LiteralPath $script:TrustedGitPath -PathType Leaf)) {
+    throw "Trusted Git executable is missing: $($script:TrustedGitPath)"
+}
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
+    if ($null -eq $script:TrustedStatPath) {
+        $statCommand = Get-Command stat -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $script:TrustedStatPath = [IO.Path]::GetFullPath([string]$statCommand.Path)
+    }
+    if (-not (Test-Path -LiteralPath $script:TrustedStatPath -PathType Leaf)) {
+        throw "Trusted Linux stat utility is missing: $($script:TrustedStatPath)"
+    }
 }
 
 $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
