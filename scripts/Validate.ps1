@@ -2911,10 +2911,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $testsRoot = [IO.Path]::GetFullPath($TestsRoot)
 $pesterModulePath = [IO.Path]::GetFullPath($PesterModulePath)
-$resultMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
-if ($resultMarker -notmatch '^SGV1-Pester-Result-[0-9a-f]{32}:$') {
-    throw 'The isolated Pester supervisor did not receive a valid one-time completion marker.'
-}
 if (-not (Test-Path -LiteralPath $testsRoot -PathType Container)) { throw "Pester tests root is missing: $testsRoot" }
 if (-not (Test-Path -LiteralPath $pesterModulePath -PathType Leaf)) { throw "Pester module manifest is missing: $pesterModulePath" }
 
@@ -2938,6 +2934,10 @@ $summary = [ordered]@{
     passedCount = [int64]$result.PassedCount
     failedCount = [int64]$result.FailedCount
     skippedCount = [int64]$result.SkippedCount
+}
+$resultMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
+if ($resultMarker -notmatch '^SGV1-Pester-Result-[0-9a-f]{32}:$') {
+    throw 'The isolated Pester supervisor did not receive a valid one-time completion marker after the Pester suite completed.'
 }
 Write-Output ($resultMarker + ($summary | ConvertTo-Json -Depth 20 -Compress))
 '@
