@@ -213,6 +213,9 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'core\.hooksPath'
         $script:Validator | Should -Match '\$repositoryValidatorPath'
         $script:Validator | Should -Match 'pesterRunnerPath'
+        $pesterInvokeIndex = $script:Validator.IndexOf('$result = Invoke-Pester')
+        $markerReadIndex = $script:Validator.IndexOf('$resultMarker = ([Console]::In.ReadToEnd())')
+        $markerReadIndex | Should -BeGreaterThan $pesterInvokeIndex
         $script:Validator | Should -Match 'Invoke-NativeChecked -Command \$powerShellPath'
         $script:Validator | Should -Match "'-NoProfile'"
         $script:Validator | Should -Match "'route'"
