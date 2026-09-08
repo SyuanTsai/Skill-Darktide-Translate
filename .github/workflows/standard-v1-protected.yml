@@ -121,6 +121,9 @@ jobs:
     name: Darktide Translate Standard v1
     needs:
       - repository-contract-windows-powershell
+    outputs:
+      evidence_base64: ${{ steps.export-evidence.outputs.evidence_base64 }}
+      evidence_sha256: ${{ steps.export-evidence.outputs.evidence_sha256 }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout immutable candidate
@@ -262,15 +265,63 @@ jobs:
             throw 'Canonical validation evidence changed after the validator returned.'
           }
 
+      - name: Export canonical evidence for clean upload
+        id: export-evidence
+        if: ${{ success() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidencePath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
+          $evidenceItem = Get-Item -LiteralPath $evidencePath -Force -ErrorAction Stop
+          if ($evidenceItem.PSIsContainer -or ($evidenceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Canonical evidence must be a regular non-reparse file before export.'
+          }
+          if ($evidenceItem.Length -gt 524288) { throw 'Canonical evidence exceeds the 512 KiB export limit.' }
+          $evidenceBytes = [IO.File]::ReadAllBytes($evidencePath)
+          $evidenceBase64 = [Convert]::ToBase64String($evidenceBytes)
+          if ($evidenceBase64.Length -gt 800000) { throw 'Canonical evidence exceeds the GitHub output transport limit.' }
+          $evidenceSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToLowerInvariant()
+          $githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
+          [IO.File]::AppendAllText($githubOutputPath, "evidence_base64=$evidenceBase64$([Environment]::NewLine)evidence_sha256=$evidenceSha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+
+  upload-canonical-validation-evidence:
+    name: upload canonical validation evidence
+    if: ${{ needs['canonical-validation'].result == 'success' && needs['canonical-validation'].outputs.evidence_base64 != '' }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Materialize trusted canonical evidence
+        shell: bash
+        env:
+          EVIDENCE_BASE64: ${{ needs['canonical-validation'].outputs.evidence_base64 }}
+          EXPECTED_SHA256: ${{ needs['canonical-validation'].outputs.evidence_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'Canonical evidence SHA-256 output is invalid.' >&2
+            exit 1
+          fi
+          if (( ${#EVIDENCE_BASE64} > 800000 )); then
+            echo 'Canonical evidence exceeds the clean-job transport limit.' >&2
+            exit 1
+          fi
+          printf '%s' "$EVIDENCE_BASE64" | base64 --decode > canonical-validation-evidence.json
+          actual_sha256="$(sha256sum canonical-validation-evidence.json | cut -d' ' -f1)"
+          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
+            echo 'Canonical evidence failed clean-job hash verification.' >&2
+            exit 1
+          fi
+          test -s canonical-validation-evidence.json
+
       - name: Upload canonical validation evidence
-        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: darktide-translate-standard-v1-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/darktide-translate-conformance-report.json
-            ${{ runner.temp }}/sgv1-*
-          if-no-files-found: warn
+          path: canonical-validation-evidence.json
+          if-no-files-found: error
           retention-days: 14
 
   # Candidate validation runs in a contained process boundary. Keep the
