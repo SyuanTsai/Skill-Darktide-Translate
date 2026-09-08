@@ -1508,6 +1508,27 @@ function Assert-NoReparseAncestors {
     }
 }
 
+function Resolve-LinuxExecutablePath {
+    param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Context)
+    $requestedPath = [IO.Path]::GetFullPath($Path)
+    $readlinkCommand = Get-Command readlink -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $readlinkPath = [IO.Path]::GetFullPath([string]$readlinkCommand.Path)
+    if (-not (Test-Path -LiteralPath $readlinkPath -PathType Leaf)) {
+        throw "$Context could not resolve its trusted readlink utility."
+    }
+    Assert-NoReparseAncestors -Path $readlinkPath -Context "$Context readlink utility"
+    $resolvedOutput = @(& $readlinkPath -f -- $requestedPath 2>$null | ForEach-Object { [string]$_ })
+    if ($LASTEXITCODE -ne 0 -or $resolvedOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace($resolvedOutput[0])) {
+        throw "$Context could not resolve its final executable target: $requestedPath"
+    }
+    $resolvedPath = [IO.Path]::GetFullPath($resolvedOutput[0].Trim())
+    if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+        throw "$Context final executable target is missing: $resolvedPath"
+    }
+    Assert-NoReparseAncestors -Path $resolvedPath -Context $Context
+    return $resolvedPath
+}
+
 function Resolve-ReportedFilePath {
     param(
         [Parameter(Mandatory = $true)] $Value,
@@ -2128,11 +2149,7 @@ function Invoke-NativeChecked {
                 }
                 Assert-NoReparseAncestors -Path $unsharePath -Context "$Context process namespace launcher"
                 $shellCommand = Get-Command sh -CommandType Application -ErrorAction Stop | Select-Object -First 1
-                $shellPath = [IO.Path]::GetFullPath([string]$shellCommand.Path)
-                if (-not (Test-Path -LiteralPath $shellPath -PathType Leaf)) {
-                    throw "$Context trusted Linux shell is missing: $shellPath"
-                }
-                Assert-NoReparseAncestors -Path $shellPath -Context "$Context trusted Linux shell"
+                $shellPath = Resolve-LinuxExecutablePath -Path ([string]$shellCommand.Path) -Context "$Context trusted Linux shell"
                 $mountCommand = Get-Command mount -CommandType Application -ErrorAction Stop | Select-Object -First 1
                 $mountPath = [IO.Path]::GetFullPath([string]$mountCommand.Path)
                 if (-not (Test-Path -LiteralPath $mountPath -PathType Leaf)) {
