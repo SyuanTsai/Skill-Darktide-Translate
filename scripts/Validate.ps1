@@ -1965,11 +1965,33 @@ function Assert-RegularFileForHash {
             }
             Assert-NoReparseAncestors -Path $script:TrustedStatPath -Context 'Trusted Linux stat utility'
         }
-        $fileType = @(& $script:TrustedStatPath -c '%F' -- $Item.FullName 2>$null)
-        $statExitCode = $LASTEXITCODE
+        $previousLcAll = [Environment]::GetEnvironmentVariable('LC_ALL', [EnvironmentVariableTarget]::Process)
+        try {
+            [Environment]::SetEnvironmentVariable('LC_ALL', 'C', [EnvironmentVariableTarget]::Process)
+            $fileType = @(& $script:TrustedStatPath -c '%F' -- $Item.FullName 2>$null)
+            $statExitCode = $LASTEXITCODE
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
+        }
         if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
             throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
         }
+    }
+}
+
+function Assert-LinuxGlibcRuntime {
+    if (-not $script:IsLinuxHost) { return }
+    $lddCommand = Get-Command ldd -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $lddPath = [IO.Path]::GetFullPath([string]$lddCommand.Path)
+    if (-not (Test-Path -LiteralPath $lddPath -PathType Leaf)) {
+        throw 'Linux libc compatibility preflight could not locate ldd.'
+    }
+    Assert-NoReparseAncestors -Path $lddPath -Context 'Linux libc compatibility utility'
+    $lddOutput = @(& $lddPath --version 2>&1 | ForEach-Object { [string]$_ })
+    $lddExitCode = $LASTEXITCODE
+    if ($lddExitCode -ne 0 -or ($lddOutput -join [Environment]::NewLine) -notmatch '(?i)(GNU libc|GLIBC)') {
+        throw 'This Linux runtime is not glibc-compatible; the canonical native process boundary requires glibc.'
     }
 }
 
@@ -2464,6 +2486,7 @@ $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
     [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 }
 else { [IO.Path]::GetFullPath($RepositoryRoot) }
+Assert-LinuxGlibcRuntime
 $supervisorRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $repositoryValidatorPath = Join-Path $supervisorRoot 'scripts/Test-Repository.ps1'
 if (-not (Test-Path -LiteralPath $repositoryValidatorPath -PathType Leaf)) {
