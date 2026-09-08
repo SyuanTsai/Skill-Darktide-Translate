@@ -2177,10 +2177,9 @@ do
         "$mount_path" -t tmpfs -o nodev,nosuid,noexec,mode=1777 tmpfs "$private_root"
     fi
 done
-# The process namespace gives the candidate a per-UID aggregate process cap in
-# addition to the per-process prlimit applied by the trusted parent.  This is
-# intentionally established before the candidate command is released.
-ulimit -u 256
+# The trusted parent applies the Linux resource limits with prlimit before
+# releasing this namespace wrapper.  Do not use a shell-specific ulimit
+# builtin here: Ubuntu's /bin/sh is commonly dash, which does not support -u.
 exec "$@"
 '@
                 $namespaceArguments = @(
