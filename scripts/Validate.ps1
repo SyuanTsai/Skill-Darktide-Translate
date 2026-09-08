@@ -24,6 +24,8 @@ $script:IsLinuxHost = $false
 $isLinuxVariable = Get-Variable -Name IsLinux -ErrorAction SilentlyContinue
 if ($null -ne $isLinuxVariable) { $script:IsLinuxHost = [bool]$isLinuxVariable.Value }
 $script:IsSupportedProcessBoundaryHost = $script:IsWindowsHost -or $script:IsLinuxHost
+$env:GIT_NO_REPLACE_OBJECTS = '1'
+$script:TrustedStatPath = $null
 
 function Assert-NoDuplicateJsonProperties {
     param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement] $Element, [string] $Context = '$')
@@ -1802,7 +1804,8 @@ function New-ContainedProcessEnvironment {
         'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_WORKSPACE', 'RUNNER_ARCH', 'RUNNER_DEBUG',
         'RUNNER_NAME', 'RUNNER_OS', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE', 'RUNNER_TRACKING_ID',
         'RUNNER_WORKSPACE', 'ImageOS', 'ImageVersion',
-        'CODEX_VALIDATION_NATIVE_PAYLOAD', 'CODEX_VALIDATION_RESUME_EVENT', 'CODEX_VALIDATION_HAS_STANDARD_INPUT'
+        'CODEX_VALIDATION_NATIVE_PAYLOAD', 'CODEX_VALIDATION_RESUME_EVENT', 'CODEX_VALIDATION_HAS_STANDARD_INPUT',
+        'GIT_NO_REPLACE_OBJECTS'
     )
     $environment = [ordered]@{}
     foreach ($name in $allowedNames) {
@@ -1843,6 +1846,7 @@ function New-ContainedProcessEnvironment {
     $environment['XDG_CACHE_HOME'] = $cachePath
     $environment['XDG_DATA_HOME'] = $dataPath
     $environment['RUNNER_TEMP'] = $tempPath
+    $environment['GIT_NO_REPLACE_OBJECTS'] = '1'
     $environment.Remove('GITHUB_TOKEN')
     $environment.Remove('GH_TOKEN')
     $environment.Remove('ACTIONS_RUNTIME_TOKEN')
@@ -1913,6 +1917,9 @@ function Get-RepositoryRawSnapshot {
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Repository contains a reparse entry while taking the raw snapshot: $relativePath"
         }
+        if (-not $item.PSIsContainer) {
+            Assert-RegularFileForHash -Item $item -Context "Repository snapshot entry '$relativePath'"
+        }
         [pscustomobject][ordered]@{
             path = $relativePath
             isContainer = [bool]$item.PSIsContainer
@@ -1939,6 +1946,58 @@ function Assert-RepositoryRawSnapshotUnchanged {
                 throw "Candidate repository entry '$($beforeEntry.path)' changed during repository tests."
             }
         }
+    }
+}
+function Assert-RegularFileForHash {
+    param(
+        [Parameter(Mandatory = $true)][IO.FileSystemInfo] $Item,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Context is not a regular non-reparse file: $($Item.FullName)"
+    }
+    if ($script:IsLinuxHost) {
+        if ($null -eq $script:TrustedStatPath) {
+            $statCommand = Get-Command stat -CommandType Application -ErrorAction Stop | Select-Object -First 1
+            $script:TrustedStatPath = [IO.Path]::GetFullPath([string]$statCommand.Path)
+            if (-not (Test-Path -LiteralPath $script:TrustedStatPath -PathType Leaf)) {
+                throw "Trusted Linux stat utility is missing: $($script:TrustedStatPath)"
+            }
+            Assert-NoReparseAncestors -Path $script:TrustedStatPath -Context 'Trusted Linux stat utility'
+        }
+        $fileType = @(& $script:TrustedStatPath -c '%F' -- $Item.FullName 2>$null)
+        $statExitCode = $LASTEXITCODE
+        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
+            throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
+        }
+    }
+}
+
+function Assert-NoGitReplacementObjects {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $replacePathOutput = @(& $GitPath -C $RepositoryRoot rev-parse --git-path refs/replace 2>$null)
+    $replacePathExitCode = $LASTEXITCODE
+    if ($replacePathExitCode -ne 0 -or $replacePathOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$replacePathOutput[0])) {
+        throw "$Context could not resolve the candidate Git replacement-object directory."
+    }
+    $replacePath = [string]$replacePathOutput[0].Trim()
+    if (-not [IO.Path]::IsPathRooted($replacePath)) {
+        $replacePath = Join-Path $RepositoryRoot $replacePath
+    }
+    $replacePath = [IO.Path]::GetFullPath($replacePath)
+    if (-not (Test-Path -LiteralPath $replacePath)) { return }
+    $replaceItem = Get-Item -LiteralPath $replacePath -Force
+    if (-not $replaceItem.PSIsContainer -or ($replaceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Context Git replacement-object path is not a regular non-reparse directory."
+    }
+    Assert-NoReparseAncestors -Path $replacePath -Context "$Context Git replacement-object directory"
+    $replacementEntries = @(Get-ChildItem -LiteralPath $replacePath -Force -ErrorAction Stop)
+    if ($replacementEntries.Count -ne 0) {
+        throw "$Context found Git replacement objects; replacement refs are not permitted."
     }
 }
 
@@ -2078,26 +2137,34 @@ function Invoke-NativeChecked {
 set -eu
 mount_path="$1"
 find_path="$2"
-shift 2
+run_root="$3"
+shift 3
 "$mount_path" --make-rprivate /
-for socket_root in / /run /var/run /dev /dev/shm /tmp /var/tmp
+for socket_root in /run /var/run /dev /dev/shm /tmp /var/tmp
 do
     if [ -d "$socket_root" ]; then
-        "$find_path" "$socket_root" -xdev -type s -exec "$mount_path" --bind /dev/null '{}' \;
+        "$find_path" "$socket_root" -xdev -type s -readable -exec "$mount_path" --bind /dev/null '{}' \; 2>/dev/null || true
     fi
 done
 for private_root in /run /tmp /var/tmp /dev/shm
 do
+    case "$private_root:$run_root" in
+        /tmp:/tmp|/tmp:/tmp/*) continue ;;
+    esac
     if [ -d "$private_root" ]; then
         "$mount_path" -t tmpfs -o nodev,nosuid,noexec,mode=1777 tmpfs "$private_root"
     fi
 done
+# The process namespace gives the candidate a per-UID aggregate process cap in
+# addition to the per-process prlimit applied by the trusted parent.  This is
+# intentionally established before the candidate command is released.
+ulimit -u 256
 exec "$@"
 '@
                 $namespaceArguments = @(
                     $unsharePath,
                     '--user', '--map-root-user', '--mount', '--pid', '--fork', '--mount-proc', '--kill-child', '--',
-                    $shellPath, '-c', $maskHostSocketsScript, '--', $mountPath, $findPath, $Command
+                    $shellPath, '-c', $maskHostSocketsScript, '--', $mountPath, $findPath, $DiagnosticRoot, $Command
                 ) + @($Arguments)
                 $nativeArguments = if ($ApplyLinuxResourceLimits) {
                     @('--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--') + @($setsidPath) + @($namespaceArguments)
@@ -2219,6 +2286,7 @@ finally {
                         throw "$Context received an invalid additional environment variable name or value."
                     }
                     $nativeEnvironmentVariables[$name] = $value
+                    $startInfo.EnvironmentVariables[$name] = $value
                 }
             }
             if ($script:IsWindowsHost) {
@@ -2409,6 +2477,7 @@ finally {
 }
 $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
 $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+Assert-NoGitReplacementObjects -GitPath $gitPath -RepositoryRoot $repoRoot -Context 'Pre-test candidate'
 $gitConfigArguments = @('-c', "safe.directory=$repoRoot", '-c', "core.worktree=$repoRoot")
 
 $candidateCommit = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
@@ -2485,6 +2554,7 @@ $installRoot = Join-Path $runRoot 'tools'
 if (Test-Path -LiteralPath $runRoot) { throw 'Run-owned artifacts path unexpectedly already exists.' }
 [void](New-Item -ItemType Directory -Path $runRoot)
 Assert-NoReparseAncestors -Path $runRoot -Context 'Run-owned artifacts path'
+$semanticCredentialEnvironment = Protect-ProcessCredentialEnvironment -SemanticCredentialNames $SemanticCredentialNames
 [void](New-Item -ItemType Directory -Path $authorityExtractRoot -Force)
 [void](New-Item -ItemType Directory -Path $installRoot -Force)
 $trustedGitConfigPath = Join-Path $runRoot 'empty-git-config'
@@ -2756,7 +2826,6 @@ foreach ($routeCase in $routeCases) {
 # code can modify any run-owned tool or report path. Its output remains part of
 # the final supervisor-owned summary, while post-Pester checks bind the final
 # candidate state.
-$semanticCredentialEnvironment = Protect-ProcessCredentialEnvironment -SemanticCredentialNames $SemanticCredentialNames
 $semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
 $semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
 $semanticReports = @()
@@ -2938,6 +3007,7 @@ $postPesterTree = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-pa
 if ($LASTEXITCODE -ne 0 -or $postPesterTree -cne $candidateTree) {
     throw 'Candidate Git tree changed during repository tests.'
 }
+Assert-NoGitReplacementObjects -GitPath $gitPath -RepositoryRoot $repoRoot -Context 'Post-test candidate'
 $postPesterIndexItem = Get-Item -LiteralPath $gitIndexPath -Force -ErrorAction SilentlyContinue
 if ($null -eq $postPesterIndexItem -or $postPesterIndexItem.PSIsContainer -or
     ($postPesterIndexItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
