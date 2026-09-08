@@ -2187,8 +2187,8 @@ do
 done
 for private_root in /run /tmp /var/tmp /dev/shm
 do
-    case "$private_root:$run_root" in
-        /tmp:/tmp|/tmp:/tmp/*) continue ;;
+    case "$run_root" in
+        "$private_root"|"$private_root"/*) continue ;;
     esac
     if [ -d "$private_root" ]; then
         "$mount_path" -t tmpfs -o nodev,nosuid,noexec,mode=1777 tmpfs "$private_root"
@@ -2545,6 +2545,22 @@ if (-not (Test-Path -LiteralPath $gitIndexPath -PathType Leaf)) {
     throw "Candidate Git index is missing before repository tests: $gitIndexPath"
 }
 Assert-NoReparseAncestors -Path $gitIndexPath -Context 'Candidate Git index'
+$gitConfigOutput = @(& $gitPath @gitConfigArguments -C $repoRoot rev-parse --git-path config 2>$null)
+if ($LASTEXITCODE -ne 0 -or $gitConfigOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$gitConfigOutput[0])) {
+    throw 'Could not resolve the candidate Git config path before repository tests.'
+}
+$gitConfigPath = [string]$gitConfigOutput[0].Trim()
+if (-not [IO.Path]::IsPathRooted($gitConfigPath)) {
+    $gitConfigPath = Join-Path $repoRoot $gitConfigPath
+}
+$gitConfigPath = [IO.Path]::GetFullPath($gitConfigPath)
+$prePesterGitConfigExists = Test-Path -LiteralPath $gitConfigPath -PathType Leaf
+$prePesterGitConfigSha256 = ''
+if ($prePesterGitConfigExists) {
+    $prePesterGitConfigItem = Get-Item -LiteralPath $gitConfigPath -Force
+    Assert-RegularFileForHash -Item $prePesterGitConfigItem -Context 'Candidate Git config'
+    $prePesterGitConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitConfigPath).Hash.ToLowerInvariant()
+}
 $prePesterGitIndexSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitIndexPath).Hash.ToLowerInvariant()
 $prePesterRepositoryRawSnapshot = @(Get-RepositoryRawSnapshot -RepositoryRoot $repoRoot)
 $resolvedBaseCommit = ''
@@ -2930,140 +2946,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$inputIsolationType = 'Codex.Validation.StandardInputIsolation' -as [type]
-if ($null -eq $inputIsolationType) {
-    $inputIsolationTypeDefinition = @(
-        'using System;'
-        'using System.IO;'
-        'using System.Runtime.InteropServices;'
-        ''
-        'namespace Codex.Validation {'
-        '    public static class StandardInputIsolation {'
-        '        private const int StdInputHandle = -10;'
-        '        private const int GenericRead = unchecked((int)0x80000000);'
-        '        private const uint FileShareRead = 0x00000001;'
-        '        private const uint FileShareWrite = 0x00000002;'
-        '        private const uint OpenExisting = 3;'
-        '        private const uint FileAttributeNormal = 0x00000080;'
-        '        private static IntPtr savedWindowsHandle = IntPtr.Zero;'
-        '        private static IntPtr nullWindowsHandle = IntPtr.Zero;'
-        '        private static int savedUnixDescriptor = -1;'
-        '        private static bool hidden;'
-        ''
-        '        [DllImport("kernel32.dll", SetLastError = true)]'
-        '        private static extern IntPtr GetStdHandle(int handle);'
-        ''
-        '        [DllImport("kernel32.dll", SetLastError = true)]'
-        '        private static extern bool SetStdHandle(int handle, IntPtr value);'
-        ''
-        '        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]'
-        '        private static extern IntPtr CreateFileW('
-        '            string fileName,'
-        '            int desiredAccess,'
-        '            uint shareMode,'
-        '            IntPtr securityAttributes,'
-        '            uint creationDisposition,'
-        '            uint flagsAndAttributes,'
-        '            IntPtr templateFile);'
-        ''
-        '        [DllImport("kernel32.dll", SetLastError = true)]'
-        '        private static extern bool CloseHandle(IntPtr handle);'
-        ''
-        '        [DllImport("libc.so.6", EntryPoint = "dup", SetLastError = true)]'
-        '        private static extern int DuplicateDescriptor(int descriptor);'
-        ''
-        '        [DllImport("libc.so.6", EntryPoint = "dup2", SetLastError = true)]'
-        '        private static extern int DuplicateDescriptorTo(int source, int destination);'
-        ''
-        '        [DllImport("libc.so.6", EntryPoint = "open", SetLastError = true)]'
-        '        private static extern int OpenFile(string path, int flags);'
-        ''
-        '        [DllImport("libc.so.6", EntryPoint = "close", SetLastError = true)]'
-        '        private static extern int CloseDescriptor(int descriptor);'
-        ''
-        '        private static bool IsWindows {'
-        '            get {'
-        '                return Environment.OSVersion.Platform == PlatformID.Win32NT ||'
-        '                    Environment.OSVersion.Platform == PlatformID.Win32S ||'
-        '                    Environment.OSVersion.Platform == PlatformID.Win32Windows ||'
-        '                    Environment.OSVersion.Platform == PlatformID.WinCE;'
-        '            }'
-        '        }'
-        ''
-        '        public static void Hide() {'
-        '            if (hidden) {'
-        '                throw new InvalidOperationException("Standard input is already isolated.");'
-        '            }'
-        '            if (IsWindows) {'
-        '                savedWindowsHandle = GetStdHandle(StdInputHandle);'
-        '                if (savedWindowsHandle == IntPtr.Zero || savedWindowsHandle == new IntPtr(-1)) {'
-        '                    throw new InvalidOperationException("Could not capture the Windows standard input handle.");'
-        '                }'
-        '                nullWindowsHandle = CreateFileW('
-        '                    "NUL",'
-        '                    GenericRead,'
-        '                    FileShareRead | FileShareWrite,'
-        '                    IntPtr.Zero,'
-        '                    OpenExisting,'
-        '                    FileAttributeNormal,'
-        '                    IntPtr.Zero);'
-        '                if (nullWindowsHandle == IntPtr.Zero || nullWindowsHandle == new IntPtr(-1) ||'
-        '                    !SetStdHandle(StdInputHandle, nullWindowsHandle)) {'
-        '                    if (nullWindowsHandle != IntPtr.Zero && nullWindowsHandle != new IntPtr(-1)) {'
-        '                        CloseHandle(nullWindowsHandle);'
-        '                    }'
-        '                    savedWindowsHandle = IntPtr.Zero;'
-        '                    nullWindowsHandle = IntPtr.Zero;'
-        '                    throw new InvalidOperationException("Could not replace the Windows standard input handle.");'
-        '                }'
-        '            }'
-        '            else {'
-        '                savedUnixDescriptor = DuplicateDescriptor(0);'
-        '                if (savedUnixDescriptor < 0) {'
-        '                    throw new InvalidOperationException("Could not capture the Unix standard input descriptor.");'
-        '                }'
-        '                int nullDescriptor = OpenFile("/dev/null", 0);'
-        '                if (nullDescriptor < 0 || DuplicateDescriptorTo(nullDescriptor, 0) < 0) {'
-        '                    if (nullDescriptor >= 0) {'
-        '                        CloseDescriptor(nullDescriptor);'
-        '                    }'
-        '                    CloseDescriptor(savedUnixDescriptor);'
-        '                    savedUnixDescriptor = -1;'
-        '                    throw new InvalidOperationException("Could not replace the Unix standard input descriptor.");'
-        '                }'
-        '                CloseDescriptor(nullDescriptor);'
-        '            }'
-        '            Console.SetIn(TextReader.Null);'
-        '            hidden = true;'
-        '        }'
-        ''
-        '        public static void Restore() {'
-        '            if (!hidden) {'
-        '                return;'
-        '            }'
-        '            if (IsWindows) {'
-        '                if (!SetStdHandle(StdInputHandle, savedWindowsHandle)) {'
-        '                    throw new InvalidOperationException("Could not restore the Windows standard input handle.");'
-        '                }'
-        '                CloseHandle(nullWindowsHandle);'
-        '                savedWindowsHandle = IntPtr.Zero;'
-        '                nullWindowsHandle = IntPtr.Zero;'
-        '            }'
-        '            else {'
-        '                if (DuplicateDescriptorTo(savedUnixDescriptor, 0) < 0) {'
-        '                    throw new InvalidOperationException("Could not restore the Unix standard input descriptor.");'
-        '                }'
-        '                CloseDescriptor(savedUnixDescriptor);'
-        '                savedUnixDescriptor = -1;'
-        '            }'
-        '            Console.SetIn(new StreamReader(Console.OpenStandardInput()));'
-        '            hidden = false;'
-        '        }'
-        '    }'
-        '}'
-    ) -join [Environment]::NewLine
-    Add-Type -TypeDefinition $inputIsolationTypeDefinition
-}
 
 $testsRoot = [IO.Path]::GetFullPath($TestsRoot)
 $pesterModulePath = [IO.Path]::GetFullPath($PesterModulePath)
@@ -3076,13 +2958,7 @@ $loadedPester = Get-Module Pester | Select-Object -First 1
 if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPesterVersion) {
     throw 'The exact frozen Pester module was not imported in the isolated test process.'
 }
-[Codex.Validation.StandardInputIsolation]::Hide()
-try {
-    $result = Invoke-Pester -Path $testsRoot -PassThru
-}
-finally {
-    [Codex.Validation.StandardInputIsolation]::Restore()
-}
+$result = Invoke-Pester -Path $testsRoot -PassThru
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
     [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
@@ -3097,22 +2973,108 @@ $summary = [ordered]@{
     failedCount = [int64]$result.FailedCount
     skippedCount = [int64]$result.SkippedCount
 }
-$resultMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
-if ($resultMarker -notmatch '^SGV1-Pester-Result-[0-9a-f]{32}:$') {
-    throw 'The isolated Pester supervisor did not receive a valid one-time completion marker after the Pester suite completed.'
-}
-Write-Output ($resultMarker + ($summary | ConvertTo-Json -Depth 20 -Compress))
+Write-Output ('SGV1-Pester-Worker:' + ($summary | ConvertTo-Json -Depth 20 -Compress))
 '@
 [IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
+$pesterRunnerSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
+$pesterSupervisorPath = Join-Path $runRoot 'invoke-pester-supervisor.ps1'
+$pesterSupervisorScript = @'
+#requires -Version 7.0
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string] $WorkerPath,
+    [Parameter(Mandatory = $true)][string] $TestsRoot,
+    [Parameter(Mandatory = $true)][string] $PesterModulePath,
+    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$completionMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
+if ($completionMarker -notmatch '^SGV1-Pester-Result-[0-9a-f]{32}:$') {
+    throw 'The trusted Pester supervisor did not receive a valid one-time completion marker.'
+}
+$powerShellExecutableName = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'pwsh.exe' } else { 'pwsh' }
+$powerShellPath = Join-Path $PSHOME $powerShellExecutableName
+if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+    throw "PowerShell Pester worker executable is missing: $powerShellPath"
+}
+$workerProcess = [Diagnostics.Process]::new()
+$workerProcess.StartInfo.FileName = $powerShellPath
+$workerProcess.StartInfo.UseShellExecute = $false
+$workerProcess.StartInfo.RedirectStandardInput = $true
+$workerProcess.StartInfo.RedirectStandardOutput = $true
+$workerProcess.StartInfo.RedirectStandardError = $true
+foreach ($argument in @(
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', $WorkerPath,
+    '-TestsRoot', $TestsRoot,
+    '-PesterModulePath', $PesterModulePath,
+    '-ExpectedPesterVersion', $ExpectedPesterVersion
+)) {
+    [void]$workerProcess.StartInfo.ArgumentList.Add($argument)
+}
+if (-not $workerProcess.Start()) {
+    throw 'Could not start the isolated Pester worker.'
+}
+try {
+    # The marker-bearing supervisor stdin is never inherited by the worker.
+    $workerProcess.StandardInput.Close()
+    $workerOutputTask = $workerProcess.StandardOutput.ReadToEndAsync()
+    $workerErrorTask = $workerProcess.StandardError.ReadToEndAsync()
+    $workerProcess.WaitForExit()
+    $workerExitCode = $workerProcess.ExitCode
+    $workerOutput = $workerOutputTask.GetAwaiter().GetResult()
+    $workerError = $workerErrorTask.GetAwaiter().GetResult()
+}
+finally {
+    $workerProcess.Dispose()
+}
+if (-not [string]::IsNullOrWhiteSpace($workerError)) {
+    [Console]::Error.WriteLine($workerError.TrimEnd())
+}
+if ($workerExitCode -ne 0) {
+    throw "The isolated Pester worker failed with exit code $workerExitCode."
+}
+$workerLines = @($workerOutput -split '\r?\n' | Where-Object {
+    $_.StartsWith('SGV1-Pester-Worker:', [StringComparison]::Ordinal)
+})
+if ($workerLines.Count -ne 1) {
+    throw 'The isolated Pester worker exited without exactly one trusted completion summary.'
+}
+$workerPayload = $workerLines[0].Substring('SGV1-Pester-Worker:'.Length)
+try {
+    $workerSummary = $workerPayload | ConvertFrom-Json -Depth 20
+}
+catch {
+    throw 'The isolated Pester worker completion summary was not valid JSON.'
+}
+if ($null -eq $workerSummary -or $workerSummary.result -cne 'passed') {
+    throw 'The isolated Pester worker did not report a passed completion summary.'
+}
+Write-Output ($completionMarker + $workerPayload)
+'@
+[IO.File]::WriteAllText($pesterSupervisorPath, $pesterSupervisorScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
+$pesterSupervisorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
 $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
 $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
 if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
 Assert-NoReparseAncestors -Path $powerShellPath -Context 'PowerShell child executable'
+$pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
+if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
+    throw 'Run-owned isolated Pester worker changed before candidate tests.'
+}
+$pesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
+if ($pesterSupervisorActualSha256 -cne $pesterSupervisorSha256) {
+    throw 'Run-owned trusted Pester supervisor changed before candidate tests.'
+}
 $pesterResultMarker = 'SGV1-Pester-Result-{0}:' -f ([guid]::NewGuid().ToString('N'))
 $pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
     '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', $pesterRunnerPath,
+    '-File', $pesterSupervisorPath,
+    '-WorkerPath', $pesterRunnerPath,
     '-TestsRoot', (Join-Path $repoRoot 'tests'),
     '-PesterModulePath', $pesterModulePath,
     '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
@@ -3122,6 +3084,14 @@ $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
 })
 if ($pesterResultLines.Count -ne 1) {
     throw 'Isolated Pester exited without exactly one supervisor-owned completion result.'
+}
+$pesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
+if ($pesterSupervisorActualSha256 -cne $pesterSupervisorSha256) {
+    throw 'Run-owned trusted Pester supervisor changed during candidate tests.'
+}
+$pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
+if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
+    throw 'Run-owned isolated Pester worker changed during candidate tests.'
 }
 try {
     $pesterResultJson = $pesterResultLines[0].Substring($pesterResultMarker.Length)
@@ -3184,6 +3154,18 @@ $env:GIT_CONFIG_KEY_0 = 'core.hooksPath'
 $env:GIT_CONFIG_VALUE_0 = $trustedGitHooksPath
 $env:GIT_CONFIG_KEY_1 = 'core.fsmonitor'
 $env:GIT_CONFIG_VALUE_1 = 'false'
+$postPesterGitConfigExists = Test-Path -LiteralPath $gitConfigPath -PathType Leaf
+if ($postPesterGitConfigExists -ne $prePesterGitConfigExists) {
+    throw 'Candidate Git config was created or removed during repository tests.'
+}
+if ($postPesterGitConfigExists) {
+    $postPesterGitConfigItem = Get-Item -LiteralPath $gitConfigPath -Force
+    Assert-RegularFileForHash -Item $postPesterGitConfigItem -Context 'Post-test candidate Git config'
+    $postPesterGitConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitConfigPath).Hash.ToLowerInvariant()
+    if ($postPesterGitConfigSha256 -cne $prePesterGitConfigSha256) {
+        throw 'Candidate Git config changed during repository tests.'
+    }
+}
 $postPesterCandidateCommit = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
 if ($LASTEXITCODE -ne 0 -or $postPesterCandidateCommit -cne $candidateCommit) {
     throw "Candidate commit changed during repository tests; expected '$candidateCommit' but found '$postPesterCandidateCommit'."

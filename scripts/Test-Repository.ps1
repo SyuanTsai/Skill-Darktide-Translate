@@ -11,6 +11,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:TrustedStatPath = $null
 
 function Assert-ExactPropertySet {
     param(
@@ -188,6 +189,30 @@ function Get-RawFileSha256 {
     finally {
         $hasher.Dispose()
         $stream.Dispose()
+    }
+}
+
+function Assert-RegularFileForHash {
+    param(
+        [Parameter(Mandatory = $true)][IO.FileSystemInfo] $Item,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Context is not a regular non-reparse file: $($Item.FullName)"
+    }
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
+        if ($null -eq $script:TrustedStatPath) {
+            $statCommand = Get-Command stat -CommandType Application -ErrorAction Stop | Select-Object -First 1
+            $script:TrustedStatPath = [IO.Path]::GetFullPath([string]$statCommand.Path)
+            if (-not (Test-Path -LiteralPath $script:TrustedStatPath -PathType Leaf)) {
+                throw "Trusted Linux stat utility is missing: $($script:TrustedStatPath)"
+            }
+        }
+        $fileType = @(& $script:TrustedStatPath -c '%F' -- $Item.FullName 2>$null)
+        $statExitCode = $LASTEXITCODE
+        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
+            throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
+        }
     }
 }
 
@@ -449,8 +474,8 @@ function Get-ContentInventory {
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Skill '$SkillId' contains a reparse point: $($item.FullName)"
         }
-        if (-not $item.PSIsContainer -and $item -isnot [IO.FileInfo]) {
-            throw "Skill '$SkillId' contains a non-regular filesystem entry: $($item.FullName)"
+        if (-not $item.PSIsContainer) {
+            Assert-RegularFileForHash -Item $item -Context "Skill '$SkillId' inventory entry"
         }
     }
 
@@ -750,6 +775,27 @@ function Get-PublisherSkillDiscoveryPaths {
             throw "Publisher discovery root contains a reparse directory: $($entry.FullName)"
         }
         Add-PublisherSkillPath -Path (Join-Path $entry.FullName 'SKILL.md')
+        $entrySkillsRoot = Join-Path $entry.FullName 'skills'
+        if (Test-Path -LiteralPath $entrySkillsRoot -PathType Container) {
+            $entrySkillsRootItem = Get-Item -LiteralPath $entrySkillsRoot -Force -ErrorAction Stop
+            if (($entrySkillsRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Publisher discovery nested skills root is a reparse directory: $entrySkillsRoot"
+            }
+            foreach ($packageEntry in @(Get-ChildItem -LiteralPath $entrySkillsRoot -Directory -Force)) {
+                if ([string]$packageEntry.Name -ceq '.' -or ([string]$packageEntry.Name).StartsWith('.')) { continue }
+                if (($packageEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "Publisher discovery nested package contains a reparse directory: $($packageEntry.FullName)"
+                }
+                Add-PublisherSkillPath -Path (Join-Path $packageEntry.FullName 'SKILL.md')
+                foreach ($scopedPackageEntry in @(Get-ChildItem -LiteralPath $packageEntry.FullName -Directory -Force)) {
+                    if ([string]$scopedPackageEntry.Name -ceq '.' -or ([string]$scopedPackageEntry.Name).StartsWith('.')) { continue }
+                    if (($scopedPackageEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        throw "Publisher discovery scoped package contains a reparse directory: $($scopedPackageEntry.FullName)"
+                    }
+                    Add-PublisherSkillPath -Path (Join-Path $scopedPackageEntry.FullName 'SKILL.md')
+                }
+            }
+        }
     }
 
     foreach ($scopeEntry in @(Get-ChildItem -LiteralPath $SkillsRoot -Directory -Force)) {

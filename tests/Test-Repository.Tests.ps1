@@ -70,7 +70,12 @@ Describe 'Darktide Translate Standard v1 repository contract' {
     }
 
     It 'rejects publisher-discoverable Skills outside the catalog' {
-        foreach ($relativePath in @('rogue/SKILL.md', 'plugins/scope/skills/rogue/SKILL.md')) {
+        foreach ($relativePath in @(
+            'rogue/SKILL.md',
+            'docs/skills/rogue/SKILL.md',
+            'docs/skills/acme/rogue/SKILL.md',
+            'plugins/scope/skills/rogue/SKILL.md'
+        )) {
             $roguePath = Join-Path $script:FixtureRoot ($relativePath.Replace('/', [IO.Path]::DirectorySeparatorChar))
             New-Item -ItemType Directory -Path (Split-Path -Parent $roguePath) -Force | Out-Null
             Set-Content -LiteralPath $roguePath -Value '# unlisted publisher package' -Encoding utf8NoBOM -NoNewline
