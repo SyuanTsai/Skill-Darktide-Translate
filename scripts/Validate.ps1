@@ -16,6 +16,7 @@ param(
     [switch] $BootstrapTransition,
     [switch] $EnableSemanticScan,
     [string[]] $SemanticCredentialNames = @(),
+    [switch] $ProtectedPesterServerProxy,
     [switch] $ProtectedPesterSupervisor,
     [string] $PesterWorkerPath,
     [string] $PesterTestsRoot,
@@ -26,7 +27,12 @@ param(
     [string] $PesterSupervisorPath,
     [string] $PesterChildWritableRoot,
     [string] $PesterDiagnosticRoot,
-    [string] $PesterRunnerSha256
+    [string] $PesterRunnerSha256,
+    [string] $PesterProxyPowerShellPath,
+    [string] $PesterProxyWorkingDirectory,
+    [string] $PesterProxyDiagnosticRoot,
+    [string] $PesterProxyChildWritableRoot,
+    [string] $PesterProxyReadOnlyPathsJson
 )
 
 Set-StrictMode -Version Latest
@@ -3768,6 +3774,354 @@ function Invoke-TrustedPowerShellProcess {
     }
 }
 
+function Invoke-ProtectedPesterServerProxy {
+    param(
+        [Parameter(Mandatory = $true)][string] $PowerShellPath,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
+        [Parameter(Mandatory = $true)][string] $ReadOnlyPathsJson
+    )
+    if (-not (Test-Path -LiteralPath $PowerShellPath -PathType Leaf)) {
+        throw "Protected Pester server executable is missing: $PowerShellPath"
+    }
+    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+        throw "Protected Pester server working directory is missing: $WorkingDirectory"
+    }
+    if (-not (Test-Path -LiteralPath $DiagnosticRoot -PathType Container)) {
+        throw "Protected Pester server diagnostic root is missing: $DiagnosticRoot"
+    }
+    if (-not (Test-Path -LiteralPath $ChildWritableRoot -PathType Container)) {
+        throw "Protected Pester server child-writable root is missing: $ChildWritableRoot"
+    }
+    Assert-NoReparseAncestors -Path $WorkingDirectory -Context 'Protected Pester server working directory'
+    Assert-NoReparseAncestors -Path $DiagnosticRoot -Context 'Protected Pester server diagnostic root'
+    Assert-NoReparseAncestors -Path $ChildWritableRoot -Context 'Protected Pester server child-writable root'
+    $readOnlyPaths = @($ReadOnlyPathsJson | ConvertFrom-Json -Depth 20)
+    foreach ($readOnlyPath in $readOnlyPaths) {
+        if ([string]::IsNullOrWhiteSpace([string]$readOnlyPath) -or -not (Test-Path -LiteralPath ([string]$readOnlyPath))) {
+            throw "Protected Pester server read-only path is missing: $readOnlyPath"
+        }
+        Assert-NoReparseAncestors -Path ([string]$readOnlyPath) -Context 'Protected Pester server read-only path'
+    }
+
+    if ($script:IsWindowsHost) {
+        $child = $null
+        $jobHandle = [IntPtr]::Zero
+        $inputStream = $null
+        $outputStream = $null
+        $errorStream = $null
+        $inputTask = $null
+        $outputTask = $null
+        $errorTask = $null
+        $proxyExitCode = 1
+        try {
+            $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
+            $jobHandle = New-WindowsKillOnCloseJob -Context 'Protected Pester server proxy'
+            $child = Start-WindowsSuspendedProcess `
+                -FileName $PowerShellPath `
+                -Arguments @('-s', '-NoLogo', '-NoProfile', '-NonInteractive') `
+                -WorkingDirectory $WorkingDirectory `
+                -EnvironmentVariables $childEnvironment `
+                -UseStandardInput $true `
+                -UseRestrictedToken $true
+            Assign-WindowsProcessToJob -JobHandle $jobHandle -Process $child -Context 'Protected Pester server proxy'
+            if (-not $child.Resume()) {
+                throw 'Protected Pester server proxy could not resume the restricted PowerShell server.'
+            }
+
+            $inputStream = [Console]::OpenStandardInput()
+            $outputStream = [Console]::OpenStandardOutput()
+            $errorStream = [Console]::OpenStandardError()
+            $inputTask = $inputStream.CopyToAsync($child.StandardInput.BaseStream)
+            $outputTask = $child.StandardOutput.BaseStream.CopyToAsync($outputStream)
+            $errorTask = $child.StandardError.BaseStream.CopyToAsync($errorStream)
+            while (-not $child.HasExited) {
+                if ($inputTask.IsCompleted -and $null -ne $child.StandardInput) {
+                    $child.StandardInput.Dispose()
+                }
+                Start-Sleep -Milliseconds 25
+            }
+            $proxyExitCode = $child.ExitCode
+            if ($null -ne $child.StandardInput) { $child.StandardInput.Dispose() }
+            if ($null -eq $outputTask -or -not $outputTask.Wait(10000) -or
+                $null -eq $errorTask -or -not $errorTask.Wait(10000)) {
+                throw 'Protected Pester server proxy left redirected output handles open.'
+            }
+            $outputTask.GetAwaiter().GetResult()
+            $errorTask.GetAwaiter().GetResult()
+        }
+        finally {
+            if ($null -ne $child -and -not $child.HasExited) {
+                [void]$child.Terminate()
+            }
+            if ($null -ne $inputStream) { $inputStream.Dispose() }
+            if ($null -ne $outputStream) { $outputStream.Dispose() }
+            if ($null -ne $errorStream) { $errorStream.Dispose() }
+            if ($null -ne $child) { $child.Dispose() }
+            if ($jobHandle -ne [IntPtr]::Zero) { Close-WindowsProcessJob -JobHandle $jobHandle }
+        }
+        return $proxyExitCode
+    }
+
+    if (-not $script:IsLinuxHost) {
+        throw 'Protected Pester server proxy requires a supported Windows or Linux host.'
+    }
+    $sandboxRoot = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($DiagnosticRoot))) `
+        ("sgv1-pester-psrp-sandbox-{0}" -f [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
+    Assert-NoReparseAncestors -Path $sandboxRoot -Context 'Protected Pester server Linux sandbox root'
+    $proxyProcess = $null
+    $proxyExitCode = 1
+    try {
+        $unshareCommand = Get-Command unshare -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $unsharePath = [IO.Path]::GetFullPath([string]$unshareCommand.Path)
+        $prlimitCommand = Get-Command prlimit -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $prlimitPath = [IO.Path]::GetFullPath([string]$prlimitCommand.Path)
+        $mountCommand = Get-Command mount -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $mountPath = [IO.Path]::GetFullPath([string]$mountCommand.Path)
+        $shellCommand = Get-Command sh -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $shellPath = Resolve-LinuxExecutablePath -Path ([string]$shellCommand.Path) -Context 'Protected Pester server Linux shell'
+        foreach ($utility in @($unsharePath, $prlimitPath, $mountPath, $shellPath)) {
+            if (-not (Test-Path -LiteralPath $utility -PathType Leaf)) { throw "Protected Pester server Linux utility is missing: $utility" }
+            Assert-NoReparseAncestors -Path $utility -Context 'Protected Pester server Linux utility'
+        }
+        $maskHostSocketsScript = @'
+set -eu
+mount_path="$1"
+sandbox_root="$2"
+run_root="$3"
+working_directory="$4"
+command_path="$5"
+readonly_count="$6"
+shift 6
+"$mount_path" --make-rprivate /
+"$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
+mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
+for system_root in /usr /bin /sbin /lib /lib64 /etc
+do
+    target="$sandbox_root$system_root"
+    mkdir -p "$target"
+    if [ -d "$system_root" ]; then
+        "$mount_path" --rbind "$system_root" "$target"
+        "$mount_path" --make-rslave "$target"
+        "$mount_path" -o remount,bind,ro "$target"
+    fi
+done
+mkdir -p "$sandbox_root$run_root"
+"$mount_path" --bind "$run_root" "$sandbox_root$run_root"
+"$mount_path" --make-rslave "$sandbox_root$run_root"
+while [ "$readonly_count" -gt 0 ]
+do
+    readonly_path="$1"
+    shift
+    readonly_count=$((readonly_count - 1))
+    case "$readonly_path" in
+        "$run_root") continue ;;
+    esac
+    if [ -d "$readonly_path" ]; then
+        target="$sandbox_root$readonly_path"
+        mkdir -p "$target"
+        "$mount_path" --rbind "$readonly_path" "$target"
+        "$mount_path" --make-rslave "$target"
+        "$mount_path" -o remount,bind,ro "$target"
+    elif [ -f "$readonly_path" ]; then
+        target="$sandbox_root$readonly_path"
+        mkdir -p "$(dirname "$target")"
+        if [ ! -e "$target" ]; then : > "$target"; fi
+        "$mount_path" --bind "$readonly_path" "$target"
+        "$mount_path" -o remount,bind,ro "$target"
+    fi
+done
+"$mount_path" -t proc -o nosuid,nodev,noexec proc "$sandbox_root/proc"
+for private_root in /tmp /run /var/tmp /dev/shm
+do
+    "$mount_path" -t tmpfs -o size=67108864,nodev,nosuid,noexec,mode=1777 tmpfs "$sandbox_root$private_root"
+done
+"$mount_path" -t tmpfs -o size=16777216,nodev,nosuid,noexec,mode=755 tmpfs "$sandbox_root/dev"
+mkdir -p "$sandbox_root/dev/shm" "$sandbox_root/dev/pts"
+for device in null zero random urandom
+do
+    : > "$sandbox_root/dev/$device"
+    "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
+done
+"$mount_path" --bind /dev/null "$sandbox_root/dev/console"
+chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
+'@
+        $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
+        $environment = @{}
+        foreach ($name in @($childEnvironment.Keys)) { $environment[[string]$name] = [string]$childEnvironment[$name] }
+        $unshareArguments = @(
+            '--user', '--map-root-user', '--mount', '--pid', '--ipc', '--uts', '--fork', '--mount-proc', '--kill-child', '--net',
+            '--', $shellPath, '-c', $maskHostSocketsScript, '--',
+            $mountPath, $sandboxRoot, [IO.Path]::GetFullPath($DiagnosticRoot), [IO.Path]::GetFullPath($WorkingDirectory),
+            [IO.Path]::GetFullPath($PowerShellPath), [string]$readOnlyPaths.Count
+        ) + @($readOnlyPaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
+        $nativeArguments = @(
+            '--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',
+            $unsharePath
+        ) + @($unshareArguments)
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $prlimitPath
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
+        $startInfo.EnvironmentVariables.Clear()
+        foreach ($name in @($environment.Keys)) { $startInfo.EnvironmentVariables[$name] = $environment[$name] }
+        $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+        if ($null -ne $argumentListProperty) {
+            foreach ($argument in $nativeArguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        }
+        else { $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $nativeArguments }
+        $proxyProcess = [Diagnostics.Process]::new()
+        $proxyProcess.StartInfo = $startInfo
+        if (-not $proxyProcess.Start()) { throw 'Protected Pester server Linux proxy could not start.' }
+        $proxyProcess.WaitForExit()
+        $proxyExitCode = $proxyProcess.ExitCode
+    }
+    finally {
+        if ($null -ne $proxyProcess) { $proxyProcess.Dispose() }
+        if (Test-Path -LiteralPath $sandboxRoot -PathType Container) {
+            Remove-Item -LiteralPath $sandboxRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $proxyExitCode
+}
+
+function Invoke-ProtectedPesterRunspace {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkerPath,
+        [Parameter(Mandatory = $true)][string] $TestsRoot,
+        [Parameter(Mandatory = $true)][string] $PesterModulePath,
+        [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
+        [Parameter(Mandatory = $true)][string] $MirrorRoot,
+        [Parameter(Mandatory = $true)][string] $InstallRoot,
+        [Parameter(Mandatory = $true)][string] $SupervisorPath,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
+        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][string] $RunnerSha256,
+        [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
+    )
+    if (-not (Test-Path -LiteralPath $SupervisorPath -PathType Leaf)) {
+        throw "Protected Pester supervisor script is missing: $SupervisorPath"
+    }
+    $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
+    $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
+    if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+        throw "Protected Pester server executable is missing: $powerShellPath"
+    }
+    Assert-Sha256 -Value $RunnerSha256 -Context 'Protected Pester worker script hash'
+    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Protected Pester worker' -Boundary $DiagnosticRoot
+    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Protected Pester worker'
+    $workerBytes = [IO.File]::ReadAllBytes($WorkerPath)
+    $workerHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $workerActualSha256 = ([BitConverter]::ToString($workerHasher.ComputeHash($workerBytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally { $workerHasher.Dispose() }
+    if ($workerActualSha256 -cne $RunnerSha256) {
+        throw 'Protected Pester worker changed before its trusted script text was materialized.'
+    }
+    $workerScriptText = [Text.UTF8Encoding]::new($false, $true).GetString($workerBytes)
+    $readOnlyPaths = @(
+        [IO.Path]::GetFullPath($MirrorRoot),
+        [IO.Path]::GetFullPath($InstallRoot),
+        [IO.Path]::GetFullPath($WorkerPath),
+        [IO.Path]::GetFullPath($TestsRoot),
+        [IO.Path]::GetFullPath($PesterModulePath),
+        [IO.Path]::GetFullPath((Split-Path -Parent $PesterModulePath)),
+        [IO.Path]::GetFullPath($SupervisorPath),
+        [IO.Path]::GetFullPath($WorkingDirectory),
+        [IO.Path]::GetFullPath((Split-Path -Parent $powerShellPath))
+    ) | Select-Object -Unique
+    $readOnlyPathsJson = @($readOnlyPaths) | ConvertTo-Json -Compress -Depth 10
+    $serverProcessInstance = [Management.Automation.Runspaces.PowerShellProcessInstance]::new()
+    $runspace = $null
+    $powerShell = $null
+    $asyncResult = $null
+    try {
+        $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null, $serverProcessInstance)
+        $startInfoField = $serverProcessInstance.GetType().GetField('_startInfo', [Reflection.BindingFlags]'Instance,NonPublic')
+        if ($null -eq $startInfoField) { throw 'Protected Pester server start information is unavailable.' }
+        $startInfo = $startInfoField.GetValue($serverProcessInstance)
+        $startInfo.FileName = $powerShellPath
+        $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
+        $proxyArguments = @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $SupervisorPath,
+            '-ProtectedPesterServerProxy',
+            '-PesterProxyPowerShellPath', $powerShellPath,
+            '-PesterProxyWorkingDirectory', $WorkingDirectory,
+            '-PesterProxyDiagnosticRoot', $DiagnosticRoot,
+            '-PesterProxyChildWritableRoot', $ChildWritableRoot,
+            '-PesterProxyReadOnlyPathsJson', $readOnlyPathsJson
+        )
+        $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+        if ($null -ne $argumentListProperty) {
+            $startInfo.ArgumentList.Clear()
+            foreach ($argument in $proxyArguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        }
+        else { $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $proxyArguments }
+
+        $runspace.Open()
+        $powerShell = [Management.Automation.PowerShell]::Create()
+        $powerShell.Runspace = $runspace
+        [void]$powerShell.AddScript($workerScriptText)
+        [void]$powerShell.AddParameter('TestsRoot', $TestsRoot)
+        [void]$powerShell.AddParameter('PesterModulePath', $PesterModulePath)
+        [void]$powerShell.AddParameter('ExpectedPesterVersion', $ExpectedPesterVersion)
+        $asyncResult = $powerShell.BeginInvoke()
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+        while (-not $asyncResult.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
+            if ($serverProcessInstance.HasExited) { break }
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not $asyncResult.IsCompleted) {
+            throw 'Protected Pester remote pipeline exceeded its bounded execution timeout.'
+        }
+        $output = @($powerShell.EndInvoke($asyncResult))
+        if ($powerShell.InvocationStateInfo.State -ne [Management.Automation.PSInvocationState]::Completed) {
+            throw "Protected Pester remote pipeline did not complete normally: $($powerShell.InvocationStateInfo.State)."
+        }
+        if ($output.Count -ne 1) {
+            throw 'Protected Pester remote pipeline did not return exactly one completion payload.'
+        }
+        $workerResultPrefix = 'SGV1-Pester-Result:'
+        $workerResultObject = $output[0]
+        if ($null -eq $workerResultObject) {
+            throw 'Protected Pester remote pipeline returned a null completion payload.'
+        }
+        $baseObjectProperty = $workerResultObject.PSObject.Properties['BaseObject']
+        if ($null -ne $baseObjectProperty) { $workerResultObject = $baseObjectProperty.Value }
+        if ($workerResultObject -isnot [string]) {
+            throw 'Protected Pester remote pipeline returned a non-string completion payload.'
+        }
+        $workerResult = [string]$workerResultObject
+        if (-not $workerResult.StartsWith($workerResultPrefix, [StringComparison]::Ordinal)) {
+            throw 'Protected Pester remote pipeline returned an unexpected completion payload.'
+        }
+        return $workerResult.Substring($workerResultPrefix.Length)
+    }
+    finally {
+        if ($null -ne $serverProcessInstance.Process -and -not $serverProcessInstance.HasExited) {
+            try { $serverProcessInstance.Process.Kill($true) } catch { }
+        }
+        if ($null -ne $powerShell) { $powerShell.Dispose() }
+        if ($null -ne $runspace) { $runspace.Dispose() }
+        if ($null -ne $serverProcessInstance) { $serverProcessInstance.Dispose() }
+    }
+}
+
+if ($ProtectedPesterServerProxy) {
+    $proxyExitCode = Invoke-ProtectedPesterServerProxy `
+        -PowerShellPath $PesterProxyPowerShellPath `
+        -WorkingDirectory $PesterProxyWorkingDirectory `
+        -DiagnosticRoot $PesterProxyDiagnosticRoot `
+        -ChildWritableRoot $PesterProxyChildWritableRoot `
+        -ReadOnlyPathsJson $PesterProxyReadOnlyPathsJson
+    exit $proxyExitCode
+}
+
 function Invoke-ProtectedPesterSupervisor {
     param(
         [Parameter(Mandatory = $true)][string] $WorkerPath,
@@ -3807,18 +4161,19 @@ function Invoke-ProtectedPesterSupervisor {
         throw 'Trusted Pester worker changed before the protected run.'
     }
 
-    $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
-    $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
-    if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
-        throw "PowerShell child executable is missing: $powerShellPath"
-    }
-    $workerOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', $WorkerPath,
-        '-TestsRoot', $TestsRoot,
-        '-PesterModulePath', $PesterModulePath,
-        '-ExpectedPesterVersion', $ExpectedPesterVersion
-    ) -Context 'Protected Pester worker' -DiagnosticRoot $DiagnosticRoot -ChildWritableRoot $ChildWritableRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -DirectWindowsProcess -ReadOnlyPaths @($MirrorRoot, $InstallRoot, $WorkerPath, $SupervisorPath) -ApplyLinuxResourceLimits
+    $workerResultJson = Invoke-ProtectedPesterRunspace `
+        -WorkerPath $WorkerPath `
+        -TestsRoot $TestsRoot `
+        -PesterModulePath $PesterModulePath `
+        -ExpectedPesterVersion $ExpectedPesterVersion `
+        -MirrorRoot $MirrorRoot `
+        -InstallRoot $InstallRoot `
+        -SupervisorPath $SupervisorPath `
+        -WorkingDirectory ([IO.Path]::GetFullPath((Get-Location).Path)) `
+        -ChildWritableRoot $ChildWritableRoot `
+        -DiagnosticRoot $DiagnosticRoot `
+        -RunnerSha256 $RunnerSha256 `
+        -TimeoutMilliseconds 300000
 
     Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
     Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
@@ -3827,15 +4182,7 @@ function Invoke-ProtectedPesterSupervisor {
         throw 'Trusted Pester worker changed during the protected run.'
     }
 
-    $workerResultPrefix = 'SGV1-Pester-Result:'
-    $workerResultLines = @($workerOutput -split "`r?`n" | Where-Object {
-        $_.StartsWith($workerResultPrefix, [StringComparison]::Ordinal)
-    })
-    if ($workerResultLines.Count -ne 1) {
-        throw 'Protected Pester worker exited without exactly one worker completion result.'
-    }
     try {
-        $workerResultJson = $workerResultLines[0].Substring($workerResultPrefix.Length)
         $workerResultDocument = [System.Text.Json.JsonDocument]::Parse($workerResultJson)
         try {
             Assert-NoDuplicateJsonProperties -Element $workerResultDocument.RootElement -Context 'Protected Pester worker result'
@@ -3867,10 +4214,11 @@ function Invoke-ProtectedPesterSupervisor {
         throw 'Protected Pester worker did not report the exact trusted test inventory.'
     }
 
-    # This process is the trusted completion control path.  Its stdin is never
-    # inherited by the low-integrity worker, and its stdout is the only stream
-    # accepted by the parent validator.  Candidate code can terminate or forge
-    # the worker, but it cannot write this supervisor-owned completion marker.
+    # The trusted supervisor owns the remoting client and accepts a result only
+    # from a normally completed remote pipeline.  Candidate code runs in the
+    # low-integrity server process: direct Console.Out writes corrupt the
+    # remoting protocol, while Environment.Exit yields a broken/disconnected
+    # pipeline and never reaches this completion control path.
     Write-Output ($completionMarker + $workerResultJson)
 }
 
@@ -4463,9 +4811,9 @@ foreach ($requiredPesterTest in $requiredPesterTests) {
 Assert-NoReparseTree -Path $pesterMirrorRoot -Context 'Trusted Pester worktree'
 
 # The worker script is trusted content written by this validator, but it runs
-# candidate code.  A separate same-integrity supervisor owns the completion
-# marker and launches the worker through the low-integrity process boundary;
-# the parent accepts only the supervisor's output, never the worker's stdout.
+# candidate code.  A separate same-integrity supervisor owns the remoting
+# client and launches a low-integrity server process; the parent accepts only
+# a result from a normally completed remote pipeline.
 $pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
 $pesterRunnerScript = @'
 #requires -Version 7.0
@@ -4527,9 +4875,9 @@ $completionPayload = [ordered]@{
 }
 $completionJson = $completionPayload | ConvertTo-Json -Depth 20 -Compress
 # Emit the result only after this base-owned runner has returned from Invoke-Pester
-# and independently checked every required test.  This payload is deliberately
-# unauthenticated at the child boundary: the parent validator owns the
-# completion nonce and creates the attestation only after this process exits.
+# and independently checked every required test.  The protected supervisor does
+# not trust raw child stdout: it accepts this value only as a pipeline object
+# delivered by the out-of-process PowerShell remoting protocol after completion.
 Write-Output ('SGV1-Pester-Result:' + $completionJson)
 '@
 [IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
