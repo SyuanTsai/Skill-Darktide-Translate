@@ -9,28 +9,27 @@ Describe 'Darktide bootstrap transition' {
         $script:ProtectedWorkflow = Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml'
     }
 
-    It 'UnitT10_ValidatesTheCurrentLegacyLayoutOnlyThroughAnExplicitTransition' {
-        # Scenario: The bootstrap commit still uses the current source catalog and .agents/skills package root.
-        # Purpose: Prove the trusted repository validator has an explicit, bounded transition path before Standard v1 promotion.
-        $reportPath = Join-Path $TestDrive 'bootstrap-repository-report.json'
+    It 'UnitT10_RejectsTheBootstrapTransitionAfterStandardV1Promotion' {
+        # Scenario: The repository now contains the promoted Standard v1 source inventory, adapter, and skills root.
+        # Purpose: Prove the one-shot bootstrap authorization cannot be reused after migration.
+        { & $script:RepositoryValidator -RepositoryRoot $script:RepositoryRoot -BootstrapTransition } |
+            Should -Throw '*catalog/skills-catalog.json fixture*'
+    }
+
+    It 'UnitT20_ValidatesThePromotedLayoutWithoutTheTransitionFlag' {
+        # Scenario: A caller validates the migrated repository through the normal Standard v1 path.
+        # Purpose: Prove the completed migration no longer depends on bootstrap authorization.
+        $reportPath = Join-Path $TestDrive 'standard-v1-repository-report.json'
         $output = @(& $script:RepositoryValidator `
                 -RepositoryRoot $script:RepositoryRoot `
-                -BootstrapTransition `
                 -OutputPath $reportPath)
         $result = ($output | Select-Object -Last 1) | ConvertFrom-Json
 
         $result.result | Should -Be 'passed'
-        $result.validationMode | Should -Be 'bootstrap-transition'
-        $result.skillsRoot | Should -Be '.agents/skills'
+        $result.sourceId | Should -Be 'darktide-translate'
+        $result.skillsRoot | Should -Be 'skills'
         $result.activeSkillCount | Should -Be 1
         Test-Path -LiteralPath $reportPath -PathType Leaf | Should -BeTrue
-    }
-
-    It 'UnitT20_DoesNotPromoteTheLegacyLayoutWithoutTheTransitionFlag' {
-        # Scenario: A caller omits the explicit transition authorization.
-        # Purpose: Prevent a missing Standard v1 adapter from silently becoming a successful validation mode.
-        { & $script:RepositoryValidator -RepositoryRoot $script:RepositoryRoot } |
-            Should -Throw '*Standard v1*'
     }
 
     It 'UnitT30_SelectsBootstrapOnlyWhenTheCandidateHasNotMigratedToStandardV1' {
