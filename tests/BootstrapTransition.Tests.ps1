@@ -95,4 +95,30 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'Invoke-Pester -Path \$requiredPesterPaths'
         $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
     }
+
+    It 'UnitT80_ProjectsLinuxEtcWithoutArchiveOwnershipCopy' {
+        # Scenario: A user namespace cannot read every host /etc file or preserve host-root ownership.
+        # Purpose: Build a private readable projection without mutating the host bind or aborting on archive metadata.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+
+        $supervisor | Should -Match 'system_root.*=.*"/etc"'
+        $supervisor | Should -Match '-type f -readable'
+        $supervisor | Should -Match '/bin/cat -- "\$source"'
+        $supervisor | Should -Not -Match '/bin/cp -a'
+    }
+
+    It 'UnitT90SeparatesChildOutputAndTrustedPesterContent' {
+        # Scenario: Low-integrity children must write only to a labeled output root, while tests come from trusted Git bytes.
+        # Purpose: Keep scanner receipts and Pester content outside candidate-writable paths and out of the worker's authority.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+
+        $supervisor | Should -Match "'low-integrity-output'"
+        $supervisor | Should -Match '-ChildWritableRoot \$childOutputRoot'
+        $supervisor | Should -Match 'Expand-TrustedGitArchive'
+        $supervisor | Should -Match 'Assert-TrustedGitTreeFile'
+        $supervisor | Should -Match '\$trustedPesterCommit'
+        $supervisor | Should -Match '-ReadOnlyPaths @\(\$pesterMirrorRoot'
+        $supervisor | Should -Match '\[ ! -e "\$target" \]'
+        $supervisor | Should -Not -Match '\$pesterSupervisorPath'
+    }
 }

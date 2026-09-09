@@ -2034,6 +2034,79 @@ function Assert-NoReparseAncestors {
     }
 }
 
+function Assert-NoReparseTree {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    Assert-NoReparseAncestors -Path $fullPath -Context $Context
+    $rootItem = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer) {
+        throw "$Context is not a directory: $fullPath"
+    }
+    foreach ($item in @(Get-ChildItem -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop)) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Context contains a reparse point: $($item.FullName)"
+        }
+    }
+}
+
+function Expand-TrustedGitArchive {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string[]] $GitConfigArguments,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $Revision,
+        [Parameter(Mandatory = $true)][string] $DestinationRoot,
+        [Parameter()][AllowEmptyCollection()][string[]] $PathSpec = @(),
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $destination = [IO.Path]::GetFullPath($DestinationRoot)
+    [void](New-Item -ItemType Directory -Path $destination -Force)
+    Assert-NoReparseAncestors -Path $destination -Context "$Context destination"
+    $archivePath = Join-Path (Split-Path -Parent $destination) ('.trusted-git-{0}.zip' -f [guid]::NewGuid().ToString('N'))
+    try {
+        & $GitPath @GitConfigArguments -C $RepositoryRoot archive --format=zip --output=$archivePath $Revision @PathSpec
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+            throw "$Context could not create the immutable Git archive."
+        }
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $destination -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $archivePath -PathType Leaf) {
+            Remove-Item -LiteralPath $archivePath -Force -ErrorAction Stop
+        }
+    }
+    Assert-NoReparseTree -Path $destination -Context $Context
+}
+
+function Assert-TrustedGitTreeFile {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string[]] $GitConfigArguments,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $Revision,
+        [Parameter(Mandatory = $true)][string] $RelativePath,
+        [Parameter(Mandatory = $true)][string] $MaterializedPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $item = Get-Item -LiteralPath $MaterializedPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Context is not a regular non-reparse file: $MaterializedPath"
+    }
+    Assert-NoReparseAncestors -Path $MaterializedPath -Context $Context
+    $revisionPath = "$Revision`:$RelativePath"
+    $expected = ([string](@(& $GitPath @GitConfigArguments -C $RepositoryRoot rev-parse --verify $revisionPath 2>$null) | Select-Object -First 1)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') {
+        throw "$Context could not resolve the trusted Git blob: $RelativePath"
+    }
+    $actual = ([string](@(& $GitPath @GitConfigArguments -C $RepositoryRoot hash-object --no-filters -- $MaterializedPath 2>$null) | Select-Object -First 1)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actual -cne $expected) {
+        throw "$Context does not match the trusted Git blob: $RelativePath"
+    }
+}
+
 function Resolve-LinuxExecutablePath {
     param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Context)
     $requestedPath = [IO.Path]::GetFullPath($Path)
@@ -2933,11 +3006,13 @@ function Invoke-NativeChecked {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
         [Parameter(Mandatory = $true)][string] $Context,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter()][AllowNull()][string] $ChildWritableRoot,
         [Parameter()][AllowNull()][string] $StandardInput,
         [Parameter()][AllowNull()][Collections.IDictionary] $AdditionalEnvironmentVariables,
         [Parameter()][switch] $IsolateRunnerCommandFiles,
         [Parameter()][switch] $TerminateProcessTree,
         [Parameter()][switch] $ProtectRunnerCommandFiles,
+        [Parameter()][AllowEmptyCollection()][string[]] $ReadOnlyPaths,
         [Parameter()][switch] $ApplyLinuxResourceLimits,
         [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline',
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
@@ -2956,7 +3031,17 @@ function Invoke-NativeChecked {
     if ($null -ne $AdditionalEnvironmentVariables -and -not $TerminateProcessTree) {
         throw "$Context cannot add environment variables without process containment."
     }
-    $stderrPath = Join-Path $DiagnosticRoot ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    $childWritableRootPath = if ([string]::IsNullOrWhiteSpace($ChildWritableRoot)) {
+        [IO.Path]::GetFullPath($DiagnosticRoot)
+    }
+    else {
+        [IO.Path]::GetFullPath($ChildWritableRoot)
+    }
+    if (-not (Test-Path -LiteralPath $childWritableRootPath -PathType Container)) {
+        throw "$Context child-writable output root is missing: $childWritableRootPath"
+    }
+    Assert-NoReparseAncestors -Path $childWritableRootPath -Context "$Context child-writable output root"
+    $stderrPath = Join-Path $childWritableRootPath ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     $runnerCommandFileNames = @(
         'GITHUB_ENV',
         'GITHUB_PATH',
@@ -2993,7 +3078,7 @@ function Invoke-NativeChecked {
                     $name,
                     [EnvironmentVariableTarget]::Process
                 )
-                $isolatedPath = Join-Path $DiagnosticRoot ("isolated-{0}-{1}.txt" -f $name.ToLowerInvariant(), [guid]::NewGuid().ToString('N'))
+                $isolatedPath = Join-Path $childWritableRootPath ("isolated-{0}-{1}.txt" -f $name.ToLowerInvariant(), [guid]::NewGuid().ToString('N'))
                 $isolatedStream = [IO.File]::Open(
                     $isolatedPath,
                     [IO.FileMode]::CreateNew,
@@ -3129,6 +3214,16 @@ function Invoke-NativeChecked {
                 }
                 & $addLinuxReadonlyBindPath -Path $chrootPath
                 & $addLinuxReadonlyBindPath -Path $setprivPath
+                foreach ($readOnlyPath in @($ReadOnlyPaths)) {
+                    $readOnlyFullPath = [IO.Path]::GetFullPath([string]$readOnlyPath)
+                    if (-not (Test-Path -LiteralPath $readOnlyFullPath)) {
+                        throw "$Context trusted read-only child path is missing: $readOnlyFullPath"
+                    }
+                    Assert-NoReparseAncestors -Path $readOnlyFullPath -Context "$Context trusted read-only child path"
+                    if (-not $linuxReadonlyBindPaths.Contains($readOnlyFullPath)) {
+                        [void]$linuxReadonlyBindPaths.Add($readOnlyFullPath)
+                    }
+                }
                 $maskHostSocketsScript = @'
 set -eu
 mount_path="$1"
@@ -3153,7 +3248,30 @@ do
             # mountpoint. Build a private snapshot first so every mutation
             # remains inside the namespace-owned tmpfs.
             "$mount_path" -t tmpfs -o size=67108864,nodev,nosuid,noexec tmpfs "$target"
-            /bin/cp -a -- "$system_root/." "$target/"
+            # Copy only readable regular files and create them with the
+            # namespace user's ownership.  Archive-style copies of /etc are
+            # unsafe here: entries such as shadow may be unreadable and
+            # preserving host-root ownership is invalid in a user namespace.
+            "$find_path" "$system_root" -xdev -type d -readable -exec /bin/sh -eu -c '
+                root="$1"
+                target="$2"
+                shift 2
+                for source do
+                    relative="${source#"$root"}"
+                    mkdir -p "$target$relative"
+                done
+            ' sh "$system_root" "$target" {} + 2>/dev/null || true
+            "$find_path" "$system_root" -xdev -type f -readable -exec /bin/sh -eu -c '
+                root="$1"
+                target="$2"
+                shift 2
+                for source do
+                    relative="${source#"$root"}"
+                    destination="$target$relative"
+                    mkdir -p "$(dirname "$destination")"
+                    /bin/cat -- "$source" > "$destination"
+                done
+            ' sh "$system_root" "$target" {} + 2>/dev/null || true
             rm -f "$target/resolv.conf"
             if [ -e "$system_root/resolv.conf" ]; then
                 /bin/cat -- "$system_root/resolv.conf" > "$target/resolv.conf"
@@ -3177,7 +3295,7 @@ do
     shift
     bind_count=$((bind_count - 1))
     case "$source_path" in
-        "$run_root"|"$run_root"/*) continue ;;
+        "$run_root") continue ;;
     esac
     if [ -d "$source_path" ]; then
         target="$sandbox_root$source_path"
@@ -3188,7 +3306,9 @@ do
     elif [ -f "$source_path" ]; then
         target="$sandbox_root$source_path"
         mkdir -p "$(dirname "$target")"
-        : > "$target"
+        if [ ! -e "$target" ]; then
+            : > "$target"
+        fi
         "$mount_path" --bind "$source_path" "$target"
         "$mount_path" -o remount,bind,ro "$target"
     fi
@@ -3684,9 +3804,13 @@ $runId = [guid]::NewGuid().ToString('N')
 $runRoot = Join-Path $artifactsRootPath "sgv1-$($runId.Substring(0, 12))"
 $authorityExtractRoot = Join-Path $runRoot 'authority'
 $installRoot = Join-Path $runRoot 'tools'
+$childOutputRoot = Join-Path $runRoot 'low-integrity-output'
 if (Test-Path -LiteralPath $runRoot) { throw 'Run-owned artifacts path unexpectedly already exists.' }
 [void](New-Item -ItemType Directory -Path $runRoot)
 Assert-NoReparseAncestors -Path $runRoot -Context 'Run-owned artifacts path'
+[void](New-Item -ItemType Directory -Path $childOutputRoot -Force)
+Assert-NoReparseAncestors -Path $childOutputRoot -Context 'Low-integrity child output root'
+Set-WindowsLowIntegrityDirectory -Path $childOutputRoot
 $semanticCredentialEnvironment = Protect-ProcessCredentialEnvironment -SemanticCredentialNames $SemanticCredentialNames
 [void](New-Item -ItemType Directory -Path $authorityExtractRoot -Force)
 [void](New-Item -ItemType Directory -Path $installRoot -Force)
@@ -3839,14 +3963,14 @@ foreach ($skillId in $skillIds) {
     $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $validatorReportPath = Join-Path $runRoot "skill-validator-$skillId.json"
     [IO.File]::WriteAllText($validatorReportPath, $validatorOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $validatorReport = Read-JsonFile -Path $validatorReportPath -Context "skill-validator package validation report for $skillId"
     Assert-SkillValidatorReport -Report $validatorReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
     $skillValidatorReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($validatorReportPath) }
 
-    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $checkReportPath = Join-Path $runRoot "skill-validator-check-$skillId.json"
     [IO.File]::WriteAllText($checkReportPath, $checkOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $checkReport = Read-JsonFile -Path $checkReportPath -Context "skill-validator full check report for $skillId"
@@ -3860,8 +3984,8 @@ foreach ($skillId in $skillIds) {
     $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $reportPath = Join-Path $runRoot "skillspector-static-$skillId.json"
-    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
+    $reportPath = Join-Path $childOutputRoot "skillspector-static-$skillId.json"
+    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
     $report = Read-JsonFile -Path $reportPath -Context "SkillSpector static report for $skillId"
     $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
     foreach ($issue in $issues) {
@@ -3965,7 +4089,7 @@ foreach ($skillId in $skillIds) {
         @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
             ForEach-Object { [string]$_.path }
     )
-    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $toolsReportPath = Join-Path $runRoot "skill-tools-$skillId.sarif.json"
     [IO.File]::WriteAllText($toolsReportPath, $toolsOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $toolsReport = Read-JsonFile -Path $toolsReportPath -Context "skill-tools report for $skillId"
@@ -3980,7 +4104,7 @@ $routeCases = @(
 foreach ($routeCase in $routeCases) {
     $routeOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @(
         $skillToolsEntryPoint, 'route', [string]$routeCase.query, '--skills', $skillsRoot, '--top-k', '1', '--format', 'json'
-    ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $routePath = Join-Path $runRoot ("skill-tools-route-{0}.json" -f ([guid]::NewGuid().ToString('N')))
     [IO.File]::WriteAllText($routePath, $routeOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     # PowerShell unwraps a one-item JSON array during assignment. Normalize the
@@ -4021,8 +4145,8 @@ if ($semanticTriggered) {
             @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
                 ForEach-Object { [string]$_.path }
         )
-        $semanticPath = Join-Path $runRoot "skillspector-semantic-$skillId.json"
-        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -AdditionalEnvironmentVariables $semanticCredentialEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
+        $semanticPath = Join-Path $childOutputRoot "skillspector-semantic-$skillId.json"
+        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticCredentialEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
         $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
         try {
             $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
@@ -4052,8 +4176,65 @@ foreach ($name in @($semanticCredentialEnvironment.Keys)) {
     $semanticCredentialEnvironment[$name] = ''
 }
 
-# Candidate tests are untrusted code. Run them in a child PowerShell process so
-# a test cannot terminate this validator before the post-test integrity checks.
+# Candidate tests are untrusted code.  Materialize a candidate snapshot for the
+# test suite, then replace its tests tree with the immutable base-owned tests.
+# The worker receives only this read-only mirror, so it cannot replace a test
+# after the protected inventory has been checked or mutate the candidate tree
+# while the suite is running.
+$requiredPesterTests = @(
+    'BootstrapTransition.Tests.ps1'
+    'LocalizationWorkset.Tests.ps1'
+    'ModUpdateAutomation.Tests.ps1'
+    'RepositoryContract.Tests.ps1'
+    'RepositoryValidation.Tests.ps1'
+    'Schema15Coordination.Tests.ps1'
+    'Schema15SourceAcquisition.Tests.ps1'
+    'SkillContract.Tests.ps1'
+    'SourcePin.Tests.ps1'
+)
+$trustedPesterCommit = [string]$BaseCommit
+if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
+    $trustedPesterCommit = [string]$env:GITHUB_SHA
+}
+if ($trustedPesterCommit -notmatch '^[0-9a-f]{40}$') {
+    throw 'Protected Pester execution requires an immutable base or trusted supervisor commit.'
+}
+$pesterMirrorRoot = Join-Path $runRoot 'trusted-pester-worktree'
+Expand-TrustedGitArchive `
+    -GitPath $gitPath `
+    -GitConfigArguments $gitConfigArguments `
+    -RepositoryRoot $repoRoot `
+    -Revision $candidateCommit `
+    -DestinationRoot $pesterMirrorRoot `
+    -Context 'Trusted candidate Pester worktree'
+$candidateMirrorTestsRoot = Join-Path $pesterMirrorRoot 'tests'
+if (Test-Path -LiteralPath $candidateMirrorTestsRoot) {
+    Remove-Item -LiteralPath $candidateMirrorTestsRoot -Recurse -Force -ErrorAction Stop
+}
+Expand-TrustedGitArchive `
+    -GitPath $gitPath `
+    -GitConfigArguments $gitConfigArguments `
+    -RepositoryRoot $repoRoot `
+    -Revision $trustedPesterCommit `
+    -DestinationRoot $pesterMirrorRoot `
+    -PathSpec @('tests') `
+    -Context 'Trusted base Pester tests'
+$trustedPesterTestsRoot = Join-Path $pesterMirrorRoot 'tests'
+foreach ($requiredPesterTest in $requiredPesterTests) {
+    Assert-TrustedGitTreeFile `
+        -GitPath $gitPath `
+        -GitConfigArguments $gitConfigArguments `
+        -RepositoryRoot $repoRoot `
+        -Revision $trustedPesterCommit `
+        -RelativePath (Join-Path 'tests' $requiredPesterTest).Replace('\', '/') `
+        -MaterializedPath (Join-Path $trustedPesterTestsRoot $requiredPesterTest) `
+        -Context 'Trusted protected Pester test'
+}
+Assert-NoReparseTree -Path $pesterMirrorRoot -Context 'Trusted Pester worktree'
+
+# The runner script is trusted content written by this supervisor.  It emits
+# only a bounded marker/payload; the parent validator, not a child supervisor,
+# creates the final receipt and performs all post-test checks.
 $pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
 $pesterRunnerScript = @'
 #requires -Version 7.0
@@ -4134,211 +4315,6 @@ Remove-Variable -Name $workerMarkerVariableName -Force -ErrorAction SilentlyCont
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
 Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
 $pesterRunnerSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
-$pesterSupervisorPath = Join-Path $runRoot 'invoke-pester-supervisor.ps1'
-$pesterSupervisorScript = @'
-#requires -Version 7.0
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory = $true)][string] $WorkerPath,
-    [Parameter(Mandatory = $true)][string] $TestsRoot,
-    [Parameter(Mandatory = $true)][string] $PesterModulePath,
-    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
-    [Parameter(Mandatory = $true)][string] $ReceiptRoot
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$completionMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
-if ($completionMarker -notmatch '^SGV1-Pester-Result-[0-9a-f]{32}:$') {
-    throw 'The trusted Pester supervisor did not receive a valid one-time completion marker.'
-}
-$powerShellExecutableName = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'pwsh.exe' } else { 'pwsh' }
-$powerShellPath = Join-Path $PSHOME $powerShellExecutableName
-if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
-    throw "PowerShell Pester worker executable is missing: $powerShellPath"
-}
-$receiptRoot = [IO.Path]::GetFullPath($ReceiptRoot)
-if (-not (Test-Path -LiteralPath $receiptRoot -PathType Container)) {
-    throw "Supervisor-owned Pester receipt root is missing: $receiptRoot"
-}
-$workerResultMarker = 'SGV1-Pester-Worker-{0}:' -f ([guid]::NewGuid().ToString('N'))
-$workerProcess = [Diagnostics.Process]::new()
-$workerProcess.StartInfo.FileName = $powerShellPath
-$workerProcess.StartInfo.UseShellExecute = $false
-$workerProcess.StartInfo.RedirectStandardInput = $true
-$workerProcess.StartInfo.RedirectStandardOutput = $true
-$workerProcess.StartInfo.RedirectStandardError = $true
-foreach ($argument in @(
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', $WorkerPath,
-    '-TestsRoot', $TestsRoot,
-    '-PesterModulePath', $PesterModulePath,
-    '-ExpectedPesterVersion', $ExpectedPesterVersion
-)) {
-    [void]$workerProcess.StartInfo.ArgumentList.Add($argument)
-}
-Add-Type -TypeDefinition @"
-using System;
-using System.IO;
-using System.Text;
-using System.Threading.Tasks;
-public static class Sgv1BoundedProcessOutput {
-    public static async Task<string> ReadAsync(Stream stream, int limit) {
-        var buffer = new byte[8192];
-        using (var memory = new MemoryStream()) {
-            int read;
-            while ((read = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
-                if (memory.Length + read > limit) {
-                    throw new InvalidOperationException("The isolated Pester worker exceeded its bounded output limit.");
-                }
-                memory.Write(buffer, 0, read);
-            }
-            return new UTF8Encoding(false, true).GetString(memory.ToArray());
-        }
-    }
-}
-"@
-$workerStarted = $false
-$workerExitCode = -1
-$workerOutput = ''
-$workerError = ''
-$completionJson = $null
-try {
-    if (-not $workerProcess.Start()) {
-        throw 'Could not start the isolated Pester worker.'
-    }
-    $workerStarted = $true
-    $workerProcess.StandardInput.Write($workerResultMarker)
-    $workerProcess.StandardInput.Close()
-    $workerOutputTask = [Sgv1BoundedProcessOutput]::ReadAsync($workerProcess.StandardOutput.BaseStream, 4194304)
-    $workerErrorTask = [Sgv1BoundedProcessOutput]::ReadAsync($workerProcess.StandardError.BaseStream, 4194304)
-    $workerOutputAndErrorTask = [System.Threading.Tasks.Task]::WhenAll([System.Threading.Tasks.Task[]]@($workerOutputTask, $workerErrorTask))
-    $workerDeadline = [DateTime]::UtcNow.AddMinutes(5)
-    while (-not $workerOutputAndErrorTask.IsCompleted) {
-        if ([DateTime]::UtcNow -ge $workerDeadline) {
-            try { if (-not $workerProcess.HasExited) { $workerProcess.Kill($true) } } catch { }
-            throw 'The isolated Pester worker exceeded its bounded output/collection timeout.'
-        }
-        Start-Sleep -Milliseconds 100
-    }
-    $workerExitCode = $workerProcess.ExitCode
-    $workerOutput = $workerOutputTask.GetAwaiter().GetResult()
-    $workerError = $workerErrorTask.GetAwaiter().GetResult()
-    $workerResultLines = @($workerOutput -split '\r?\n' | Where-Object { $_.StartsWith($workerResultMarker, [StringComparison]::Ordinal) })
-    if ($workerResultLines.Count -ne 1) {
-        throw 'The isolated Pester worker did not provide exactly one bounded result marker.'
-    }
-    $completionJson = $workerResultLines[0].Substring($workerResultMarker.Length)
-    if ([string]::IsNullOrWhiteSpace($completionJson)) {
-        throw 'The isolated Pester worker provided an empty result payload.'
-    }
-}
-catch {
-    if ($workerStarted -and -not $workerProcess.HasExited) {
-        try { $workerProcess.Kill($true) } catch { }
-    }
-    throw
-}
-finally {
-    $workerProcess.Dispose()
-}
-if (-not [string]::IsNullOrWhiteSpace($workerError)) {
-    [Console]::Error.WriteLine($workerError.TrimEnd())
-}
-if ($workerExitCode -ne 0) {
-    throw "The isolated Pester worker failed with exit code $workerExitCode."
-}
-$completionDocument = [System.Text.Json.JsonDocument]::Parse($completionJson)
-try {
-    if ($completionDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
-        throw 'The isolated Pester completion payload must have a JSON object root.'
-    }
-    $completionPropertyNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($property in $completionDocument.RootElement.EnumerateObject()) {
-        if (-not $completionPropertyNames.Add($property.Name)) { throw "The isolated Pester completion payload contains duplicate property '$($property.Name)'." }
-        if ($property.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
-            throw 'The isolated Pester completion payload contains an unsupported nested object.'
-        }
-    }
-}
-finally {
-    $completionDocument.Dispose()
-}
-$completion = $completionJson | ConvertFrom-Json -Depth 20
-$expectedCompletionProperties = @('result', 'pesterVersion', 'totalCount', 'passedCount', 'failedCount', 'skippedCount', 'requiredTests')
-$actualCompletionProperties = @($completion.PSObject.Properties | ForEach-Object { [string]$_.Name })
-if (@($expectedCompletionProperties | Where-Object { $actualCompletionProperties -cnotcontains $_ }).Count -gt 0 -or
-    @($actualCompletionProperties | Where-Object { $expectedCompletionProperties -cnotcontains $_ }).Count -gt 0 -or
-    $actualCompletionProperties.Count -ne $expectedCompletionProperties.Count) {
-    throw 'The isolated Pester completion payload has an invalid property set.'
-}
-$requiredPesterTests = @(
-    'BootstrapTransition.Tests.ps1'
-    'LocalizationWorkset.Tests.ps1'
-    'ModUpdateAutomation.Tests.ps1'
-    'RepositoryContract.Tests.ps1'
-    'RepositoryValidation.Tests.ps1'
-    'Schema15Coordination.Tests.ps1'
-    'Schema15SourceAcquisition.Tests.ps1'
-    'SkillContract.Tests.ps1'
-    'SourcePin.Tests.ps1'
-)
-if ($completion.result -isnot [string] -or $completion.result -cne 'passed' -or
-    $completion.pesterVersion -isnot [string] -or $completion.pesterVersion -cne $ExpectedPesterVersion -or
-    $completion.totalCount -isnot [int64] -or $completion.passedCount -isnot [int64] -or
-    $completion.failedCount -isnot [int64] -or $completion.skippedCount -isnot [int64] -or
-    $completion.requiredTests -isnot [array]) {
-    throw 'The isolated Pester completion payload contains invalid typed result fields.'
-}
-$requiredTests = @($completion.requiredTests)
-if ($requiredTests.Count -ne $requiredPesterTests.Count -or
-    @(
-        for ($requiredTestIndex = 0; $requiredTestIndex -lt $requiredPesterTests.Count; $requiredTestIndex++) {
-            if ([string]$requiredTests[$requiredTestIndex] -cne [string]$requiredPesterTests[$requiredTestIndex]) {
-                $requiredTestIndex
-            }
-        }
-    ).Count -gt 0) {
-    throw 'The isolated Pester completion payload contains an unexpected required-test set.'
-}
-if ([int64]$completion.totalCount -le 0 -or [int64]$completion.failedCount -ne 0 -or
-    [int64]$completion.skippedCount -ne 0 -or
-    [int64]$completion.passedCount + [int64]$completion.skippedCount -ne [int64]$completion.totalCount) {
-    throw 'The isolated Pester completion payload reports an incomplete regression run.'
-}
-$workerPayload = [ordered]@{
-    result = 'passed'
-    pesterVersion = [string]$completion.pesterVersion
-    totalCount = [int64]$completion.totalCount
-    passedCount = [int64]$completion.passedCount
-    failedCount = [int64]$completion.failedCount
-    skippedCount = [int64]$completion.skippedCount
-    requiredTests = @($requiredPesterTests)
-}
-$receiptIdBytes = [byte[]]::new(16)
-[Security.Cryptography.RandomNumberGenerator]::Fill($receiptIdBytes)
-$receiptId = ([BitConverter]::ToString($receiptIdBytes) -replace '-', '').ToLowerInvariant()
-$receiptPath = Join-Path $receiptRoot ("trusted-pester-receipt-{0}.json" -f $receiptId)
-$receiptJson = $workerPayload | ConvertTo-Json -Depth 20 -Compress
-$receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
-$receiptStream = [IO.File]::Open($receiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-try {
-    $receiptStream.Write($receiptBytes, 0, $receiptBytes.Length)
-    $receiptStream.Flush($true)
-}
-finally {
-    $receiptStream.Dispose()
-}
-$receiptItem = Get-Item -LiteralPath $receiptPath -Force
-if ($receiptItem.PSIsContainer -or ($receiptItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$receiptItem.Length -gt 1048576) {
-    throw 'The supervisor-owned Pester receipt is not a bounded regular file.'
-}
-Write-Output ($completionMarker + ($workerPayload | ConvertTo-Json -Depth 20 -Compress))
-'@
-[IO.File]::WriteAllText($pesterSupervisorPath, $pesterSupervisorScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
-$pesterSupervisorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
 $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
 $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
 if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
@@ -4349,33 +4325,19 @@ $pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pester
 if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
     throw 'Run-owned isolated Pester worker changed before candidate tests.'
 }
-Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
-$pesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
-if ($pesterSupervisorActualSha256 -cne $pesterSupervisorSha256) {
-    throw 'Run-owned trusted Pester supervisor changed before candidate tests.'
-}
-$pesterResultMarker = 'SGV1-Pester-Result-{0}:' -f ([guid]::NewGuid().ToString('N'))
+$pesterWorkerMarker = 'SGV1-Pester-Worker-{0}:' -f ([guid]::NewGuid().ToString('N'))
 $pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
     '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', $pesterSupervisorPath,
-    '-WorkerPath', $pesterRunnerPath,
-    '-TestsRoot', (Join-Path $repoRoot 'tests'),
+    '-File', $pesterRunnerPath,
+    '-TestsRoot', $trustedPesterTestsRoot,
     '-PesterModulePath', $pesterModulePath,
-    '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion,
-    '-ReceiptRoot', $runRoot
- ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -ApplyLinuxResourceLimits
+    '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
+ ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -StandardInput $pesterWorkerMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -ReadOnlyPaths @($pesterMirrorRoot, $installRoot, $pesterRunnerPath) -ApplyLinuxResourceLimits
 $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
-    $_.StartsWith($pesterResultMarker, [StringComparison]::Ordinal)
+    $_.StartsWith($pesterWorkerMarker, [StringComparison]::Ordinal)
 })
 if ($pesterResultLines.Count -ne 1) {
-    throw 'Isolated Pester exited without exactly one supervisor-owned completion result.'
-}
-Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
-$pesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
-if ($pesterSupervisorActualSha256 -cne $pesterSupervisorSha256) {
-    throw 'Run-owned trusted Pester supervisor changed during candidate tests.'
+    throw 'Isolated Pester exited without exactly one protected completion result.'
 }
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
 Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
@@ -4384,7 +4346,7 @@ if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
     throw 'Run-owned isolated Pester worker changed during candidate tests.'
 }
 try {
-    $pesterResultJson = $pesterResultLines[0].Substring($pesterResultMarker.Length)
+    $pesterResultJson = $pesterResultLines[0].Substring($pesterWorkerMarker.Length)
     $pesterResultDocument = [System.Text.Json.JsonDocument]::Parse($pesterResultJson)
     try {
         Assert-NoDuplicateJsonProperties -Element $pesterResultDocument.RootElement -Context 'Isolated Pester result'
@@ -4404,9 +4366,47 @@ if ($pesterResult.result -cne 'passed' -or
     [int64]$pesterResult.PassedCount + [int64]$pesterResult.SkippedCount -ne [int64]$pesterResult.TotalCount) {
     throw 'Isolated Pester repository regression result was missing, mismatched, or incomplete.'
 }
+$workerRequiredTests = @($pesterResult.requiredTests)
+if ($pesterResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne $requiredPesterTests.Count -or
+    @(
+        for ($requiredTestIndex = 0; $requiredTestIndex -lt $requiredPesterTests.Count; $requiredTestIndex++) {
+            if ([string]$workerRequiredTests[$requiredTestIndex] -cne [string]$requiredPesterTests[$requiredTestIndex]) {
+                $requiredTestIndex
+            }
+        }
+    ).Count -gt 0) {
+    throw 'Isolated Pester repository regression did not report the exact trusted test inventory.'
+}
+$workerPayload = [ordered]@{
+    result = 'passed'
+    pesterVersion = [string]$pesterResult.pesterVersion
+    totalCount = [int64]$pesterResult.TotalCount
+    passedCount = [int64]$pesterResult.PassedCount
+    failedCount = [int64]$pesterResult.FailedCount
+    skippedCount = [int64]$pesterResult.SkippedCount
+    requiredTests = @($requiredPesterTests)
+}
+$receiptIdBytes = [byte[]]::new(16)
+[Security.Cryptography.RandomNumberGenerator]::Fill($receiptIdBytes)
+$receiptId = ([BitConverter]::ToString($receiptIdBytes) -replace '-', '').ToLowerInvariant()
+$receiptPath = Join-Path $runRoot ("trusted-pester-receipt-{0}.json" -f $receiptId)
+$receiptJson = $workerPayload | ConvertTo-Json -Depth 20 -Compress
+$receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
+$receiptStream = [IO.File]::Open($receiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+try {
+    $receiptStream.Write($receiptBytes, 0, $receiptBytes.Length)
+    $receiptStream.Flush($true)
+}
+finally {
+    $receiptStream.Dispose()
+}
+$receiptItem = Get-Item -LiteralPath $receiptPath -Force
+if ($receiptItem.PSIsContainer -or ($receiptItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$receiptItem.Length -gt 1048576) {
+    throw 'The trusted Pester receipt is not a bounded regular file.'
+}
 
-# Candidate Pester code runs with the runner account and may replace files in
-# the run-owned or supervisor roots. Never invoke the original path again
+# Candidate Pester code runs in a contained child and may replace files in the
+# candidate checkout. Never invoke the original path again
 # after that untrusted process. Keep the trusted bytes in memory and execute
 # a scriptblock created directly from that pre-test snapshot; this avoids
 # reopening any candidate-writable pathname for post-test evidence.
@@ -4548,7 +4548,14 @@ $summary = [pscustomobject][ordered]@{
             repositoryValidation = 'passed'
             skillTools = $skillToolsReports
             routing = $skillToolsRouteReports
-            pester = [ordered]@{ result = 'passed'; total = [int]$pesterResult.TotalCount; passed = [int]$pesterResult.PassedCount; skipped = [int]$pesterResult.SkippedCount }
+            pester = [ordered]@{
+                result = 'passed'
+                trustedCommit = $trustedPesterCommit
+                receipt = [IO.Path]::GetFileName($receiptPath)
+                total = [int]$pesterResult.TotalCount
+                passed = [int]$pesterResult.PassedCount
+                skipped = [int]$pesterResult.SkippedCount
+            }
         }
         conditionalSemanticScan = [ordered]@{ requested = [bool]$EnableSemanticScan; triggered = $semanticTriggered; candidateProfile = 'offline-candidate'; executionProfile = if ($semanticTriggered) { 'trusted-semantic' } else { 'not-run' }; reports = $semanticReports }
         aiReview = 'required-before-release'
