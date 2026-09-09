@@ -24,6 +24,18 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
     }
 
+    It 'UnitT20_ResolvesBlankTrustedExecutableInputsAndRejectsExplicitMissingPaths' {
+        # Scenario: Optional trusted tool inputs are blank, then an explicit path is missing.
+        # Purpose: Allow only omitted values to use trusted discovery; never silently replace an invalid explicit path.
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot -TrustedGitPath ' ' -TrustedStatPath ' ' } | Should -Not -Throw
+        $missingGitPath = Join-Path $TestDrive 'missing-trusted-git.exe'
+        $thrown = $null
+        try { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot -TrustedGitPath $missingGitPath }
+        catch { $thrown = $_.Exception }
+        $thrown | Should -Not -BeNullOrEmpty
+        $thrown.Message | Should -Match 'Trusted Git executable'
+    }
+
     It 'produces a deterministic per-Skill content hash' {
         $first = & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot | Select-Object -Last 1 | ConvertFrom-Json
         $second = & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot | Select-Object -Last 1 | ConvertFrom-Json

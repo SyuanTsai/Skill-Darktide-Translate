@@ -10,7 +10,6 @@ on:
     branches:
       - main
   pull_request_target:
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -88,7 +87,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
-          $trackedPsOutput = [string]((& $gitPath ls-files -z -- '*.ps1') -join '')
+          $trackedPsOutput = [string]((& $gitPath ls-files -z -- '*.ps1' '*.psm1') -join '')
           if ($LASTEXITCODE -ne 0) { throw 'Git failed while enumerating candidate PowerShell trust-anchor files.' }
           $trackedPsFiles = @($trackedPsOutput.Split([char]0) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
           foreach ($relativePath in $trackedPsFiles) {
@@ -128,6 +127,8 @@ jobs:
     outputs:
       evidence_base64: ${{ steps.export-evidence.outputs.evidence_base64 }}
       evidence_sha256: ${{ steps.export-evidence.outputs.evidence_sha256 }}
+      diagnostics_base64: ${{ steps.export-diagnostics.outputs.diagnostics_base64 }}
+      diagnostics_sha256: ${{ steps.export-diagnostics.outputs.diagnostics_sha256 }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout immutable candidate
@@ -184,7 +185,7 @@ jobs:
               throw "Git could not materialize the protected supervisor '$($file.RelativePath)': $stderr"
             }
             $item = Get-Item -LiteralPath $destination -Force
-            if (-not $item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
               throw "Protected supervisor file '$($file.RelativePath)' is a reparse point."
             }
           }
@@ -212,6 +213,81 @@ jobs:
           }
           "STANDARD_GO_RUNTIME_VERSION=$($Matches.version)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Delegate Linux cgroup v2 subtree for protected Pester
+        shell: bash
+        run: |
+          set -euo pipefail
+          cgroup_parent="/sys/fs/cgroup/codex-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ ! "$cgroup_parent" =~ ^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+$ ]]; then
+            echo 'The protected Pester cgroup path did not match the expected run-bound format.' >&2
+            exit 1
+          fi
+          controllers_path='/sys/fs/cgroup/cgroup.controllers'
+          if [[ ! -r "$controllers_path" ]]; then
+            echo 'The runner does not expose a readable cgroup v2 controller list.' >&2
+            exit 1
+          fi
+          controllers="$(< "$controllers_path")"
+          if [[ ! " $controllers " =~ [[:space:]]memory[[:space:]] ]]; then
+            echo 'The runner cgroup v2 hierarchy does not expose the memory controller.' >&2
+            exit 1
+          fi
+          if [[ ! " $controllers " =~ [[:space:]]cpu[[:space:]] ]]; then
+            echo 'The runner cgroup v2 hierarchy does not expose the CPU controller.' >&2
+            exit 1
+          fi
+          root_subtree_control='/sys/fs/cgroup/cgroup.subtree_control'
+          if [[ ! -e "$root_subtree_control" ]]; then
+            echo 'The runner cgroup v2 hierarchy does not expose a root subtree control file.' >&2
+            exit 1
+          fi
+          root_controllers_to_enable='+cpu +memory'
+          if [[ " $controllers " =~ [[:space:]]pids[[:space:]] ]]; then
+            root_controllers_to_enable+=' +pids'
+          fi
+          printf '%s\n' "$root_controllers_to_enable" | sudo -n tee "$root_subtree_control" >/dev/null
+          if [[ -e "$cgroup_parent" ]]; then
+            echo "The delegated cgroup path already exists: $cgroup_parent" >&2
+            exit 1
+          fi
+          cgroup_supervisor="$cgroup_parent/trusted-validator"
+          cleanup_on_error() {
+            sudo -n rmdir -- "$cgroup_supervisor" 2>/dev/null || true
+            sudo -n rmdir -- "$cgroup_parent" 2>/dev/null || true
+          }
+          trap cleanup_on_error ERR
+          sudo -n mkdir -- "$cgroup_parent"
+          sudo -n chown "$(id -u):$(id -g)" -- "$cgroup_parent"
+          sudo -n chmod 0755 -- "$cgroup_parent"
+          controllers_to_enable='+cpu +memory'
+          if [[ " $controllers " =~ [[:space:]]pids[[:space:]] ]]; then
+            controllers_to_enable+=' +pids'
+          fi
+          printf '%s\n' "$controllers_to_enable" | sudo -n tee "$cgroup_parent/cgroup.subtree_control" >/dev/null
+          for delegation_file in \
+            "$cgroup_parent/cgroup.procs" \
+            "$cgroup_parent/cgroup.threads" \
+            "$cgroup_parent/cgroup.subtree_control"; do
+            sudo -n chown "$(id -u):$(id -g)" -- "$delegation_file"
+          done
+          delegated_controls="$(< "$cgroup_parent/cgroup.subtree_control")"
+          if [[ ! " $delegated_controls " =~ [[:space:]]memory[[:space:]] || ! " $delegated_controls " =~ [[:space:]]cpu[[:space:]] ]]; then
+            echo 'The delegated cgroup root did not enable the memory and CPU controllers.' >&2
+            exit 1
+          fi
+          if [[ ! -w "$cgroup_parent" ]]; then
+            echo 'The delegated cgroup root is not writable by the validation runner.' >&2
+            exit 1
+          fi
+          mkdir -- "$cgroup_supervisor"
+          if [[ ! -w "$cgroup_supervisor" ]]; then
+            echo 'The trusted validator cgroup is not writable by the validation runner.' >&2
+            exit 1
+          fi
+          printf 'CODEX_PESTER_CGROUP_ROOT=%s\nCODEX_PESTER_VALIDATOR_CGROUP=%s\n' \
+            "$cgroup_parent" "$cgroup_supervisor" >> "$GITHUB_ENV"
+          trap - ERR
+
       - name: Run canonical Standard v1 validation
         id: canonical-validation
         shell: pwsh
@@ -220,6 +296,18 @@ jobs:
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $validatorCgroup = [string]$env:CODEX_PESTER_VALIDATOR_CGROUP
+          if ($validatorCgroup -notmatch '^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+/trusted-validator$') {
+            throw 'The trusted canonical validator cgroup path is missing or invalid.'
+          }
+          $validatorPid = [string]$PID
+          $validatorPid | & sudo -n tee -- (Join-Path $validatorCgroup 'cgroup.procs') | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not place the trusted canonical validator inside its delegated cgroup.' }
+          $relativeValidatorCgroup = $validatorCgroup.Substring('/sys/fs/cgroup'.Length)
+          $currentCgroup = [IO.File]::ReadAllText("/proc/$PID/cgroup").Trim()
+          if ($currentCgroup -notmatch ("0::" + [regex]::Escape($relativeValidatorCgroup) + '$')) {
+            throw 'The trusted canonical validator did not enter its delegated cgroup.'
+          }
           $baseCandidate = if ($env:GITHUB_EVENT_NAME -eq 'pull_request_target') {
             $env:PULL_REQUEST_BASE_SHA
           }
@@ -248,7 +336,48 @@ jobs:
           }
           $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
           $trustedValidator = Join-Path $env:TRUSTED_SUPERVISOR_ROOT 'scripts/Validate.ps1'
-          & $trustedValidator -RepositoryRoot (Get-Location).Path -ArtifactsRoot $env:RUNNER_TEMP -BaseCommit $baseCommit -ExpectedGoRuntimeVersion $env:STANDARD_GO_RUNTIME_VERSION -OutputPath $outputPath
+          $validatorArguments = @(
+            '-RepositoryRoot', (Get-Location).Path,
+            '-ArtifactsRoot', $env:RUNNER_TEMP,
+            '-BaseCommit', $baseCommit,
+            '-ExpectedGoRuntimeVersion', $env:STANDARD_GO_RUNTIME_VERSION,
+            '-OutputPath', $outputPath
+          )
+          $isBootstrapTransition =
+            (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'catalog/skills-catalog.json') -PathType Leaf) -and
+            (-not (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'catalog/source.json') -PathType Leaf)) -and
+            (-not (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'config/standard-v1.json') -PathType Leaf))
+          if ($isBootstrapTransition) {
+            # The trusted validator rechecks the exact current-layout fixture and
+            # refuses a mixed or post-migration tree before producing evidence.
+            $validatorArguments += '-BootstrapTransition'
+          }
+          & $trustedValidator @validatorArguments
+
+      - name: Remove delegated Linux cgroup subtree
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cgroup_parent="${CODEX_PESTER_CGROUP_ROOT:-}"
+          if [[ -z "$cgroup_parent" ]]; then
+            exit 0
+          fi
+          if [[ ! "$cgroup_parent" =~ ^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+$ ]]; then
+            echo 'The cleanup cgroup path did not match the expected run-bound format.' >&2
+            exit 1
+          fi
+          if [[ -e "$cgroup_parent" ]]; then
+            cgroup_supervisor="${CODEX_PESTER_VALIDATOR_CGROUP:-$cgroup_parent/trusted-validator}"
+            if [[ ! "$cgroup_supervisor" =~ ^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+/trusted-validator$ ]]; then
+              echo 'The cleanup validator cgroup path did not match the expected run-bound format.' >&2
+              exit 1
+            fi
+            if [[ -e "$cgroup_supervisor" ]]; then
+              sudo -n rmdir -- "$cgroup_supervisor"
+            fi
+            sudo -n rmdir -- "$cgroup_parent"
+          fi
 
       - name: Verify canonical validation evidence
         if: ${{ success() }}
@@ -288,6 +417,33 @@ jobs:
           $githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
           [IO.File]::AppendAllText($githubOutputPath, "evidence_base64=$evidenceBase64$([Environment]::NewLine)evidence_sha256=$evidenceSha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
 
+      - name: Export bounded validation diagnostics for clean upload
+        id: export-diagnostics
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
+          $summaryPaths = @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory -Filter 'sgv1-*' -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'security-preflight-summary.json' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+          if ($summaryPaths.Count -eq 0) {
+            [IO.File]::AppendAllText($outputPath, "diagnostics_base64=$([Environment]::NewLine)diagnostics_sha256=$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+            exit 0
+          }
+          if ($summaryPaths.Count -ne 1) { throw 'Expected exactly one bounded validation diagnostics summary.' }
+          $summaryPath = [IO.Path]::GetFullPath([string]$summaryPaths[0])
+          $summaryItem = Get-Item -LiteralPath $summaryPath -Force
+          if ($summaryItem.PSIsContainer -or ($summaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Validation diagnostics must be a regular non-reparse file before export.'
+          }
+          if ($summaryItem.Length -gt 524288) { throw 'Validation diagnostics exceed the 512 KiB export limit.' }
+          $bytes = [IO.File]::ReadAllBytes($summaryPath)
+          $base64 = [Convert]::ToBase64String($bytes)
+          if ($base64.Length -gt 800000) { throw 'Validation diagnostics exceed the GitHub output transport limit.' }
+          $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $summaryPath).Hash.ToLowerInvariant()
+          [IO.File]::AppendAllText($outputPath, "diagnostics_base64=$base64$([Environment]::NewLine)diagnostics_sha256=$sha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+
   upload-canonical-validation-evidence:
     name: upload canonical validation evidence
     if: ${{ needs['canonical-validation'].result == 'success' && needs['canonical-validation'].outputs.evidence_base64 != '' }}
@@ -325,6 +481,46 @@ jobs:
         with:
           name: darktide-translate-standard-v1-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: canonical-validation-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
+  upload-validation-diagnostics:
+    name: upload bounded validation diagnostics
+    if: ${{ always() && needs['canonical-validation'].result == 'failure' && needs['canonical-validation'].outputs.diagnostics_base64 != '' }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Materialize bounded validation diagnostics
+        shell: bash
+        env:
+          DIAGNOSTICS_BASE64: ${{ needs['canonical-validation'].outputs.diagnostics_base64 }}
+          EXPECTED_SHA256: ${{ needs['canonical-validation'].outputs.diagnostics_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'Validation diagnostics SHA-256 output is invalid.' >&2
+            exit 1
+          fi
+          if (( ${#DIAGNOSTICS_BASE64} > 800000 )); then
+            echo 'Validation diagnostics exceed the clean-job transport limit.' >&2
+            exit 1
+          fi
+          printf '%s' "$DIAGNOSTICS_BASE64" | base64 --decode > security-preflight-summary.json
+          actual_sha256="$(sha256sum security-preflight-summary.json | cut -d' ' -f1)"
+          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
+            echo 'Validation diagnostics failed clean-job hash verification.' >&2
+            exit 1
+          fi
+          test -s security-preflight-summary.json
+
+      - name: Upload bounded validation diagnostics
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: darktide-translate-standard-v1-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: security-preflight-summary.json
           if-no-files-found: error
           retention-days: 14
 

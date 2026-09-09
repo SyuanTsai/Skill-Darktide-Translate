@@ -13,8 +13,26 @@ param(
     [string] $BaseCommit,
     [string] $ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION,
     [string] $OutputPath,
+    [switch] $BootstrapTransition,
     [switch] $EnableSemanticScan,
-    [string[]] $SemanticCredentialNames = @()
+    [string[]] $SemanticCredentialNames = @(),
+    [switch] $ProtectedPesterServerProxy,
+    [switch] $ProtectedPesterSupervisor,
+    [string] $PesterWorkerPath,
+    [string] $PesterTestsRoot,
+    [string] $PesterModulePath,
+    [string] $PesterExpectedVersion,
+    [string] $PesterMirrorRoot,
+    [string] $PesterInstallRoot,
+    [string] $PesterSupervisorPath,
+    [string] $PesterChildWritableRoot,
+    [string] $PesterDiagnosticRoot,
+    [string] $PesterRunnerSha256,
+    [string] $PesterProxyPowerShellPath,
+    [string] $PesterProxyWorkingDirectory,
+    [string] $PesterProxyDiagnosticRoot,
+    [string] $PesterProxyChildWritableRoot,
+    [string] $PesterProxyReadOnlyPathsJson
 )
 
 Set-StrictMode -Version Latest
@@ -167,17 +185,7 @@ function Get-DescendantProcessIds {
     }
     $processes = @()
     if ($script:IsWindowsHost) {
-        try {
-            $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | ForEach-Object {
-                [pscustomobject]@{
-                    processId = [int]$_.ProcessId
-                    parentProcessId = [int]$_.ParentProcessId
-                }
-            })
-        }
-        catch {
-            throw "Could not enumerate Windows child processes for process-tree cleanup: $($_.Exception.Message)"
-        }
+        $processes = @(Get-WindowsProcessTable)
     }
     else {
         foreach ($entry in @(Get-ChildItem -LiteralPath '/proc' -Directory -ErrorAction SilentlyContinue)) {
@@ -277,6 +285,303 @@ function Get-UnixProcessGroupProcessIds {
         }
     }
     return @($members.ToArray())
+}
+
+function Get-LinuxProcessResourceUsage {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId
+    )
+    if (-not $script:IsLinuxHost) { throw 'Linux aggregate resource inspection requires a Linux host.' }
+    $statPath = Join-Path '/proc' "$ProcessId/stat"
+    $statusPath = Join-Path '/proc' "$ProcessId/status"
+    try {
+        $stat = [IO.File]::ReadAllText($statPath)
+        $status = [IO.File]::ReadAllText($statusPath)
+    }
+    catch {
+        throw "Could not inspect Linux resource usage for process ${ProcessId}: $($_.Exception.Message)"
+    }
+    $closeParen = $stat.LastIndexOf(')')
+    if ($closeParen -lt 0) { throw "Could not parse Linux process ${ProcessId} resource metadata." }
+    $fields = @([regex]::Split($stat.Substring($closeParen + 1).Trim(), '\s+'))
+    if ($fields.Count -lt 15 -or
+        [string]$fields[11] -notmatch '^[0-9]+$' -or [string]$fields[12] -notmatch '^[0-9]+$' -or
+        [string]$fields[13] -notmatch '^[0-9]+$' -or [string]$fields[14] -notmatch '^[0-9]+$') {
+        throw "Could not parse Linux CPU usage for process ${ProcessId}."
+    }
+    $memoryMatch = [regex]::Match($status, '(?m)^VmRSS:\s+(?<kilobytes>[0-9]+)\s+kB\s*$')
+    if (-not $memoryMatch.Success) { throw "Could not parse Linux resident memory for process ${ProcessId}." }
+    return [pscustomobject][ordered]@{
+        processId = $ProcessId
+        memoryBytes = [int64]$memoryMatch.Groups['kilobytes'].Value * 1024
+        # utime/stime cover the live process; cutime/cstime preserve CPU
+        # consumed by children that have already been reaped by this process.
+        # Summing them across live processes does not double-count live
+        # descendants because Linux only reports child time after wait/reap.
+        cpuTicks = [int64]$fields[11] + [int64]$fields[12] + [int64]$fields[13] + [int64]$fields[14]
+    }
+}
+
+function Get-LinuxAggregateClockTicksPerSecond {
+    if (-not $script:IsLinuxHost) { throw 'Linux aggregate resource inspection requires a Linux host.' }
+    $getconfCommand = Get-Command getconf -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $getconfPath = [IO.Path]::GetFullPath([string]$getconfCommand.Path)
+    if (-not (Test-Path -LiteralPath $getconfPath -PathType Leaf)) { throw 'Linux aggregate resource preflight could not locate getconf.' }
+    Assert-NoReparseAncestors -Path $getconfPath -Context 'Trusted Linux getconf utility'
+    $clockTicks = @(& $getconfPath CLK_TCK 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $clockTicks.Count -ne 1 -or [string]$clockTicks[0] -notmatch '^[0-9]+$' -or [int64]$clockTicks[0] -le 0) {
+        throw 'Linux aggregate resource preflight could not resolve a positive CLK_TCK value.'
+    }
+    return [int64]$clockTicks[0]
+}
+
+function Assert-LinuxAggregateResourceUsage {
+    param(
+        [Parameter(Mandatory = $true)][int] $RootProcessId,
+        [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $ProcessGroupId = 0,
+        [Parameter(Mandatory = $true)][int64] $ClockTicksPerSecond,
+        [Parameter()][AllowNull()][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $candidateIds = [Collections.Generic.HashSet[int]]::new()
+    if (Test-ProcessIdExists -ProcessId $RootProcessId) { [void]$candidateIds.Add($RootProcessId) }
+    if ($ProcessGroupId -gt 0) {
+        foreach ($processId in @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId)) { [void]$candidateIds.Add([int]$processId) }
+    }
+    foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) { [void]$candidateIds.Add([int]$processId) }
+    $memoryBytes = [int64]0
+    $cpuTicks = [int64]0
+    foreach ($processId in $candidateIds) {
+        try {
+            $usage = Get-LinuxProcessResourceUsage -ProcessId ([int]$processId)
+        }
+        catch {
+            if (Test-ProcessIdExists -ProcessId ([int]$processId)) { throw "$Context could not inspect every process in the candidate resource boundary: $($_.Exception.Message)" }
+            continue
+        }
+        $memoryBytes += [int64]$usage.memoryBytes
+        $cpuTicks += [int64]$usage.cpuTicks
+    }
+    if ($candidateIds.Count -gt 256) { throw "$Context exceeded the aggregate Linux process-count limit of 256." }
+    if ($memoryBytes -gt 2147483648) { throw "$Context exceeded the aggregate Linux resident-memory limit of 2147483648 bytes." }
+    if ($cpuTicks -gt ([int64]300 * $ClockTicksPerSecond)) { throw "$Context exceeded the aggregate Linux CPU limit of 300 seconds." }
+    if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
+        $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $CgroupPath -Context $Context
+        if ($cgroupCpuMicroseconds -gt [int64]300000000) {
+            throw "$Context exceeded the kernel-accounted Linux cgroup CPU limit of 300 seconds."
+        }
+    }
+}
+
+function Get-LinuxCgroupCpuUsage {
+    param(
+        [Parameter(Mandatory = $true)][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $cpuStatPath = Join-Path $CgroupPath 'cpu.stat'
+    if (-not (Test-Path -LiteralPath $cpuStatPath -PathType Leaf)) {
+        throw "$Context requires kernel-maintained Linux cgroup CPU accounting."
+    }
+    $cpuStat = [IO.File]::ReadAllText($cpuStatPath)
+    if ($cpuStat -notmatch '(?m)^usage_usec\s+(?<microseconds>[0-9]+)\s*$') {
+        throw "$Context received an invalid Linux cgroup cpu.stat usage_usec record."
+    }
+    return [int64]$Matches['microseconds']
+}
+
+function Get-LinuxPesterCgroupRoot {
+    if (-not $script:IsLinuxHost) { return $null }
+    $configuredRoot = [Environment]::GetEnvironmentVariable('CODEX_PESTER_CGROUP_ROOT')
+    if ([string]::IsNullOrWhiteSpace($configuredRoot)) {
+        throw 'Protected Pester validation requires a workflow-delegated Linux cgroup v2 root.'
+    }
+    if ($configuredRoot -notmatch '^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+$') {
+        throw 'Protected Pester validation received an invalid delegated Linux cgroup root.'
+    }
+    $rootPath = [IO.Path]::GetFullPath($configuredRoot)
+    if ($rootPath -cne $configuredRoot -or
+        -not (Test-Path -LiteralPath $rootPath -PathType Container)) {
+        throw 'Protected Pester validation requires an existing delegated Linux cgroup root.'
+    }
+    Assert-NoReparseAncestors -Path $rootPath -Context 'Protected Pester delegated cgroup root'
+    $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Protected Pester delegated cgroup root must not be a reparse point.'
+    }
+    $controllersPath = Join-Path $rootPath 'cgroup.controllers'
+    $subtreeControlPath = Join-Path $rootPath 'cgroup.subtree_control'
+    if (-not (Test-Path -LiteralPath $controllersPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $subtreeControlPath -PathType Leaf)) {
+        throw 'Protected Pester delegated root is not a Linux cgroup v2 hierarchy.'
+    }
+    $controllers = [IO.File]::ReadAllText($controllersPath)
+    if ($controllers -notmatch '(^|\s)memory(\s|$)' -or
+        $controllers -notmatch '(^|\s)cpu(\s|$)') {
+        throw 'Protected Pester delegated Linux cgroup root does not expose the memory and CPU controllers.'
+    }
+    $subtreeControl = [IO.File]::ReadAllText($subtreeControlPath)
+    if ($subtreeControl -notmatch '(^|\s)memory(\s|$)' -or
+        $subtreeControl -notmatch '(^|\s)cpu(\s|$)') {
+        throw 'Protected Pester delegated Linux cgroup root has not enabled the memory and CPU controllers for children.'
+    }
+    $relativeRoot = $rootPath.Substring('/sys/fs/cgroup'.Length)
+    $currentCgroup = [IO.File]::ReadAllText("/proc/$PID/cgroup")
+    if ($currentCgroup -notmatch ("0::" + [regex]::Escape($relativeRoot) + '/')) {
+        throw 'Protected Pester validation is not running inside the delegated Linux cgroup subtree.'
+    }
+    return $rootPath
+}
+
+function New-LinuxPesterCgroup {
+    param([Parameter(Mandatory = $true)][string] $Context)
+    if (-not $script:IsLinuxHost) { return $null }
+    $cgroupRoot = Get-LinuxPesterCgroupRoot
+    $controllersPath = Join-Path $cgroupRoot 'cgroup.controllers'
+    if (-not (Test-Path -LiteralPath $cgroupRoot -PathType Container) -or
+        -not (Test-Path -LiteralPath $controllersPath -PathType Leaf)) {
+        throw "$Context requires a writable Linux cgroup v2 hierarchy with the memory and CPU controllers."
+    }
+    $controllers = [IO.File]::ReadAllText($controllersPath)
+    if ($controllers -notmatch '(^|\s)memory(\s|$)' -or
+        $controllers -notmatch '(^|\s)cpu(\s|$)') {
+        throw "$Context requires the Linux cgroup v2 memory and CPU controllers."
+    }
+    $cgroupPath = Join-Path $cgroupRoot ("codex-validation-pester-{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($cgroupPath) | Out-Null
+        Assert-NoReparseAncestors -Path $cgroupPath -Context "$Context cgroup"
+        $memoryMaxPath = Join-Path $cgroupPath 'memory.max'
+        if (-not (Test-Path -LiteralPath $memoryMaxPath -PathType Leaf)) {
+            throw 'The Linux cgroup v2 memory controller is not enabled for the new cgroup.'
+        }
+        [IO.File]::WriteAllText($memoryMaxPath, '2147483648')
+        $memoryMax = ([IO.File]::ReadAllText($memoryMaxPath)).Trim()
+        if ($memoryMax -cne '2147483648') {
+            throw "The Linux Pester cgroup memory.max is '$memoryMax', not the required hard limit."
+        }
+        [void](Get-LinuxCgroupCpuUsage -CgroupPath $cgroupPath -Context "$Context cgroup")
+        $pidsMaxPath = Join-Path $cgroupPath 'pids.max'
+        if (Test-Path -LiteralPath $pidsMaxPath -PathType Leaf) {
+            [IO.File]::WriteAllText($pidsMaxPath, '256')
+            $pidsMax = ([IO.File]::ReadAllText($pidsMaxPath)).Trim()
+            if ($pidsMax -cne '256') { throw "The Linux Pester cgroup pids.max is '$pidsMax', not 256." }
+        }
+        return $cgroupPath
+    }
+    catch {
+        if (Test-Path -LiteralPath $cgroupPath -PathType Container) {
+            Remove-Item -LiteralPath $cgroupPath -Force -ErrorAction SilentlyContinue
+        }
+        throw "$Context could not establish a hard Linux cgroup boundary: $($_.Exception.Message)"
+    }
+}
+
+function Add-LinuxProcessTreeToCgroup {
+    param(
+        [Parameter(Mandatory = $true)][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][int] $RootProcessId,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { return }
+    $processFile = Join-Path $CgroupPath 'cgroup.procs'
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $processIds = [Collections.Generic.HashSet[int]]::new()
+        [void]$processIds.Add($RootProcessId)
+        foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
+            [void]$processIds.Add([int]$processId)
+        }
+        foreach ($processId in $processIds) {
+            if (-not (Test-ProcessIdExists -ProcessId ([int]$processId))) { continue }
+            try {
+                [IO.File]::WriteAllText($processFile, ([string]$processId + [Environment]::NewLine))
+            }
+            catch {
+                if (Test-ProcessIdExists -ProcessId ([int]$processId)) {
+                    throw "$Context could not place process $processId in the hard Linux cgroup: $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+}
+
+function Remove-LinuxPesterCgroup {
+    param([Parameter()][AllowNull()][string] $CgroupPath)
+    if (-not $script:IsLinuxHost -or [string]::IsNullOrWhiteSpace($CgroupPath)) { return }
+    $killPath = Join-Path $CgroupPath 'cgroup.kill'
+    if (Test-Path -LiteralPath $killPath -PathType Leaf) {
+        try { [IO.File]::WriteAllText($killPath, '1') } catch { }
+    }
+    $eventsPath = Join-Path $CgroupPath 'cgroup.events'
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    for ($attempt = 0; $attempt -lt 120; $attempt++) {
+        if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
+        if (-not (Test-Path -LiteralPath $eventsPath -PathType Leaf)) {
+            throw 'Protected Pester cgroup cleanup could not observe cgroup.events.'
+        }
+        $events = [IO.File]::ReadAllText($eventsPath)
+        if ($events -notmatch '(?m)^populated\s+(?<value>[01])\s*$') {
+            throw 'Protected Pester cgroup cleanup received an invalid cgroup.events population record.'
+        }
+        if ([string]$Matches['value'] -eq '0') {
+            try { Remove-Item -LiteralPath $CgroupPath -Force -ErrorAction Stop } catch { }
+            if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        Start-Sleep -Milliseconds 25
+    }
+    if (Test-Path -LiteralPath $CgroupPath -PathType Container) {
+        throw 'Protected Pester cgroup cleanup did not evacuate and remove the cgroup within the bounded cleanup window.'
+    }
+}
+
+function Get-LinuxWritableRootUsage {
+    param(
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { throw 'Linux writable-root inspection requires a Linux host.' }
+    $rootPath = [IO.Path]::GetFullPath($Root)
+    $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Context writable root is not a regular non-reparse directory: $rootPath"
+    }
+    $pending = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
+    $pending.Push([IO.DirectoryInfo]$rootItem)
+    $bytes = [int64]0
+    $fileCount = 0
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($entry in @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)) {
+            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Context writable root contains a reparse entry: $($entry.FullName)"
+            }
+            if ($entry.PSIsContainer) {
+                $pending.Push([IO.DirectoryInfo]$entry)
+                continue
+            }
+            $fileCount++
+            if ($fileCount -gt 100000) { throw "$Context exceeded the aggregate writable-file-count limit of 100000." }
+            if ($entry.Length -gt 0 -and [int64]$entry.Length -gt ([int64]::MaxValue - $bytes)) {
+                throw "$Context writable-root size overflowed the bounded accounting range."
+            }
+            $bytes += [int64]$entry.Length
+        }
+    }
+    return [pscustomobject][ordered]@{ bytes = $bytes; fileCount = $fileCount }
+}
+
+function Assert-LinuxWritableRootUsage {
+    param(
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][int64] $BaselineBytes,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $usage = Get-LinuxWritableRootUsage -Root $Root -Context $Context
+    $growth = [int64]$usage.bytes - $BaselineBytes
+    if ($growth -gt 536870912) {
+        throw "$Context exceeded the aggregate writable-root growth limit of 536870912 bytes."
+    }
+    return $usage
 }
 
 function Test-ProcessIdExists {
@@ -460,13 +765,44 @@ namespace Codex.Validation {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
 
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string stringSecurityDescriptor,
+            uint stringSDRevision,
+            out IntPtr securityDescriptor,
+            out uint securityDescriptorSize);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetKernelObjectSecurity(
+            IntPtr handle,
+            uint securityInformation,
+            IntPtr securityDescriptor);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr handle);
+
         public static IntPtr CreateKillOnCloseJob() {
             IntPtr jobHandle = CreateJobObject(IntPtr.Zero, null);
             if (jobHandle == IntPtr.Zero) {
                 return IntPtr.Zero;
             }
             ExtendedLimitInformation information = new ExtendedLimitInformation();
-            information.BasicLimitInformation.LimitFlags = 0x00002000;
+            const uint JobObjectLimitKillOnClose = 0x00002000;
+            const uint JobObjectLimitActiveProcess = 0x00000008;
+            const uint JobObjectLimitJobMemory = 0x00000200;
+            const uint JobObjectLimitJobTime = 0x00000004;
+            const uint JobObjectLimitDieOnUnhandledException = 0x00000400;
+            information.BasicLimitInformation.LimitFlags =
+                JobObjectLimitKillOnClose |
+                JobObjectLimitActiveProcess |
+                JobObjectLimitJobMemory |
+                JobObjectLimitJobTime |
+                JobObjectLimitDieOnUnhandledException;
+            information.BasicLimitInformation.ActiveProcessLimit = 256;
+            information.BasicLimitInformation.PerJobUserTimeLimit = 300L * 10000000L;
+            information.JobMemoryLimit = new UIntPtr(2147483648UL);
             int informationLength = Marshal.SizeOf(typeof(ExtendedLimitInformation));
             IntPtr informationBuffer = Marshal.AllocHGlobal(informationLength);
             try {
@@ -513,6 +849,30 @@ namespace Codex.Validation {
         public static bool Close(IntPtr handle) {
             return CloseHandle(handle);
         }
+
+        public static bool SetLowIntegrityKernelObject(IntPtr handle) {
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) {
+                return false;
+            }
+            IntPtr securityDescriptor = IntPtr.Zero;
+            uint securityDescriptorSize;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                "S:(ML;;NW;;;LW)",
+                1,
+                out securityDescriptor,
+                out securityDescriptorSize)) {
+                return false;
+            }
+            try {
+                const uint LabelSecurityInformation = 0x00000010;
+                return SetKernelObjectSecurity(handle, LabelSecurityInformation, securityDescriptor);
+            }
+            finally {
+                if (securityDescriptor != IntPtr.Zero) {
+                    LocalFree(securityDescriptor);
+                }
+            }
+        }
     }
 }
 '@ -ErrorAction Stop
@@ -522,6 +882,112 @@ namespace Codex.Validation {
         throw 'The Windows process boundary interop type could not be loaded.'
     }
     return $nativeType
+}
+
+function Get-WindowsProcessTable {
+    if (-not $script:IsWindowsHost) {
+        throw 'Windows process-table enumeration is supported only on Windows hosts.'
+    }
+    $nativeType = 'Codex.Validation.WindowsProcessEnumeration' -as [type]
+    if ($null -eq $nativeType) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace Codex.Validation {
+    public sealed class WindowsProcessEntry {
+        public int ProcessId { get; private set; }
+        public int ParentProcessId { get; private set; }
+
+        internal WindowsProcessEntry(int processId, int parentProcessId) {
+            ProcessId = processId;
+            ParentProcessId = parentProcessId;
+        }
+    }
+
+    public static class WindowsProcessEnumeration {
+        private const uint SnapshotProcess = 0x00000002;
+        private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct NativeProcessEntry {
+            public uint Size;
+            public uint Usage;
+            public uint ProcessId;
+            public IntPtr DefaultHeapId;
+            public uint ModuleId;
+            public uint Threads;
+            public uint ParentProcessId;
+            public int PriorityClassBase;
+            public uint Flags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string ExecutableFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool Process32FirstW(IntPtr snapshot, ref NativeProcessEntry entry);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool Process32NextW(IntPtr snapshot, ref NativeProcessEntry entry);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static WindowsProcessEntry[] GetAll() {
+            IntPtr snapshot = CreateToolhelp32Snapshot(SnapshotProcess, 0);
+            if (snapshot == IntPtr.Zero || snapshot == InvalidHandle) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateToolhelp32Snapshot failed.");
+            }
+            try {
+                NativeProcessEntry entry = new NativeProcessEntry();
+                entry.Size = (uint)Marshal.SizeOf(typeof(NativeProcessEntry));
+                if (!Process32FirstW(snapshot, ref entry)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Process32FirstW failed.");
+                }
+                List<WindowsProcessEntry> result = new List<WindowsProcessEntry>();
+                do {
+                    if (entry.ProcessId > 0) {
+                        result.Add(new WindowsProcessEntry((int)entry.ProcessId, (int)entry.ParentProcessId));
+                    }
+                    entry.Size = (uint)Marshal.SizeOf(typeof(NativeProcessEntry));
+                }
+                while (Process32NextW(snapshot, ref entry));
+                int error = Marshal.GetLastWin32Error();
+                if (error != 18) {
+                    throw new Win32Exception(error, "Process32NextW failed.");
+                }
+                return result.ToArray();
+            }
+            finally {
+                CloseHandle(snapshot);
+            }
+        }
+    }
+}
+'@ -ErrorAction Stop
+        $nativeType = 'Codex.Validation.WindowsProcessEnumeration' -as [type]
+    }
+    if ($null -eq $nativeType) {
+        throw 'The Windows process-table interop type could not be loaded.'
+    }
+    $entries = @($nativeType::GetAll())
+    if ($entries.Count -eq 0) {
+        throw 'The Windows process-table snapshot was empty.'
+    }
+    return @($entries | ForEach-Object {
+        [pscustomobject]@{
+            processId = [int]$_.ProcessId
+            parentProcessId = [int]$_.ParentProcessId
+        }
+    })
 }
 
 function Get-WindowsSuspendedProcessBoundaryType {
@@ -679,6 +1145,16 @@ namespace Codex.Validation {
         private const uint ProcThreadAttributeHandleList = 0x00020002;
         private const int ErrorInsufficientBuffer = 122;
         private const uint WaitObject0 = 0x00000000;
+        private const uint TokenAssignPrimary = 0x00000001;
+        private const uint TokenDuplicate = 0x00000002;
+        private const uint TokenQuery = 0x00000008;
+        private const uint TokenAdjustDefault = 0x00000080;
+        private const int TokenIsRestricted = 40;
+        private const int TokenIntegrityLevel = 25;
+        private const int TokenPrimary = 1;
+        private const int SecurityImpersonation = 2;
+        private const uint DisableMaxPrivilege = 0x00000001;
+        private const uint SeGroupIntegrity = 0x00000020;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct SecurityAttributes {
@@ -723,6 +1199,17 @@ namespace Codex.Validation {
             public int ThreadId;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SidAndAttributes {
+            public IntPtr Sid;
+            public uint Attributes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TokenMandatoryLabel {
+            public SidAndAttributes Label;
+        }
+
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CreatePipe(
@@ -746,6 +1233,93 @@ namespace Codex.Validation {
             IntPtr processAttributes,
             IntPtr threadAttributes,
             bool inheritHandles,
+            uint creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref StartupInfoEx startupInfo,
+            out NativeProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = false)]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool OpenProcessToken(
+            IntPtr processHandle,
+            uint desiredAccess,
+            out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateRestrictedToken(
+            IntPtr existingTokenHandle,
+            uint flags,
+            uint disableSidCount,
+            IntPtr sidsToDisable,
+            uint deletePrivilegeCount,
+            IntPtr privilegesToDelete,
+            uint restrictedSidCount,
+            IntPtr sidsToRestrict,
+            out IntPtr newTokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DuplicateTokenEx(
+            IntPtr existingTokenHandle,
+            uint desiredAccess,
+            IntPtr tokenAttributes,
+            int impersonationLevel,
+            int tokenType,
+            out IntPtr newTokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetTokenInformation(
+            IntPtr tokenHandle,
+            int tokenInformationClass,
+            out int tokenInformation,
+            int tokenInformationLength,
+            out int returnLength);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertStringSidToSidW(
+            string stringSid,
+            out IntPtr sid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern uint GetLengthSid(IntPtr sid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetTokenInformation(
+            IntPtr tokenHandle,
+            int tokenInformationClass,
+            IntPtr tokenInformation,
+            int tokenInformationLength);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateProcessAsUserW(
+            IntPtr token,
+            string applicationName,
+            StringBuilder commandLine,
+            IntPtr processAttributes,
+            IntPtr threadAttributes,
+            bool inheritHandles,
+            uint creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref StartupInfoEx startupInfo,
+            out NativeProcessInformation processInformation);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateProcessWithTokenW(
+            IntPtr token,
+            uint logonFlags,
+            string applicationName,
+            StringBuilder commandLine,
             uint creationFlags,
             IntPtr environment,
             string currentDirectory,
@@ -777,12 +1351,118 @@ namespace Codex.Validation {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr handle);
+
+        private static void SetLowIntegrityLevel(IntPtr tokenHandle) {
+            IntPtr integritySid = IntPtr.Zero;
+            IntPtr labelBuffer = IntPtr.Zero;
+            if (!ConvertStringSidToSidW("S-1-16-4096", out integritySid)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "ConvertStringSidToSidW failed.");
+            }
+            try {
+                uint sidLength = GetLengthSid(integritySid);
+                if (sidLength == 0) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetLengthSid failed.");
+                }
+                int labelLength = Marshal.SizeOf(typeof(TokenMandatoryLabel));
+                int informationLength = checked(labelLength + (int)sidLength);
+                labelBuffer = Marshal.AllocHGlobal(informationLength);
+                TokenMandatoryLabel label = new TokenMandatoryLabel();
+                label.Label.Sid = integritySid;
+                label.Label.Attributes = SeGroupIntegrity;
+                Marshal.StructureToPtr(label, labelBuffer, false);
+                if (!SetTokenInformation(
+                    tokenHandle,
+                    TokenIntegrityLevel,
+                    labelBuffer,
+                    informationLength)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "SetTokenInformation(TokenIntegrityLevel) failed.");
+                }
+            }
+            finally {
+                if (labelBuffer != IntPtr.Zero) {
+                    Marshal.FreeHGlobal(labelBuffer);
+                }
+                if (integritySid != IntPtr.Zero) {
+                    LocalFree(integritySid);
+                }
+            }
+        }
+
+        private static IntPtr CreateRestrictedPrimaryToken() {
+            IntPtr sourceToken = IntPtr.Zero;
+            if (!OpenProcessToken(
+                GetCurrentProcess(),
+                TokenAssignPrimary | TokenDuplicate | TokenQuery | TokenAdjustDefault,
+                out sourceToken)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken failed.");
+            }
+            try {
+                int isRestricted;
+                int returnLength;
+                if (!GetTokenInformation(
+                    sourceToken,
+                    TokenIsRestricted,
+                    out isRestricted,
+                    sizeof(int),
+                    out returnLength)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation(TokenIsRestricted) failed.");
+                }
+                if (isRestricted != 0) {
+                    IntPtr duplicatedRestrictedToken;
+                    if (!DuplicateTokenEx(
+                        sourceToken,
+                        TokenAssignPrimary | TokenDuplicate | TokenQuery | TokenAdjustDefault,
+                        IntPtr.Zero,
+                        SecurityImpersonation,
+                        TokenPrimary,
+                        out duplicatedRestrictedToken)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "DuplicateTokenEx failed.");
+                    }
+                    try {
+                        SetLowIntegrityLevel(duplicatedRestrictedToken);
+                        return duplicatedRestrictedToken;
+                    }
+                    catch {
+                        CloseHandle(duplicatedRestrictedToken);
+                        throw;
+                    }
+                }
+                IntPtr restrictedToken;
+                if (!CreateRestrictedToken(
+                    sourceToken,
+                    DisableMaxPrivilege,
+                    0,
+                    IntPtr.Zero,
+                    0,
+                    IntPtr.Zero,
+                    0,
+                    IntPtr.Zero,
+                    out restrictedToken)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateRestrictedToken failed.");
+                }
+                try {
+                    SetLowIntegrityLevel(restrictedToken);
+                    return restrictedToken;
+                }
+                catch {
+                    CloseHandle(restrictedToken);
+                    throw;
+                }
+            }
+            finally {
+                CloseHandle(sourceToken);
+            }
+        }
+
         public static WindowsSuspendedProcess Start(
             string fileName,
             string[] arguments,
             string workingDirectory,
             IDictionary environment,
-            bool useStandardInput) {
+            bool useStandardInput,
+            bool useRestrictedToken) {
             if (String.IsNullOrWhiteSpace(fileName)) { throw new ArgumentException("fileName"); }
             if (String.IsNullOrWhiteSpace(workingDirectory)) { throw new ArgumentException("workingDirectory"); }
 
@@ -796,6 +1476,7 @@ namespace Codex.Validation {
             IntPtr attributeList = IntPtr.Zero;
             IntPtr attributeListSize = IntPtr.Zero;
             IntPtr handleList = IntPtr.Zero;
+            IntPtr restrictedToken = IntPtr.Zero;
             bool attributeListInitialized = false;
             NativeProcessInformation nativeProcessInformation = new NativeProcessInformation();
             WindowsSuspendedProcess result = null;
@@ -860,18 +1541,54 @@ namespace Codex.Validation {
                 startupInfo.AttributeList = attributeList;
                 string environmentText = BuildEnvironment(environment);
                 environmentBlock = Marshal.StringToHGlobalUni(environmentText);
-                StringBuilder commandLine = new StringBuilder(BuildCommandLine(fileName, arguments));
-                ThrowIfFalse(CreateProcessW(
-                    fileName,
-                    commandLine,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    true,
-                    CreateSuspended | CreateUnicodeEnvironment | CreateExtendedStartupInfo | CreateNoWindow,
-                    environmentBlock,
-                    workingDirectory,
-                    ref startupInfo,
-                    out nativeProcessInformation), "CreateProcessW");
+                string commandLineText = BuildCommandLine(fileName, arguments);
+                uint creationFlags = CreateSuspended | CreateUnicodeEnvironment | CreateExtendedStartupInfo | CreateNoWindow;
+                if (useRestrictedToken) {
+                    restrictedToken = CreateRestrictedPrimaryToken();
+                    bool processCreated = CreateProcessAsUserW(
+                        restrictedToken,
+                        fileName,
+                        new StringBuilder(commandLineText),
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        true,
+                        creationFlags,
+                        environmentBlock,
+                        workingDirectory,
+                        ref startupInfo,
+                        out nativeProcessInformation);
+                    int firstCreateError = processCreated ? 0 : Marshal.GetLastWin32Error();
+                    if (!processCreated) {
+                        processCreated = CreateProcessWithTokenW(
+                            restrictedToken,
+                            0,
+                            fileName,
+                            new StringBuilder(commandLineText),
+                            creationFlags,
+                            environmentBlock,
+                            workingDirectory,
+                            ref startupInfo,
+                            out nativeProcessInformation);
+                    }
+                    if (!processCreated) {
+                        int createError = Marshal.GetLastWin32Error();
+                        if (createError == 0) { createError = firstCreateError; }
+                        throw new Win32Exception(createError, "CreateProcessAsUserW/CreateProcessWithTokenW failed.");
+                    }
+                }
+                else {
+                    ThrowIfFalse(CreateProcessW(
+                        fileName,
+                        new StringBuilder(commandLineText),
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        true,
+                        creationFlags,
+                        environmentBlock,
+                        workingDirectory,
+                        ref startupInfo,
+                        out nativeProcessInformation), "CreateProcessW");
+                }
 
                 CloseHandle(childStandardInput); childStandardInput = IntPtr.Zero;
                 CloseHandle(childStandardOutput); childStandardOutput = IntPtr.Zero;
@@ -906,6 +1623,7 @@ namespace Codex.Validation {
                 if (attributeList != IntPtr.Zero) { Marshal.FreeHGlobal(attributeList); }
                 if (handleList != IntPtr.Zero) { Marshal.FreeHGlobal(handleList); }
                 if (environmentBlock != IntPtr.Zero) { Marshal.FreeHGlobal(environmentBlock); }
+                CloseIfPresent(restrictedToken);
             }
         }
 
@@ -1011,10 +1729,11 @@ function Start-WindowsSuspendedProcess {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
         [Parameter(Mandatory = $true)][string] $WorkingDirectory,
         [Parameter(Mandatory = $true)] [Collections.IDictionary] $EnvironmentVariables,
-        [Parameter(Mandatory = $true)][bool] $UseStandardInput
+        [Parameter(Mandatory = $true)][bool] $UseStandardInput,
+        [Parameter(Mandatory = $true)][bool] $UseRestrictedToken
     )
     $nativeType = Get-WindowsSuspendedProcessBoundaryType
-    return $nativeType::Start($FileName, $Arguments, $WorkingDirectory, $EnvironmentVariables, $UseStandardInput)
+    return $nativeType::Start($FileName, $Arguments, $WorkingDirectory, $EnvironmentVariables, $UseStandardInput, $UseRestrictedToken)
 }
 
 function New-WindowsKillOnCloseJob {
@@ -1334,10 +2053,10 @@ function Stop-ProcessTree {
             (-not $ObservedProcessIdentities.ContainsKey([int]$_) -or
                 -not (Test-ProcessIdentity -ProcessId ([int]$_) -Identity ([string]$ObservedProcessIdentities[[int]$_])))
         })
-        if ($remainingGroupMembers.Count -gt 0 -and $unboundGroupMembers.Count -gt 0) {
+        if (@($remainingGroupMembers).Count -gt 0 -and @($unboundGroupMembers).Count -gt 0) {
             throw 'Could not establish process identity for every candidate process-group member.'
         }
-        if (-not $remainingRoot -and $remainingObserved.Count -eq 0) { return }
+        if (-not $remainingRoot -and @($remainingObserved).Count -eq 0) { return }
     }
     throw "Could not terminate the complete candidate process boundary rooted at process $RootProcessId."
 }
@@ -1505,6 +2224,79 @@ function Assert-NoReparseAncestors {
         $parentPath = Split-Path -Parent $currentPath
         if ([string]::IsNullOrWhiteSpace($parentPath) -or (Test-PathEqual -Left $parentPath -Right $currentPath)) { break }
         $currentPath = $parentPath
+    }
+}
+
+function Assert-NoReparseTree {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    Assert-NoReparseAncestors -Path $fullPath -Context $Context
+    $rootItem = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer) {
+        throw "$Context is not a directory: $fullPath"
+    }
+    foreach ($item in @(Get-ChildItem -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop)) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Context contains a reparse point: $($item.FullName)"
+        }
+    }
+}
+
+function Expand-TrustedGitArchive {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string[]] $GitConfigArguments,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $Revision,
+        [Parameter(Mandatory = $true)][string] $DestinationRoot,
+        [Parameter()][AllowEmptyCollection()][string[]] $PathSpec = @(),
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $destination = [IO.Path]::GetFullPath($DestinationRoot)
+    [void](New-Item -ItemType Directory -Path $destination -Force)
+    Assert-NoReparseAncestors -Path $destination -Context "$Context destination"
+    $archivePath = Join-Path (Split-Path -Parent $destination) ('.trusted-git-{0}.zip' -f [guid]::NewGuid().ToString('N'))
+    try {
+        & $GitPath @GitConfigArguments -C $RepositoryRoot archive --format=zip --output=$archivePath $Revision @PathSpec
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+            throw "$Context could not create the immutable Git archive."
+        }
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $destination -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $archivePath -PathType Leaf) {
+            Remove-Item -LiteralPath $archivePath -Force -ErrorAction Stop
+        }
+    }
+    Assert-NoReparseTree -Path $destination -Context $Context
+}
+
+function Assert-TrustedGitTreeFile {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string[]] $GitConfigArguments,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $Revision,
+        [Parameter(Mandatory = $true)][string] $RelativePath,
+        [Parameter(Mandatory = $true)][string] $MaterializedPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $item = Get-Item -LiteralPath $MaterializedPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Context is not a regular non-reparse file: $MaterializedPath"
+    }
+    Assert-NoReparseAncestors -Path $MaterializedPath -Context $Context
+    $revisionPath = "$Revision`:$RelativePath"
+    $expected = ([string](@(& $GitPath @GitConfigArguments -C $RepositoryRoot rev-parse --verify $revisionPath 2>$null) | Select-Object -First 1)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') {
+        throw "$Context could not resolve the trusted Git blob: $RelativePath"
+    }
+    $actual = ([string](@(& $GitPath @GitConfigArguments -C $RepositoryRoot hash-object --no-filters -- $MaterializedPath 2>$null) | Select-Object -First 1)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actual -cne $expected) {
+        throw "$Context does not match the trusted Git blob: $RelativePath"
     }
 }
 
@@ -1805,6 +2597,61 @@ function Assert-ExternalReceiptFile {
     return $path
 }
 
+function Set-WindowsLowIntegrityDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+    if (-not $script:IsWindowsHost) {
+        return
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Windows low-integrity boundary path must be a regular non-reparse directory: $fullPath"
+    }
+    Assert-NoReparseAncestors -Path $fullPath -Context 'Windows low-integrity boundary directory'
+    $icaclsCommand = Get-Command icacls.exe -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1
+    $icaclsPath = [IO.Path]::GetFullPath([string]$icaclsCommand.Path)
+    if (-not (Test-Path -LiteralPath $icaclsPath -PathType Leaf)) {
+        throw "Windows low-integrity boundary utility is missing: $icaclsPath"
+    }
+    Assert-NoReparseAncestors -Path $icaclsPath -Context 'Windows low-integrity boundary utility'
+    $arguments = @($fullPath, '/setintegritylevel', '(OI)(CI)L')
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $icaclsPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+    if ($null -ne $argumentListProperty) {
+        foreach ($argument in $arguments) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+        }
+    }
+    else {
+        $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $arguments
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'Windows low-integrity boundary utility did not start.'
+        }
+        $standardOutput = $process.StandardOutput.ReadToEnd()
+        $standardError = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            $diagnostic = (($standardOutput, $standardError | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' ').Trim()
+            throw "icacls could not set the low-integrity label on '$fullPath' (exit code $($process.ExitCode)): $diagnostic"
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function New-ContainedProcessEnvironment {
     param(
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot
@@ -1825,7 +2672,6 @@ function New-ContainedProcessEnvironment {
         'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_WORKSPACE', 'RUNNER_ARCH', 'RUNNER_DEBUG',
         'RUNNER_NAME', 'RUNNER_OS', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE', 'RUNNER_TRACKING_ID',
         'RUNNER_WORKSPACE', 'ImageOS', 'ImageVersion',
-        'CODEX_VALIDATION_NATIVE_PAYLOAD', 'CODEX_VALIDATION_RESUME_EVENT', 'CODEX_VALIDATION_HAS_STANDARD_INPUT',
         'GIT_NO_REPLACE_OBJECTS'
     )
     $environment = [ordered]@{}
@@ -1858,6 +2704,7 @@ function New-ContainedProcessEnvironment {
         }
         Assert-NoReparseAncestors -Path $path -Context 'Contained native-process environment path'
     }
+    Set-WindowsLowIntegrityDirectory -Path $containmentRoot
     $environment['HOME'] = $homePath
     $environment['USERPROFILE'] = $homePath
     $environment['TMP'] = $tempPath
@@ -1969,6 +2816,307 @@ function Assert-RepositoryRawSnapshotUnchanged {
         }
     }
 }
+
+function Assert-BootstrapTransitionChangedPaths {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $BaseCommit,
+        [Parameter(Mandatory = $true)][string] $CandidateCommit
+    )
+    if ([string]::IsNullOrWhiteSpace($BaseCommit)) {
+        throw 'Bootstrap transition requires a distinct base commit for changed-path binding.'
+    }
+
+    $allowedPathList = @(
+        '.github/workflows/skill-validator.yml'
+        '.github/workflows/standard-v1-protected.yml'
+        'scripts/Test-Repository.ps1'
+        'scripts/Validate.ps1'
+        'tests/BootstrapTransition.Tests.ps1'
+        'tests/validate-windows-powershell.ps1'
+    )
+    $allowedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($path in $allowedPathList) { [void]$allowedPaths.Add($path) }
+    $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
+    $gitOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot diff --find-renames=100% --name-status -z "$BaseCommit...$CandidateCommit") -join '')
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not compare bootstrap transition candidate '$CandidateCommit' with base commit '$BaseCommit'."
+    }
+    $tokens = @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })
+    if ($tokens.Count -eq 0) {
+        throw 'Bootstrap transition changed-path binding found no candidate changes.'
+    }
+    $changedPaths = [Collections.Generic.List[string]]::new()
+    $changedPathSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $status = [string]$tokens[$index]
+        if ($status -cmatch '^[RC][0-9]{3}$') {
+            throw "Bootstrap transition changed-path allowlist rejects rename/copy status '$status'."
+        }
+        if ($status -cnotmatch '^[AM]$') {
+            throw "Bootstrap transition changed-path allowlist rejects Git status '$status'."
+        }
+        if ($index + 1 -ge $tokens.Count) {
+            throw 'Git returned an incomplete bootstrap transition status record.'
+        }
+        $path = [string]$tokens[$index + 1]
+        if (-not $allowedPaths.Contains($path)) {
+            throw "Bootstrap transition changed-path allowlist rejects '$path'."
+        }
+        if (-not $changedPathSet.Add($path)) {
+            throw "Bootstrap transition changed-path binding returned duplicate path '$path'."
+        }
+        [void]$changedPaths.Add($path)
+        $index++
+    }
+
+    $requiredPathList = @(
+        '.github/workflows/standard-v1-protected.yml'
+        'scripts/Test-Repository.ps1'
+        'scripts/Validate.ps1'
+        'tests/validate-windows-powershell.ps1'
+    )
+    foreach ($requiredPath in $requiredPathList) {
+        if (-not $changedPathSet.Contains($requiredPath)) {
+            throw "Bootstrap transition changed-path binding is missing required path '$requiredPath'."
+        }
+    }
+    return [pscustomobject][ordered]@{
+        baseCommit = $BaseCommit
+        candidateCommit = $CandidateCommit
+        allowedPaths = @($allowedPathList)
+        changedPaths = @($changedPaths.ToArray() | Sort-Object)
+    }
+}
+
+function Invoke-BootstrapTransitionValidation {
+    param(
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $ArtifactsRoot,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $OutputPath,
+        [Parameter(Mandatory = $true)][string] $RepositoryValidatorPath,
+        [Parameter(Mandatory = $true)][string] $RepositoryValidatorHash,
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter()][string] $TrustedStatPath,
+        [Parameter(Mandatory = $true)][string] $CandidateCommit,
+        [Parameter(Mandatory = $true)][string] $CandidateTree,
+        [Parameter(Mandatory = $true)][string] $BaseCommit,
+        [Parameter(Mandatory = $true)][string] $GitIndexPath,
+        [Parameter(Mandatory = $true)][string] $GitIndexSha256,
+        [Parameter(Mandatory = $true)][string] $GitConfigPath,
+        [Parameter(Mandatory = $true)][bool] $GitConfigExists,
+        [Parameter(Mandatory = $true)][string] $GitConfigSha256,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $RepositorySnapshot
+    )
+
+    $transitionScope = Assert-BootstrapTransitionChangedPaths `
+        -GitPath $GitPath `
+        -RepositoryRoot $RepositoryRoot `
+        -BaseCommit $BaseCommit `
+        -CandidateCommit $CandidateCommit
+    $artifactsRootPath = [IO.Path]::GetFullPath($ArtifactsRoot)
+    if (Test-PathWithinOrEqual -Path $artifactsRootPath -Root $RepositoryRoot) {
+        throw 'Bootstrap transition artifacts root must be outside the candidate repository.'
+    }
+    [void](New-Item -ItemType Directory -Path $artifactsRootPath -Force)
+    $artifactsItem = Get-Item -LiteralPath $artifactsRootPath -Force
+    if (-not $artifactsItem.PSIsContainer -or ($artifactsItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Bootstrap transition artifacts root must be a regular non-reparse directory.'
+    }
+    Assert-NoReparseAncestors -Path $artifactsRootPath -Context 'Bootstrap transition artifacts root'
+    $runRoot = Join-Path $artifactsRootPath "sgv1-bootstrap-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+    if (Test-Path -LiteralPath $runRoot) { throw 'Bootstrap transition run path unexpectedly already exists.' }
+    [void](New-Item -ItemType Directory -Path $runRoot -Force)
+    Assert-NoReparseAncestors -Path $runRoot -Context 'Bootstrap transition run path'
+    Set-WindowsLowIntegrityDirectory -Path $runRoot
+
+    $probeCommand = if ($script:IsWindowsHost) {
+        Get-Command powershell.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    }
+    else {
+        Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    }
+    $probePath = [IO.Path]::GetFullPath([string]$probeCommand.Path)
+    if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
+        throw "Bootstrap transition process-boundary probe executable is missing: $probePath"
+    }
+    Assert-NoReparseAncestors -Path $probePath -Context 'Bootstrap transition process-boundary probe executable'
+    [void](Invoke-NativeChecked `
+        -Command $probePath `
+        -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'exit 0') `
+        -Context 'Bootstrap transition trusted process-boundary probe' `
+        -DiagnosticRoot $runRoot `
+        -IsolateRunnerCommandFiles `
+        -TerminateProcessTree `
+        -ProtectRunnerCommandFiles `
+        -ApplyLinuxResourceLimits `
+        -NetworkProfile Offline `
+        -TimeoutMilliseconds 10000)
+
+    try {
+        [void](Invoke-NativeChecked `
+            -Command $probePath `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'Start-Sleep -Seconds 30') `
+            -Context 'Bootstrap transition bounded cancellation probe' `
+            -DiagnosticRoot $runRoot `
+            -IsolateRunnerCommandFiles `
+            -TerminateProcessTree `
+            -ProtectRunnerCommandFiles `
+            -ApplyLinuxResourceLimits `
+            -NetworkProfile Offline `
+            -TimeoutMilliseconds 1000)
+        throw 'Bootstrap transition bounded cancellation probe completed unexpectedly.'
+    }
+    catch {
+        $cancellationMessage = [string]$_.Exception.Message
+        if ($cancellationMessage -notmatch 'bounded candidate execution timeout') {
+            throw "Bootstrap transition bounded cancellation probe failed without the expected timeout cleanup result: $cancellationMessage"
+        }
+    }
+    $platformBoundary = [ordered]@{
+        host = if ($script:IsWindowsHost) { 'windows' } else { 'linux' }
+        processIdentity = 'passed'
+        processGroup = if ($script:IsWindowsHost) { 'windows-job-object' } else { 'linux-pid-namespace-and-process-group' }
+        restrictedExecution = if ($script:IsWindowsHost) { 'restricted-token' } else { 'setpriv-no-new-privs' }
+        integrityLevel = if ($script:IsWindowsHost) { 'low' } else { 'unprivileged' }
+        resourceLimits = if ($script:IsWindowsHost) { 'job-active-process-256-cpu-300s-memory-2GiB' } else { 'cgroup-cpu-accounting-300s-memory-2GiB+aggregate-process-256+prlimit-address-2GiB' }
+        commandFileBoundary = 'passed'
+        networkProfile = 'offline'
+        probe = 'passed'
+        cancellationCleanup = 'passed'
+    }
+
+    $integrityReportPath = Join-Path $runRoot 'candidate-integrity.json'
+    $integrityJson = & $RepositoryValidatorPath `
+        -RepositoryRoot $RepositoryRoot `
+        -OutputPath $integrityReportPath `
+        -TrustedGitPath $GitPath `
+        -TrustedStatPath $TrustedStatPath `
+        -BootstrapTransition | Select-Object -Last 1
+    $integrityReport = $integrityJson | ConvertFrom-Json -Depth 100
+    if ($integrityReport.result -cne 'passed' -or
+        $integrityReport.validationMode -cne 'bootstrap-transition' -or
+        [int]$integrityReport.activeSkillCount -le 0) {
+        throw 'Bootstrap transition integrity verification did not bind a non-empty current-layout Skill inventory.'
+    }
+    if (-not (Test-Path -LiteralPath $integrityReportPath -PathType Leaf)) {
+        throw 'Bootstrap transition integrity evidence was not written by the trusted repository validator.'
+    }
+    Assert-NoReparseAncestors -Path $integrityReportPath -Context 'Bootstrap transition integrity evidence'
+
+    $postCommit = ([string](@(& $GitPath -c "safe.directory=$RepositoryRoot" -c "core.worktree=$RepositoryRoot" -C $RepositoryRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $postCommit -cne $CandidateCommit) {
+        throw "Bootstrap transition changed the candidate commit; expected '$CandidateCommit' but found '$postCommit'."
+    }
+    $postTree = ([string](@(& $GitPath -c "safe.directory=$RepositoryRoot" -c "core.worktree=$RepositoryRoot" -C $RepositoryRoot rev-parse "$postCommit^{tree}" 2>$null) | Select-Object -First 1)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $postTree -cne $CandidateTree) {
+        throw "Bootstrap transition changed the candidate tree; expected '$CandidateTree' but found '$postTree'."
+    }
+    $postDirty = @(& $GitPath -c "safe.directory=$RepositoryRoot" -c "core.worktree=$RepositoryRoot" -C $RepositoryRoot status --porcelain=v1 --untracked-files=all)
+    if ($LASTEXITCODE -ne 0 -or $postDirty.Count -ne 0) {
+        throw 'Bootstrap transition changed the candidate Git status.'
+    }
+    $postIndexItem = Get-Item -LiteralPath $GitIndexPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $postIndexItem -or $postIndexItem.PSIsContainer -or
+        ($postIndexItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Candidate Git index is missing or changed type after bootstrap transition.'
+    }
+    $postIndexSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $GitIndexPath).Hash.ToLowerInvariant()
+    if ($postIndexSha256 -cne $GitIndexSha256) {
+        throw 'Candidate Git index changed during bootstrap transition.'
+    }
+    $postConfigExists = Test-Path -LiteralPath $GitConfigPath -PathType Leaf
+    if ($postConfigExists -ne $GitConfigExists) {
+        throw 'Candidate Git config existence changed during bootstrap transition.'
+    }
+    if ($postConfigExists) {
+        $postConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $GitConfigPath).Hash.ToLowerInvariant()
+        if ($postConfigSha256 -cne $GitConfigSha256) {
+            throw 'Candidate Git config changed during bootstrap transition.'
+        }
+    }
+    $postSnapshot = @(Get-RepositoryRawSnapshot -RepositoryRoot $RepositoryRoot)
+    Assert-RepositoryRawSnapshotUnchanged -Before $RepositorySnapshot -After $postSnapshot
+
+    $summary = [ordered]@{
+        schemaVersion = 1
+        validationMode = 'bootstrap-transition'
+        candidate = [ordered]@{ commit = $CandidateCommit; tree = $CandidateTree }
+        transitionScope = $transitionScope
+        trusted = [ordered]@{
+            repositoryValidatorSha256 = $RepositoryValidatorHash
+            candidateCodeExecuted = $false
+            candidateExecutionProfile = 'not-run'
+            assertions = 'trusted-supervisor-only'
+        }
+        stages = [ordered]@{
+            bootstrapFixture = 'passed'
+            platformBoundary = 'passed'
+            cancellationCleanup = 'passed'
+            integrityVerification = 'passed'
+            candidateExecution = 'not-run'
+            postTestIdentity = 'passed'
+            externalAuthority = 'not-required-before-standard-v1-promotion'
+            scanner = 'not-run-before-standard-v1-promotion'
+            repositoryRegression = 'deferred-to-standard-v1-promotion'
+        }
+        platformBoundary = $platformBoundary
+        integrity = [ordered]@{
+            skillsRoot = [string]$integrityReport.skillsRoot
+            activeSkillCount = [int]$integrityReport.activeSkillCount
+            skills = @($integrityReport.skills | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    skillId = [string]$_.skillId
+                    contentSha256 = [string]$_.contentSha256
+                }
+            })
+        }
+        result = 'passed'
+    }
+    $summaryJson = $summary | ConvertTo-Json -Depth 100
+    $summaryPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+        Join-Path $runRoot 'conformance-report.json'
+    }
+    else {
+        Assert-PathWithinRoot -Path ([IO.Path]::GetFullPath($OutputPath)) -Root $artifactsRootPath -Context 'Bootstrap transition output'
+    }
+    $summaryDirectory = Split-Path -Parent $summaryPath
+    if (-not [string]::IsNullOrWhiteSpace($summaryDirectory)) {
+        [void](New-Item -ItemType Directory -Path $summaryDirectory -Force)
+        Assert-NoReparseAncestors -Path $summaryDirectory -Context 'Bootstrap transition output directory'
+    }
+    if (Test-Path -LiteralPath $summaryPath) { throw 'Bootstrap transition output path already exists; evidence must not overwrite prior content.' }
+    $summaryEncoding = [Text.UTF8Encoding]::new($false)
+    $summaryBytes = $summaryEncoding.GetBytes($summaryJson + [Environment]::NewLine)
+    $summaryHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $summarySha256 = ([BitConverter]::ToString($summaryHasher.ComputeHash($summaryBytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally { $summaryHasher.Dispose() }
+    $summaryStream = [IO.File]::Open($summaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+        $summaryStream.Write($summaryBytes, 0, $summaryBytes.Length)
+        $summaryStream.Flush($true)
+    }
+    finally { $summaryStream.Dispose() }
+    Assert-NoReparseAncestors -Path $summaryPath -Context 'Bootstrap transition output'
+    $writtenSummarySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $summaryPath).Hash.ToLowerInvariant()
+    if ($writtenSummarySha256 -cne $summarySha256) {
+        throw 'Bootstrap transition evidence changed during immediate readback.'
+    }
+    $githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
+    if (-not [string]::IsNullOrWhiteSpace($githubOutputPath)) {
+        if (-not (Test-Path -LiteralPath $githubOutputPath -PathType Leaf)) {
+            throw "GitHub output command file is missing: $githubOutputPath"
+        }
+        Assert-NoReparseAncestors -Path $githubOutputPath -Context 'GitHub output command file'
+        [IO.File]::AppendAllText($githubOutputPath, "standard_v1_evidence_sha256=$summarySha256$([Environment]::NewLine)", $summaryEncoding)
+    }
+    Write-Host "Darktide Translate bootstrap transition validation passed. Evidence: $summaryPath"
+    return $summaryJson
+}
+
 function Assert-RegularFileForHash {
     param(
         [Parameter(Mandatory = $true)][IO.FileSystemInfo] $Item,
@@ -2050,22 +3198,43 @@ function Invoke-NativeChecked {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
         [Parameter(Mandatory = $true)][string] $Context,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter()][AllowNull()][string] $ChildWritableRoot,
         [Parameter()][AllowNull()][string] $StandardInput,
         [Parameter()][AllowNull()][Collections.IDictionary] $AdditionalEnvironmentVariables,
         [Parameter()][switch] $IsolateRunnerCommandFiles,
         [Parameter()][switch] $TerminateProcessTree,
         [Parameter()][switch] $ProtectRunnerCommandFiles,
+        [Parameter()][switch] $DirectWindowsProcess,
+        [Parameter()][AllowEmptyCollection()][string[]] $ReadOnlyPaths,
         [Parameter()][switch] $ApplyLinuxResourceLimits,
+        [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline',
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
     )
     if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) { throw "$Context executable is missing: $Command" }
+    # On Windows, the child is created with a restricted primary token and a
+    # resource-limited Job Object before its suspended thread is released.
+    $linuxClockTicksPerSecond = if ($TerminateProcessTree -and $script:IsLinuxHost) { Get-LinuxAggregateClockTicksPerSecond } else { [int64]0 }
+    $linuxWritableRootBaselineBytes = [int64]0
+    # Retain the legacy switch for adapter source compatibility; Standard v1
+    # has no opt-out for the bounded Linux resource profile.
+    $applyLinuxResourceLimitsEffective = $true
     if ($ProtectRunnerCommandFiles -and -not $IsolateRunnerCommandFiles) {
         throw "$Context cannot protect runner command files without isolation."
     }
     if ($null -ne $AdditionalEnvironmentVariables -and -not $TerminateProcessTree) {
         throw "$Context cannot add environment variables without process containment."
     }
-    $stderrPath = Join-Path $DiagnosticRoot ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    $childWritableRootPath = if ([string]::IsNullOrWhiteSpace($ChildWritableRoot)) {
+        [IO.Path]::GetFullPath($DiagnosticRoot)
+    }
+    else {
+        [IO.Path]::GetFullPath($ChildWritableRoot)
+    }
+    if (-not (Test-Path -LiteralPath $childWritableRootPath -PathType Container)) {
+        throw "$Context child-writable output root is missing: $childWritableRootPath"
+    }
+    Assert-NoReparseAncestors -Path $childWritableRootPath -Context "$Context child-writable output root"
+    $stderrPath = Join-Path $childWritableRootPath ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     $runnerCommandFileNames = @(
         'GITHUB_ENV',
         'GITHUB_PATH',
@@ -2086,10 +3255,11 @@ function Invoke-NativeChecked {
     $windowsJobHandle = [IntPtr]::Zero
     $windowsResumeEvent = $null
     $windowsResumeEventSignaled = $false
-    $windowsResumeEventReleaseEligible = $false
     $stdoutTask = $null
     $stderrTask = $null
     $maxProcessOutputCharacters = 4 * 1024 * 1024
+    $linuxSandboxRoot = $null
+    $windowsResumeEventReleaseEligible = $false
     try {
         if ($ProtectRunnerCommandFiles) {
             $runnerCommandFileSnapshot = Get-RunnerCommandFileSnapshot -Names $runnerCommandFileNames
@@ -2101,7 +3271,7 @@ function Invoke-NativeChecked {
                     $name,
                     [EnvironmentVariableTarget]::Process
                 )
-                $isolatedPath = Join-Path $DiagnosticRoot ("isolated-{0}-{1}.txt" -f $name.ToLowerInvariant(), [guid]::NewGuid().ToString('N'))
+                $isolatedPath = Join-Path $childWritableRootPath ("isolated-{0}-{1}.txt" -f $name.ToLowerInvariant(), [guid]::NewGuid().ToString('N'))
                 $isolatedStream = [IO.File]::Open(
                     $isolatedPath,
                     [IO.FileMode]::CreateNew,
@@ -2163,7 +3333,7 @@ function Invoke-NativeChecked {
                 }
                 Assert-NoReparseAncestors -Path $findPath -Context "$Context trusted Linux find utility"
                 $prlimitPath = $null
-                if ($ApplyLinuxResourceLimits) {
+                if ($applyLinuxResourceLimitsEffective) {
                     $prlimitCommand = Get-Command prlimit -CommandType Application -ErrorAction Stop | Select-Object -First 1
                     $prlimitPath = [IO.Path]::GetFullPath([string]$prlimitCommand.Path)
                     if (-not (Test-Path -LiteralPath $prlimitPath -PathType Leaf)) {
@@ -2171,40 +3341,201 @@ function Invoke-NativeChecked {
                     }
                     Assert-NoReparseAncestors -Path $prlimitPath -Context "$Context trusted Linux prlimit utility"
                 }
-                $nativeCommand = if ($ApplyLinuxResourceLimits) { $prlimitPath } else { $setsidPath }
+                $chrootCommand = Get-Command chroot -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $chrootPath = [IO.Path]::GetFullPath([string]$chrootCommand.Path)
+                if (-not (Test-Path -LiteralPath $chrootPath -PathType Leaf)) {
+                    throw "$Context trusted Linux chroot utility is missing: $chrootPath"
+                }
+                Assert-NoReparseAncestors -Path $chrootPath -Context "$Context trusted Linux chroot utility"
+                $setprivCommand = Get-Command setpriv -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $setprivPath = [IO.Path]::GetFullPath([string]$setprivCommand.Path)
+                if (-not (Test-Path -LiteralPath $setprivPath -PathType Leaf)) {
+                    throw "$Context trusted Linux setpriv utility is missing: $setprivPath"
+                }
+                Assert-NoReparseAncestors -Path $setprivPath -Context "$Context trusted Linux setpriv utility"
+                $nativeCommand = if ($applyLinuxResourceLimitsEffective) { $prlimitPath } else { $setsidPath }
+                $sandboxRoot = Join-Path ([IO.Path]::GetDirectoryName($DiagnosticRoot)) ("sgv1-sandbox-{0}" -f [guid]::NewGuid().ToString('N'))
+                $linuxSandboxRoot = $sandboxRoot
+                [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
+                Assert-NoReparseAncestors -Path $sandboxRoot -Context "$Context Linux sandbox root"
+                $linuxReadonlyBindPaths = [Collections.Generic.List[string]]::new()
+                $diagnosticRootFullPath = [IO.Path]::GetFullPath($DiagnosticRoot)
+                $addLinuxReadonlyBindPath = {
+                    param([Parameter(Mandatory = $true)][string] $Path)
+                    $fullPath = [IO.Path]::GetFullPath($Path)
+                    if (-not (Test-Path -LiteralPath $fullPath)) { return }
+                    foreach ($systemRootPath in @('/usr', '/bin', '/sbin', '/lib', '/lib64', '/etc')) {
+                        if ($fullPath -ceq $systemRootPath -or $fullPath.StartsWith($systemRootPath + '/', [StringComparison]::Ordinal)) { return }
+                    }
+                    Assert-NoReparseAncestors -Path $fullPath -Context "$Context Linux sandbox bind source"
+                    if (-not $linuxReadonlyBindPaths.Contains($fullPath)) {
+                        [void]$linuxReadonlyBindPaths.Add($fullPath)
+                    }
+                }
+                foreach ($systemRoot in @('/usr', '/bin', '/sbin', '/lib', '/lib64', '/etc')) {
+                    & $addLinuxReadonlyBindPath -Path $systemRoot
+                }
+                $workingDirectory = [IO.Path]::GetFullPath((Get-Location).Path)
+                if (-not (Test-PathWithinOrEqual -Path $workingDirectory -Root $diagnosticRootFullPath)) {
+                    & $addLinuxReadonlyBindPath -Path $workingDirectory
+                }
+                if (-not [string]::IsNullOrWhiteSpace($env:PSHOME) -and (Test-Path -LiteralPath $env:PSHOME -PathType Container)) {
+                    & $addLinuxReadonlyBindPath -Path $env:PSHOME
+                }
+                foreach ($modulePath in @(([string]$env:PSModulePath -split ':') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+                    if (Test-Path -LiteralPath $modulePath -PathType Container) {
+                        & $addLinuxReadonlyBindPath -Path $modulePath
+                    }
+                }
+                $commandParent = Split-Path -Parent ([IO.Path]::GetFullPath($Command))
+                if (-not [string]::IsNullOrWhiteSpace($commandParent) -and
+                    -not (Test-PathWithinOrEqual -Path $commandParent -Root $diagnosticRootFullPath)) {
+                    & $addLinuxReadonlyBindPath -Path $commandParent
+                }
+                foreach ($argument in @($Arguments)) {
+                    $argumentText = [string]$argument
+                    if (-not [IO.Path]::IsPathRooted($argumentText) -or -not (Test-Path -LiteralPath $argumentText)) { continue }
+                    $argumentFullPath = [IO.Path]::GetFullPath($argumentText)
+                    if (Test-Path -LiteralPath $argumentFullPath -PathType Container) {
+                        if (-not (Test-PathWithinOrEqual -Path $argumentFullPath -Root $diagnosticRootFullPath)) {
+                            & $addLinuxReadonlyBindPath -Path $argumentFullPath
+                        }
+                    }
+                    elseif ([IO.Path]::GetExtension($argumentFullPath) -in @('.ps1', '.psm1', '.psd1', '.dll', '.so', '.so.1', '.exe')) {
+                        & $addLinuxReadonlyBindPath -Path $argumentFullPath
+                    }
+                }
+                & $addLinuxReadonlyBindPath -Path $chrootPath
+                & $addLinuxReadonlyBindPath -Path $setprivPath
+                foreach ($readOnlyPath in @($ReadOnlyPaths)) {
+                    $readOnlyFullPath = [IO.Path]::GetFullPath([string]$readOnlyPath)
+                    if (-not (Test-Path -LiteralPath $readOnlyFullPath)) {
+                        throw "$Context trusted read-only child path is missing: $readOnlyFullPath"
+                    }
+                    Assert-NoReparseAncestors -Path $readOnlyFullPath -Context "$Context trusted read-only child path"
+                    if (-not $linuxReadonlyBindPaths.Contains($readOnlyFullPath)) {
+                        [void]$linuxReadonlyBindPaths.Add($readOnlyFullPath)
+                    }
+                }
                 $maskHostSocketsScript = @'
 set -eu
 mount_path="$1"
 find_path="$2"
-run_root="$3"
-shift 3
+chroot_path="$3"
+sandbox_root="$4"
+run_root="$5"
+working_directory="$6"
+command_path="$7"
+bind_count="$8"
+shift 8
 "$mount_path" --make-rprivate /
-for socket_root in /run /var/run /dev /dev/shm /tmp /var/tmp
+"$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
+mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
+for system_root in /usr /bin /sbin /lib /lib64 /etc
 do
-    if [ -d "$socket_root" ]; then
-        "$find_path" "$socket_root" -xdev -type s -readable -exec "$mount_path" --bind /dev/null '{}' \; 2>/dev/null || true
+    target="$sandbox_root$system_root"
+    mkdir -p "$target"
+    if [ -d "$system_root" ]; then
+        if [ "$system_root" = "/etc" ]; then
+            # Do not rbind the host /etc and then unlink its resolv.conf
+            # mountpoint. Build a private snapshot first so every mutation
+            # remains inside the namespace-owned tmpfs.
+            "$mount_path" -t tmpfs -o size=67108864,nodev,nosuid,noexec tmpfs "$target"
+            # Copy only readable regular files and create them with the
+            # namespace user's ownership.  Archive-style copies of /etc are
+            # unsafe here: entries such as shadow may be unreadable and
+            # preserving host-root ownership is invalid in a user namespace.
+            "$find_path" "$system_root" -xdev -type d -readable -exec /bin/sh -eu -c '
+                root="$1"
+                target="$2"
+                shift 2
+                for source do
+                    relative="${source#"$root"}"
+                    mkdir -p "$target$relative"
+                done
+            ' sh "$system_root" "$target" {} + 2>/dev/null || true
+            "$find_path" "$system_root" -xdev -type f -readable -exec /bin/sh -eu -c '
+                root="$1"
+                target="$2"
+                shift 2
+                for source do
+                    relative="${source#"$root"}"
+                    destination="$target$relative"
+                    mkdir -p "$(dirname "$destination")"
+                    /bin/cat -- "$source" > "$destination"
+                done
+            ' sh "$system_root" "$target" {} + 2>/dev/null || true
+            rm -f "$target/resolv.conf"
+            if [ -e "$system_root/resolv.conf" ]; then
+                /bin/cat -- "$system_root/resolv.conf" > "$target/resolv.conf"
+            else
+                : > "$target/resolv.conf"
+            fi
+            "$mount_path" -o remount,bind,ro "$target"
+        else
+            "$mount_path" --rbind "$system_root" "$target"
+            "$mount_path" --make-rslave "$target"
+            "$mount_path" -o remount,bind,ro "$target"
+        fi
     fi
 done
-for private_root in /run /tmp /var/tmp /dev/shm
+mkdir -p "$sandbox_root$run_root"
+"$mount_path" --bind "$run_root" "$sandbox_root$run_root"
+"$mount_path" --make-rslave "$sandbox_root$run_root"
+while [ "$bind_count" -gt 0 ]
+do
+    source_path="$1"
+    shift
+    bind_count=$((bind_count - 1))
+    case "$source_path" in
+        "$run_root") continue ;;
+    esac
+    if [ -d "$source_path" ]; then
+        target="$sandbox_root$source_path"
+        mkdir -p "$target"
+        "$mount_path" --rbind "$source_path" "$target"
+        "$mount_path" --make-rslave "$target"
+        "$mount_path" -o remount,bind,ro "$target"
+    elif [ -f "$source_path" ]; then
+        target="$sandbox_root$source_path"
+        mkdir -p "$(dirname "$target")"
+        if [ ! -e "$target" ]; then
+            : > "$target"
+        fi
+        "$mount_path" --bind "$source_path" "$target"
+        "$mount_path" -o remount,bind,ro "$target"
+    fi
+done
+"$mount_path" -t proc -o nosuid,nodev,noexec proc "$sandbox_root/proc"
+for private_root in /tmp /run /var/tmp /dev/shm
 do
     case "$run_root" in
         "$private_root"|"$private_root"/*) continue ;;
     esac
-    if [ -d "$private_root" ]; then
-        "$mount_path" -t tmpfs -o nodev,nosuid,noexec,mode=1777 tmpfs "$private_root"
-    fi
+    "$mount_path" -t tmpfs -o size=67108864,nodev,nosuid,noexec,mode=1777 tmpfs "$sandbox_root$private_root"
 done
-# The trusted parent applies the Linux resource limits with prlimit before
-# releasing this namespace wrapper.  Do not use a shell-specific ulimit
-# builtin here: Ubuntu's /bin/sh is commonly dash, which does not support -u.
-exec "$@"
+"$mount_path" -t tmpfs -o size=16777216,nodev,nosuid,noexec,mode=755 tmpfs "$sandbox_root/dev"
+mkdir -p "$sandbox_root/dev/shm" "$sandbox_root/dev/pts"
+for device in null zero random urandom
+do
+    : > "$sandbox_root/dev/$device"
+    "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
+done
+"$find_path" "$sandbox_root/dev" -xdev -type s -exec "$mount_path" --bind /dev/null '{}' \; 2>/dev/null || true
+exec "$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" "$@"
 '@
+                $networkNamespaceArguments = if ($NetworkProfile -ceq 'Offline') { @('--net') } else { @() }
+                $linuxMountArguments = @(
+                    $mountPath, $findPath, $chrootPath, $sandboxRoot, $DiagnosticRoot, $workingDirectory, $Command,
+                    [string]$linuxReadonlyBindPaths.Count
+                ) + @($linuxReadonlyBindPaths.ToArray()) + @($Arguments)
                 $namespaceArguments = @(
                     $unsharePath,
-                    '--user', '--map-root-user', '--mount', '--pid', '--ipc', '--uts', '--fork', '--mount-proc', '--kill-child', '--net', '--',
-                    $shellPath, '-c', $maskHostSocketsScript, '--', $mountPath, $findPath, $DiagnosticRoot, $Command
-                ) + @($Arguments)
-                $nativeArguments = if ($ApplyLinuxResourceLimits) {
+                    '--user', '--map-root-user', '--mount', '--pid', '--ipc', '--uts', '--fork', '--mount-proc', '--kill-child'
+                ) + $networkNamespaceArguments + @(
+                    '--', $shellPath, '-c', $maskHostSocketsScript, '--'
+                ) + $linuxMountArguments
+                $nativeArguments = if ($applyLinuxResourceLimitsEffective) {
                     @('--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--') + @($setsidPath) + @($namespaceArguments)
                 }
                 else {
@@ -2212,25 +3543,38 @@ exec "$@"
                 }
             }
             elseif ($script:IsWindowsHost) {
-                # Start a trusted gate that waits on a supervisor-owned event.
-                # The candidate command is released only after Job Object assignment.
-                $payloadJson = [ordered]@{
-                    command = $Command
-                    arguments = @($Arguments)
-                } | ConvertTo-Json -Compress -Depth 20
-                $payloadEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payloadJson))
-                $createdNewEvent = $false
-                $eventName = "Local\CodexValidationResume-{0}" -f [guid]::NewGuid().ToString('N')
-                $windowsResumeEvent = [Threading.EventWaitHandle]::new(
-                    $false,
-                    [Threading.EventResetMode]::ManualReset,
-                    $eventName,
-                    [ref]$createdNewEvent
-                )
-                if (-not $createdNewEvent -or $null -eq $windowsResumeEvent) {
-                    throw "$Context could not create a private Windows resume event."
+                if ($DirectWindowsProcess) {
+                    # The actual command is created suspended, assigned to the
+                    # Job Object, and resumed below. Do not retain a same-level
+                    # wrapper while untrusted Pester code is running.
+                    $nativeCommand = $Command
+                    $nativeArguments = @($Arguments)
                 }
-                $wrapperScript = @'
+                else {
+                    # Start a trusted gate that waits on a supervisor-owned event.
+                    # The candidate command is released only after Job Object assignment.
+                    $payloadJson = [ordered]@{
+                        command = $Command
+                        arguments = @($Arguments)
+                    } | ConvertTo-Json -Compress -Depth 20
+                    $payloadEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payloadJson))
+                    $createdNewEvent = $false
+                    $eventName = "Local\CodexValidationResume-{0}" -f [guid]::NewGuid().ToString('N')
+                    $windowsResumeEvent = [Threading.EventWaitHandle]::new(
+                        $false,
+                        [Threading.EventResetMode]::ManualReset,
+                        $eventName,
+                        [ref]$createdNewEvent
+                    )
+                    if (-not $createdNewEvent -or $null -eq $windowsResumeEvent) {
+                        throw "$Context could not create a private Windows resume event."
+                    }
+                    $eventBoundaryType = Get-WindowsProcessBoundaryType
+                    if (-not $eventBoundaryType::SetLowIntegrityKernelObject($windowsResumeEvent.SafeWaitHandle.DangerousGetHandle())) {
+                        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        throw "$Context could not apply the low-integrity label to the Windows resume event (Win32 error $errorCode)."
+                    }
+                    $wrapperScript = @'
 $payloadEncoded = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_NATIVE_PAYLOAD')
 $eventName = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_RESUME_EVENT')
 $hasStandardInput = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_HAS_STANDARD_INPUT')
@@ -2261,19 +3605,20 @@ finally {
     $resumeEvent.Dispose()
 }
 '@
-                $wrapperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapperScript))
-                $nativeCommand = Join-Path $PSHOME 'pwsh.exe'
-                if (-not (Test-Path -LiteralPath $nativeCommand -PathType Leaf)) {
-                    throw "$Context trusted PowerShell gate is missing: $nativeCommand"
+                    $wrapperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapperScript))
+                    $nativeCommand = Join-Path $PSHOME 'pwsh.exe'
+                    if (-not (Test-Path -LiteralPath $nativeCommand -PathType Leaf)) {
+                        throw "$Context trusted PowerShell gate is missing: $nativeCommand"
+                    }
+                    Assert-NoReparseAncestors -Path $nativeCommand -Context "$Context trusted PowerShell gate"
+                    $nativeArguments = @(
+                        '-NoLogo',
+                        '-NoProfile',
+                        '-NonInteractive',
+                        '-EncodedCommand',
+                        $wrapperEncoded
+                    )
                 }
-                Assert-NoReparseAncestors -Path $nativeCommand -Context "$Context trusted PowerShell gate"
-                $nativeArguments = @(
-                    '-NoLogo',
-                    '-NoProfile',
-                    '-NonInteractive',
-                    '-EncodedCommand',
-                    $wrapperEncoded
-                )
             }
             $parentProcessGroupId = if ($script:IsLinuxHost) { Get-UnixProcessGroupId -ProcessId $PID } else { 0 }
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -2290,6 +3635,9 @@ finally {
             }
             else {
                 $null
+            }
+            if ($script:IsLinuxHost) {
+                $linuxWritableRootBaselineBytes = [int64](Get-LinuxWritableRootUsage -Root $DiagnosticRoot -Context $Context).bytes
             }
             if ($null -ne $nativeEnvironmentVariables) {
                 $startInfo.EnvironmentVariables.Clear()
@@ -2308,9 +3656,20 @@ finally {
             }
             $startInfo.WorkingDirectory = [string](Get-Location).Path
             if ($script:IsWindowsHost) {
-                $startInfo.EnvironmentVariables['CODEX_VALIDATION_NATIVE_PAYLOAD'] = $payloadEncoded
-                $startInfo.EnvironmentVariables['CODEX_VALIDATION_RESUME_EVENT'] = $eventName
-                $startInfo.EnvironmentVariables['CODEX_VALIDATION_HAS_STANDARD_INPUT'] = if ($PSBoundParameters.ContainsKey('StandardInput')) { '1' } else { '0' }
+                if ($DirectWindowsProcess) {
+                    foreach ($gateEnvironmentName in @(
+                        'CODEX_VALIDATION_NATIVE_PAYLOAD',
+                        'CODEX_VALIDATION_RESUME_EVENT',
+                        'CODEX_VALIDATION_HAS_STANDARD_INPUT'
+                    )) {
+                        [void]$startInfo.EnvironmentVariables.Remove($gateEnvironmentName)
+                    }
+                }
+                else {
+                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_NATIVE_PAYLOAD'] = $payloadEncoded
+                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_RESUME_EVENT'] = $eventName
+                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_HAS_STANDARD_INPUT'] = if ($PSBoundParameters.ContainsKey('StandardInput')) { '1' } else { '0' }
+                }
             }
             $nativeEnvironmentVariables = @{}
             foreach ($environmentName in @($startInfo.EnvironmentVariables.Keys)) {
@@ -2328,12 +3687,7 @@ finally {
                 }
             }
             if ($script:IsWindowsHost) {
-                $childProcess = Start-WindowsSuspendedProcess `
-                    -FileName $nativeCommand `
-                    -Arguments $nativeArguments `
-                    -WorkingDirectory $startInfo.WorkingDirectory `
-                    -EnvironmentVariables $nativeEnvironmentVariables `
-                    -UseStandardInput ($PSBoundParameters.ContainsKey('StandardInput'))
+                $childProcess = Start-WindowsSuspendedProcess -FileName $nativeCommand -Arguments $nativeArguments -WorkingDirectory $startInfo.WorkingDirectory -EnvironmentVariables $nativeEnvironmentVariables -UseStandardInput ($PSBoundParameters.ContainsKey('StandardInput')) -UseRestrictedToken $true
             }
             else {
                 $childProcess = [Diagnostics.Process]::new()
@@ -2376,7 +3730,7 @@ finally {
                 $childProcess.StandardInput.Write($StandardInput)
                 $childProcess.StandardInput.Close()
             }
-            if ($script:IsWindowsHost) {
+            if ($script:IsWindowsHost -and $null -ne $windowsResumeEvent) {
                 if (-not $windowsResumeEvent.Set()) {
                     throw "$Context could not release the Windows candidate gate."
                 }
@@ -2384,14 +3738,25 @@ finally {
             }
             $processDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
+            if ($script:IsLinuxHost -and $childProcessGroupId -gt 0 -and -not $childProcess.HasExited) {
+                [void](Assert-LinuxWritableRootUsage -Root $DiagnosticRoot -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+                Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
+            }
             while (-not $childProcess.HasExited) {
                 if ([DateTime]::UtcNow -ge $processDeadline) {
                     throw "$Context exceeded the bounded candidate execution timeout of $TimeoutMilliseconds milliseconds."
                 }
                 [void]$childProcess.WaitForExit(100)
                 Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
+                if ($script:IsLinuxHost -and -not $childProcess.HasExited) {
+                    [void](Assert-LinuxWritableRootUsage -Root $DiagnosticRoot -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+                    Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
+                }
             }
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
+            if ($script:IsLinuxHost) {
+                [void](Assert-LinuxWritableRootUsage -Root $DiagnosticRoot -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+            }
             Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
             $processTreeStopped = $true
             if (-not $childProcess.WaitForExit(5000)) {
@@ -2462,6 +3827,15 @@ finally {
                 }
             }
             if ($null -ne $childProcess) { $childProcess.Dispose() }
+            if ($script:IsLinuxHost -and -not [string]::IsNullOrWhiteSpace($linuxSandboxRoot) -and
+                ([IO.Path]::GetFileName($linuxSandboxRoot) -match '^sgv1-sandbox-[0-9a-f]{32}$')) {
+                if (Test-Path -LiteralPath $linuxSandboxRoot -PathType Container) {
+                    Remove-Item -LiteralPath $linuxSandboxRoot -Recurse -Force -ErrorAction Stop
+                }
+                if (Test-Path -LiteralPath $linuxSandboxRoot) {
+                    throw "$Context Linux sandbox root remained after trusted cleanup: $linuxSandboxRoot"
+                }
+            }
             if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
         }
     }
@@ -2496,6 +3870,573 @@ function Test-SecurityRelevantSkillChange {
         $index++
     }
     return $false
+}
+
+function Invoke-TrustedPowerShellProcess {
+    param(
+        [Parameter(Mandatory = $true)][string] $Command,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
+        [Parameter()][AllowNull()][string] $StandardInput,
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
+    )
+    if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) {
+        throw "$Context executable is missing: $Command"
+    }
+    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+        throw "$Context working directory is missing: $WorkingDirectory"
+    }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Command
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
+    foreach ($gateEnvironmentName in @(
+        'CODEX_VALIDATION_NATIVE_PAYLOAD',
+        'CODEX_VALIDATION_RESUME_EVENT',
+        'CODEX_VALIDATION_HAS_STANDARD_INPUT'
+    )) {
+        [void]$startInfo.EnvironmentVariables.Remove($gateEnvironmentName)
+    }
+    $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+    if ($null -ne $argumentListProperty) {
+        foreach ($argument in $Arguments) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+        }
+    }
+    else {
+        $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $Arguments
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "$Context could not start the trusted process."
+        }
+        if ($PSBoundParameters.ContainsKey('StandardInput')) {
+            $process.StandardInput.Write([string]$StandardInput)
+        }
+        $process.StandardInput.Close()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                $process.Kill($true)
+                $process.WaitForExit(5000)
+            }
+            catch {
+                throw "$Context timed out and could not be terminated safely: $($_.Exception.Message)"
+            }
+            throw "$Context exceeded its timeout of $TimeoutMilliseconds milliseconds."
+        }
+        $stdoutText = $stdoutTask.GetAwaiter().GetResult()
+        $stderrText = $stderrTask.GetAwaiter().GetResult()
+        if ($stdoutText.Length -gt 4194304 -or $stderrText.Length -gt 4194304) {
+            throw "$Context exceeded the bounded trusted-process output limit."
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "$Context exited with code $($process.ExitCode).`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText"
+        }
+        return $stdoutText
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Invoke-ProtectedPesterServerProxy {
+    param(
+        [Parameter(Mandatory = $true)][string] $PowerShellPath,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
+        [Parameter(Mandatory = $true)][string] $ReadOnlyPathsJson
+    )
+    if (-not (Test-Path -LiteralPath $PowerShellPath -PathType Leaf)) {
+        throw "Protected Pester server executable is missing: $PowerShellPath"
+    }
+    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+        throw "Protected Pester server working directory is missing: $WorkingDirectory"
+    }
+    if (-not (Test-Path -LiteralPath $DiagnosticRoot -PathType Container)) {
+        throw "Protected Pester server diagnostic root is missing: $DiagnosticRoot"
+    }
+    if (-not (Test-Path -LiteralPath $ChildWritableRoot -PathType Container)) {
+        throw "Protected Pester server child-writable root is missing: $ChildWritableRoot"
+    }
+    Assert-NoReparseAncestors -Path $WorkingDirectory -Context 'Protected Pester server working directory'
+    Assert-NoReparseAncestors -Path $DiagnosticRoot -Context 'Protected Pester server diagnostic root'
+    Assert-NoReparseAncestors -Path $ChildWritableRoot -Context 'Protected Pester server child-writable root'
+    $readOnlyPaths = @($ReadOnlyPathsJson | ConvertFrom-Json -Depth 20)
+    foreach ($readOnlyPath in $readOnlyPaths) {
+        if ([string]::IsNullOrWhiteSpace([string]$readOnlyPath) -or -not (Test-Path -LiteralPath ([string]$readOnlyPath))) {
+            throw "Protected Pester server read-only path is missing: $readOnlyPath"
+        }
+        Assert-NoReparseAncestors -Path ([string]$readOnlyPath) -Context 'Protected Pester server read-only path'
+    }
+
+    if ($script:IsWindowsHost) {
+        $child = $null
+        $jobHandle = [IntPtr]::Zero
+        $inputStream = $null
+        $outputStream = $null
+        $errorStream = $null
+        $inputTask = $null
+        $outputTask = $null
+        $errorTask = $null
+        $proxyExitCode = 1
+        try {
+            $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
+            $jobHandle = New-WindowsKillOnCloseJob -Context 'Protected Pester server proxy'
+            $child = Start-WindowsSuspendedProcess `
+                -FileName $PowerShellPath `
+                -Arguments @('-s', '-NoLogo', '-NoProfile', '-NonInteractive') `
+                -WorkingDirectory $WorkingDirectory `
+                -EnvironmentVariables $childEnvironment `
+                -UseStandardInput $true `
+                -UseRestrictedToken $true
+            Assign-WindowsProcessToJob -JobHandle $jobHandle -Process $child -Context 'Protected Pester server proxy'
+            if (-not $child.Resume()) {
+                throw 'Protected Pester server proxy could not resume the restricted PowerShell server.'
+            }
+
+            $inputStream = [Console]::OpenStandardInput()
+            $outputStream = [Console]::OpenStandardOutput()
+            $errorStream = [Console]::OpenStandardError()
+            $inputTask = $inputStream.CopyToAsync($child.StandardInput.BaseStream)
+            $outputTask = $child.StandardOutput.BaseStream.CopyToAsync($outputStream)
+            $errorTask = $child.StandardError.BaseStream.CopyToAsync($errorStream)
+            while (-not $child.HasExited) {
+                if ($inputTask.IsCompleted -and $null -ne $child.StandardInput) {
+                    $child.StandardInput.Dispose()
+                }
+                Start-Sleep -Milliseconds 25
+            }
+            $proxyExitCode = $child.ExitCode
+            if ($null -ne $child.StandardInput) { $child.StandardInput.Dispose() }
+            if ($null -eq $outputTask -or -not $outputTask.Wait(10000) -or
+                $null -eq $errorTask -or -not $errorTask.Wait(10000)) {
+                throw 'Protected Pester server proxy left redirected output handles open.'
+            }
+            $outputTask.GetAwaiter().GetResult()
+            $errorTask.GetAwaiter().GetResult()
+        }
+        finally {
+            if ($null -ne $child -and -not $child.HasExited) {
+                [void]$child.Terminate()
+            }
+            if ($null -ne $inputStream) { $inputStream.Dispose() }
+            if ($null -ne $outputStream) { $outputStream.Dispose() }
+            if ($null -ne $errorStream) { $errorStream.Dispose() }
+            if ($null -ne $child) { $child.Dispose() }
+            if ($jobHandle -ne [IntPtr]::Zero) { Close-WindowsProcessJob -JobHandle $jobHandle }
+        }
+        return $proxyExitCode
+    }
+
+    if (-not $script:IsLinuxHost) {
+        throw 'Protected Pester server proxy requires a supported Windows or Linux host.'
+    }
+    $sandboxRoot = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($DiagnosticRoot))) `
+        ("sgv1-pester-psrp-sandbox-{0}" -f [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
+    Assert-NoReparseAncestors -Path $sandboxRoot -Context 'Protected Pester server Linux sandbox root'
+    $proxyProcess = $null
+    $proxyExitCode = 1
+    try {
+        $unshareCommand = Get-Command unshare -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $unsharePath = [IO.Path]::GetFullPath([string]$unshareCommand.Path)
+        $prlimitCommand = Get-Command prlimit -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $prlimitPath = [IO.Path]::GetFullPath([string]$prlimitCommand.Path)
+        $mountCommand = Get-Command mount -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $mountPath = [IO.Path]::GetFullPath([string]$mountCommand.Path)
+        $shellCommand = Get-Command sh -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $shellPath = Resolve-LinuxExecutablePath -Path ([string]$shellCommand.Path) -Context 'Protected Pester server Linux shell'
+        foreach ($utility in @($unsharePath, $prlimitPath, $mountPath, $shellPath)) {
+            if (-not (Test-Path -LiteralPath $utility -PathType Leaf)) { throw "Protected Pester server Linux utility is missing: $utility" }
+            Assert-NoReparseAncestors -Path $utility -Context 'Protected Pester server Linux utility'
+        }
+        $maskHostSocketsScript = @'
+set -eu
+mount_path="$1"
+sandbox_root="$2"
+run_root="$3"
+working_directory="$4"
+command_path="$5"
+readonly_count="$6"
+shift 6
+"$mount_path" --make-rprivate /
+"$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
+mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
+for system_root in /usr /bin /sbin /lib /lib64 /etc
+do
+    target="$sandbox_root$system_root"
+    mkdir -p "$target"
+    if [ -d "$system_root" ]; then
+        "$mount_path" --rbind "$system_root" "$target"
+        "$mount_path" --make-rslave "$target"
+        "$mount_path" -o remount,bind,ro "$target"
+    fi
+done
+mkdir -p "$sandbox_root$run_root"
+"$mount_path" --bind "$run_root" "$sandbox_root$run_root"
+"$mount_path" --make-rslave "$sandbox_root$run_root"
+while [ "$readonly_count" -gt 0 ]
+do
+    readonly_path="$1"
+    shift
+    readonly_count=$((readonly_count - 1))
+    case "$readonly_path" in
+        "$run_root") continue ;;
+    esac
+    if [ -d "$readonly_path" ]; then
+        target="$sandbox_root$readonly_path"
+        mkdir -p "$target"
+        "$mount_path" --rbind "$readonly_path" "$target"
+        "$mount_path" --make-rslave "$target"
+        "$mount_path" -o remount,bind,ro "$target"
+    elif [ -f "$readonly_path" ]; then
+        target="$sandbox_root$readonly_path"
+        mkdir -p "$(dirname "$target")"
+        if [ ! -e "$target" ]; then : > "$target"; fi
+        "$mount_path" --bind "$readonly_path" "$target"
+        "$mount_path" -o remount,bind,ro "$target"
+    fi
+done
+"$mount_path" -t proc -o nosuid,nodev,noexec proc "$sandbox_root/proc"
+for private_root in /tmp /run /var/tmp /dev/shm
+do
+    "$mount_path" -t tmpfs -o size=67108864,nodev,nosuid,noexec,mode=1777 tmpfs "$sandbox_root$private_root"
+done
+"$mount_path" -t tmpfs -o size=16777216,nodev,nosuid,noexec,mode=755 tmpfs "$sandbox_root/dev"
+mkdir -p "$sandbox_root/dev/shm" "$sandbox_root/dev/pts"
+for device in null zero random urandom
+do
+    : > "$sandbox_root/dev/$device"
+    "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
+done
+"$mount_path" --bind /dev/null "$sandbox_root/dev/console"
+exec chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
+'@
+        $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
+        $environment = @{}
+        foreach ($name in @($childEnvironment.Keys)) { $environment[[string]$name] = [string]$childEnvironment[$name] }
+        $unshareArguments = @(
+            '--user', '--map-root-user', '--mount', '--pid', '--ipc', '--uts', '--fork', '--mount-proc', '--kill-child', '--net',
+            '--', $shellPath, '-c', $maskHostSocketsScript, '--',
+            $mountPath, $sandboxRoot, [IO.Path]::GetFullPath($DiagnosticRoot), [IO.Path]::GetFullPath($WorkingDirectory),
+            [IO.Path]::GetFullPath($PowerShellPath), [string]$readOnlyPaths.Count
+        ) + @($readOnlyPaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
+        $nativeArguments = @(
+            '--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',
+            $unsharePath
+        ) + @($unshareArguments)
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $prlimitPath
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
+        $startInfo.EnvironmentVariables.Clear()
+        foreach ($name in @($environment.Keys)) { $startInfo.EnvironmentVariables[$name] = $environment[$name] }
+        $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+        if ($null -ne $argumentListProperty) {
+            foreach ($argument in $nativeArguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        }
+        else { $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $nativeArguments }
+        $proxyProcess = [Diagnostics.Process]::new()
+        $proxyProcess.StartInfo = $startInfo
+        if (-not $proxyProcess.Start()) { throw 'Protected Pester server Linux proxy could not start.' }
+        $proxyProcess.WaitForExit()
+        $proxyExitCode = $proxyProcess.ExitCode
+    }
+    finally {
+        if ($null -ne $proxyProcess) { $proxyProcess.Dispose() }
+        if (Test-Path -LiteralPath $sandboxRoot -PathType Container) {
+            Remove-Item -LiteralPath $sandboxRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $proxyExitCode
+}
+
+function Invoke-ProtectedPesterRunspace {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkerPath,
+        [Parameter(Mandatory = $true)][string] $TestsRoot,
+        [Parameter(Mandatory = $true)][string] $PesterModulePath,
+        [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
+        [Parameter(Mandatory = $true)][string] $MirrorRoot,
+        [Parameter(Mandatory = $true)][string] $InstallRoot,
+        [Parameter(Mandatory = $true)][string] $SupervisorPath,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
+        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][string] $RunnerSha256,
+        [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
+    )
+    if (-not (Test-Path -LiteralPath $SupervisorPath -PathType Leaf)) {
+        throw "Protected Pester supervisor script is missing: $SupervisorPath"
+    }
+    $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
+    $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
+    if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+        throw "Protected Pester server executable is missing: $powerShellPath"
+    }
+    Assert-Sha256 -Value $RunnerSha256 -Context 'Protected Pester worker script hash'
+    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Protected Pester worker' -Boundary $DiagnosticRoot
+    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Protected Pester worker'
+    $workerBytes = [IO.File]::ReadAllBytes($WorkerPath)
+    $workerHasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $workerActualSha256 = ([BitConverter]::ToString($workerHasher.ComputeHash($workerBytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally { $workerHasher.Dispose() }
+    if ($workerActualSha256 -cne $RunnerSha256) {
+        throw 'Protected Pester worker changed before its trusted script text was materialized.'
+    }
+    $workerScriptText = [Text.UTF8Encoding]::new($false, $true).GetString($workerBytes)
+    $readOnlyPaths = @(
+        [IO.Path]::GetFullPath($MirrorRoot),
+        [IO.Path]::GetFullPath($InstallRoot),
+        [IO.Path]::GetFullPath($WorkerPath),
+        [IO.Path]::GetFullPath($TestsRoot),
+        [IO.Path]::GetFullPath($PesterModulePath),
+        [IO.Path]::GetFullPath((Split-Path -Parent $PesterModulePath)),
+        [IO.Path]::GetFullPath($SupervisorPath),
+        [IO.Path]::GetFullPath($WorkingDirectory),
+        [IO.Path]::GetFullPath((Split-Path -Parent $powerShellPath))
+    ) | Select-Object -Unique
+    $readOnlyPathsJson = @($readOnlyPaths) | ConvertTo-Json -Compress -Depth 10
+    $serverProcessInstance = [Management.Automation.Runspaces.PowerShellProcessInstance]::new()
+    $runspace = $null
+    $powerShell = $null
+    $asyncResult = $null
+    $linuxClockTicksPerSecond = [int64]0
+    $linuxPesterCgroupPath = $null
+    try {
+        if ($script:IsLinuxHost) {
+            $linuxClockTicksPerSecond = Get-LinuxAggregateClockTicksPerSecond
+            $linuxPesterCgroupPath = New-LinuxPesterCgroup -Context 'Protected Pester remote pipeline'
+        }
+        $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null, $serverProcessInstance)
+        $startInfoField = $serverProcessInstance.GetType().GetField('_startInfo', [Reflection.BindingFlags]'Instance,NonPublic')
+        if ($null -eq $startInfoField) { throw 'Protected Pester server start information is unavailable.' }
+        $startInfo = $startInfoField.GetValue($serverProcessInstance)
+        $startInfo.FileName = $powerShellPath
+        $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
+        $proxyArguments = @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $SupervisorPath,
+            '-ProtectedPesterServerProxy',
+            '-PesterProxyPowerShellPath', $powerShellPath,
+            '-PesterProxyWorkingDirectory', $WorkingDirectory,
+            '-PesterProxyDiagnosticRoot', $DiagnosticRoot,
+            '-PesterProxyChildWritableRoot', $ChildWritableRoot,
+            '-PesterProxyReadOnlyPathsJson', $readOnlyPathsJson
+        )
+        $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+        if ($null -ne $argumentListProperty) {
+            $startInfo.ArgumentList.Clear()
+            foreach ($argument in $proxyArguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        }
+        else { $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $proxyArguments }
+
+        $runspace.Open()
+        if ($script:IsLinuxHost) {
+            if ($null -eq $serverProcessInstance.Process) {
+                throw 'Protected Pester remote pipeline did not expose its Linux proxy process.'
+            }
+            Add-LinuxProcessTreeToCgroup `
+                -CgroupPath $linuxPesterCgroupPath `
+                -RootProcessId $serverProcessInstance.Process.Id `
+                -Context 'Protected Pester remote pipeline'
+        }
+        $powerShell = [Management.Automation.PowerShell]::Create()
+        $powerShell.Runspace = $runspace
+        [void]$powerShell.AddScript($workerScriptText)
+        [void]$powerShell.AddParameter('TestsRoot', $TestsRoot)
+        [void]$powerShell.AddParameter('PesterModulePath', $PesterModulePath)
+        [void]$powerShell.AddParameter('ExpectedPesterVersion', $ExpectedPesterVersion)
+        $asyncResult = $powerShell.BeginInvoke()
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+        while (-not $asyncResult.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
+            if ($serverProcessInstance.HasExited) { break }
+            if ($script:IsLinuxHost) {
+                Assert-LinuxAggregateResourceUsage `
+                    -RootProcessId $serverProcessInstance.Process.Id `
+                    -ClockTicksPerSecond $linuxClockTicksPerSecond `
+                    -CgroupPath $linuxPesterCgroupPath `
+                    -Context 'Protected Pester remote pipeline'
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not $asyncResult.IsCompleted) {
+            throw 'Protected Pester remote pipeline exceeded its bounded execution timeout.'
+        }
+        $output = @($powerShell.EndInvoke($asyncResult))
+        if ($powerShell.InvocationStateInfo.State -ne [Management.Automation.PSInvocationState]::Completed) {
+            throw "Protected Pester remote pipeline did not complete normally: $($powerShell.InvocationStateInfo.State)."
+        }
+        if ($output.Count -ne 1) {
+            throw 'Protected Pester remote pipeline did not return exactly one completion payload.'
+        }
+        $workerResultPrefix = 'SGV1-Pester-Result:'
+        $workerResultObject = $output[0]
+        if ($null -eq $workerResultObject) {
+            throw 'Protected Pester remote pipeline returned a null completion payload.'
+        }
+        $baseObjectProperty = $workerResultObject.PSObject.Properties['BaseObject']
+        if ($null -ne $baseObjectProperty) { $workerResultObject = $baseObjectProperty.Value }
+        if ($workerResultObject -isnot [string]) {
+            throw 'Protected Pester remote pipeline returned a non-string completion payload.'
+        }
+        $workerResult = [string]$workerResultObject
+        if (-not $workerResult.StartsWith($workerResultPrefix, [StringComparison]::Ordinal)) {
+            throw 'Protected Pester remote pipeline returned an unexpected completion payload.'
+        }
+        return $workerResult.Substring($workerResultPrefix.Length)
+    }
+    finally {
+        if ($null -ne $serverProcessInstance.Process -and -not $serverProcessInstance.HasExited) {
+            try { $serverProcessInstance.Process.Kill($true) } catch { }
+        }
+        $linuxPesterCgroupCleanupException = $null
+        try { Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath }
+        catch { $linuxPesterCgroupCleanupException = $_.Exception }
+        if ($null -ne $powerShell) { $powerShell.Dispose() }
+        if ($null -ne $runspace) { $runspace.Dispose() }
+        if ($null -ne $serverProcessInstance) { $serverProcessInstance.Dispose() }
+        if ($null -ne $linuxPesterCgroupCleanupException) { throw $linuxPesterCgroupCleanupException }
+    }
+}
+
+if ($ProtectedPesterServerProxy) {
+    $proxyExitCode = Invoke-ProtectedPesterServerProxy `
+        -PowerShellPath $PesterProxyPowerShellPath `
+        -WorkingDirectory $PesterProxyWorkingDirectory `
+        -DiagnosticRoot $PesterProxyDiagnosticRoot `
+        -ChildWritableRoot $PesterProxyChildWritableRoot `
+        -ReadOnlyPathsJson $PesterProxyReadOnlyPathsJson
+    exit $proxyExitCode
+}
+
+function Invoke-ProtectedPesterSupervisor {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkerPath,
+        [Parameter(Mandatory = $true)][string] $TestsRoot,
+        [Parameter(Mandatory = $true)][string] $PesterModulePath,
+        [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
+        [Parameter(Mandatory = $true)][string] $MirrorRoot,
+        [Parameter(Mandatory = $true)][string] $InstallRoot,
+        [Parameter(Mandatory = $true)][string] $SupervisorPath,
+        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][string] $RunnerSha256
+    )
+    $completionMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
+    if ($completionMarker -notmatch '^SGV1-Pester-Supervisor-[0-9a-f]{32}:$') {
+        throw 'The trusted Pester supervisor did not receive a valid one-time completion marker.'
+    }
+    if ($RunnerSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'The trusted Pester supervisor requires an immutable runner SHA-256.'
+    }
+
+    $requiredPesterTests = @(
+        'BootstrapTransition.Tests.ps1'
+        'LocalizationWorkset.Tests.ps1'
+        'ModUpdateAutomation.Tests.ps1'
+        'RepositoryContract.Tests.ps1'
+        'RepositoryValidation.Tests.ps1'
+        'Schema15Coordination.Tests.ps1'
+        'Schema15SourceAcquisition.Tests.ps1'
+        'SkillContract.Tests.ps1'
+        'SourcePin.Tests.ps1'
+    )
+    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
+    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
+    $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
+    if ($runnerActualSha256 -cne $RunnerSha256) {
+        throw 'Trusted Pester worker changed before the protected run.'
+    }
+
+    $workerResultJson = Invoke-ProtectedPesterRunspace `
+        -WorkerPath $WorkerPath `
+        -TestsRoot $TestsRoot `
+        -PesterModulePath $PesterModulePath `
+        -ExpectedPesterVersion $ExpectedPesterVersion `
+        -MirrorRoot $MirrorRoot `
+        -InstallRoot $InstallRoot `
+        -SupervisorPath $SupervisorPath `
+        -WorkingDirectory ([IO.Path]::GetFullPath((Get-Location).Path)) `
+        -ChildWritableRoot $ChildWritableRoot `
+        -DiagnosticRoot $DiagnosticRoot `
+        -RunnerSha256 $RunnerSha256 `
+        -TimeoutMilliseconds 300000
+
+    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
+    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
+    $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
+    if ($runnerActualSha256 -cne $RunnerSha256) {
+        throw 'Trusted Pester worker changed during the protected run.'
+    }
+
+    try {
+        $workerResultDocument = [System.Text.Json.JsonDocument]::Parse($workerResultJson)
+        try {
+            Assert-NoDuplicateJsonProperties -Element $workerResultDocument.RootElement -Context 'Protected Pester worker result'
+        }
+        finally {
+            $workerResultDocument.Dispose()
+        }
+        $workerResult = $workerResultJson | ConvertFrom-Json -Depth 20
+    }
+    catch {
+        throw "Protected Pester worker result is not valid unambiguous JSON: $($_.Exception.Message)"
+    }
+    if ($workerResult.result -cne 'passed' -or
+        $workerResult.pesterVersion -cne $ExpectedPesterVersion -or
+        [int64]$workerResult.TotalCount -le 0 -or [int64]$workerResult.FailedCount -ne 0 -or
+        [int64]$workerResult.SkippedCount -ne 0 -or
+        [int64]$workerResult.PassedCount + [int64]$workerResult.SkippedCount -ne [int64]$workerResult.TotalCount) {
+        throw 'Protected Pester worker result was missing, mismatched, or incomplete.'
+    }
+    $workerRequiredTests = @($workerResult.requiredTests)
+    if ($workerResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne $requiredPesterTests.Count -or
+        @(
+            for ($requiredTestIndex = 0; $requiredTestIndex -lt $requiredPesterTests.Count; $requiredTestIndex++) {
+                if ([string]$workerRequiredTests[$requiredTestIndex] -cne [string]$requiredPesterTests[$requiredTestIndex]) {
+                    $requiredTestIndex
+                }
+            }
+        ).Count -gt 0) {
+        throw 'Protected Pester worker did not report the exact trusted test inventory.'
+    }
+
+    # The trusted supervisor owns the remoting client and accepts a result only
+    # from a normally completed remote pipeline.  Candidate code runs in the
+    # low-integrity server process: direct Console.Out writes corrupt the
+    # remoting protocol, while Environment.Exit yields a broken/disconnected
+    # pipeline and never reaches this completion control path.
+    Write-Output ($completionMarker + $workerResultJson)
+}
+
+if ($ProtectedPesterSupervisor) {
+    Invoke-ProtectedPesterSupervisor `
+        -WorkerPath $PesterWorkerPath `
+        -TestsRoot $PesterTestsRoot `
+        -PesterModulePath $PesterModulePath `
+        -ExpectedPesterVersion $PesterExpectedVersion `
+        -MirrorRoot $PesterMirrorRoot `
+        -InstallRoot $PesterInstallRoot `
+        -SupervisorPath $PesterSupervisorPath `
+        -ChildWritableRoot $PesterChildWritableRoot `
+        -DiagnosticRoot $PesterDiagnosticRoot `
+        -RunnerSha256 $PesterRunnerSha256
+    exit 0
 }
 
 $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
@@ -2587,6 +4528,29 @@ if (-not [string]::IsNullOrWhiteSpace($BaseCommit)) {
     $BaseCommit = $resolvedBaseCommit
 }
 
+if ($BootstrapTransition) {
+    if ([string]::IsNullOrWhiteSpace($resolvedBaseCommit)) {
+        throw 'Bootstrap transition requires a distinct base commit for changed-path binding.'
+    }
+    return Invoke-BootstrapTransitionValidation `
+        -RepositoryRoot $repoRoot `
+        -ArtifactsRoot $ArtifactsRoot `
+        -OutputPath ([string]$OutputPath) `
+        -RepositoryValidatorPath $repositoryValidatorPath `
+        -RepositoryValidatorHash $repositoryValidatorHash `
+        -GitPath $gitPath `
+        -TrustedStatPath $trustedStatPath `
+        -CandidateCommit $candidateCommit `
+        -CandidateTree $candidateTree `
+        -BaseCommit $resolvedBaseCommit `
+        -GitIndexPath $gitIndexPath `
+        -GitIndexSha256 $prePesterGitIndexSha256 `
+        -GitConfigPath $gitConfigPath `
+        -GitConfigExists $prePesterGitConfigExists `
+        -GitConfigSha256 $prePesterGitConfigSha256 `
+        -RepositorySnapshot $prePesterRepositoryRawSnapshot
+}
+
 $adapterPath = Join-Path $repoRoot 'config/standard-v1.json'
 $adapter = Read-JsonFile -Path $adapterPath -Context 'Standard v1 repository adapter'
 $approvedAuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
@@ -2620,9 +4584,13 @@ $runId = [guid]::NewGuid().ToString('N')
 $runRoot = Join-Path $artifactsRootPath "sgv1-$($runId.Substring(0, 12))"
 $authorityExtractRoot = Join-Path $runRoot 'authority'
 $installRoot = Join-Path $runRoot 'tools'
+$childOutputRoot = Join-Path $runRoot 'low-integrity-output'
 if (Test-Path -LiteralPath $runRoot) { throw 'Run-owned artifacts path unexpectedly already exists.' }
 [void](New-Item -ItemType Directory -Path $runRoot)
 Assert-NoReparseAncestors -Path $runRoot -Context 'Run-owned artifacts path'
+[void](New-Item -ItemType Directory -Path $childOutputRoot -Force)
+Assert-NoReparseAncestors -Path $childOutputRoot -Context 'Low-integrity child output root'
+Set-WindowsLowIntegrityDirectory -Path $childOutputRoot
 $semanticCredentialEnvironment = Protect-ProcessCredentialEnvironment -SemanticCredentialNames $SemanticCredentialNames
 [void](New-Item -ItemType Directory -Path $authorityExtractRoot -Force)
 [void](New-Item -ItemType Directory -Path $installRoot -Force)
@@ -2630,9 +4598,11 @@ $trustedGitConfigPath = Join-Path $runRoot 'empty-git-config'
 $trustedGitHooksPath = Join-Path $runRoot 'empty-git-hooks'
 [IO.File]::WriteAllText($trustedGitConfigPath, '', [Text.UTF8Encoding]::new($false))
 [void](New-Item -ItemType Directory -Path $trustedGitHooksPath -Force)
-$trustedGitConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedGitConfigPath).Hash.ToLowerInvariant()
+$trustedGitConfigItem = Get-Item -LiteralPath $trustedGitConfigPath -Force
+Assert-RegularFileForHash -Item $trustedGitConfigItem -Context 'Run-owned Git global config'
 Assert-NoReparseAncestors -Path $trustedGitConfigPath -Context 'Run-owned Git global config'
 Assert-NoReparseAncestors -Path $trustedGitHooksPath -Context 'Run-owned empty Git hooks directory'
+$trustedGitConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedGitConfigPath).Hash.ToLowerInvariant()
 
 # Bind the exact package/file inventory before any scanner is acquired or executed.
 $integrityReportPath = Join-Path $runRoot 'candidate-integrity.json'
@@ -2773,14 +4743,14 @@ foreach ($skillId in $skillIds) {
     $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $validatorReportPath = Join-Path $runRoot "skill-validator-$skillId.json"
     [IO.File]::WriteAllText($validatorReportPath, $validatorOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $validatorReport = Read-JsonFile -Path $validatorReportPath -Context "skill-validator package validation report for $skillId"
     Assert-SkillValidatorReport -Report $validatorReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
     $skillValidatorReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($validatorReportPath) }
 
-    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $checkReportPath = Join-Path $runRoot "skill-validator-check-$skillId.json"
     [IO.File]::WriteAllText($checkReportPath, $checkOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $checkReport = Read-JsonFile -Path $checkReportPath -Context "skill-validator full check report for $skillId"
@@ -2794,8 +4764,8 @@ foreach ($skillId in $skillIds) {
     $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $reportPath = Join-Path $runRoot "skillspector-static-$skillId.json"
-    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
+    $reportPath = Join-Path $childOutputRoot "skillspector-static-$skillId.json"
+    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
     $report = Read-JsonFile -Path $reportPath -Context "SkillSpector static report for $skillId"
     $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
     foreach ($issue in $issues) {
@@ -2819,6 +4789,51 @@ foreach ($skillId in $skillIds) {
         }
     }
     $staticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($reportPath); findings = $issues.Count; files = $expectedInventoryPaths.Count }
+}
+
+$securityPreflightPath = Join-Path $runRoot 'security-preflight.json'
+$securityPreflight = [ordered]@{
+    result = if ($securityBlockers.Count -eq 0) { 'passed' } else { 'blocked' }
+    findings = @($securityFindings)
+    blockingFindings = @($securityBlockers)
+    humanReviewRequired = @($securityHumanReview)
+}
+[IO.File]::WriteAllText($securityPreflightPath, ($securityPreflight | ConvertTo-Json -Depth 100) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+$securityPreflightSummaryPath = Join-Path $runRoot 'security-preflight-summary.json'
+function Get-SanitizedSecurityFindingValue {
+    param(
+        [Parameter(Mandatory = $true)] $Finding,
+        [Parameter(Mandatory = $true)][string[]] $Names
+    )
+    foreach ($name in $Names) {
+        $property = $Finding.PSObject.Properties[$name]
+        if ($null -ne $property -and $null -ne $property.Value) {
+            $value = [string]$property.Value
+            if ($value.Length -gt 256) { $value = $value.Substring(0, 256) }
+            return $value
+        }
+    }
+    return ''
+}
+$sanitizedSecurityFindings = @($securityFindings | Select-Object -First 64 | ForEach-Object {
+    [ordered]@{
+        skill = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('skillId', 'skill')
+        rule = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('ruleId', 'rule', 'check')
+        severity = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('severity', 'reportedSeverity')
+        stage = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('stage')
+        action = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('action')
+        reportId = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('reportId', 'report', 'path')
+    }
+})
+$securityPreflightSummary = [ordered]@{
+    schemaVersion = 1
+    result = if ($securityBlockers.Count -eq 0) { 'passed' } else { 'blocked' }
+    runId = $runId
+    diagnostics = $sanitizedSecurityFindings
+}
+[IO.File]::WriteAllText($securityPreflightSummaryPath, ($securityPreflightSummary | ConvertTo-Json -Depth 20) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+if ($securityBlockers.Count -gt 0) {
+    throw 'SkillSpector classified one or more candidate files as BLOCK or HUMAN_REVIEW_REQUIRED; candidate-executing repository tests are not started.'
 }
 
 # Stage 5: Repository Tests.
@@ -2854,7 +4869,7 @@ foreach ($skillId in $skillIds) {
         @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
             ForEach-Object { [string]$_.path }
     )
-    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $toolsReportPath = Join-Path $runRoot "skill-tools-$skillId.sarif.json"
     [IO.File]::WriteAllText($toolsReportPath, $toolsOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $toolsReport = Read-JsonFile -Path $toolsReportPath -Context "skill-tools report for $skillId"
@@ -2869,7 +4884,7 @@ $routeCases = @(
 foreach ($routeCase in $routeCases) {
     $routeOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @(
         $skillToolsEntryPoint, 'route', [string]$routeCase.query, '--skills', $skillsRoot, '--top-k', '1', '--format', 'json'
-    ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $routePath = Join-Path $runRoot ("skill-tools-route-{0}.json" -f ([guid]::NewGuid().ToString('N')))
     [IO.File]::WriteAllText($routePath, $routeOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     # PowerShell unwraps a one-item JSON array during assignment. Normalize the
@@ -2910,8 +4925,8 @@ if ($semanticTriggered) {
             @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
                 ForEach-Object { [string]$_.path }
         )
-        $semanticPath = Join-Path $runRoot "skillspector-semantic-$skillId.json"
-        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -AdditionalEnvironmentVariables $semanticCredentialEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
+        $semanticPath = Join-Path $childOutputRoot "skillspector-semantic-$skillId.json"
+        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticCredentialEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
         $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
         try {
             $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
@@ -2941,8 +4956,66 @@ foreach ($name in @($semanticCredentialEnvironment.Keys)) {
     $semanticCredentialEnvironment[$name] = ''
 }
 
-# Candidate tests are untrusted code. Run them in a child PowerShell process so
-# a test cannot terminate this validator before the post-test integrity checks.
+# Candidate tests are untrusted code.  Materialize a candidate snapshot for the
+# test suite, then replace its tests tree with the immutable base-owned tests.
+# The worker receives only this read-only mirror, so it cannot replace a test
+# after the protected inventory has been checked or mutate the candidate tree
+# while the suite is running.
+$requiredPesterTests = @(
+    'BootstrapTransition.Tests.ps1'
+    'LocalizationWorkset.Tests.ps1'
+    'ModUpdateAutomation.Tests.ps1'
+    'RepositoryContract.Tests.ps1'
+    'RepositoryValidation.Tests.ps1'
+    'Schema15Coordination.Tests.ps1'
+    'Schema15SourceAcquisition.Tests.ps1'
+    'SkillContract.Tests.ps1'
+    'SourcePin.Tests.ps1'
+)
+$trustedPesterCommit = [string]$BaseCommit
+if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
+    $trustedPesterCommit = [string]$env:GITHUB_SHA
+}
+if ($trustedPesterCommit -notmatch '^[0-9a-f]{40}$') {
+    throw 'Protected Pester execution requires an immutable base or trusted supervisor commit.'
+}
+$pesterMirrorRoot = Join-Path $runRoot 'trusted-pester-worktree'
+Expand-TrustedGitArchive `
+    -GitPath $gitPath `
+    -GitConfigArguments $gitConfigArguments `
+    -RepositoryRoot $repoRoot `
+    -Revision $candidateCommit `
+    -DestinationRoot $pesterMirrorRoot `
+    -Context 'Trusted candidate Pester worktree'
+$candidateMirrorTestsRoot = Join-Path $pesterMirrorRoot 'tests'
+if (Test-Path -LiteralPath $candidateMirrorTestsRoot) {
+    Remove-Item -LiteralPath $candidateMirrorTestsRoot -Recurse -Force -ErrorAction Stop
+}
+Expand-TrustedGitArchive `
+    -GitPath $gitPath `
+    -GitConfigArguments $gitConfigArguments `
+    -RepositoryRoot $repoRoot `
+    -Revision $trustedPesterCommit `
+    -DestinationRoot $pesterMirrorRoot `
+    -PathSpec @('tests') `
+    -Context 'Trusted base Pester tests'
+$trustedPesterTestsRoot = Join-Path $pesterMirrorRoot 'tests'
+foreach ($requiredPesterTest in $requiredPesterTests) {
+    Assert-TrustedGitTreeFile `
+        -GitPath $gitPath `
+        -GitConfigArguments $gitConfigArguments `
+        -RepositoryRoot $repoRoot `
+        -Revision $trustedPesterCommit `
+        -RelativePath (Join-Path 'tests' $requiredPesterTest).Replace('\', '/') `
+        -MaterializedPath (Join-Path $trustedPesterTestsRoot $requiredPesterTest) `
+        -Context 'Trusted protected Pester test'
+}
+Assert-NoReparseTree -Path $pesterMirrorRoot -Context 'Trusted Pester worktree'
+
+# The worker script is trusted content written by this validator, but it runs
+# candidate code.  A separate same-integrity supervisor owns the remoting
+# client and launches a low-integrity server process; the parent accepts only
+# a result from a normally completed remote pipeline.
 $pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
 $pesterRunnerScript = @'
 #requires -Version 7.0
@@ -2950,9 +5023,7 @@ $pesterRunnerScript = @'
 param(
     [Parameter(Mandatory = $true)][string] $TestsRoot,
     [Parameter(Mandatory = $true)][string] $PesterModulePath,
-    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
-    [Parameter(Mandatory = $true)][string] $CompletionPipeName,
-    [Parameter(Mandatory = $true)][string] $CompletionToken
+    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion
 )
 
 Set-StrictMode -Version Latest
@@ -2969,16 +5040,33 @@ $loadedPester = Get-Module Pester | Select-Object -First 1
 if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPesterVersion) {
     throw 'The exact frozen Pester module was not imported in the isolated test process.'
 }
-$result = Invoke-Pester -Path $testsRoot -PassThru
+$requiredPesterTests = @(
+    'BootstrapTransition.Tests.ps1'
+    'LocalizationWorkset.Tests.ps1'
+    'ModUpdateAutomation.Tests.ps1'
+    'RepositoryContract.Tests.ps1'
+    'RepositoryValidation.Tests.ps1'
+    'Schema15Coordination.Tests.ps1'
+    'Schema15SourceAcquisition.Tests.ps1'
+    'SkillContract.Tests.ps1'
+    'SourcePin.Tests.ps1'
+)
+$requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
+    $testPath = Join-Path $testsRoot $_
+    $testItem = Get-Item -LiteralPath $testPath -Force -ErrorAction Stop
+    if ($testItem.PSIsContainer -or ($testItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Required Pester test is not a regular non-reparse file: $testPath"
+    }
+    [IO.Path]::GetFullPath($testPath)
+})
+$result = Invoke-Pester -Path $requiredPesterPaths -PassThru
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
     [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
     throw 'Pester repository regression did not complete successfully.'
 }
 
-$requiredPesterTests = @()
 $completionPayload = [ordered]@{
-    token = $CompletionToken
     result = 'passed'
     pesterVersion = [string]$loadedPester.Version
     totalCount = [int64]$result.TotalCount
@@ -2988,192 +5076,113 @@ $completionPayload = [ordered]@{
     requiredTests = @($requiredPesterTests)
 }
 $completionJson = $completionPayload | ConvertTo-Json -Depth 20 -Compress
-$completionBytes = [Text.UTF8Encoding]::new($false).GetBytes($completionJson)
-$completionPipe = [IO.Pipes.NamedPipeClientStream]::new('.', $CompletionPipeName, [IO.Pipes.PipeDirection]::Out, [IO.Pipes.PipeOptions]::Asynchronous)
-try {
-    $completionPipe.Connect(30000)
-    $completionPipe.Write($completionBytes, 0, $completionBytes.Length)
-    $completionPipe.Flush()
-}
-finally {
-    $completionPipe.Dispose()
-}
+# Emit the result only after this base-owned runner has returned from Invoke-Pester
+# and independently checked every required test.  The protected supervisor does
+# not trust raw child stdout: it accepts this value only as a pipeline object
+# delivered by the out-of-process PowerShell remoting protocol after completion.
+Write-Output ('SGV1-Pester-Result:' + $completionJson)
 '@
 [IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
 Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
 $pesterRunnerSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
-$pesterSupervisorPath = Join-Path $runRoot 'invoke-pester-supervisor.ps1'
-$pesterSupervisorScript = @'
-#requires -Version 7.0
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory = $true)][string] $WorkerPath,
-    [Parameter(Mandatory = $true)][string] $TestsRoot,
-    [Parameter(Mandatory = $true)][string] $PesterModulePath,
-    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
-    [Parameter(Mandatory = $true)][string] $ReceiptRoot
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$completionMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
-if ($completionMarker -notmatch '^SGV1-Pester-Result-[0-9a-f]{32}:$') {
-    throw 'The trusted Pester supervisor did not receive a valid one-time completion marker.'
-}
-$powerShellExecutableName = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'pwsh.exe' } else { 'pwsh' }
+$powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
 $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
-if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
-    throw "PowerShell Pester worker executable is missing: $powerShellPath"
+if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
+Assert-NoReparseAncestors -Path $powerShellPath -Context 'PowerShell child executable'
+Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
+$pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
+if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
+    throw 'Run-owned isolated Pester worker changed before candidate tests.'
 }
-$receiptRoot = [IO.Path]::GetFullPath($ReceiptRoot)
-if (-not (Test-Path -LiteralPath $receiptRoot -PathType Container)) {
-    throw "Supervisor-owned Pester receipt root is missing: $receiptRoot"
-}
-$completionPipeName = 'Sgv1-Pester-{0}' -f ([guid]::NewGuid().ToString('N'))
-$completionToken = [guid]::NewGuid().ToString('N')
-$completionPipe = [IO.Pipes.NamedPipeServerStream]::new(
-    $completionPipeName,
-    [IO.Pipes.PipeDirection]::In,
-    1,
-    [IO.Pipes.PipeTransmissionMode]::Byte,
-    [IO.Pipes.PipeOptions]::Asynchronous
-)
-$workerProcess = [Diagnostics.Process]::new()
-$workerProcess.StartInfo.FileName = $powerShellPath
-$workerProcess.StartInfo.UseShellExecute = $false
-$workerProcess.StartInfo.RedirectStandardInput = $true
-$workerProcess.StartInfo.RedirectStandardOutput = $true
-$workerProcess.StartInfo.RedirectStandardError = $true
-foreach ($argument in @(
+$trustedPesterSupervisorPath = Join-Path $supervisorRoot 'scripts/Validate.ps1'
+Assert-NoReparseAncestors -Path $trustedPesterSupervisorPath -Context 'Trusted Pester supervisor'
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $trustedPesterSupervisorPath -Force) -Context 'Trusted Pester supervisor'
+$trustedPesterSupervisorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
+$trustedPesterSupervisorMarker = 'SGV1-Pester-Supervisor-{0}:' -f ([guid]::NewGuid().ToString('N'))
+$pesterOutput = Invoke-TrustedPowerShellProcess -Command $powerShellPath -Arguments @(
     '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', $WorkerPath,
-    '-TestsRoot', $TestsRoot,
-    '-PesterModulePath', $PesterModulePath,
-    '-ExpectedPesterVersion', $ExpectedPesterVersion,
-    '-CompletionPipeName', $completionPipeName,
-    '-CompletionToken', $completionToken
-)) {
-    [void]$workerProcess.StartInfo.ArgumentList.Add($argument)
+    '-File', $trustedPesterSupervisorPath,
+    '-ProtectedPesterSupervisor',
+    '-PesterWorkerPath', $pesterRunnerPath,
+    '-PesterTestsRoot', $trustedPesterTestsRoot,
+    '-PesterModulePath', $pesterModulePath,
+    '-PesterExpectedVersion', [string]$receipts.pester.resolvedVersion,
+    '-PesterMirrorRoot', $pesterMirrorRoot,
+    '-PesterInstallRoot', $installRoot,
+    '-PesterSupervisorPath', $trustedPesterSupervisorPath,
+    '-PesterChildWritableRoot', $childOutputRoot,
+    '-PesterDiagnosticRoot', $runRoot,
+    '-PesterRunnerSha256', $pesterRunnerSha256
+) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 300000
+$trustedPesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
+if ($trustedPesterSupervisorActualSha256 -cne $trustedPesterSupervisorSha256) {
+    throw 'Trusted Pester supervisor changed during the protected run.'
 }
-Add-Type -TypeDefinition @"
-using System;
-using System.IO;
-using System.Text;
-using System.Threading.Tasks;
-public static class Sgv1BoundedProcessOutput {
-    public static async Task<string> ReadAsync(Stream stream, int limit) {
-        var buffer = new byte[8192];
-        using (var memory = new MemoryStream()) {
-            int read;
-            while ((read = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
-                if (memory.Length + read > limit) {
-                    throw new InvalidOperationException("The isolated Pester worker exceeded its bounded output limit.");
-                }
-                memory.Write(buffer, 0, read);
-            }
-            return new UTF8Encoding(false, true).GetString(memory.ToArray());
-        }
-    }
+$pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
+    $_.StartsWith($trustedPesterSupervisorMarker, [StringComparison]::Ordinal)
+})
+if ($pesterResultLines.Count -ne 1) {
+    throw 'Trusted Pester supervisor exited without exactly one supervisor-owned completion result.'
 }
-"@
-$workerStarted = $false
-$workerExitCode = -1
-$workerOutput = ''
-$workerError = ''
-$completionJson = $null
-$completionConnectionTask = $completionPipe.WaitForConnectionAsync()
+Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
+$pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
+if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
+    throw 'Run-owned isolated Pester worker changed during candidate tests.'
+}
 try {
-    if (-not $workerProcess.Start()) {
-        throw 'Could not start the isolated Pester worker.'
+    $pesterResultJson = $pesterResultLines[0].Substring($trustedPesterSupervisorMarker.Length)
+    $pesterResultDocument = [System.Text.Json.JsonDocument]::Parse($pesterResultJson)
+    try {
+        Assert-NoDuplicateJsonProperties -Element $pesterResultDocument.RootElement -Context 'Isolated Pester result'
     }
-    $workerStarted = $true
-    # The marker-bearing supervisor stdin is never inherited by the worker.
-    $workerProcess.StandardInput.Close()
-    $workerOutputTask = [Sgv1BoundedProcessOutput]::ReadAsync($workerProcess.StandardOutput.BaseStream, 4194304)
-    $workerErrorTask = [Sgv1BoundedProcessOutput]::ReadAsync($workerProcess.StandardError.BaseStream, 4194304)
-    $workerProcess.WaitForExit()
-    $workerExitCode = $workerProcess.ExitCode
-    $workerOutput = $workerOutputTask.GetAwaiter().GetResult()
-    $workerError = $workerErrorTask.GetAwaiter().GetResult()
-    if (-not $completionConnectionTask.Wait(5000)) {
-        throw 'The isolated Pester worker exited without a trusted completion-channel connection.'
+    finally {
+        $pesterResultDocument.Dispose()
     }
-    $completionReadTask = [Sgv1BoundedProcessOutput]::ReadAsync($completionPipe, 1048576)
-    $completionJson = $completionReadTask.GetAwaiter().GetResult()
+    $pesterResult = $pesterResultJson | ConvertFrom-Json -Depth 20
 }
 catch {
-    if ($workerStarted -and -not $workerProcess.HasExited) {
-        try { $workerProcess.Kill($true) } catch { }
-    }
-    throw
+    throw "Trusted Pester supervisor result is not valid unambiguous JSON: $($_.Exception.Message)"
 }
-finally {
-    $workerProcess.Dispose()
-    $completionPipe.Dispose()
+if ($pesterResult.result -cne 'passed' -or
+    $pesterResult.pesterVersion -cne [string]$receipts.pester.resolvedVersion -or
+    [int64]$pesterResult.TotalCount -le 0 -or [int64]$pesterResult.FailedCount -ne 0 -or
+    [int64]$pesterResult.SkippedCount -ne 0 -or
+    [int64]$pesterResult.PassedCount + [int64]$pesterResult.SkippedCount -ne [int64]$pesterResult.TotalCount) {
+    throw 'Trusted Pester supervisor result was missing, mismatched, or incomplete.'
 }
-if (-not [string]::IsNullOrWhiteSpace($workerError)) {
-    [Console]::Error.WriteLine($workerError.TrimEnd())
-}
-if ($workerExitCode -ne 0) {
-    throw "The isolated Pester worker failed with exit code $workerExitCode."
-}
-$completionDocument = [System.Text.Json.JsonDocument]::Parse($completionJson)
-try {
-    if ($completionDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
-        throw 'The isolated Pester completion payload must have a JSON object root.'
-    }
-    $completionPropertyNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($property in $completionDocument.RootElement.EnumerateObject()) {
-        if (-not $completionPropertyNames.Add($property.Name)) { throw "The isolated Pester completion payload contains duplicate property '$($property.Name)'." }
-        if ($property.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
-            throw 'The isolated Pester completion payload contains an unsupported nested object.'
+$workerRequiredTests = @($pesterResult.requiredTests)
+if ($pesterResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne $requiredPesterTests.Count -or
+    @(
+        for ($requiredTestIndex = 0; $requiredTestIndex -lt $requiredPesterTests.Count; $requiredTestIndex++) {
+            if ([string]$workerRequiredTests[$requiredTestIndex] -cne [string]$requiredPesterTests[$requiredTestIndex]) {
+                $requiredTestIndex
+            }
         }
-    }
+    ).Count -gt 0) {
+    throw 'Trusted Pester supervisor did not report the exact trusted test inventory.'
 }
-finally {
-    $completionDocument.Dispose()
-}
-$completion = $completionJson | ConvertFrom-Json -Depth 20
-$expectedCompletionProperties = @('token', 'result', 'pesterVersion', 'totalCount', 'passedCount', 'failedCount', 'skippedCount', 'requiredTests')
-$actualCompletionProperties = @($completion.PSObject.Properties | ForEach-Object { [string]$_.Name })
-if (@($expectedCompletionProperties | Where-Object { $actualCompletionProperties -cnotcontains $_ }).Count -gt 0 -or
-    @($actualCompletionProperties | Where-Object { $expectedCompletionProperties -cnotcontains $_ }).Count -gt 0 -or
-    $actualCompletionProperties.Count -ne $expectedCompletionProperties.Count) {
-    throw 'The isolated Pester completion payload has an invalid property set.'
-}
-$requiredPesterTests = @()
-if ($completion.token -isnot [string] -or $completion.token -cne $completionToken -or
-    $completion.result -isnot [string] -or $completion.result -cne 'passed' -or
-    $completion.pesterVersion -isnot [string] -or $completion.pesterVersion -cne $ExpectedPesterVersion -or
-    $completion.totalCount -isnot [int64] -or $completion.passedCount -isnot [int64] -or
-    $completion.failedCount -isnot [int64] -or $completion.skippedCount -isnot [int64] -or
-    $completion.requiredTests -isnot [array]) {
-    throw 'The isolated Pester completion payload contains invalid typed result fields.'
-}
-$requiredTests = @($completion.requiredTests)
-if ($requiredTests.Count -ne $requiredPesterTests.Count) {
-    throw 'The isolated Pester completion payload contains an unexpected required-test set.'
-}
-if ([int64]$completion.totalCount -le 0 -or [int64]$completion.failedCount -ne 0 -or
-    [int64]$completion.skippedCount -ne 0 -or
-    [int64]$completion.passedCount + [int64]$completion.skippedCount -ne [int64]$completion.totalCount) {
-    throw 'The isolated Pester completion payload reports an incomplete regression run.'
-}
-$workerPayload = [ordered]@{
+$completionAttestationNonceBytes = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($completionAttestationNonceBytes)
+$completionAttestationNonce = ([BitConverter]::ToString($completionAttestationNonceBytes) -replace '-', '').ToLowerInvariant()
+$receiptPayload = [ordered]@{
     result = 'passed'
-    pesterVersion = [string]$completion.pesterVersion
-    totalCount = [int64]$completion.totalCount
-    passedCount = [int64]$completion.passedCount
-    failedCount = [int64]$completion.failedCount
-    skippedCount = [int64]$completion.skippedCount
+    completionAttestation = 'trusted-parent-post-exit'
+    completionAttestationNonce = $completionAttestationNonce
+    pesterVersion = [string]$pesterResult.pesterVersion
+    totalCount = [int64]$pesterResult.TotalCount
+    passedCount = [int64]$pesterResult.PassedCount
+    failedCount = [int64]$pesterResult.FailedCount
+    skippedCount = [int64]$pesterResult.SkippedCount
     requiredTests = @($requiredPesterTests)
 }
 $receiptIdBytes = [byte[]]::new(16)
 [Security.Cryptography.RandomNumberGenerator]::Fill($receiptIdBytes)
 $receiptId = ([BitConverter]::ToString($receiptIdBytes) -replace '-', '').ToLowerInvariant()
-$receiptPath = Join-Path $receiptRoot ("trusted-pester-receipt-{0}.json" -f $receiptId)
-$receiptJson = $workerPayload | ConvertTo-Json -Depth 20 -Compress
+$receiptPath = Join-Path $runRoot ("trusted-pester-receipt-{0}.json" -f $receiptId)
+$receiptJson = $receiptPayload | ConvertTo-Json -Depth 20 -Compress
 $receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
 $receiptStream = [IO.File]::Open($receiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
 try {
@@ -3185,82 +5194,11 @@ finally {
 }
 $receiptItem = Get-Item -LiteralPath $receiptPath -Force
 if ($receiptItem.PSIsContainer -or ($receiptItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$receiptItem.Length -gt 1048576) {
-    throw 'The supervisor-owned Pester receipt is not a bounded regular file.'
-}
-Write-Output ($completionMarker + ($workerPayload | ConvertTo-Json -Depth 20 -Compress))
-'@
-[IO.File]::WriteAllText($pesterSupervisorPath, $pesterSupervisorScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
-$pesterSupervisorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
-$powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
-$powerShellPath = Join-Path $PSHOME $powerShellExecutableName
-if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
-Assert-NoReparseAncestors -Path $powerShellPath -Context 'PowerShell child executable'
-Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
-$pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
-if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
-    throw 'Run-owned isolated Pester worker changed before candidate tests.'
-}
-Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
-$pesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
-if ($pesterSupervisorActualSha256 -cne $pesterSupervisorSha256) {
-    throw 'Run-owned trusted Pester supervisor changed before candidate tests.'
-}
-$pesterResultMarker = 'SGV1-Pester-Result-{0}:' -f ([guid]::NewGuid().ToString('N'))
-$pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', $pesterSupervisorPath,
-    '-WorkerPath', $pesterRunnerPath,
-    '-TestsRoot', (Join-Path $repoRoot 'tests'),
-    '-PesterModulePath', $pesterModulePath,
-    '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion,
-    '-ReceiptRoot', $runRoot
- ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -StandardInput $pesterResultMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -ApplyLinuxResourceLimits
-$pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
-    $_.StartsWith($pesterResultMarker, [StringComparison]::Ordinal)
-})
-if ($pesterResultLines.Count -ne 1) {
-    throw 'Isolated Pester exited without exactly one supervisor-owned completion result.'
-}
-Assert-NoReparseAncestors -Path $pesterSupervisorPath -Context 'Run-owned trusted Pester supervisor' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterSupervisorPath -Force) -Context 'Run-owned trusted Pester supervisor'
-$pesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterSupervisorPath).Hash.ToLowerInvariant()
-if ($pesterSupervisorActualSha256 -cne $pesterSupervisorSha256) {
-    throw 'Run-owned trusted Pester supervisor changed during candidate tests.'
-}
-Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
-$pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
-if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
-    throw 'Run-owned isolated Pester worker changed during candidate tests.'
-}
-try {
-    $pesterResultJson = $pesterResultLines[0].Substring($pesterResultMarker.Length)
-    $pesterResultDocument = [System.Text.Json.JsonDocument]::Parse($pesterResultJson)
-    try {
-        Assert-NoDuplicateJsonProperties -Element $pesterResultDocument.RootElement -Context 'Isolated Pester result'
-    }
-    finally {
-        $pesterResultDocument.Dispose()
-    }
-    $pesterResult = $pesterResultJson | ConvertFrom-Json -Depth 20
-}
-catch {
-    throw "Isolated Pester result is not valid unambiguous JSON: $($_.Exception.Message)"
-}
-if ($pesterResult.result -cne 'passed' -or
-    $pesterResult.pesterVersion -cne [string]$receipts.pester.resolvedVersion -or
-    [int64]$pesterResult.TotalCount -le 0 -or [int64]$pesterResult.FailedCount -ne 0 -or
-    [int64]$pesterResult.SkippedCount -ne 0 -or
-    [int64]$pesterResult.PassedCount + [int64]$pesterResult.SkippedCount -ne [int64]$pesterResult.TotalCount) {
-    throw 'Isolated Pester repository regression result was missing, mismatched, or incomplete.'
+    throw 'The trusted Pester receipt is not a bounded regular file.'
 }
 
-# Candidate Pester code runs with the runner account and may replace files in
-# the run-owned or supervisor roots. Never invoke the original path again
+# Candidate Pester code runs in a contained child and may replace files in the
+# candidate checkout. Never invoke the original path again
 # after that untrusted process. Keep the trusted bytes in memory and execute
 # a scriptblock created directly from that pre-test snapshot; this avoids
 # reopening any candidate-writable pathname for post-test evidence.
@@ -3281,12 +5219,14 @@ if ($null -eq $postPesterRepositoryValidatorScript) {
 }
 
 $postPesterRepositoryReportPath = Join-Path $runRoot 'repository-validation-post-pester.json'
+$trustedGitConfigActualItem = Get-Item -LiteralPath $trustedGitConfigPath -Force
+Assert-RegularFileForHash -Item $trustedGitConfigActualItem -Context 'Run-owned Git global config'
+Assert-NoReparseAncestors -Path $trustedGitConfigPath -Context 'Run-owned Git global config'
+Assert-NoReparseAncestors -Path $trustedGitHooksPath -Context 'Run-owned empty Git hooks directory'
 $trustedGitConfigActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedGitConfigPath).Hash.ToLowerInvariant()
 if ($trustedGitConfigActualSha256 -cne $trustedGitConfigSha256) {
     throw 'Run-owned Git global config changed before post-Pester evidence collection.'
 }
-Assert-NoReparseAncestors -Path $trustedGitConfigPath -Context 'Run-owned Git global config'
-Assert-NoReparseAncestors -Path $trustedGitHooksPath -Context 'Run-owned empty Git hooks directory'
 $hookEntries = @(Get-ChildItem -LiteralPath $trustedGitHooksPath -Force)
 if ($hookEntries.Count -ne 0) {
     throw 'Run-owned Git hooks directory is not empty before post-Pester evidence collection.'
@@ -3328,7 +5268,7 @@ $postPesterGitIndexSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitInd
 if ($postPesterGitIndexSha256 -cne $prePesterGitIndexSha256) {
     throw 'Candidate Git index changed during repository tests.'
 }
-$postPesterRepositoryJson = & $postPesterRepositoryValidatorScript -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath -NoFilters | Select-Object -Last 1
+$postPesterRepositoryJson = & $postPesterRepositoryValidatorScript -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath -TrustedGitPath $gitPath -TrustedStatPath $trustedStatPath -NoFilters | Select-Object -Last 1
 $postPesterRepositoryReport = $postPesterRepositoryJson | ConvertFrom-Json -Depth 100
 if ($postPesterRepositoryReport.result -cne 'passed' -or [int]$postPesterRepositoryReport.activeSkillCount -ne $skillIds.Count) {
     throw 'Post-Pester repository validation did not cover the exact active Skill inventory.'
@@ -3357,6 +5297,18 @@ $summary = [pscustomobject][ordered]@{
         policyPath = 'docs/standards/validation-security-gate.json'
         policySha256 = $validationSecurityGatePolicySha256
         stageIds = @($validationSecurityGate.stages | ForEach-Object { [string]$_.id })
+    }
+    executionBoundary = [ordered]@{
+        candidateProfile = 'offline-candidate'
+        semanticProfile = if ($semanticTriggered) { 'trusted-semantic' } else { 'not-run' }
+        platform = if ($script:IsWindowsHost) { 'windows-restricted-primary-token-job-object' } elseif ($script:IsLinuxHost) { 'linux-private-root-namespace' } else { 'unsupported' }
+        integrityLevel = if ($script:IsWindowsHost) { 'low' } elseif ($script:IsLinuxHost) { 'unprivileged' } else { 'unsupported' }
+        aggregateLimits = 'process-count-resident-memory-cpu-output-timeout'
+        cleanup = 'trusted-process-tree-and-sandbox-root-cleanup-verified'
+    }
+    assertionInventory = [ordered]@{
+        canonicalStages = @($validationSecurityGate.stages | ForEach-Object { [string]$_.id })
+        requiredPesterTests = @($requiredPesterTests)
     }
     candidate = [ordered]@{
         repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
@@ -3388,9 +5340,16 @@ $summary = [pscustomobject][ordered]@{
             repositoryValidation = 'passed'
             skillTools = $skillToolsReports
             routing = $skillToolsRouteReports
-            pester = [ordered]@{ result = 'passed'; total = [int]$pesterResult.TotalCount; passed = [int]$pesterResult.PassedCount; skipped = [int]$pesterResult.SkippedCount }
+            pester = [ordered]@{
+                result = 'passed'
+                trustedCommit = $trustedPesterCommit
+                receipt = [IO.Path]::GetFileName($receiptPath)
+                total = [int]$pesterResult.TotalCount
+                passed = [int]$pesterResult.PassedCount
+                skipped = [int]$pesterResult.SkippedCount
+            }
         }
-        conditionalSemanticScan = [ordered]@{ requested = [bool]$EnableSemanticScan; triggered = $semanticTriggered; reports = $semanticReports }
+        conditionalSemanticScan = [ordered]@{ requested = [bool]$EnableSemanticScan; triggered = $semanticTriggered; candidateProfile = 'offline-candidate'; executionProfile = if ($semanticTriggered) { 'trusted-semantic' } else { 'not-run' }; reports = $semanticReports }
         aiReview = 'required-before-release'
         humanApproval = 'required-before-release'
         publishOrInstall = 'blocked-until-approved-release'

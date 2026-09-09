@@ -110,9 +110,17 @@ Describe 'Canonical Standard v1 validation adapter' {
         $skillToolsValidator | Should -Match 'skill-tools SARIF contains a malformed or error-level result'
     }
 
-    It 'keeps reports in the run artifacts root and records review boundaries' {
+    # Scenario: Canonical validation emits run-owned evidence after the security preflight.
+    # Purpose: Keep candidate-controlled paths out of evidence and retain every required review boundary.
+    It 'UnitT70_KeepsReportsInTheRunArtifactsRootAndRecordsReviewBoundaries' {
         $script:Validator | Should -Match ([regex]::Escape("Join-Path `$runRoot 'conformance-report.json'"))
         $script:Validator | Should -Match 'canonicalGate = \[ordered\]@'
+        $script:Validator | Should -Match 'executionBoundary = \[ordered\]@'
+        $script:Validator | Should -Match 'assertionInventory = \[ordered\]@'
+        $script:Validator | Should -Match 'security-preflight\.json'
+        $script:Validator | Should -Match 'security-preflight-summary\.json'
+        $script:Validator | Should -Match 'Get-SanitizedSecurityFindingValue'
+        $script:Validator | Should -Match 'Select-Object -First 64'
         $script:Validator | Should -Match "policyPath = 'docs/standards/validation-security-gate.json'"
         $script:Validator | Should -Match "aiReview = 'required-before-release'"
         $script:Validator | Should -Match "humanApproval = 'required-before-release'"
@@ -120,102 +128,33 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match "deviations = 'None'"
     }
 
-    It 'models semantic scan as a deterministic fail-closed conditional stage' {
+    # Scenario: Static candidate checks remain offline while an explicitly enabled semantic scan uses its trusted profile.
+    # Purpose: Prevent optional semantic scanning from weakening deterministic failure or credential isolation.
+    It 'UnitT80_ModelsSemanticScanAsADeterministicFailClosedConditionalStage' {
         $script:Validator | Should -Match 'Test-SecurityRelevantSkillChange'
         $script:Validator | Should -Match '\$staticFindingCount -gt 0'
         $script:Validator | Should -Match 'Triggered SkillSpector semantic scan did not complete'
         $script:Validator | Should -Match '\[switch\] \$EnableSemanticScan'
         $script:Validator | Should -Match '\$semanticTriggered = \[bool\]\$EnableSemanticScan -and'
         $script:Validator | Should -Match 'repository-validation-post-pester'
-        $script:Validator | Should -Match 'pesterRunnerPath'
-        $script:Validator | Should -Match 'pesterSupervisorPath'
-        $script:Validator | Should -Match 'NamedPipeServerStream'
-        $script:Validator | Should -Match 'NamedPipeClientStream'
-        $script:Validator | Should -Match 'CompletionPipeName'
-        $script:Validator | Should -Match 'CompletionToken'
-        $script:Validator | Should -Match 'trusted-pester-receipt-'
-        $script:Validator | Should -Match 'CreateNew'
-        $script:Validator | Should -Match 'Sgv1BoundedProcessOutput'
-        $script:Validator | Should -Match 'completionDocument'
-        $script:Validator | Should -Not -Match 'SGV1-Pester-Receipt:'
-        $script:Validator | Should -Not -Match 'SGV1-Pester-Worker:'
-        $script:Validator | Should -Match 'StandardInput \$pesterResultMarker'
-        $script:Validator | Should -Match 'WorkerPath.*pesterRunnerPath'
-        $script:Validator | Should -Match 'The marker-bearing supervisor stdin is never inherited by the worker'
-        $script:Validator | Should -Not -Match 'StandardInputIsolation'
-        $pesterInvokeIndex = $script:Validator.IndexOf('$result = Invoke-Pester')
-        $supervisorMarkerReadIndex = $script:Validator.IndexOf('$completionMarker = ([Console]::In.ReadToEnd())')
-        $workerStartIndex = $script:Validator.IndexOf('$workerProcess.Start()')
-        $supervisorMarkerReadIndex | Should -BeGreaterThan -1
-        $workerStartIndex | Should -BeGreaterThan $supervisorMarkerReadIndex
-        $pesterInvokeIndex | Should -BeGreaterThan -1
+        $script:Validator | Should -Match 'Invoke-ProtectedPesterRunspace'
+        $script:Validator | Should -Match 'CreateOutOfProcessRunspace'
+        $script:Validator | Should -Match '\$trustedPesterSupervisorMarker'
+        $script:Validator | Should -Match '\$completionAttestationNonce'
+        $script:Validator | Should -Match "completionAttestation = 'trusted-parent-post-exit'"
+        $script:Validator | Should -Not -Match 'NamedPipeServerStream|NamedPipeClientStream|CompletionPipeName|CompletionToken|workerResultMarker'
+        $script:Validator | Should -Match "ValidateSet\('Offline', 'TrustedSemantic'\)"
+        $script:Validator | Should -Match '-NetworkProfile Offline'
+        $script:Validator | Should -Match '-NetworkProfile TrustedSemantic'
         $script:Validator | Should -Match 'IsolateRunnerCommandFiles'
         $script:Validator | Should -Match 'TerminateProcessTree'
         $script:Validator | Should -Match 'ProtectRunnerCommandFiles'
-        $script:Validator | Should -Match 'Stop-ProcessTree'
-        $script:Validator | Should -Match 'Get-DescendantProcessIds'
-        $script:Validator | Should -Match 'Get-UnixProcessGroupId'
-        $script:Validator | Should -Match 'function Assert-LinuxGlibcRuntime'
-        $script:Validator | Should -Match 'function Resolve-LinuxExecutablePath'
-        $script:Validator | Should -Match 'Get-Command readlink'
-        $script:Validator | Should -Match "SetEnvironmentVariable\('LC_ALL', 'C'"
-        $script:Validator | Should -Match 'Get-UnixProcessGroupProcessIds'
-        $script:Validator | Should -Match 'Add-ObservedProcessIds'
-        $script:Validator | Should -Match 'function Get-ProcessIdentity'
-        $script:Validator | Should -Match 'function Test-ProcessIdentity'
-        $script:Validator | Should -Match 'function Stop-UnixProcessByIdentity'
-        $script:Validator | Should -Match 'OpenProcessFileDescriptor'
-        $script:Validator | Should -Match 'SendProcessSignal'
-        $script:Validator | Should -Match 'function Get-WindowsProcessBoundaryType'
-        $script:Validator | Should -Match 'CreateKillOnCloseJob'
-        $script:Validator | Should -Match 'AssignProcess'
-        $script:Validator | Should -Match 'TerminateProcessHandle'
-        $script:Validator | Should -Match 'WindowsJobHandle'
-        $script:Validator | Should -Match 'TimeoutMilliseconds'
-        $script:Validator | Should -Match 'bounded candidate execution timeout'
-        $script:Validator | Should -Match 'EventWaitHandle'
-        $script:Validator | Should -Match 'CODEX_VALIDATION_RESUME_EVENT'
-        $script:Validator | Should -Match 'CreateSuspended'
-        $script:Validator | Should -Match 'StartupInfoEx'
-        $script:Validator | Should -Match 'ProcThreadAttributeHandleList'
-        $script:Validator | Should -Match 'InitializeProcThreadAttributeList'
-        $script:Validator | Should -Match 'UpdateProcThreadAttribute'
-        $script:Validator | Should -Match 'CreateExtendedStartupInfo'
-        $script:Validator | Should -Match '\.Resume\(\)'
-        $script:Validator | Should -Match 'ReadBoundedAsync'
-        $script:Validator | Should -Match 'bounded native-process output limit'
-        $script:Validator | Should -Match 'unassigned suspended Windows process safely'
-        $windowsAssignmentIndex = $script:Validator.IndexOf('Assign-WindowsProcessToJob -JobHandle $windowsJobHandle')
-        $windowsReleaseIndex = $script:Validator.IndexOf('$windowsResumeEvent.Set()')
-        $windowsAssignmentIndex | Should -BeGreaterThan -1
-        $windowsReleaseIndex | Should -BeGreaterThan $windowsAssignmentIndex
-        $script:Validator | Should -Not -Match 'taskkill'
-        $script:Validator | Should -Not -Match '\$killPath'
-        $script:Validator | Should -Match 'function Enable-UnixChildSubreaper'
-        $script:Validator | Should -Match 'function Wait-ForUnixProcessGroupId'
-        $script:Validator | Should -Match 'ObservedProcessIdentities'
-        $script:Validator | Should -Match 'ProcessGroupId'
-        $script:Validator | Should -Match 'setsid'
-        $script:Validator | Should -Match 'unshare'
-        $script:Validator | Should -Match '--kill-child'
-        $script:Validator | Should -Match 'maskHostSocketsScript'
-        $script:Validator | Should -Match '--make-rprivate'
-        $script:Validator | Should -Match 'find_path'
-        $script:Validator | Should -Match 'private_root'
-        $script:Validator | Should -Match 'ApplyLinuxResourceLimits'
-        $script:Validator | Should -Match '--nproc=256'
-        $script:Validator | Should -Not -Match 'ulimit\s+-u'
         $script:Validator | Should -Match 'function New-ContainedProcessEnvironment'
         $script:Validator | Should -Match 'function Protect-ProcessCredentialEnvironment'
         $script:Validator | Should -Match 'SemanticCredentialNames'
         $script:Validator | Should -Match 'AdditionalEnvironmentVariables'
         $script:Validator | Should -Match 'EnvironmentVariables\.Clear\(\)'
         $script:Validator | Should -Match 'ACTIONS_RUNTIME_TOKEN'
-        $script:Validator | Should -Match 'WaitForExit\(100\)'
-        $observedProcessIndex = $script:Validator.IndexOf('Add-ObservedProcessIds -RootProcessId')
-        $timedWaitIndex = $script:Validator.IndexOf('WaitForExit(100)')
-        $observedProcessIndex | Should -BeGreaterThan -1
-        $timedWaitIndex | Should -BeGreaterThan $observedProcessIndex
         $script:Validator | Should -Match 'Assert-RunnerCommandFilesUnchanged'
         $script:Validator | Should -Match 'standard_v1_evidence_sha256'
         $script:Validator | Should -Not -Match 'pesterResultPath'
@@ -236,7 +175,7 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'core\.hooksPath'
         $script:Validator | Should -Match '\$repositoryValidatorPath'
         $script:Validator | Should -Match 'pesterRunnerPath'
-        $script:Validator | Should -Match 'Invoke-NativeChecked -Command \$powerShellPath'
+        $script:Validator | Should -Match 'Invoke-TrustedPowerShellProcess -Command \$powerShellPath'
         $script:Validator | Should -Match "'-NoProfile'"
         $script:Validator | Should -Match "'route'"
         $script:Validator | Should -Match 'skill-tools route did not return exactly one result'

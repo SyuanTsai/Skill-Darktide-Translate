@@ -8,13 +8,16 @@ param(
     [string] $OutputPath,
     [string] $TrustedGitPath,
     [string] $TrustedStatPath,
+    [switch] $BootstrapTransition,
     [switch] $NoFilters
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:TrustedStatPath = if ([string]::IsNullOrWhiteSpace($TrustedStatPath)) { $null } else { [IO.Path]::GetFullPath($TrustedStatPath) }
-$script:TrustedGitPath = if ([string]::IsNullOrWhiteSpace($TrustedGitPath)) { $null } else { [IO.Path]::GetFullPath($TrustedGitPath) }
+$resolvedTrustedStatPath = if ([string]::IsNullOrWhiteSpace($TrustedStatPath)) { $null } else { [IO.Path]::GetFullPath($TrustedStatPath) }
+$resolvedTrustedGitPath = if ([string]::IsNullOrWhiteSpace($TrustedGitPath)) { $null } else { [IO.Path]::GetFullPath($TrustedGitPath) }
+$script:TrustedStatPath = $resolvedTrustedStatPath
+$script:TrustedGitPath = $resolvedTrustedGitPath
 
 function Assert-ExactPropertySet {
     param(
@@ -204,7 +207,7 @@ function Assert-RegularFileForHash {
         throw "$Context is not a regular non-reparse file: $($Item.FullName)"
     }
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
-        if ($null -eq $script:TrustedStatPath) {
+        if ([string]::IsNullOrWhiteSpace($script:TrustedStatPath)) {
             $statCommand = Get-Command stat -CommandType Application -ErrorAction Stop | Select-Object -First 1
             $script:TrustedStatPath = [IO.Path]::GetFullPath([string]$statCommand.Path)
             if (-not (Test-Path -LiteralPath $script:TrustedStatPath -PathType Leaf)) {
@@ -467,14 +470,47 @@ function Read-OpenAiMetadata {
     return [pscustomobject]@{ interface = [pscustomobject]$interface; tools = @($tools); policy = [pscustomobject]$policy }
 }
 
+function Assert-BootstrapOpenAiMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $ExpectedSkillId
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force
+    Assert-RegularFileForHash -Item $item -Context "Bootstrap metadata for '$ExpectedSkillId'"
+    $text = [IO.File]::ReadAllText($item.FullName, [Text.UTF8Encoding]::new($false, $true))
+    if ($text -notmatch '(?m)^\s*display_name:\s+"Auto Update Darktide MOD"\s*$') {
+        throw "Bootstrap agents/openai.yaml display_name is invalid for '$ExpectedSkillId'."
+    }
+    if ($text -notmatch '(?m)^\s*short_description:\s+"[^"]+"\s*$') {
+        throw "Bootstrap agents/openai.yaml short_description is missing for '$ExpectedSkillId'."
+    }
+    if ($text -notmatch ('(?m)^\s*default_prompt:\s+"[^"]*\$' + [regex]::Escape($ExpectedSkillId) + '[^"]*"\s*$')) {
+        throw "Bootstrap agents/openai.yaml default_prompt is not bound to '$ExpectedSkillId'."
+    }
+    if ($text -match '(?m)^\s*allow_implicit_invocation:\s*false\s*$') {
+        throw "Bootstrap agents/openai.yaml must not disable implicit invocation for '$ExpectedSkillId'."
+    }
+    return $true
+}
+
 function Get-ContentInventory {
     param(
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
         [Parameter(Mandatory = $true)][string] $SkillId,
+        [Parameter()][string] $SkillsRoot = 'skills',
         [Parameter()][switch] $NoFilters
     )
 
-    $skillRoot = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot "skills/$SkillId"))
+    $skillsRootRelative = $SkillsRoot.Replace('\', '/')
+    if ([IO.Path]::IsPathRooted($skillsRootRelative) -or
+        $skillsRootRelative -cmatch '(^|/)\.\.?(/|$)' -or
+        $skillsRootRelative -cmatch '[\x00\r\n]' -or
+        [string]::IsNullOrWhiteSpace($skillsRootRelative)) {
+        throw "Skill root '$SkillsRoot' is not a safe repository-relative path."
+    }
+    $skillRootRelative = "$skillsRootRelative/$SkillId"
+    $skillRoot = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot $skillRootRelative.Replace('/', [IO.Path]::DirectorySeparatorChar)))
     $skillRootItem = Get-Item -LiteralPath $skillRoot -Force
     if (-not $skillRootItem.PSIsContainer -or ($skillRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "Skill '$SkillId' root must be a regular non-reparse directory."
@@ -519,7 +555,7 @@ function Get-ContentInventory {
     if ([string]::IsNullOrWhiteSpace($gitPath)) { throw 'Trusted Git executable was not bound before repository validation.' }
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
     $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    $gitOutput = [string]((& $gitPath @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- "skills/$SkillId") -join '')
+    $gitOutput = [string]((& $gitPath @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- $skillRootRelative) -join '')
     if ($LASTEXITCODE -ne 0) { throw "Git inventory lookup failed for '$SkillId'." }
     foreach ($record in @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })) {
         if ([string]$record -cnotmatch '^(?<mode>[0-9]{6}) (?<objectId>[0-9a-f]{40}) (?<stage>[0-3])\t(?<path>[^\x00\r\n]+)$') {
@@ -528,7 +564,7 @@ function Get-ContentInventory {
         if ([string]$Matches.mode -cnotin @('100644', '100755') -or [string]$Matches.stage -cne '0') {
             throw "Skill '$SkillId' contains non-regular or unresolved Git entry '$($Matches.path)'."
         }
-        $prefix = "skills/$SkillId/"
+        $prefix = "$skillRootRelative/"
         $packagePath = ([string]$Matches.path).Substring($prefix.Length)
         $trackedEntry = [pscustomobject][ordered]@{ mode = [string]$Matches.mode; objectId = [string]$Matches.objectId }
         if (-not $tracked.TryAdd($packagePath, $trackedEntry)) {
@@ -547,7 +583,7 @@ function Get-ContentInventory {
     $files = @()
     $canonical = [Text.StringBuilder]::new()
     foreach ($path in $sortedPaths) {
-        $repositoryPath = "skills/$SkillId/$path"
+        $repositoryPath = "$skillRootRelative/$path"
         if (-not $NoFilters) {
             $workingObjectId = ([string](@(
                 & $gitPath @gitConfigArguments -C $RepositoryRoot hash-object "--path=$repositoryPath" -- $pathToFile[$path].FullName
@@ -575,10 +611,149 @@ function Get-ContentInventory {
         $contentSha256 = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical.ToString()))) -replace '-', '').ToLowerInvariant()
     }
     finally { $hasher.Dispose() }
-    return [pscustomobject][ordered]@{ skillId = $SkillId; contentSha256 = $contentSha256; files = $files }
+    return [pscustomobject][ordered]@{
+        skillId = $SkillId
+        skillsRoot = $skillsRootRelative
+        contentSha256 = $contentSha256
+        files = $files
+    }
 }
 
-if ($null -eq $script:TrustedGitPath) {
+function Write-RepositoryValidationResult {
+    param(
+        [Parameter(Mandatory = $true)] $Result,
+        [string] $OutputPath,
+        [string] $SuccessMessage = 'Darktide Translate repository validation passed.'
+    )
+
+    $json = $Result | ConvertTo-Json -Depth 30
+    if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
+        $outputFullPath = [IO.Path]::GetFullPath($OutputPath)
+        $outputDirectory = Split-Path -Parent $outputFullPath
+        if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
+            [void](New-Item -ItemType Directory -Path $outputDirectory -Force)
+        }
+        [IO.File]::WriteAllText($outputFullPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    }
+    Write-Host $SuccessMessage
+    return $json
+}
+
+function Invoke-BootstrapTransitionRepositoryValidation {
+    param(
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter()][string] $OutputPath,
+        [Parameter()][switch] $NoFilters
+    )
+
+    $catalogPath = Join-Path $RepositoryRoot 'catalog/skills-catalog.json'
+    $legacySourcePath = Join-Path $RepositoryRoot 'catalog/source.json'
+    $standardAdapterPath = Join-Path $RepositoryRoot 'config/standard-v1.json'
+    $standardSkillsRoot = Join-Path $RepositoryRoot 'skills'
+    if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) {
+        throw 'Bootstrap transition requires the current catalog/skills-catalog.json fixture.'
+    }
+    if ((Test-Path -LiteralPath $legacySourcePath -PathType Leaf) -or
+        (Test-Path -LiteralPath $standardAdapterPath -PathType Leaf) -or
+        (Test-Path -LiteralPath $standardSkillsRoot -PathType Container)) {
+        throw 'Bootstrap transition is valid only before the Standard v1 source inventory, adapter, or skills/ root is promoted.'
+    }
+
+    $catalog = Read-StrictJson -Path $catalogPath
+    Assert-ExactPropertySet -Value $catalog -Expected @('schemaVersion', 'catalogId', 'sources', 'profiles', 'skills') -Context 'catalog/skills-catalog.json'
+    if (($catalog.schemaVersion -isnot [int] -and $catalog.schemaVersion -isnot [long]) -or [int64]$catalog.schemaVersion -ne 1) {
+        throw 'catalog/skills-catalog.json schemaVersion must be integer 1.'
+    }
+    if ($catalog.catalogId -isnot [string] -or [string]$catalog.catalogId -cne 'darktide-translate') {
+        throw 'catalog/skills-catalog.json catalogId must be exact string darktide-translate.'
+    }
+    if ($catalog.sources -isnot [array] -or @($catalog.sources).Count -ne 1) {
+        throw 'Bootstrap catalog must contain exactly one source.'
+    }
+    $source = @($catalog.sources)[0]
+    Assert-ExactPropertySet -Value $source -Expected @('id', 'repository') -Context 'catalog/skills-catalog.json source'
+    if ($source.id -cne 'darktide-translate' -or
+        $source.repository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git') {
+        throw 'Bootstrap catalog source identity is invalid.'
+    }
+    if ($catalog.profiles -isnot [array] -or @($catalog.profiles).Count -ne 1) {
+        throw 'Bootstrap catalog must contain exactly one profile.'
+    }
+    $profile = @($catalog.profiles)[0]
+    Assert-ExactPropertySet -Value $profile -Expected @('id', 'description', 'default', 'includes', 'excludes') -Context 'catalog/skills-catalog.json profile'
+    if ($profile.id -cne 'darktide-mod-maintenance' -or $profile.default -ne $false -or
+        @($profile.includes) -join "`n" -cne 'auto-update-darktide-mod' -or @($profile.excludes).Count -ne 0) {
+        throw 'Bootstrap catalog profile identity is invalid.'
+    }
+    if ($catalog.skills -isnot [array] -or @($catalog.skills).Count -ne 1) {
+        throw 'Bootstrap catalog must contain exactly one Skill.'
+    }
+
+    $skill = @($catalog.skills)[0]
+    Assert-ExactPropertySet -Value $skill -Expected @('id', 'group', 'source', 'profiles', 'compatibility', 'dependencies', 'lifecycle') -Context 'catalog/skills-catalog.json Skill'
+    if ($skill.id -cne 'auto-update-darktide-mod' -or $skill.group -cne 'darktide-mod-maintenance' -or
+        @($skill.profiles) -join "`n" -cne 'darktide-mod-maintenance' -or @($skill.dependencies).Count -ne 0) {
+        throw 'Bootstrap catalog Skill identity is invalid.'
+    }
+    Assert-ExactPropertySet -Value $skill.source -Expected @('sourceId', 'path') -Context 'catalog/skills-catalog.json Skill source'
+    if ($skill.source.sourceId -cne 'darktide-translate' -or
+        $skill.source.path -cne '.agents/skills/auto-update-darktide-mod') {
+        throw 'Bootstrap catalog Skill source path is invalid.'
+    }
+    Assert-ExactPropertySet -Value $skill.lifecycle -Expected @('status', 'aliases') -Context 'catalog/skills-catalog.json Skill lifecycle'
+    if ($skill.lifecycle.status -cne 'active' -or @($skill.lifecycle.aliases).Count -ne 0) {
+        throw 'Bootstrap catalog Skill lifecycle is invalid.'
+    }
+    Assert-ExactPropertySet -Value $skill.compatibility -Expected @('platforms', 'shells', 'requiredCapabilities', 'anyOfCapabilities') -Context 'catalog/skills-catalog.json Skill compatibility'
+    if (@($skill.compatibility.platforms) -notcontains 'windows' -or
+        @($skill.compatibility.shells) -notcontains 'pwsh>=7') {
+        throw 'Bootstrap catalog Skill platform compatibility is invalid.'
+    }
+
+    $skillsRootRelative = '.agents/skills'
+    $skillsRoot = Join-Path $RepositoryRoot $skillsRootRelative.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    if (-not (Test-Path -LiteralPath $skillsRoot -PathType Container)) {
+        throw 'Bootstrap .agents/skills package root is missing.'
+    }
+    $skillsRootItem = Get-Item -LiteralPath $skillsRoot -Force
+    if (($skillsRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Bootstrap .agents/skills package root must be a regular non-reparse directory.'
+    }
+    $rootEntries = @(Get-ChildItem -LiteralPath $skillsRoot -Force)
+    foreach ($entry in $rootEntries) {
+        if (-not $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Bootstrap .agents/skills root contains a non-package or reparse entry '$($entry.Name)'."
+        }
+    }
+    $actualSkillIds = @($rootEntries | ForEach-Object { [string]$_.Name })
+    if ($actualSkillIds.Count -ne 1 -or $actualSkillIds[0] -cne 'auto-update-darktide-mod') {
+        throw 'Bootstrap .agents/skills inventory does not exactly match the catalog.'
+    }
+
+    $skillRoot = Join-Path $skillsRoot 'auto-update-darktide-mod'
+    $skillFile = Join-Path $skillRoot 'SKILL.md'
+    $metadataFile = Join-Path $skillRoot 'agents/openai.yaml'
+    foreach ($requiredPath in @($skillFile, $metadataFile)) {
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw "Bootstrap Skill is missing '$requiredPath'."
+        }
+    }
+    [void](Read-SkillFrontmatter -Path $skillFile -ExpectedSkillId 'auto-update-darktide-mod')
+    [void](Assert-BootstrapOpenAiMetadata -Path $metadataFile -ExpectedSkillId 'auto-update-darktide-mod')
+    $package = Get-ContentInventory -RepositoryRoot $RepositoryRoot -SkillId 'auto-update-darktide-mod' -SkillsRoot $skillsRootRelative -NoFilters:$NoFilters
+    $result = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        validationMode = 'bootstrap-transition'
+        catalogId = 'darktide-translate'
+        skillsRoot = $skillsRootRelative
+        activeSkillCount = 1
+        skills = @($package)
+        result = 'passed'
+    }
+    return Write-RepositoryValidationResult -Result $result -OutputPath $OutputPath -SuccessMessage 'Darktide Translate bootstrap transition repository validation passed.'
+}
+
+if ([string]::IsNullOrWhiteSpace($script:TrustedGitPath)) {
     $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
     $script:TrustedGitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
 }
@@ -586,7 +761,7 @@ if (-not (Test-Path -LiteralPath $script:TrustedGitPath -PathType Leaf)) {
     throw "Trusted Git executable is missing: $($script:TrustedGitPath)"
 }
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
-    if ($null -eq $script:TrustedStatPath) {
+    if ([string]::IsNullOrWhiteSpace($script:TrustedStatPath)) {
         $statCommand = Get-Command stat -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $script:TrustedStatPath = [IO.Path]::GetFullPath([string]$statCommand.Path)
     }
@@ -600,7 +775,17 @@ $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
 }
 else { [IO.Path]::GetFullPath($RepositoryRoot) }
 
+if ($BootstrapTransition) {
+    return Invoke-BootstrapTransitionRepositoryValidation `
+        -RepositoryRoot $repoRoot `
+        -OutputPath $OutputPath `
+        -NoFilters:$NoFilters
+}
+
 $sourcePath = Join-Path $repoRoot 'catalog/source.json'
+if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+    throw 'Standard v1 source inventory is missing; use -BootstrapTransition only for the explicit current-layout promotion.'
+}
 $inventory = Read-StrictJson -Path $sourcePath
 Assert-ExactPropertySet -Value $inventory -Expected @('schemaVersion', 'sourceId', 'repository', 'skillsRoot', 'skills') -Context 'catalog/source.json'
 if (($inventory.schemaVersion -isnot [int] -and $inventory.schemaVersion -isnot [long]) -or [int64]$inventory.schemaVersion -ne 2) {
@@ -930,12 +1115,7 @@ $result = [pscustomobject][ordered]@{
     skills = $packages
     result = 'passed'
 }
-$json = $result | ConvertTo-Json -Depth 20
-if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
-    $outputFullPath = [IO.Path]::GetFullPath($OutputPath)
-    $outputDirectory = Split-Path -Parent $outputFullPath
-    if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) { [void](New-Item -ItemType Directory -Path $outputDirectory -Force) }
-    [IO.File]::WriteAllText($outputFullPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-}
-Write-Host "Darktide Translate repository validation passed: $($skillIds.Count) active Skills."
-$json
+Write-RepositoryValidationResult `
+    -Result $result `
+    -OutputPath $OutputPath `
+    -SuccessMessage "Darktide Translate repository validation passed: $($skillIds.Count) active Skills."
