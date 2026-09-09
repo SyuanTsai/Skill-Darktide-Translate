@@ -229,12 +229,16 @@ jobs:
             echo 'The runner cgroup v2 hierarchy does not expose the memory controller.' >&2
             exit 1
           fi
+          if [[ ! " $controllers " =~ [[:space:]]cpu[[:space:]] ]]; then
+            echo 'The runner cgroup v2 hierarchy does not expose the CPU controller.' >&2
+            exit 1
+          fi
           root_subtree_control='/sys/fs/cgroup/cgroup.subtree_control'
           if [[ ! -e "$root_subtree_control" ]]; then
             echo 'The runner cgroup v2 hierarchy does not expose a root subtree control file.' >&2
             exit 1
           fi
-          root_controllers_to_enable='+memory'
+          root_controllers_to_enable='+cpu +memory'
           if [[ " $controllers " =~ [[:space:]]pids[[:space:]] ]]; then
             root_controllers_to_enable+=' +pids'
           fi
@@ -252,7 +256,7 @@ jobs:
           sudo -n mkdir -- "$cgroup_parent"
           sudo -n chown "$(id -u):$(id -g)" -- "$cgroup_parent"
           sudo -n chmod 0755 -- "$cgroup_parent"
-          controllers_to_enable='+memory'
+          controllers_to_enable='+cpu +memory'
           if [[ " $controllers " =~ [[:space:]]pids[[:space:]] ]]; then
             controllers_to_enable+=' +pids'
           fi
@@ -264,8 +268,8 @@ jobs:
             sudo -n chown "$(id -u):$(id -g)" -- "$delegation_file"
           done
           delegated_controls="$(< "$cgroup_parent/cgroup.subtree_control")"
-          if [[ ! " $delegated_controls " =~ [[:space:]]memory[[:space:]] ]]; then
-            echo 'The delegated cgroup root did not enable the memory controller.' >&2
+          if [[ ! " $delegated_controls " =~ [[:space:]]memory[[:space:]] || ! " $delegated_controls " =~ [[:space:]]cpu[[:space:]] ]]; then
+            echo 'The delegated cgroup root did not enable the memory and CPU controllers.' >&2
             exit 1
           fi
           if [[ ! -w "$cgroup_parent" ]]; then

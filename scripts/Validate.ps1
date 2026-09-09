@@ -340,6 +340,7 @@ function Assert-LinuxAggregateResourceUsage {
         [Parameter(Mandatory = $true)][int] $RootProcessId,
         [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $ProcessGroupId = 0,
         [Parameter(Mandatory = $true)][int64] $ClockTicksPerSecond,
+        [Parameter()][AllowNull()][string] $CgroupPath,
         [Parameter(Mandatory = $true)][string] $Context
     )
     $candidateIds = [Collections.Generic.HashSet[int]]::new()
@@ -364,6 +365,28 @@ function Assert-LinuxAggregateResourceUsage {
     if ($candidateIds.Count -gt 256) { throw "$Context exceeded the aggregate Linux process-count limit of 256." }
     if ($memoryBytes -gt 2147483648) { throw "$Context exceeded the aggregate Linux resident-memory limit of 2147483648 bytes." }
     if ($cpuTicks -gt ([int64]300 * $ClockTicksPerSecond)) { throw "$Context exceeded the aggregate Linux CPU limit of 300 seconds." }
+    if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
+        $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $CgroupPath -Context $Context
+        if ($cgroupCpuMicroseconds -gt [int64]300000000) {
+            throw "$Context exceeded the kernel-accounted Linux cgroup CPU limit of 300 seconds."
+        }
+    }
+}
+
+function Get-LinuxCgroupCpuUsage {
+    param(
+        [Parameter(Mandatory = $true)][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $cpuStatPath = Join-Path $CgroupPath 'cpu.stat'
+    if (-not (Test-Path -LiteralPath $cpuStatPath -PathType Leaf)) {
+        throw "$Context requires kernel-maintained Linux cgroup CPU accounting."
+    }
+    $cpuStat = [IO.File]::ReadAllText($cpuStatPath)
+    if ($cpuStat -notmatch '(?m)^usage_usec\s+(?<microseconds>[0-9]+)\s*$') {
+        throw "$Context received an invalid Linux cgroup cpu.stat usage_usec record."
+    }
+    return [int64]$Matches['microseconds']
 }
 
 function Get-LinuxPesterCgroupRoot {
@@ -392,12 +415,14 @@ function Get-LinuxPesterCgroupRoot {
         throw 'Protected Pester delegated root is not a Linux cgroup v2 hierarchy.'
     }
     $controllers = [IO.File]::ReadAllText($controllersPath)
-    if ($controllers -notmatch '(^|\s)memory(\s|$)') {
-        throw 'Protected Pester delegated Linux cgroup root does not expose the memory controller.'
+    if ($controllers -notmatch '(^|\s)memory(\s|$)' -or
+        $controllers -notmatch '(^|\s)cpu(\s|$)') {
+        throw 'Protected Pester delegated Linux cgroup root does not expose the memory and CPU controllers.'
     }
     $subtreeControl = [IO.File]::ReadAllText($subtreeControlPath)
-    if ($subtreeControl -notmatch '(^|\s)memory(\s|$)') {
-        throw 'Protected Pester delegated Linux cgroup root has not enabled the memory controller for children.'
+    if ($subtreeControl -notmatch '(^|\s)memory(\s|$)' -or
+        $subtreeControl -notmatch '(^|\s)cpu(\s|$)') {
+        throw 'Protected Pester delegated Linux cgroup root has not enabled the memory and CPU controllers for children.'
     }
     $relativeRoot = $rootPath.Substring('/sys/fs/cgroup'.Length)
     $currentCgroup = [IO.File]::ReadAllText("/proc/$PID/cgroup")
@@ -414,11 +439,12 @@ function New-LinuxPesterCgroup {
     $controllersPath = Join-Path $cgroupRoot 'cgroup.controllers'
     if (-not (Test-Path -LiteralPath $cgroupRoot -PathType Container) -or
         -not (Test-Path -LiteralPath $controllersPath -PathType Leaf)) {
-        throw "$Context requires a writable Linux cgroup v2 hierarchy with the memory controller."
+        throw "$Context requires a writable Linux cgroup v2 hierarchy with the memory and CPU controllers."
     }
     $controllers = [IO.File]::ReadAllText($controllersPath)
-    if ($controllers -notmatch '(^|\s)memory(\s|$)') {
-        throw "$Context requires the Linux cgroup v2 memory controller."
+    if ($controllers -notmatch '(^|\s)memory(\s|$)' -or
+        $controllers -notmatch '(^|\s)cpu(\s|$)') {
+        throw "$Context requires the Linux cgroup v2 memory and CPU controllers."
     }
     $cgroupPath = Join-Path $cgroupRoot ("codex-validation-pester-{0}" -f [guid]::NewGuid().ToString('N'))
     try {
@@ -433,6 +459,7 @@ function New-LinuxPesterCgroup {
         if ($memoryMax -cne '2147483648') {
             throw "The Linux Pester cgroup memory.max is '$memoryMax', not the required hard limit."
         }
+        [void](Get-LinuxCgroupCpuUsage -CgroupPath $cgroupPath -Context "$Context cgroup")
         $pidsMaxPath = Join-Path $cgroupPath 'pids.max'
         if (Test-Path -LiteralPath $pidsMaxPath -PathType Leaf) {
             [IO.File]::WriteAllText($pidsMaxPath, '256')
@@ -2953,7 +2980,7 @@ function Invoke-BootstrapTransitionValidation {
         processGroup = if ($script:IsWindowsHost) { 'windows-job-object' } else { 'linux-pid-namespace-and-process-group' }
         restrictedExecution = if ($script:IsWindowsHost) { 'restricted-token' } else { 'setpriv-no-new-privs' }
         integrityLevel = if ($script:IsWindowsHost) { 'low' } else { 'unprivileged' }
-        resourceLimits = if ($script:IsWindowsHost) { 'job-active-process-256-cpu-300s-memory-2GiB' } else { 'prlimit-nproc-256-cpu-300s-address-2GiB' }
+        resourceLimits = if ($script:IsWindowsHost) { 'job-active-process-256-cpu-300s-memory-2GiB' } else { 'cgroup-cpu-accounting-300s-memory-2GiB+aggregate-process-256+prlimit-address-2GiB' }
         commandFileBoundary = 'passed'
         networkProfile = 'offline'
         probe = 'passed'
@@ -3495,7 +3522,7 @@ do
     "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
 done
 "$find_path" "$sandbox_root/dev" -xdev -type s -exec "$mount_path" --bind /dev/null '{}' \; 2>/dev/null || true
-"$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" "$@"
+exec "$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" "$@"
 '@
                 $networkNamespaceArguments = if ($NetworkProfile -ceq 'Offline') { @('--net') } else { @() }
                 $linuxMountArguments = @(
@@ -4242,6 +4269,7 @@ function Invoke-ProtectedPesterRunspace {
                 Assert-LinuxAggregateResourceUsage `
                     -RootProcessId $serverProcessInstance.Process.Id `
                     -ClockTicksPerSecond $linuxClockTicksPerSecond `
+                    -CgroupPath $linuxPesterCgroupPath `
                     -Context 'Protected Pester remote pipeline'
             }
             Start-Sleep -Milliseconds 50
