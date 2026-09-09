@@ -84,7 +84,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
-          $trackedPsOutput = [string]((& $gitPath ls-files -z -- '*.ps1') -join '')
+          $trackedPsOutput = [string]((& $gitPath ls-files -z -- '*.ps1' '*.psm1') -join '')
           if ($LASTEXITCODE -ne 0) { throw 'Git failed while enumerating candidate PowerShell trust-anchor files.' }
           $trackedPsFiles = @($trackedPsOutput.Split([char]0) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
           foreach ($relativePath in $trackedPsFiles) {
@@ -124,6 +124,8 @@ jobs:
     outputs:
       evidence_base64: ${{ steps.export-evidence.outputs.evidence_base64 }}
       evidence_sha256: ${{ steps.export-evidence.outputs.evidence_sha256 }}
+      diagnostics_base64: ${{ steps.export-diagnostics.outputs.diagnostics_base64 }}
+      diagnostics_sha256: ${{ steps.export-diagnostics.outputs.diagnostics_sha256 }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout immutable candidate
@@ -180,7 +182,7 @@ jobs:
               throw "Git could not materialize the protected supervisor '$($file.RelativePath)': $stderr"
             }
             $item = Get-Item -LiteralPath $destination -Force
-            if (-not $item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
               throw "Protected supervisor file '$($file.RelativePath)' is a reparse point."
             }
           }
@@ -244,7 +246,23 @@ jobs:
           }
           $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
           $trustedValidator = Join-Path $env:TRUSTED_SUPERVISOR_ROOT 'scripts/Validate.ps1'
-          & $trustedValidator -RepositoryRoot (Get-Location).Path -ArtifactsRoot $env:RUNNER_TEMP -BaseCommit $baseCommit -ExpectedGoRuntimeVersion $env:STANDARD_GO_RUNTIME_VERSION -OutputPath $outputPath
+          $validatorArguments = @(
+            '-RepositoryRoot', (Get-Location).Path,
+            '-ArtifactsRoot', $env:RUNNER_TEMP,
+            '-BaseCommit', $baseCommit,
+            '-ExpectedGoRuntimeVersion', $env:STANDARD_GO_RUNTIME_VERSION,
+            '-OutputPath', $outputPath
+          )
+          $isBootstrapTransition =
+            (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'catalog/skills-catalog.json') -PathType Leaf) -and
+            (-not (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'catalog/source.json') -PathType Leaf)) -and
+            (-not (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'config/standard-v1.json') -PathType Leaf))
+          if ($isBootstrapTransition) {
+            # The trusted validator rechecks the exact current-layout fixture and
+            # refuses a mixed or post-migration tree before producing evidence.
+            $validatorArguments += '-BootstrapTransition'
+          }
+          & $trustedValidator @validatorArguments
 
       - name: Verify canonical validation evidence
         if: ${{ success() }}
@@ -284,6 +302,33 @@ jobs:
           $githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
           [IO.File]::AppendAllText($githubOutputPath, "evidence_base64=$evidenceBase64$([Environment]::NewLine)evidence_sha256=$evidenceSha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
 
+      - name: Export bounded validation diagnostics for clean upload
+        id: export-diagnostics
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
+          $summaryPaths = @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory -Filter 'sgv1-*' -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'security-preflight-summary.json' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+          if ($summaryPaths.Count -eq 0) {
+            [IO.File]::AppendAllText($outputPath, "diagnostics_base64=$([Environment]::NewLine)diagnostics_sha256=$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+            exit 0
+          }
+          if ($summaryPaths.Count -ne 1) { throw 'Expected exactly one bounded validation diagnostics summary.' }
+          $summaryPath = [IO.Path]::GetFullPath([string]$summaryPaths[0])
+          $summaryItem = Get-Item -LiteralPath $summaryPath -Force
+          if ($summaryItem.PSIsContainer -or ($summaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Validation diagnostics must be a regular non-reparse file before export.'
+          }
+          if ($summaryItem.Length -gt 524288) { throw 'Validation diagnostics exceed the 512 KiB export limit.' }
+          $bytes = [IO.File]::ReadAllBytes($summaryPath)
+          $base64 = [Convert]::ToBase64String($bytes)
+          if ($base64.Length -gt 800000) { throw 'Validation diagnostics exceed the GitHub output transport limit.' }
+          $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $summaryPath).Hash.ToLowerInvariant()
+          [IO.File]::AppendAllText($outputPath, "diagnostics_base64=$base64$([Environment]::NewLine)diagnostics_sha256=$sha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+
   upload-canonical-validation-evidence:
     name: upload canonical validation evidence
     if: ${{ needs['canonical-validation'].result == 'success' && needs['canonical-validation'].outputs.evidence_base64 != '' }}
@@ -321,6 +366,46 @@ jobs:
         with:
           name: darktide-translate-standard-v1-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: canonical-validation-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
+  upload-validation-diagnostics:
+    name: upload bounded validation diagnostics
+    if: ${{ always() && needs['canonical-validation'].result == 'failure' && needs['canonical-validation'].outputs.diagnostics_base64 != '' }}
+    needs:
+      - canonical-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Materialize bounded validation diagnostics
+        shell: bash
+        env:
+          DIAGNOSTICS_BASE64: ${{ needs['canonical-validation'].outputs.diagnostics_base64 }}
+          EXPECTED_SHA256: ${{ needs['canonical-validation'].outputs.diagnostics_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'Validation diagnostics SHA-256 output is invalid.' >&2
+            exit 1
+          fi
+          if (( ${#DIAGNOSTICS_BASE64} > 800000 )); then
+            echo 'Validation diagnostics exceed the clean-job transport limit.' >&2
+            exit 1
+          fi
+          printf '%s' "$DIAGNOSTICS_BASE64" | base64 --decode > security-preflight-summary.json
+          actual_sha256="$(sha256sum security-preflight-summary.json | cut -d' ' -f1)"
+          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
+            echo 'Validation diagnostics failed clean-job hash verification.' >&2
+            exit 1
+          fi
+          test -s security-preflight-summary.json
+
+      - name: Upload bounded validation diagnostics
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: darktide-translate-standard-v1-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: security-preflight-summary.json
           if-no-files-found: error
           retention-days: 14
 
