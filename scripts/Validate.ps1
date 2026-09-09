@@ -958,6 +958,8 @@ namespace Codex.Validation {
         private const uint TokenAdjustDefault = 0x00000080;
         private const int TokenIsRestricted = 40;
         private const int TokenIntegrityLevel = 25;
+        private const int TokenPrimary = 1;
+        private const int SecurityImpersonation = 2;
         private const uint DisableMaxPrivilege = 0x00000001;
         private const uint SeGroupIntegrity = 0x00000020;
 
@@ -1065,6 +1067,16 @@ namespace Codex.Validation {
             IntPtr privilegesToDelete,
             uint restrictedSidCount,
             IntPtr sidsToRestrict,
+            out IntPtr newTokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DuplicateTokenEx(
+            IntPtr existingTokenHandle,
+            uint desiredAccess,
+            IntPtr tokenAttributes,
+            int impersonationLevel,
+            int tokenType,
             out IntPtr newTokenHandle);
 
         [DllImport("advapi32.dll", SetLastError = true)]
@@ -1205,10 +1217,24 @@ namespace Codex.Validation {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation(TokenIsRestricted) failed.");
                 }
                 if (isRestricted != 0) {
-                    SetLowIntegrityLevel(sourceToken);
-                    IntPtr existingRestrictedToken = sourceToken;
-                    sourceToken = IntPtr.Zero;
-                    return existingRestrictedToken;
+                    IntPtr duplicatedRestrictedToken;
+                    if (!DuplicateTokenEx(
+                        sourceToken,
+                        TokenAssignPrimary | TokenDuplicate | TokenQuery | TokenAdjustDefault,
+                        IntPtr.Zero,
+                        SecurityImpersonation,
+                        TokenPrimary,
+                        out duplicatedRestrictedToken)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "DuplicateTokenEx failed.");
+                    }
+                    try {
+                        SetLowIntegrityLevel(duplicatedRestrictedToken);
+                        return duplicatedRestrictedToken;
+                    }
+                    catch {
+                        CloseHandle(duplicatedRestrictedToken);
+                        throw;
+                    }
                 }
                 IntPtr restrictedToken;
                 if (!CreateRestrictedToken(
@@ -3122,15 +3148,24 @@ do
     target="$sandbox_root$system_root"
     mkdir -p "$target"
     if [ -d "$system_root" ]; then
-        "$mount_path" --rbind "$system_root" "$target"
-        "$mount_path" --make-rslave "$target"
-        if [ "$system_root" = "/etc" ] && [ -e "$system_root/resolv.conf" ]; then
+        if [ "$system_root" = "/etc" ]; then
+            # Do not rbind the host /etc and then unlink its resolv.conf
+            # mountpoint. Build a private snapshot first so every mutation
+            # remains inside the namespace-owned tmpfs.
+            "$mount_path" -t tmpfs -o size=67108864,nodev,nosuid,noexec tmpfs "$target"
+            /bin/cp -a -- "$system_root/." "$target/"
             rm -f "$target/resolv.conf"
-            : > "$target/resolv.conf"
-            "$mount_path" --bind "$system_root/resolv.conf" "$target/resolv.conf"
-            "$mount_path" -o remount,bind,ro "$target/resolv.conf"
+            if [ -e "$system_root/resolv.conf" ]; then
+                /bin/cat -- "$system_root/resolv.conf" > "$target/resolv.conf"
+            else
+                : > "$target/resolv.conf"
+            fi
+            "$mount_path" -o remount,bind,ro "$target"
+        else
+            "$mount_path" --rbind "$system_root" "$target"
+            "$mount_path" --make-rslave "$target"
+            "$mount_path" -o remount,bind,ro "$target"
         fi
-        "$mount_path" -o remount,bind,ro "$target"
     fi
 done
 mkdir -p "$sandbox_root$run_root"
@@ -4050,14 +4085,32 @@ $loadedPester = Get-Module Pester | Select-Object -First 1
 if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPesterVersion) {
     throw 'The exact frozen Pester module was not imported in the isolated test process.'
 }
-$result = Invoke-Pester -Path $testsRoot -PassThru
+$requiredPesterTests = @(
+    'BootstrapTransition.Tests.ps1'
+    'LocalizationWorkset.Tests.ps1'
+    'ModUpdateAutomation.Tests.ps1'
+    'RepositoryContract.Tests.ps1'
+    'RepositoryValidation.Tests.ps1'
+    'Schema15Coordination.Tests.ps1'
+    'Schema15SourceAcquisition.Tests.ps1'
+    'SkillContract.Tests.ps1'
+    'SourcePin.Tests.ps1'
+)
+$requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
+    $testPath = Join-Path $testsRoot $_
+    $testItem = Get-Item -LiteralPath $testPath -Force -ErrorAction Stop
+    if ($testItem.PSIsContainer -or ($testItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Required Pester test is not a regular non-reparse file: $testPath"
+    }
+    [IO.Path]::GetFullPath($testPath)
+})
+$result = Invoke-Pester -Path $requiredPesterPaths -PassThru
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
     [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
     throw 'Pester repository regression did not complete successfully.'
 }
 
-$requiredPesterTests = @()
 $completionPayload = [ordered]@{
     result = 'passed'
     pesterVersion = [string]$loadedPester.Version
@@ -4219,7 +4272,17 @@ if (@($expectedCompletionProperties | Where-Object { $actualCompletionProperties
     $actualCompletionProperties.Count -ne $expectedCompletionProperties.Count) {
     throw 'The isolated Pester completion payload has an invalid property set.'
 }
-$requiredPesterTests = @()
+$requiredPesterTests = @(
+    'BootstrapTransition.Tests.ps1'
+    'LocalizationWorkset.Tests.ps1'
+    'ModUpdateAutomation.Tests.ps1'
+    'RepositoryContract.Tests.ps1'
+    'RepositoryValidation.Tests.ps1'
+    'Schema15Coordination.Tests.ps1'
+    'Schema15SourceAcquisition.Tests.ps1'
+    'SkillContract.Tests.ps1'
+    'SourcePin.Tests.ps1'
+)
 if ($completion.result -isnot [string] -or $completion.result -cne 'passed' -or
     $completion.pesterVersion -isnot [string] -or $completion.pesterVersion -cne $ExpectedPesterVersion -or
     $completion.totalCount -isnot [int64] -or $completion.passedCount -isnot [int64] -or
@@ -4228,7 +4291,14 @@ if ($completion.result -isnot [string] -or $completion.result -cne 'passed' -or
     throw 'The isolated Pester completion payload contains invalid typed result fields.'
 }
 $requiredTests = @($completion.requiredTests)
-if ($requiredTests.Count -ne $requiredPesterTests.Count) {
+if ($requiredTests.Count -ne $requiredPesterTests.Count -or
+    @(
+        for ($requiredTestIndex = 0; $requiredTestIndex -lt $requiredPesterTests.Count; $requiredTestIndex++) {
+            if ([string]$requiredTests[$requiredTestIndex] -cne [string]$requiredPesterTests[$requiredTestIndex]) {
+                $requiredTestIndex
+            }
+        }
+    ).Count -gt 0) {
     throw 'The isolated Pester completion payload contains an unexpected required-test set.'
 }
 if ([int64]$completion.totalCount -le 0 -or [int64]$completion.failedCount -ne 0 -or

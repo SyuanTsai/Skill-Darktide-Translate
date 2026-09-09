@@ -79,7 +79,20 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'TokenIntegrityLevel'
         $supervisor | Should -Match 'SetTokenInformation'
         $supervisor | Should -Match 'SetLowIntegrityKernelObject'
+        $supervisor | Should -Match 'CreateRestrictedToken'
         $supervisor | Should -Match 'Set-WindowsLowIntegrityDirectory'
         $supervisor | Should -Match "'/setintegritylevel'"
+    }
+
+    It 'UnitT70_PinsTheTrustedPesterRegressionInventory' {
+        # Scenario: Candidate code removes a protected regression file before the isolated run.
+        # Purpose: Require the base-owned supervisor to invoke a fixed, non-empty test inventory.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+
+        $supervisor | Should -Match "'BootstrapTransition\.Tests\.ps1'"
+        $supervisor | Should -Match "'RepositoryValidation\.Tests\.ps1'"
+        $supervisor | Should -Match '\$requiredPesterPaths'
+        $supervisor | Should -Match 'Invoke-Pester -Path \$requiredPesterPaths'
+        $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
     }
 }
