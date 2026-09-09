@@ -121,6 +121,7 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\[switch\] \$DirectWindowsProcess'
         $supervisor | Should -Match 'if \(\$DirectWindowsProcess\)'
         $supervisor | Should -Match '-DirectWindowsProcess'
+        $supervisor | Should -Match 'if \(\$script:IsWindowsHost -and -not \$DirectWindowsProcess\)'
         $supervisor | Should -Match '\[ ! -e "\$target" \]'
         $supervisor | Should -Not -Match '\$pesterSupervisorPath'
     }

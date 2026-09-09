@@ -3463,7 +3463,7 @@ finally {
                 $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $nativeArguments
             }
             $startInfo.WorkingDirectory = [string](Get-Location).Path
-            if ($script:IsWindowsHost) {
+            if ($script:IsWindowsHost -and -not $DirectWindowsProcess) {
                 $startInfo.EnvironmentVariables['CODEX_VALIDATION_NATIVE_PAYLOAD'] = $payloadEncoded
                 $startInfo.EnvironmentVariables['CODEX_VALIDATION_RESUME_EVENT'] = $eventName
                 $startInfo.EnvironmentVariables['CODEX_VALIDATION_HAS_STANDARD_INPUT'] = if ($PSBoundParameters.ContainsKey('StandardInput')) { '1' } else { '0' }
