@@ -572,6 +572,24 @@ namespace Codex.Validation {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
 
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string stringSecurityDescriptor,
+            uint stringSDRevision,
+            out IntPtr securityDescriptor,
+            out uint securityDescriptorSize);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetKernelObjectSecurity(
+            IntPtr handle,
+            uint securityInformation,
+            IntPtr securityDescriptor);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr handle);
+
         public static IntPtr CreateKillOnCloseJob() {
             IntPtr jobHandle = CreateJobObject(IntPtr.Zero, null);
             if (jobHandle == IntPtr.Zero) {
@@ -637,6 +655,30 @@ namespace Codex.Validation {
 
         public static bool Close(IntPtr handle) {
             return CloseHandle(handle);
+        }
+
+        public static bool SetLowIntegrityKernelObject(IntPtr handle) {
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) {
+                return false;
+            }
+            IntPtr securityDescriptor = IntPtr.Zero;
+            uint securityDescriptorSize;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                "S:(ML;;NW;;;LW)",
+                1,
+                out securityDescriptor,
+                out securityDescriptorSize)) {
+                return false;
+            }
+            try {
+                const uint LabelSecurityInformation = 0x00000010;
+                return SetKernelObjectSecurity(handle, LabelSecurityInformation, securityDescriptor);
+            }
+            finally {
+                if (securityDescriptor != IntPtr.Zero) {
+                    LocalFree(securityDescriptor);
+                }
+            }
         }
     }
 }
@@ -913,8 +955,11 @@ namespace Codex.Validation {
         private const uint TokenAssignPrimary = 0x00000001;
         private const uint TokenDuplicate = 0x00000002;
         private const uint TokenQuery = 0x00000008;
+        private const uint TokenAdjustDefault = 0x00000080;
         private const int TokenIsRestricted = 40;
+        private const int TokenIntegrityLevel = 25;
         private const uint DisableMaxPrivilege = 0x00000001;
+        private const uint SeGroupIntegrity = 0x00000020;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct SecurityAttributes {
@@ -957,6 +1002,17 @@ namespace Codex.Validation {
             public IntPtr ThreadHandle;
             public int ProcessId;
             public int ThreadId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SidAndAttributes {
+            public IntPtr Sid;
+            public uint Attributes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TokenMandatoryLabel {
+            public SidAndAttributes Label;
         }
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -1022,6 +1078,23 @@ namespace Codex.Validation {
 
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertStringSidToSidW(
+            string stringSid,
+            out IntPtr sid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern uint GetLengthSid(IntPtr sid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetTokenInformation(
+            IntPtr tokenHandle,
+            int tokenInformationClass,
+            IntPtr tokenInformation,
+            int tokenInformationLength);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CreateProcessAsUserW(
             IntPtr token,
             string applicationName,
@@ -1073,11 +1146,50 @@ namespace Codex.Validation {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr handle);
+
+        private static void SetLowIntegrityLevel(IntPtr tokenHandle) {
+            IntPtr integritySid = IntPtr.Zero;
+            IntPtr labelBuffer = IntPtr.Zero;
+            if (!ConvertStringSidToSidW("S-1-16-4096", out integritySid)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "ConvertStringSidToSidW failed.");
+            }
+            try {
+                uint sidLength = GetLengthSid(integritySid);
+                if (sidLength == 0) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetLengthSid failed.");
+                }
+                int labelLength = Marshal.SizeOf(typeof(TokenMandatoryLabel));
+                int informationLength = checked(labelLength + (int)sidLength);
+                labelBuffer = Marshal.AllocHGlobal(informationLength);
+                TokenMandatoryLabel label = new TokenMandatoryLabel();
+                label.Label.Sid = integritySid;
+                label.Label.Attributes = SeGroupIntegrity;
+                Marshal.StructureToPtr(label, labelBuffer, false);
+                if (!SetTokenInformation(
+                    tokenHandle,
+                    TokenIntegrityLevel,
+                    labelBuffer,
+                    informationLength)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "SetTokenInformation(TokenIntegrityLevel) failed.");
+                }
+            }
+            finally {
+                if (labelBuffer != IntPtr.Zero) {
+                    Marshal.FreeHGlobal(labelBuffer);
+                }
+                if (integritySid != IntPtr.Zero) {
+                    LocalFree(integritySid);
+                }
+            }
+        }
+
         private static IntPtr CreateRestrictedPrimaryToken() {
             IntPtr sourceToken = IntPtr.Zero;
             if (!OpenProcessToken(
                 GetCurrentProcess(),
-                TokenAssignPrimary | TokenDuplicate | TokenQuery,
+                TokenAssignPrimary | TokenDuplicate | TokenQuery | TokenAdjustDefault,
                 out sourceToken)) {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken failed.");
             }
@@ -1093,6 +1205,7 @@ namespace Codex.Validation {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation(TokenIsRestricted) failed.");
                 }
                 if (isRestricted != 0) {
+                    SetLowIntegrityLevel(sourceToken);
                     IntPtr existingRestrictedToken = sourceToken;
                     sourceToken = IntPtr.Zero;
                     return existingRestrictedToken;
@@ -1110,7 +1223,14 @@ namespace Codex.Validation {
                     out restrictedToken)) {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateRestrictedToken failed.");
                 }
-                return restrictedToken;
+                try {
+                    SetLowIntegrityLevel(restrictedToken);
+                    return restrictedToken;
+                }
+                catch {
+                    CloseHandle(restrictedToken);
+                    throw;
+                }
             }
             finally {
                 CloseHandle(sourceToken);
@@ -2185,6 +2305,61 @@ function Assert-ExternalReceiptFile {
     return $path
 }
 
+function Set-WindowsLowIntegrityDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+    if (-not $script:IsWindowsHost) {
+        return
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Windows low-integrity boundary path must be a regular non-reparse directory: $fullPath"
+    }
+    Assert-NoReparseAncestors -Path $fullPath -Context 'Windows low-integrity boundary directory'
+    $icaclsCommand = Get-Command icacls.exe -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1
+    $icaclsPath = [IO.Path]::GetFullPath([string]$icaclsCommand.Path)
+    if (-not (Test-Path -LiteralPath $icaclsPath -PathType Leaf)) {
+        throw "Windows low-integrity boundary utility is missing: $icaclsPath"
+    }
+    Assert-NoReparseAncestors -Path $icaclsPath -Context 'Windows low-integrity boundary utility'
+    $arguments = @($fullPath, '/setintegritylevel', '(OI)(CI)L')
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $icaclsPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+    if ($null -ne $argumentListProperty) {
+        foreach ($argument in $arguments) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+        }
+    }
+    else {
+        $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $arguments
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'Windows low-integrity boundary utility did not start.'
+        }
+        $standardOutput = $process.StandardOutput.ReadToEnd()
+        $standardError = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            $diagnostic = (($standardOutput, $standardError | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' ').Trim()
+            throw "icacls could not set the low-integrity label on '$fullPath' (exit code $($process.ExitCode)): $diagnostic"
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function New-ContainedProcessEnvironment {
     param(
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot
@@ -2238,6 +2413,7 @@ function New-ContainedProcessEnvironment {
         }
         Assert-NoReparseAncestors -Path $path -Context 'Contained native-process environment path'
     }
+    Set-WindowsLowIntegrityDirectory -Path $containmentRoot
     $environment['HOME'] = $homePath
     $environment['USERPROFILE'] = $homePath
     $environment['TMP'] = $tempPath
@@ -2462,6 +2638,7 @@ function Invoke-BootstrapTransitionValidation {
     if (Test-Path -LiteralPath $runRoot) { throw 'Bootstrap transition run path unexpectedly already exists.' }
     [void](New-Item -ItemType Directory -Path $runRoot -Force)
     Assert-NoReparseAncestors -Path $runRoot -Context 'Bootstrap transition run path'
+    Set-WindowsLowIntegrityDirectory -Path $runRoot
 
     $probeCommand = if ($script:IsWindowsHost) {
         Get-Command powershell.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
@@ -2511,6 +2688,7 @@ function Invoke-BootstrapTransitionValidation {
         processIdentity = 'passed'
         processGroup = if ($script:IsWindowsHost) { 'windows-job-object' } else { 'linux-pid-namespace-and-process-group' }
         restrictedExecution = if ($script:IsWindowsHost) { 'restricted-token' } else { 'setpriv-no-new-privs' }
+        integrityLevel = if ($script:IsWindowsHost) { 'low' } else { 'unprivileged' }
         resourceLimits = if ($script:IsWindowsHost) { 'job-active-process-256-cpu-300s-memory-2GiB' } else { 'prlimit-nproc-256-cpu-300s-address-2GiB' }
         commandFileBoundary = 'passed'
         networkProfile = 'offline'
@@ -3034,6 +3212,11 @@ done
                 )
                 if (-not $createdNewEvent -or $null -eq $windowsResumeEvent) {
                     throw "$Context could not create a private Windows resume event."
+                }
+                $eventBoundaryType = Get-WindowsProcessBoundaryType
+                if (-not $eventBoundaryType::SetLowIntegrityKernelObject($windowsResumeEvent.SafeWaitHandle.DangerousGetHandle())) {
+                    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw "$Context could not apply the low-integrity label to the Windows resume event (Win32 error $errorCode)."
                 }
                 $wrapperScript = @'
 $payloadEncoded = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_NATIVE_PAYLOAD')
@@ -4257,6 +4440,7 @@ $summary = [pscustomobject][ordered]@{
         candidateProfile = 'offline-candidate'
         semanticProfile = if ($semanticTriggered) { 'trusted-semantic' } else { 'not-run' }
         platform = if ($script:IsWindowsHost) { 'windows-restricted-primary-token-job-object' } elseif ($script:IsLinuxHost) { 'linux-private-root-namespace' } else { 'unsupported' }
+        integrityLevel = if ($script:IsWindowsHost) { 'low' } elseif ($script:IsLinuxHost) { 'unprivileged' } else { 'unsupported' }
         aggregateLimits = 'process-count-resident-memory-cpu-output-timeout'
         cleanup = 'trusted-process-tree-and-sandbox-root-cleanup-verified'
     }

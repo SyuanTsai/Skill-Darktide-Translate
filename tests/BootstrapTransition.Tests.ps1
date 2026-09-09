@@ -69,4 +69,17 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'tests/validate-windows-powershell\.ps1'
         $supervisor | Should -Match 'Bootstrap transition bounded cancellation probe'
     }
+
+    It 'UnitT60_UsesAWindowsLowIntegrityBoundaryForCandidateWrites' {
+        # Scenario: The candidate runs under the same runner account as the trusted supervisor.
+        # Purpose: Require a mandatory-integrity boundary so candidate code cannot write up into supervisor-owned roots.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+
+        $supervisor | Should -Match 'S-1-16-4096'
+        $supervisor | Should -Match 'TokenIntegrityLevel'
+        $supervisor | Should -Match 'SetTokenInformation'
+        $supervisor | Should -Match 'SetLowIntegrityKernelObject'
+        $supervisor | Should -Match 'Set-WindowsLowIntegrityDirectory'
+        $supervisor | Should -Match "'/setintegritylevel'"
+    }
 }
