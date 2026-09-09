@@ -113,11 +113,12 @@ Describe 'Darktide bootstrap transition' {
         $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
 
         $supervisor | Should -Match "'low-integrity-output'"
-        $supervisor | Should -Match '-ChildWritableRoot \$childOutputRoot'
+        $supervisor | Should -Match '''-PesterChildWritableRoot'', \$childOutputRoot'
+        $supervisor | Should -Match '-ChildWritableRoot \$ChildWritableRoot'
         $supervisor | Should -Match 'Expand-TrustedGitArchive'
         $supervisor | Should -Match 'Assert-TrustedGitTreeFile'
         $supervisor | Should -Match '\$trustedPesterCommit'
-        $supervisor | Should -Match '-ReadOnlyPaths @\(\$pesterMirrorRoot'
+        $supervisor | Should -Match '-ReadOnlyPaths @\(\$MirrorRoot'
         $supervisor | Should -Match '\[switch\] \$DirectWindowsProcess'
         $supervisor | Should -Match 'if \(\$DirectWindowsProcess\)'
         $supervisor | Should -Match '-DirectWindowsProcess'
@@ -125,10 +126,14 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'EnvironmentVariables\.Remove\(\$gateEnvironmentName\)'
         $supervisor | Should -Match '\[ ! -e "\$target" \]'
         $supervisor | Should -Match 'SGV1-Pester-Result:'
+        $supervisor | Should -Match 'Invoke-TrustedPowerShellProcess'
+        $supervisor | Should -Match 'Invoke-ProtectedPesterSupervisor'
+        $supervisor | Should -Match '\$trustedPesterSupervisorMarker'
+        $supervisor | Should -Match '\$completionMarker = \(\[Console\]::In\.ReadToEnd\(\)\)'
         $supervisor | Should -Match 'trusted-parent-post-exit'
         $supervisor | Should -Match '\$completionAttestationNonce'
         $supervisor | Should -Not -Match '\$workerMarkerVariableName'
         $supervisor | Should -Not -Match '-StandardInput \$pesterWorkerMarker'
-        $supervisor | Should -Not -Match '\$pesterSupervisorPath'
+        $supervisor | Should -Not -Match '\$pesterSupervisorPath\s*='
     }
 }

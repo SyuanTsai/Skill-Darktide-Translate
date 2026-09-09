@@ -15,7 +15,18 @@ param(
     [string] $OutputPath,
     [switch] $BootstrapTransition,
     [switch] $EnableSemanticScan,
-    [string[]] $SemanticCredentialNames = @()
+    [string[]] $SemanticCredentialNames = @(),
+    [switch] $ProtectedPesterSupervisor,
+    [string] $PesterWorkerPath,
+    [string] $PesterTestsRoot,
+    [string] $PesterModulePath,
+    [string] $PesterExpectedVersion,
+    [string] $PesterMirrorRoot,
+    [string] $PesterInstallRoot,
+    [string] $PesterSupervisorPath,
+    [string] $PesterChildWritableRoot,
+    [string] $PesterDiagnosticRoot,
+    [string] $PesterRunnerSha256
 )
 
 Set-StrictMode -Version Latest
@@ -3679,6 +3690,205 @@ function Test-SecurityRelevantSkillChange {
     return $false
 }
 
+function Invoke-TrustedPowerShellProcess {
+    param(
+        [Parameter(Mandatory = $true)][string] $Command,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
+        [Parameter()][AllowNull()][string] $StandardInput,
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
+    )
+    if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) {
+        throw "$Context executable is missing: $Command"
+    }
+    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+        throw "$Context working directory is missing: $WorkingDirectory"
+    }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Command
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
+    foreach ($gateEnvironmentName in @(
+        'CODEX_VALIDATION_NATIVE_PAYLOAD',
+        'CODEX_VALIDATION_RESUME_EVENT',
+        'CODEX_VALIDATION_HAS_STANDARD_INPUT'
+    )) {
+        [void]$startInfo.EnvironmentVariables.Remove($gateEnvironmentName)
+    }
+    $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+    if ($null -ne $argumentListProperty) {
+        foreach ($argument in $Arguments) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+        }
+    }
+    else {
+        $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $Arguments
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "$Context could not start the trusted process."
+        }
+        if ($PSBoundParameters.ContainsKey('StandardInput')) {
+            $process.StandardInput.Write([string]$StandardInput)
+        }
+        $process.StandardInput.Close()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                $process.Kill($true)
+                $process.WaitForExit(5000)
+            }
+            catch {
+                throw "$Context timed out and could not be terminated safely: $($_.Exception.Message)"
+            }
+            throw "$Context exceeded its timeout of $TimeoutMilliseconds milliseconds."
+        }
+        $stdoutText = $stdoutTask.GetAwaiter().GetResult()
+        $stderrText = $stderrTask.GetAwaiter().GetResult()
+        if ($stdoutText.Length -gt 4194304 -or $stderrText.Length -gt 4194304) {
+            throw "$Context exceeded the bounded trusted-process output limit."
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "$Context exited with code $($process.ExitCode).`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText"
+        }
+        return $stdoutText
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Invoke-ProtectedPesterSupervisor {
+    param(
+        [Parameter(Mandatory = $true)][string] $WorkerPath,
+        [Parameter(Mandatory = $true)][string] $TestsRoot,
+        [Parameter(Mandatory = $true)][string] $PesterModulePath,
+        [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
+        [Parameter(Mandatory = $true)][string] $MirrorRoot,
+        [Parameter(Mandatory = $true)][string] $InstallRoot,
+        [Parameter(Mandatory = $true)][string] $SupervisorPath,
+        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][string] $RunnerSha256
+    )
+    $completionMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
+    if ($completionMarker -notmatch '^SGV1-Pester-Supervisor-[0-9a-f]{32}:$') {
+        throw 'The trusted Pester supervisor did not receive a valid one-time completion marker.'
+    }
+    if ($RunnerSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'The trusted Pester supervisor requires an immutable runner SHA-256.'
+    }
+
+    $requiredPesterTests = @(
+        'BootstrapTransition.Tests.ps1'
+        'LocalizationWorkset.Tests.ps1'
+        'ModUpdateAutomation.Tests.ps1'
+        'RepositoryContract.Tests.ps1'
+        'RepositoryValidation.Tests.ps1'
+        'Schema15Coordination.Tests.ps1'
+        'Schema15SourceAcquisition.Tests.ps1'
+        'SkillContract.Tests.ps1'
+        'SourcePin.Tests.ps1'
+    )
+    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
+    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
+    $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
+    if ($runnerActualSha256 -cne $RunnerSha256) {
+        throw 'Trusted Pester worker changed before the protected run.'
+    }
+
+    $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
+    $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
+    if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+        throw "PowerShell child executable is missing: $powerShellPath"
+    }
+    $workerOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $WorkerPath,
+        '-TestsRoot', $TestsRoot,
+        '-PesterModulePath', $PesterModulePath,
+        '-ExpectedPesterVersion', $ExpectedPesterVersion
+    ) -Context 'Protected Pester worker' -DiagnosticRoot $DiagnosticRoot -ChildWritableRoot $ChildWritableRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -DirectWindowsProcess -ReadOnlyPaths @($MirrorRoot, $InstallRoot, $WorkerPath, $SupervisorPath) -ApplyLinuxResourceLimits
+
+    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
+    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
+    $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
+    if ($runnerActualSha256 -cne $RunnerSha256) {
+        throw 'Trusted Pester worker changed during the protected run.'
+    }
+
+    $workerResultPrefix = 'SGV1-Pester-Result:'
+    $workerResultLines = @($workerOutput -split "`r?`n" | Where-Object {
+        $_.StartsWith($workerResultPrefix, [StringComparison]::Ordinal)
+    })
+    if ($workerResultLines.Count -ne 1) {
+        throw 'Protected Pester worker exited without exactly one worker completion result.'
+    }
+    try {
+        $workerResultJson = $workerResultLines[0].Substring($workerResultPrefix.Length)
+        $workerResultDocument = [System.Text.Json.JsonDocument]::Parse($workerResultJson)
+        try {
+            Assert-NoDuplicateJsonProperties -Element $workerResultDocument.RootElement -Context 'Protected Pester worker result'
+        }
+        finally {
+            $workerResultDocument.Dispose()
+        }
+        $workerResult = $workerResultJson | ConvertFrom-Json -Depth 20
+    }
+    catch {
+        throw "Protected Pester worker result is not valid unambiguous JSON: $($_.Exception.Message)"
+    }
+    if ($workerResult.result -cne 'passed' -or
+        $workerResult.pesterVersion -cne $ExpectedPesterVersion -or
+        [int64]$workerResult.TotalCount -le 0 -or [int64]$workerResult.FailedCount -ne 0 -or
+        [int64]$workerResult.SkippedCount -ne 0 -or
+        [int64]$workerResult.PassedCount + [int64]$workerResult.SkippedCount -ne [int64]$workerResult.TotalCount) {
+        throw 'Protected Pester worker result was missing, mismatched, or incomplete.'
+    }
+    $workerRequiredTests = @($workerResult.requiredTests)
+    if ($workerResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne $requiredPesterTests.Count -or
+        @(
+            for ($requiredTestIndex = 0; $requiredTestIndex -lt $requiredPesterTests.Count; $requiredTestIndex++) {
+                if ([string]$workerRequiredTests[$requiredTestIndex] -cne [string]$requiredPesterTests[$requiredTestIndex]) {
+                    $requiredTestIndex
+                }
+            }
+        ).Count -gt 0) {
+        throw 'Protected Pester worker did not report the exact trusted test inventory.'
+    }
+
+    # This process is the trusted completion control path.  Its stdin is never
+    # inherited by the low-integrity worker, and its stdout is the only stream
+    # accepted by the parent validator.  Candidate code can terminate or forge
+    # the worker, but it cannot write this supervisor-owned completion marker.
+    Write-Output ($completionMarker + $workerResultJson)
+}
+
+if ($ProtectedPesterSupervisor) {
+    Invoke-ProtectedPesterSupervisor `
+        -WorkerPath $PesterWorkerPath `
+        -TestsRoot $PesterTestsRoot `
+        -PesterModulePath $PesterModulePath `
+        -ExpectedPesterVersion $PesterExpectedVersion `
+        -MirrorRoot $PesterMirrorRoot `
+        -InstallRoot $PesterInstallRoot `
+        -SupervisorPath $PesterSupervisorPath `
+        -ChildWritableRoot $PesterChildWritableRoot `
+        -DiagnosticRoot $PesterDiagnosticRoot `
+        -RunnerSha256 $PesterRunnerSha256
+    exit 0
+}
+
 $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
     [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 }
@@ -4252,9 +4462,10 @@ foreach ($requiredPesterTest in $requiredPesterTests) {
 }
 Assert-NoReparseTree -Path $pesterMirrorRoot -Context 'Trusted Pester worktree'
 
-# The runner script is trusted content written by this supervisor.  It emits
-# only a bounded fixed-prefix payload; the parent validator, not a child
-# supervisor, creates the final receipt and performs all post-test checks.
+# The worker script is trusted content written by this validator, but it runs
+# candidate code.  A separate same-integrity supervisor owns the completion
+# marker and launches the worker through the low-integrity process boundary;
+# the parent accepts only the supervisor's output, never the worker's stdout.
 $pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
 $pesterRunnerScript = @'
 #requires -Version 7.0
@@ -4335,19 +4546,35 @@ $pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pester
 if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
     throw 'Run-owned isolated Pester worker changed before candidate tests.'
 }
-$pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
+$trustedPesterSupervisorPath = Join-Path $supervisorRoot 'scripts/Validate.ps1'
+Assert-NoReparseAncestors -Path $trustedPesterSupervisorPath -Context 'Trusted Pester supervisor'
+Assert-RegularFileForHash -Item (Get-Item -LiteralPath $trustedPesterSupervisorPath -Force) -Context 'Trusted Pester supervisor'
+$trustedPesterSupervisorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
+$trustedPesterSupervisorMarker = 'SGV1-Pester-Supervisor-{0}:' -f ([guid]::NewGuid().ToString('N'))
+$pesterOutput = Invoke-TrustedPowerShellProcess -Command $powerShellPath -Arguments @(
     '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', $pesterRunnerPath,
-    '-TestsRoot', $trustedPesterTestsRoot,
+    '-File', $trustedPesterSupervisorPath,
+    '-ProtectedPesterSupervisor',
+    '-PesterWorkerPath', $pesterRunnerPath,
+    '-PesterTestsRoot', $trustedPesterTestsRoot,
     '-PesterModulePath', $pesterModulePath,
-    '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
- ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -DirectWindowsProcess -ReadOnlyPaths @($pesterMirrorRoot, $installRoot, $pesterRunnerPath) -ApplyLinuxResourceLimits
-$pesterResultPrefix = 'SGV1-Pester-Result:'
+    '-PesterExpectedVersion', [string]$receipts.pester.resolvedVersion,
+    '-PesterMirrorRoot', $pesterMirrorRoot,
+    '-PesterInstallRoot', $installRoot,
+    '-PesterSupervisorPath', $trustedPesterSupervisorPath,
+    '-PesterChildWritableRoot', $childOutputRoot,
+    '-PesterDiagnosticRoot', $runRoot,
+    '-PesterRunnerSha256', $pesterRunnerSha256
+) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 300000
+$trustedPesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
+if ($trustedPesterSupervisorActualSha256 -cne $trustedPesterSupervisorSha256) {
+    throw 'Trusted Pester supervisor changed during the protected run.'
+}
 $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
-    $_.StartsWith($pesterResultPrefix, [StringComparison]::Ordinal)
+    $_.StartsWith($trustedPesterSupervisorMarker, [StringComparison]::Ordinal)
 })
 if ($pesterResultLines.Count -ne 1) {
-    throw 'Isolated Pester exited without exactly one protected completion result.'
+    throw 'Trusted Pester supervisor exited without exactly one supervisor-owned completion result.'
 }
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
 Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
@@ -4356,7 +4583,7 @@ if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
     throw 'Run-owned isolated Pester worker changed during candidate tests.'
 }
 try {
-    $pesterResultJson = $pesterResultLines[0].Substring($pesterResultPrefix.Length)
+    $pesterResultJson = $pesterResultLines[0].Substring($trustedPesterSupervisorMarker.Length)
     $pesterResultDocument = [System.Text.Json.JsonDocument]::Parse($pesterResultJson)
     try {
         Assert-NoDuplicateJsonProperties -Element $pesterResultDocument.RootElement -Context 'Isolated Pester result'
@@ -4367,14 +4594,14 @@ try {
     $pesterResult = $pesterResultJson | ConvertFrom-Json -Depth 20
 }
 catch {
-    throw "Isolated Pester result is not valid unambiguous JSON: $($_.Exception.Message)"
+    throw "Trusted Pester supervisor result is not valid unambiguous JSON: $($_.Exception.Message)"
 }
 if ($pesterResult.result -cne 'passed' -or
     $pesterResult.pesterVersion -cne [string]$receipts.pester.resolvedVersion -or
     [int64]$pesterResult.TotalCount -le 0 -or [int64]$pesterResult.FailedCount -ne 0 -or
     [int64]$pesterResult.SkippedCount -ne 0 -or
     [int64]$pesterResult.PassedCount + [int64]$pesterResult.SkippedCount -ne [int64]$pesterResult.TotalCount) {
-    throw 'Isolated Pester repository regression result was missing, mismatched, or incomplete.'
+    throw 'Trusted Pester supervisor result was missing, mismatched, or incomplete.'
 }
 $workerRequiredTests = @($pesterResult.requiredTests)
 if ($pesterResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne $requiredPesterTests.Count -or
@@ -4385,7 +4612,7 @@ if ($pesterResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -n
             }
         }
     ).Count -gt 0) {
-    throw 'Isolated Pester repository regression did not report the exact trusted test inventory.'
+    throw 'Trusted Pester supervisor did not report the exact trusted test inventory.'
 }
 $completionAttestationNonceBytes = [byte[]]::new(32)
 [Security.Cryptography.RandomNumberGenerator]::Fill($completionAttestationNonceBytes)
