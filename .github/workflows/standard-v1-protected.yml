@@ -75,8 +75,12 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          $global:LASTEXITCODE = $null
           & $env:TRUSTED_WINDOWS_CONTRACT -RepositoryRoot (Get-Location).Path
-          if ($LASTEXITCODE -ne 0) { throw 'The protected Windows PowerShell compatibility contract failed.' }
+          $protectedContractExitCode = $LASTEXITCODE
+          if ($null -ne $protectedContractExitCode -and $protectedContractExitCode -ne 0) {
+            throw 'The protected Windows PowerShell compatibility contract failed.'
+          }
 
       - name: Parse candidate PowerShell trust-anchor files
         shell: powershell

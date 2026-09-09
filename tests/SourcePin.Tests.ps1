@@ -2,18 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Immutable Skill source pin' {
     BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        $layout = Get-TestRepositoryLayout -RepositoryRoot $repoRoot
         $sourceScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Get-SourcePin.ps1'
         $fixtureRoot = Join-Path $TestDrive 'source-pin-repository'
         $fixtureScripts = Join-Path $fixtureRoot 'scripts'
+        $fixtureSkillRoot = Join-Path $fixtureRoot $layout.SkillPath.Replace('/', [IO.Path]::DirectorySeparatorChar)
 
         New-Item -ItemType Directory -Path $fixtureScripts | Out-Null
+        New-Item -ItemType Directory -Path (Split-Path -Parent $fixtureSkillRoot) -Force | Out-Null
+        Copy-Item -LiteralPath $layout.SkillRoot -Destination $fixtureSkillRoot -Recurse
         Copy-Item -LiteralPath $sourceScript -Destination (Join-Path $fixtureScripts 'Get-SourcePin.ps1')
         & git -C $fixtureRoot init --quiet
         & git -C $fixtureRoot config user.name 'Source Pin Test'
         & git -C $fixtureRoot config user.email 'source-pin-test@example.invalid'
 
         Set-Content -LiteralPath (Join-Path $fixtureRoot 'VERSION') -Value '0.1.0' -NoNewline
-        & git -C $fixtureRoot add VERSION scripts/Get-SourcePin.ps1
+        & git -C $fixtureRoot add VERSION scripts/Get-SourcePin.ps1 $layout.SkillPath
         & git -C $fixtureRoot commit --quiet -m 'initial version'
         $script:firstCommit = (& git -C $fixtureRoot rev-parse HEAD).Trim()
 
@@ -47,13 +53,12 @@ Describe 'Immutable Skill source pin' {
     # Scenario: A consumer needs to prove that every installed Skill byte came from the pinned repository commit.
     # Purpose: Include a per-file blob and SHA-256 manifest in addition to the whole-repository content hash.
     It 'InterT30_EmitsAnInstalledSkillFileManifest' {
-        $repositoryScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Get-SourcePin.ps1'
-        $pin = (& $repositoryScript -Ref HEAD | Out-String) | ConvertFrom-Json
+        $pin = (& $script:fixtureScript -Ref $script:firstCommit | Out-String) | ConvertFrom-Json
 
         $pin.schemaVersion | Should -Be 1
-        $pin.skillPath | Should -Be '.agents/skills/auto-update-darktide-mod'
+        $pin.skillPath | Should -Be $layout.SkillPath
         @($pin.skillFiles).Count | Should -BeGreaterThan 10
-        @($pin.skillFiles | Where-Object repositoryPath -eq '.agents/skills/auto-update-darktide-mod/SKILL.md').Count | Should -Be 1
+        @($pin.skillFiles | Where-Object repositoryPath -eq "$($layout.SkillPath)/SKILL.md").Count | Should -Be 1
         @($pin.skillFiles | Where-Object { $_.blobOid -notmatch '^[0-9a-f]{40}$' -or $_.sha256 -notmatch '^[0-9a-f]{64}$' }).Count | Should -Be 0
     }
 }

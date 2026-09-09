@@ -5,6 +5,8 @@ Describe 'Repository pre-push validation' {
         $script:repoRoot = Split-Path -Parent $PSScriptRoot
         $script:stateValidatorPath = Join-Path $script:repoRoot 'scripts/Test-CleanRepositoryHead.ps1'
         $script:prePushPath = Join-Path $script:repoRoot 'scripts/Invoke-PrePushValidation.ps1'
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:layout = Get-TestRepositoryLayout -RepositoryRoot $script:repoRoot
 
         function New-TestGitRepository {
             param([string] $Path)
@@ -58,24 +60,42 @@ Describe 'Repository pre-push validation' {
     It 'UnitT40_UsesOnePrePushEntrypointForTheLocalAndCiContract' {
         Test-Path -LiteralPath $script:prePushPath | Should -Be $true
         $prePush = Get-Content -LiteralPath $script:prePushPath -Raw
-        $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot '.github/workflows/validate.yml') -Raw
+        $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
 
-        $prePush | Should -Match 'Test-CleanRepositoryHead\.ps1'
-        $prePush | Should -Match 'tests/Invoke-Tests\.ps1'
-        $prePush | Should -Match 'Test-ReferenceIntegrity\.ps1'
-        $prePush | Should -Match 'scripts/Get-SourcePin\.ps1'
-        ([regex]::Matches($prePush, 'Test-CleanRepositoryHead\.ps1')).Count | Should -Be 2
-        $workflow | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
+        if ($script:layout.Name -ceq 'legacy') {
+            $prePush | Should -Match 'Test-CleanRepositoryHead\.ps1'
+            $prePush | Should -Match 'tests/Invoke-Tests\.ps1'
+            $prePush | Should -Match 'Test-ReferenceIntegrity\.ps1'
+            $prePush | Should -Match 'scripts/Get-SourcePin\.ps1'
+            ([regex]::Matches($prePush, 'Test-CleanRepositoryHead\.ps1')).Count | Should -Be 2
+            $workflow | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
+        }
+        else {
+            $prePush | Should -Match 'scripts/Validate\.ps1'
+            $prePush | Should -Match 'ArtifactsRoot'
+            $prePush | Should -Match 'BaseCommit'
+            $prePush | Should -Not -Match 'tests/Invoke-Tests\.ps1'
+            $prePush | Should -Not -Match 'Test-ReferenceIntegrity\.ps1'
+            $workflow | Should -Match 'scripts/Validate\.ps1'
+        }
         $workflow | Should -Not -Match 'run: \./tests/Invoke-Tests\.ps1'
     }
 
     It 'UnitT50_RunsEachPullRequestHeadOnceAndRevalidatesMainAfterMerge' {
-        foreach ($workflowName in @('validate.yml', 'skill-validator.yml')) {
-            $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot ".github/workflows/$workflowName") -Raw
+        if ($script:layout.Name -ceq 'legacy') {
+            foreach ($workflowName in @('validate.yml', 'skill-validator.yml')) {
+                $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot ".github/workflows/$workflowName") -Raw
 
+                $workflow | Should -Match '(?m)^  push:\r?$'
+                $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
+                $workflow | Should -Match '(?m)^  pull_request:'
+            }
+        }
+        else {
+            $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
             $workflow | Should -Match '(?m)^  push:\r?$'
             $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
-            $workflow | Should -Match '(?m)^  pull_request:'
+            $workflow | Should -Match '(?m)^  pull_request_target:'
         }
     }
 }

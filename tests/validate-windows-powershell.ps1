@@ -95,8 +95,53 @@ else {
 
 $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
 Assert-True ($workflow -match 'shell: powershell') 'The required Windows PowerShell 5.1 contract is missing.'
+Assert-True ($workflow -match '\$global:LASTEXITCODE\s*=\s*\$null') 'The Windows PowerShell wrapper must clear stale native exit state before invoking the trusted script.'
+Assert-True ($workflow -match '\$protectedContractExitCode\s*=\s*\$LASTEXITCODE') 'The Windows PowerShell wrapper must capture the trusted script native exit state.'
+Assert-True ($workflow -match '\$null\s+-ne\s+\$protectedContractExitCode') 'The Windows PowerShell wrapper must treat an unset native exit state as success.'
 Assert-True ($workflow -match "go-version: 'stable'") 'The workflow must use the latest stable Go channel.'
 Assert-True ($workflow -match 'check-latest: true') 'The workflow must resolve the latest stable Go runtime per run.'
 Assert-True ($workflow -notmatch "go-version: '[0-9]+\.[0-9]+\.[0-9]+'") 'The workflow must not pin a Go patch version.'
+
+# Scenario: The protected wrapper calls a PowerShell script that may leave the native exit state unset, throw, or run a failing native command.
+# Purpose: Preserve fail-closed behavior without treating Windows PowerShell 5.1's null LASTEXITCODE as a failure.
+$wrapperProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('darktide-windows-wrapper-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $wrapperProbeRoot -Force | Out-Null
+try {
+    $successScript = Join-Path $wrapperProbeRoot 'success.ps1'
+    $exceptionScript = Join-Path $wrapperProbeRoot 'exception.ps1'
+    $nativeFailureScript = Join-Path $wrapperProbeRoot 'native-failure.ps1'
+    Set-Content -LiteralPath $successScript -Value "Write-Output 'success'" -Encoding UTF8
+    Set-Content -LiteralPath $exceptionScript -Value "throw 'expected protected wrapper exception'" -Encoding UTF8
+    Set-Content -LiteralPath $nativeFailureScript -Value "& cmd.exe /c exit 7" -Encoding UTF8
+
+    function Invoke-ProtectedWrapperProbe {
+        param([Parameter(Mandatory = $true)][string] $ScriptPath)
+        $global:LASTEXITCODE = $null
+        & $ScriptPath | Out-Null
+        $probeExitCode = $LASTEXITCODE
+        if ($null -ne $probeExitCode -and $probeExitCode -ne 0) {
+            throw "Protected wrapper probe failed with native exit code $probeExitCode."
+        }
+        return $probeExitCode
+    }
+
+    $successExitCode = Invoke-ProtectedWrapperProbe -ScriptPath $successScript
+    Assert-True ($null -eq $successExitCode) 'A successful PowerShell script with no native command must leave the protected wrapper in the success state.'
+
+    $exceptionObserved = $false
+    try { Invoke-ProtectedWrapperProbe -ScriptPath $exceptionScript | Out-Null }
+    catch { $exceptionObserved = $true }
+    Assert-True $exceptionObserved 'A PowerShell exception must fail the protected wrapper.'
+
+    $nativeFailureObserved = $false
+    try { Invoke-ProtectedWrapperProbe -ScriptPath $nativeFailureScript | Out-Null }
+    catch { $nativeFailureObserved = $true }
+    Assert-True $nativeFailureObserved 'A non-zero native exit code must fail the protected wrapper.'
+}
+finally {
+    if (Test-Path -LiteralPath $wrapperProbeRoot) {
+        Remove-Item -LiteralPath $wrapperProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Host 'Windows PowerShell 5.1 repository compatibility contract passed.'
