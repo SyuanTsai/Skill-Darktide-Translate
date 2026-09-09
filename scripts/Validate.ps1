@@ -2479,7 +2479,6 @@ function New-ContainedProcessEnvironment {
         'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_WORKSPACE', 'RUNNER_ARCH', 'RUNNER_DEBUG',
         'RUNNER_NAME', 'RUNNER_OS', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE', 'RUNNER_TRACKING_ID',
         'RUNNER_WORKSPACE', 'ImageOS', 'ImageVersion',
-        'CODEX_VALIDATION_NATIVE_PAYLOAD', 'CODEX_VALIDATION_RESUME_EVENT', 'CODEX_VALIDATION_HAS_STANDARD_INPUT',
         'GIT_NO_REPLACE_OBJECTS'
     )
     $environment = [ordered]@{}
@@ -3463,10 +3462,21 @@ finally {
                 $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $nativeArguments
             }
             $startInfo.WorkingDirectory = [string](Get-Location).Path
-            if ($script:IsWindowsHost -and -not $DirectWindowsProcess) {
-                $startInfo.EnvironmentVariables['CODEX_VALIDATION_NATIVE_PAYLOAD'] = $payloadEncoded
-                $startInfo.EnvironmentVariables['CODEX_VALIDATION_RESUME_EVENT'] = $eventName
-                $startInfo.EnvironmentVariables['CODEX_VALIDATION_HAS_STANDARD_INPUT'] = if ($PSBoundParameters.ContainsKey('StandardInput')) { '1' } else { '0' }
+            if ($script:IsWindowsHost) {
+                if ($DirectWindowsProcess) {
+                    foreach ($gateEnvironmentName in @(
+                        'CODEX_VALIDATION_NATIVE_PAYLOAD',
+                        'CODEX_VALIDATION_RESUME_EVENT',
+                        'CODEX_VALIDATION_HAS_STANDARD_INPUT'
+                    )) {
+                        [void]$startInfo.EnvironmentVariables.Remove($gateEnvironmentName)
+                    }
+                }
+                else {
+                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_NATIVE_PAYLOAD'] = $payloadEncoded
+                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_RESUME_EVENT'] = $eventName
+                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_HAS_STANDARD_INPUT'] = if ($PSBoundParameters.ContainsKey('StandardInput')) { '1' } else { '0' }
+                }
             }
             $nativeEnvironmentVariables = @{}
             foreach ($environmentName in @($startInfo.EnvironmentVariables.Keys)) {
