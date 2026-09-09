@@ -118,6 +118,9 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'Assert-TrustedGitTreeFile'
         $supervisor | Should -Match '\$trustedPesterCommit'
         $supervisor | Should -Match '-ReadOnlyPaths @\(\$pesterMirrorRoot'
+        $supervisor | Should -Match '\[switch\] \$DirectWindowsProcess'
+        $supervisor | Should -Match 'if \(\$DirectWindowsProcess\)'
+        $supervisor | Should -Match '-DirectWindowsProcess'
         $supervisor | Should -Match '\[ ! -e "\$target" \]'
         $supervisor | Should -Not -Match '\$pesterSupervisorPath'
     }

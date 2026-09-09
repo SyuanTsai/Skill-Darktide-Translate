@@ -3012,6 +3012,7 @@ function Invoke-NativeChecked {
         [Parameter()][switch] $IsolateRunnerCommandFiles,
         [Parameter()][switch] $TerminateProcessTree,
         [Parameter()][switch] $ProtectRunnerCommandFiles,
+        [Parameter()][switch] $DirectWindowsProcess,
         [Parameter()][AllowEmptyCollection()][string[]] $ReadOnlyPaths,
         [Parameter()][switch] $ApplyLinuxResourceLimits,
         [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline',
@@ -3350,30 +3351,38 @@ done
                 }
             }
             elseif ($script:IsWindowsHost) {
-                # Start a trusted gate that waits on a supervisor-owned event.
-                # The candidate command is released only after Job Object assignment.
-                $payloadJson = [ordered]@{
-                    command = $Command
-                    arguments = @($Arguments)
-                } | ConvertTo-Json -Compress -Depth 20
-                $payloadEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payloadJson))
-                $createdNewEvent = $false
-                $eventName = "Local\CodexValidationResume-{0}" -f [guid]::NewGuid().ToString('N')
-                $windowsResumeEvent = [Threading.EventWaitHandle]::new(
-                    $false,
-                    [Threading.EventResetMode]::ManualReset,
-                    $eventName,
-                    [ref]$createdNewEvent
-                )
-                if (-not $createdNewEvent -or $null -eq $windowsResumeEvent) {
-                    throw "$Context could not create a private Windows resume event."
+                if ($DirectWindowsProcess) {
+                    # The actual command is created suspended, assigned to the
+                    # Job Object, and resumed below. Do not retain a same-level
+                    # wrapper while untrusted Pester code is running.
+                    $nativeCommand = $Command
+                    $nativeArguments = @($Arguments)
                 }
-                $eventBoundaryType = Get-WindowsProcessBoundaryType
-                if (-not $eventBoundaryType::SetLowIntegrityKernelObject($windowsResumeEvent.SafeWaitHandle.DangerousGetHandle())) {
-                    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                    throw "$Context could not apply the low-integrity label to the Windows resume event (Win32 error $errorCode)."
-                }
-                $wrapperScript = @'
+                else {
+                    # Start a trusted gate that waits on a supervisor-owned event.
+                    # The candidate command is released only after Job Object assignment.
+                    $payloadJson = [ordered]@{
+                        command = $Command
+                        arguments = @($Arguments)
+                    } | ConvertTo-Json -Compress -Depth 20
+                    $payloadEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payloadJson))
+                    $createdNewEvent = $false
+                    $eventName = "Local\CodexValidationResume-{0}" -f [guid]::NewGuid().ToString('N')
+                    $windowsResumeEvent = [Threading.EventWaitHandle]::new(
+                        $false,
+                        [Threading.EventResetMode]::ManualReset,
+                        $eventName,
+                        [ref]$createdNewEvent
+                    )
+                    if (-not $createdNewEvent -or $null -eq $windowsResumeEvent) {
+                        throw "$Context could not create a private Windows resume event."
+                    }
+                    $eventBoundaryType = Get-WindowsProcessBoundaryType
+                    if (-not $eventBoundaryType::SetLowIntegrityKernelObject($windowsResumeEvent.SafeWaitHandle.DangerousGetHandle())) {
+                        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        throw "$Context could not apply the low-integrity label to the Windows resume event (Win32 error $errorCode)."
+                    }
+                    $wrapperScript = @'
 $payloadEncoded = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_NATIVE_PAYLOAD')
 $eventName = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_RESUME_EVENT')
 $hasStandardInput = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_HAS_STANDARD_INPUT')
@@ -3404,19 +3413,20 @@ finally {
     $resumeEvent.Dispose()
 }
 '@
-                $wrapperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapperScript))
-                $nativeCommand = Join-Path $PSHOME 'pwsh.exe'
-                if (-not (Test-Path -LiteralPath $nativeCommand -PathType Leaf)) {
-                    throw "$Context trusted PowerShell gate is missing: $nativeCommand"
+                    $wrapperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapperScript))
+                    $nativeCommand = Join-Path $PSHOME 'pwsh.exe'
+                    if (-not (Test-Path -LiteralPath $nativeCommand -PathType Leaf)) {
+                        throw "$Context trusted PowerShell gate is missing: $nativeCommand"
+                    }
+                    Assert-NoReparseAncestors -Path $nativeCommand -Context "$Context trusted PowerShell gate"
+                    $nativeArguments = @(
+                        '-NoLogo',
+                        '-NoProfile',
+                        '-NonInteractive',
+                        '-EncodedCommand',
+                        $wrapperEncoded
+                    )
                 }
-                Assert-NoReparseAncestors -Path $nativeCommand -Context "$Context trusted PowerShell gate"
-                $nativeArguments = @(
-                    '-NoLogo',
-                    '-NoProfile',
-                    '-NonInteractive',
-                    '-EncodedCommand',
-                    $wrapperEncoded
-                )
             }
             $parentProcessGroupId = if ($script:IsLinuxHost) { Get-UnixProcessGroupId -ProcessId $PID } else { 0 }
             $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -3517,7 +3527,7 @@ finally {
                 $childProcess.StandardInput.Write($StandardInput)
                 $childProcess.StandardInput.Close()
             }
-            if ($script:IsWindowsHost) {
+            if ($script:IsWindowsHost -and $null -ne $windowsResumeEvent) {
                 if (-not $windowsResumeEvent.Set()) {
                     throw "$Context could not release the Windows candidate gate."
                 }
@@ -4332,7 +4342,7 @@ $pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
     '-TestsRoot', $trustedPesterTestsRoot,
     '-PesterModulePath', $pesterModulePath,
     '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
- ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -StandardInput $pesterWorkerMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -ReadOnlyPaths @($pesterMirrorRoot, $installRoot, $pesterRunnerPath) -ApplyLinuxResourceLimits
+ ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -StandardInput $pesterWorkerMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -DirectWindowsProcess -ReadOnlyPaths @($pesterMirrorRoot, $installRoot, $pesterRunnerPath) -ApplyLinuxResourceLimits
 $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
     $_.StartsWith($pesterWorkerMarker, [StringComparison]::Ordinal)
 })
