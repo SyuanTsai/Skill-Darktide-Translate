@@ -10,9 +10,9 @@ on:
       - '.agents/skills/**'
       - '.github/workflows/skill-validator.yml'
   pull_request:
-    paths:
-      - '.agents/skills/**'
-      - '.github/workflows/skill-validator.yml'
+    # The repository ruleset requires these contexts on every pull request.
+    # Path-filtering this workflow can leave required checks absent on
+    # bootstrap changes that do not modify an Agent Skill.
   workflow_dispatch:
 
 permissions:
