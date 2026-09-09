@@ -304,7 +304,9 @@ function Get-LinuxProcessResourceUsage {
     $closeParen = $stat.LastIndexOf(')')
     if ($closeParen -lt 0) { throw "Could not parse Linux process ${ProcessId} resource metadata." }
     $fields = @([regex]::Split($stat.Substring($closeParen + 1).Trim(), '\s+'))
-    if ($fields.Count -lt 13 -or [string]$fields[11] -notmatch '^[0-9]+$' -or [string]$fields[12] -notmatch '^[0-9]+$') {
+    if ($fields.Count -lt 15 -or
+        [string]$fields[11] -notmatch '^[0-9]+$' -or [string]$fields[12] -notmatch '^[0-9]+$' -or
+        [string]$fields[13] -notmatch '^[0-9]+$' -or [string]$fields[14] -notmatch '^[0-9]+$') {
         throw "Could not parse Linux CPU usage for process ${ProcessId}."
     }
     $memoryMatch = [regex]::Match($status, '(?m)^VmRSS:\s+(?<kilobytes>[0-9]+)\s+kB\s*$')
@@ -312,7 +314,11 @@ function Get-LinuxProcessResourceUsage {
     return [pscustomobject][ordered]@{
         processId = $ProcessId
         memoryBytes = [int64]$memoryMatch.Groups['kilobytes'].Value * 1024
-        cpuTicks = [int64]$fields[11] + [int64]$fields[12]
+        # utime/stime cover the live process; cutime/cstime preserve CPU
+        # consumed by children that have already been reaped by this process.
+        # Summing them across live processes does not double-count live
+        # descendants because Linux only reports child time after wait/reap.
+        cpuTicks = [int64]$fields[11] + [int64]$fields[12] + [int64]$fields[13] + [int64]$fields[14]
     }
 }
 
@@ -358,6 +364,91 @@ function Assert-LinuxAggregateResourceUsage {
     if ($candidateIds.Count -gt 256) { throw "$Context exceeded the aggregate Linux process-count limit of 256." }
     if ($memoryBytes -gt 2147483648) { throw "$Context exceeded the aggregate Linux resident-memory limit of 2147483648 bytes." }
     if ($cpuTicks -gt ([int64]300 * $ClockTicksPerSecond)) { throw "$Context exceeded the aggregate Linux CPU limit of 300 seconds." }
+}
+
+function New-LinuxPesterCgroup {
+    param([Parameter(Mandatory = $true)][string] $Context)
+    if (-not $script:IsLinuxHost) { return $null }
+    $cgroupRoot = '/sys/fs/cgroup'
+    $controllersPath = Join-Path $cgroupRoot 'cgroup.controllers'
+    if (-not (Test-Path -LiteralPath $cgroupRoot -PathType Container) -or
+        -not (Test-Path -LiteralPath $controllersPath -PathType Leaf)) {
+        throw "$Context requires a writable Linux cgroup v2 hierarchy with the memory controller."
+    }
+    $controllers = [IO.File]::ReadAllText($controllersPath)
+    if ($controllers -notmatch '(^|\s)memory(\s|$)') {
+        throw "$Context requires the Linux cgroup v2 memory controller."
+    }
+    $cgroupPath = Join-Path $cgroupRoot ("codex-validation-pester-{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($cgroupPath) | Out-Null
+        Assert-NoReparseAncestors -Path $cgroupPath -Context "$Context cgroup"
+        $memoryMaxPath = Join-Path $cgroupPath 'memory.max'
+        if (-not (Test-Path -LiteralPath $memoryMaxPath -PathType Leaf)) {
+            throw 'The Linux cgroup v2 memory controller is not enabled for the new cgroup.'
+        }
+        [IO.File]::WriteAllText($memoryMaxPath, '2147483648')
+        $memoryMax = ([IO.File]::ReadAllText($memoryMaxPath)).Trim()
+        if ($memoryMax -cne '2147483648') {
+            throw "The Linux Pester cgroup memory.max is '$memoryMax', not the required hard limit."
+        }
+        $pidsMaxPath = Join-Path $cgroupPath 'pids.max'
+        if (Test-Path -LiteralPath $pidsMaxPath -PathType Leaf) {
+            [IO.File]::WriteAllText($pidsMaxPath, '256')
+            $pidsMax = ([IO.File]::ReadAllText($pidsMaxPath)).Trim()
+            if ($pidsMax -cne '256') { throw "The Linux Pester cgroup pids.max is '$pidsMax', not 256." }
+        }
+        return $cgroupPath
+    }
+    catch {
+        if (Test-Path -LiteralPath $cgroupPath -PathType Container) {
+            Remove-Item -LiteralPath $cgroupPath -Force -ErrorAction SilentlyContinue
+        }
+        throw "$Context could not establish a hard Linux cgroup boundary: $($_.Exception.Message)"
+    }
+}
+
+function Add-LinuxProcessTreeToCgroup {
+    param(
+        [Parameter(Mandatory = $true)][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][int] $RootProcessId,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { return }
+    $processFile = Join-Path $CgroupPath 'cgroup.procs'
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $processIds = [Collections.Generic.HashSet[int]]::new()
+        [void]$processIds.Add($RootProcessId)
+        foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
+            [void]$processIds.Add([int]$processId)
+        }
+        foreach ($processId in $processIds) {
+            if (-not (Test-ProcessIdExists -ProcessId ([int]$processId))) { continue }
+            try {
+                [IO.File]::WriteAllText($processFile, ([string]$processId + [Environment]::NewLine))
+            }
+            catch {
+                if (Test-ProcessIdExists -ProcessId ([int]$processId)) {
+                    throw "$Context could not place process $processId in the hard Linux cgroup: $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+}
+
+function Remove-LinuxPesterCgroup {
+    param([Parameter()][AllowNull()][string] $CgroupPath)
+    if (-not $script:IsLinuxHost -or [string]::IsNullOrWhiteSpace($CgroupPath)) { return }
+    $killPath = Join-Path $CgroupPath 'cgroup.kill'
+    if (Test-Path -LiteralPath $killPath -PathType Leaf) {
+        try { [IO.File]::WriteAllText($killPath, '1') } catch { }
+    }
+    try {
+        if (Test-Path -LiteralPath $CgroupPath -PathType Container) {
+            Remove-Item -LiteralPath $CgroupPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch { }
 }
 
 function Get-LinuxWritableRootUsage {
@@ -4043,8 +4134,12 @@ function Invoke-ProtectedPesterRunspace {
     $powerShell = $null
     $asyncResult = $null
     $linuxClockTicksPerSecond = [int64]0
+    $linuxPesterCgroupPath = $null
     try {
-        if ($script:IsLinuxHost) { $linuxClockTicksPerSecond = Get-LinuxAggregateClockTicksPerSecond }
+        if ($script:IsLinuxHost) {
+            $linuxClockTicksPerSecond = Get-LinuxAggregateClockTicksPerSecond
+            $linuxPesterCgroupPath = New-LinuxPesterCgroup -Context 'Protected Pester remote pipeline'
+        }
         $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null, $serverProcessInstance)
         $startInfoField = $serverProcessInstance.GetType().GetField('_startInfo', [Reflection.BindingFlags]'Instance,NonPublic')
         if ($null -eq $startInfoField) { throw 'Protected Pester server start information is unavailable.' }
@@ -4068,6 +4163,15 @@ function Invoke-ProtectedPesterRunspace {
         else { $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $proxyArguments }
 
         $runspace.Open()
+        if ($script:IsLinuxHost) {
+            if ($null -eq $serverProcessInstance.Process) {
+                throw 'Protected Pester remote pipeline did not expose its Linux proxy process.'
+            }
+            Add-LinuxProcessTreeToCgroup `
+                -CgroupPath $linuxPesterCgroupPath `
+                -RootProcessId $serverProcessInstance.Process.Id `
+                -Context 'Protected Pester remote pipeline'
+        }
         $powerShell = [Management.Automation.PowerShell]::Create()
         $powerShell.Runspace = $runspace
         [void]$powerShell.AddScript($workerScriptText)
@@ -4113,6 +4217,7 @@ function Invoke-ProtectedPesterRunspace {
         return $workerResult.Substring($workerResultPrefix.Length)
     }
     finally {
+        Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath
         if ($null -ne $serverProcessInstance.Process -and -not $serverProcessInstance.HasExited) {
             try { $serverProcessInstance.Process.Kill($true) } catch { }
         }
