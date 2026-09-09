@@ -4122,7 +4122,7 @@ do
     "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
 done
 "$mount_path" --bind /dev/null "$sandbox_root/dev/console"
-chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
+exec chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
 '@
         $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
         $environment = @{}

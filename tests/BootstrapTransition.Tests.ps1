@@ -162,6 +162,7 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'EnvironmentVariables\.Remove\(\$gateEnvironmentName\)'
         $supervisor | Should -Match '\[ ! -e "\$target" \]'
         $supervisor | Should -Match 'exec "\$chroot_path"'
+        $supervisor | Should -Match 'exec chroot "\$sandbox_root"'
         $supervisor | Should -Match 'SGV1-Pester-Result:'
         $supervisor | Should -Match 'Invoke-TrustedPowerShellProcess'
         $supervisor | Should -Match 'Invoke-ProtectedPesterSupervisor'
