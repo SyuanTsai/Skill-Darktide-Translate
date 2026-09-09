@@ -123,6 +123,8 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'CreateOutOfProcessRunspace'
         $supervisor | Should -Match 'AddScript\(\$workerScriptText\)'
         $supervisor | Should -Match 'InvocationStateInfo\.State'
+        $supervisor | Should -Match 'Assert-LinuxAggregateResourceUsage'
+        $supervisor | Should -Match 'Get-LinuxAggregateClockTicksPerSecond'
         $supervisor | Should -Match 'Start-WindowsSuspendedProcess'
         $supervisor | Should -Match '\.CopyToAsync\('
         $supervisor | Should -Match '--kill-child'

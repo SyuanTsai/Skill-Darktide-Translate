@@ -332,13 +332,15 @@ function Get-LinuxAggregateClockTicksPerSecond {
 function Assert-LinuxAggregateResourceUsage {
     param(
         [Parameter(Mandatory = $true)][int] $RootProcessId,
-        [Parameter(Mandatory = $true)][int] $ProcessGroupId,
+        [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $ProcessGroupId = 0,
         [Parameter(Mandatory = $true)][int64] $ClockTicksPerSecond,
         [Parameter(Mandatory = $true)][string] $Context
     )
     $candidateIds = [Collections.Generic.HashSet[int]]::new()
     if (Test-ProcessIdExists -ProcessId $RootProcessId) { [void]$candidateIds.Add($RootProcessId) }
-    foreach ($processId in @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId)) { [void]$candidateIds.Add([int]$processId) }
+    if ($ProcessGroupId -gt 0) {
+        foreach ($processId in @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId)) { [void]$candidateIds.Add([int]$processId) }
+    }
     foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) { [void]$candidateIds.Add([int]$processId) }
     $memoryBytes = [int64]0
     $cpuTicks = [int64]0
@@ -4040,7 +4042,9 @@ function Invoke-ProtectedPesterRunspace {
     $runspace = $null
     $powerShell = $null
     $asyncResult = $null
+    $linuxClockTicksPerSecond = [int64]0
     try {
+        if ($script:IsLinuxHost) { $linuxClockTicksPerSecond = Get-LinuxAggregateClockTicksPerSecond }
         $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null, $serverProcessInstance)
         $startInfoField = $serverProcessInstance.GetType().GetField('_startInfo', [Reflection.BindingFlags]'Instance,NonPublic')
         if ($null -eq $startInfoField) { throw 'Protected Pester server start information is unavailable.' }
@@ -4074,6 +4078,12 @@ function Invoke-ProtectedPesterRunspace {
         $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
         while (-not $asyncResult.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
             if ($serverProcessInstance.HasExited) { break }
+            if ($script:IsLinuxHost) {
+                Assert-LinuxAggregateResourceUsage `
+                    -RootProcessId $serverProcessInstance.Process.Id `
+                    -ClockTicksPerSecond $linuxClockTicksPerSecond `
+                    -Context 'Protected Pester remote pipeline'
+            }
             Start-Sleep -Milliseconds 50
         }
         if (-not $asyncResult.IsCompleted) {
