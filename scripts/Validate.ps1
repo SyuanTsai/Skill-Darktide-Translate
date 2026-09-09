@@ -484,12 +484,27 @@ function Remove-LinuxPesterCgroup {
     if (Test-Path -LiteralPath $killPath -PathType Leaf) {
         try { [IO.File]::WriteAllText($killPath, '1') } catch { }
     }
-    try {
-        if (Test-Path -LiteralPath $CgroupPath -PathType Container) {
-            Remove-Item -LiteralPath $CgroupPath -Force -ErrorAction SilentlyContinue
+    $eventsPath = Join-Path $CgroupPath 'cgroup.events'
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    for ($attempt = 0; $attempt -lt 120; $attempt++) {
+        if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
+        if (-not (Test-Path -LiteralPath $eventsPath -PathType Leaf)) {
+            throw 'Protected Pester cgroup cleanup could not observe cgroup.events.'
         }
+        $events = [IO.File]::ReadAllText($eventsPath)
+        if ($events -notmatch '(?m)^populated\s+(?<value>[01])\s*$') {
+            throw 'Protected Pester cgroup cleanup received an invalid cgroup.events population record.'
+        }
+        if ([string]$Matches['value'] -eq '0') {
+            try { Remove-Item -LiteralPath $CgroupPath -Force -ErrorAction Stop } catch { }
+            if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        Start-Sleep -Milliseconds 25
     }
-    catch { }
+    if (Test-Path -LiteralPath $CgroupPath -PathType Container) {
+        throw 'Protected Pester cgroup cleanup did not evacuate and remove the cgroup within the bounded cleanup window.'
+    }
 }
 
 function Get-LinuxWritableRootUsage {
@@ -4258,13 +4273,16 @@ function Invoke-ProtectedPesterRunspace {
         return $workerResult.Substring($workerResultPrefix.Length)
     }
     finally {
-        Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath
         if ($null -ne $serverProcessInstance.Process -and -not $serverProcessInstance.HasExited) {
             try { $serverProcessInstance.Process.Kill($true) } catch { }
         }
+        $linuxPesterCgroupCleanupException = $null
+        try { Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath }
+        catch { $linuxPesterCgroupCleanupException = $_.Exception }
         if ($null -ne $powerShell) { $powerShell.Dispose() }
         if ($null -ne $runspace) { $runspace.Dispose() }
         if ($null -ne $serverProcessInstance) { $serverProcessInstance.Dispose() }
+        if ($null -ne $linuxPesterCgroupCleanupException) { throw $linuxPesterCgroupCleanupException }
     }
 }
 
