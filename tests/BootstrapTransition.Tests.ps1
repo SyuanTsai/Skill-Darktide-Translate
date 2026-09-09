@@ -111,6 +111,7 @@ Describe 'Darktide bootstrap transition' {
         # Scenario: Low-integrity children must write only to a labeled output root, while tests come from trusted Git bytes.
         # Purpose: Keep scanner receipts and Pester content outside candidate-writable paths and out of the worker's authority.
         $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
 
         $supervisor | Should -Match "'low-integrity-output'"
         $supervisor | Should -Match '''-PesterChildWritableRoot'', \$childOutputRoot'
@@ -126,10 +127,23 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'Assert-LinuxAggregateResourceUsage'
         $supervisor | Should -Match 'Get-LinuxAggregateClockTicksPerSecond'
         $supervisor | Should -Match '\$fields\[13\].*\$fields\[14\]'
+        $supervisor | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
+        $supervisor | Should -Match 'Get-LinuxPesterCgroupRoot'
+        $supervisor | Should -Match '/proc/\$PID/cgroup'
         $supervisor | Should -Match 'New-LinuxPesterCgroup'
         $supervisor | Should -Match 'memory\.max'
         $supervisor | Should -Match 'cgroup\.procs'
         $supervisor | Should -Match 'Add-LinuxProcessTreeToCgroup'
+        $workflow | Should -Match 'Delegate Linux cgroup v2 subtree'
+        $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
+        $workflow | Should -Match 'CODEX_PESTER_VALIDATOR_CGROUP'
+        $workflow | Should -Match 'root_subtree_control'
+        $workflow | Should -Match 'cgroup\.subtree_control'
+        $workflow | Should -Match 'cgroup\.threads'
+        $workflow | Should -Match 'cgroup_parent/cgroup\.procs'
+        $workflow | Should -Match 'sudo -n chown'
+        $workflow | Should -Match 'trusted-validator'
+        $workflow | Should -Match 'Remove delegated Linux cgroup subtree'
         $supervisor | Should -Match 'Start-WindowsSuspendedProcess'
         $supervisor | Should -Match '\.CopyToAsync\('
         $supervisor | Should -Match '--kill-child'

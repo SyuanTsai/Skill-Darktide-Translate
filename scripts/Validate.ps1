@@ -366,10 +366,51 @@ function Assert-LinuxAggregateResourceUsage {
     if ($cpuTicks -gt ([int64]300 * $ClockTicksPerSecond)) { throw "$Context exceeded the aggregate Linux CPU limit of 300 seconds." }
 }
 
+function Get-LinuxPesterCgroupRoot {
+    if (-not $script:IsLinuxHost) { return $null }
+    $configuredRoot = [Environment]::GetEnvironmentVariable('CODEX_PESTER_CGROUP_ROOT')
+    if ([string]::IsNullOrWhiteSpace($configuredRoot)) {
+        throw 'Protected Pester validation requires a workflow-delegated Linux cgroup v2 root.'
+    }
+    if ($configuredRoot -notmatch '^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+$') {
+        throw 'Protected Pester validation received an invalid delegated Linux cgroup root.'
+    }
+    $rootPath = [IO.Path]::GetFullPath($configuredRoot)
+    if ($rootPath -cne $configuredRoot -or
+        -not (Test-Path -LiteralPath $rootPath -PathType Container)) {
+        throw 'Protected Pester validation requires an existing delegated Linux cgroup root.'
+    }
+    Assert-NoReparseAncestors -Path $rootPath -Context 'Protected Pester delegated cgroup root'
+    $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Protected Pester delegated cgroup root must not be a reparse point.'
+    }
+    $controllersPath = Join-Path $rootPath 'cgroup.controllers'
+    $subtreeControlPath = Join-Path $rootPath 'cgroup.subtree_control'
+    if (-not (Test-Path -LiteralPath $controllersPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $subtreeControlPath -PathType Leaf)) {
+        throw 'Protected Pester delegated root is not a Linux cgroup v2 hierarchy.'
+    }
+    $controllers = [IO.File]::ReadAllText($controllersPath)
+    if ($controllers -notmatch '(^|\s)memory(\s|$)') {
+        throw 'Protected Pester delegated Linux cgroup root does not expose the memory controller.'
+    }
+    $subtreeControl = [IO.File]::ReadAllText($subtreeControlPath)
+    if ($subtreeControl -notmatch '(^|\s)memory(\s|$)') {
+        throw 'Protected Pester delegated Linux cgroup root has not enabled the memory controller for children.'
+    }
+    $relativeRoot = $rootPath.Substring('/sys/fs/cgroup'.Length)
+    $currentCgroup = [IO.File]::ReadAllText("/proc/$PID/cgroup")
+    if ($currentCgroup -notmatch ("0::" + [regex]::Escape($relativeRoot) + '/')) {
+        throw 'Protected Pester validation is not running inside the delegated Linux cgroup subtree.'
+    }
+    return $rootPath
+}
+
 function New-LinuxPesterCgroup {
     param([Parameter(Mandatory = $true)][string] $Context)
     if (-not $script:IsLinuxHost) { return $null }
-    $cgroupRoot = '/sys/fs/cgroup'
+    $cgroupRoot = Get-LinuxPesterCgroupRoot
     $controllersPath = Join-Path $cgroupRoot 'cgroup.controllers'
     if (-not (Test-Path -LiteralPath $cgroupRoot -PathType Container) -or
         -not (Test-Path -LiteralPath $controllersPath -PathType Leaf)) {
