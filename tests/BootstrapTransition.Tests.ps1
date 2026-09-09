@@ -124,6 +124,11 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'if \(\$script:IsWindowsHost\)\s*\{\s*if \(\$DirectWindowsProcess\)'
         $supervisor | Should -Match 'EnvironmentVariables\.Remove\(\$gateEnvironmentName\)'
         $supervisor | Should -Match '\[ ! -e "\$target" \]'
+        $supervisor | Should -Match 'SGV1-Pester-Result:'
+        $supervisor | Should -Match 'trusted-parent-post-exit'
+        $supervisor | Should -Match '\$completionAttestationNonce'
+        $supervisor | Should -Not -Match '\$workerMarkerVariableName'
+        $supervisor | Should -Not -Match '-StandardInput \$pesterWorkerMarker'
         $supervisor | Should -Not -Match '\$pesterSupervisorPath'
     }
 }

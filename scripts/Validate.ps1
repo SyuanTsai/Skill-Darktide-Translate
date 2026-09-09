@@ -4253,8 +4253,8 @@ foreach ($requiredPesterTest in $requiredPesterTests) {
 Assert-NoReparseTree -Path $pesterMirrorRoot -Context 'Trusted Pester worktree'
 
 # The runner script is trusted content written by this supervisor.  It emits
-# only a bounded marker/payload; the parent validator, not a child supervisor,
-# creates the final receipt and performs all post-test checks.
+# only a bounded fixed-prefix payload; the parent validator, not a child
+# supervisor, creates the final receipt and performs all post-test checks.
 $pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
 $pesterRunnerScript = @'
 #requires -Version 7.0
@@ -4267,13 +4267,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$workerMarkerVariableName = '__sgv1WorkerCompletionMarker'
-New-Variable -Name $workerMarkerVariableName -Value (([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)) -Option Private -Force
-$workerMarkerForValidation = [string](Get-Variable -Name $workerMarkerVariableName -ValueOnly)
-if ($workerMarkerForValidation -notmatch '^SGV1-Pester-Worker-[0-9a-f]{32}:$') {
-    throw 'The isolated Pester worker did not receive a valid private completion marker.'
-}
-Remove-Variable -Name workerMarkerForValidation -Force -ErrorAction SilentlyContinue
 
 $testsRoot = [IO.Path]::GetFullPath($TestsRoot)
 $pesterModulePath = [IO.Path]::GetFullPath($PesterModulePath)
@@ -4323,13 +4316,10 @@ $completionPayload = [ordered]@{
 }
 $completionJson = $completionPayload | ConvertTo-Json -Depth 20 -Compress
 # Emit the result only after this base-owned runner has returned from Invoke-Pester
-# and independently checked every required test. The per-run marker is supplied
-# over private worker stdin and retained in a Private session-state variable,
-# which candidate tests cannot inherit or read.
-$workerMarkerForOutput = [string](Get-Variable -Name $workerMarkerVariableName -ValueOnly)
-Write-Output ($workerMarkerForOutput + $completionJson)
-Remove-Variable -Name workerMarkerForOutput -Force -ErrorAction SilentlyContinue
-Remove-Variable -Name $workerMarkerVariableName -Force -ErrorAction SilentlyContinue
+# and independently checked every required test.  This payload is deliberately
+# unauthenticated at the child boundary: the parent validator owns the
+# completion nonce and creates the attestation only after this process exits.
+Write-Output ('SGV1-Pester-Result:' + $completionJson)
 '@
 [IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
@@ -4345,16 +4335,16 @@ $pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pester
 if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
     throw 'Run-owned isolated Pester worker changed before candidate tests.'
 }
-$pesterWorkerMarker = 'SGV1-Pester-Worker-{0}:' -f ([guid]::NewGuid().ToString('N'))
 $pesterOutput = Invoke-NativeChecked -Command $powerShellPath -Arguments @(
     '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
     '-File', $pesterRunnerPath,
     '-TestsRoot', $trustedPesterTestsRoot,
     '-PesterModulePath', $pesterModulePath,
     '-ExpectedPesterVersion', [string]$receipts.pester.resolvedVersion
- ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -StandardInput $pesterWorkerMarker -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -DirectWindowsProcess -ReadOnlyPaths @($pesterMirrorRoot, $installRoot, $pesterRunnerPath) -ApplyLinuxResourceLimits
+ ) -Context 'Isolated Pester repository regression' -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -DirectWindowsProcess -ReadOnlyPaths @($pesterMirrorRoot, $installRoot, $pesterRunnerPath) -ApplyLinuxResourceLimits
+$pesterResultPrefix = 'SGV1-Pester-Result:'
 $pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
-    $_.StartsWith($pesterWorkerMarker, [StringComparison]::Ordinal)
+    $_.StartsWith($pesterResultPrefix, [StringComparison]::Ordinal)
 })
 if ($pesterResultLines.Count -ne 1) {
     throw 'Isolated Pester exited without exactly one protected completion result.'
@@ -4366,7 +4356,7 @@ if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
     throw 'Run-owned isolated Pester worker changed during candidate tests.'
 }
 try {
-    $pesterResultJson = $pesterResultLines[0].Substring($pesterWorkerMarker.Length)
+    $pesterResultJson = $pesterResultLines[0].Substring($pesterResultPrefix.Length)
     $pesterResultDocument = [System.Text.Json.JsonDocument]::Parse($pesterResultJson)
     try {
         Assert-NoDuplicateJsonProperties -Element $pesterResultDocument.RootElement -Context 'Isolated Pester result'
@@ -4397,8 +4387,13 @@ if ($pesterResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -n
     ).Count -gt 0) {
     throw 'Isolated Pester repository regression did not report the exact trusted test inventory.'
 }
-$workerPayload = [ordered]@{
+$completionAttestationNonceBytes = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Fill($completionAttestationNonceBytes)
+$completionAttestationNonce = ([BitConverter]::ToString($completionAttestationNonceBytes) -replace '-', '').ToLowerInvariant()
+$receiptPayload = [ordered]@{
     result = 'passed'
+    completionAttestation = 'trusted-parent-post-exit'
+    completionAttestationNonce = $completionAttestationNonce
     pesterVersion = [string]$pesterResult.pesterVersion
     totalCount = [int64]$pesterResult.TotalCount
     passedCount = [int64]$pesterResult.PassedCount
@@ -4410,7 +4405,7 @@ $receiptIdBytes = [byte[]]::new(16)
 [Security.Cryptography.RandomNumberGenerator]::Fill($receiptIdBytes)
 $receiptId = ([BitConverter]::ToString($receiptIdBytes) -replace '-', '').ToLowerInvariant()
 $receiptPath = Join-Path $runRoot ("trusted-pester-receipt-{0}.json" -f $receiptId)
-$receiptJson = $workerPayload | ConvertTo-Json -Depth 20 -Compress
+$receiptJson = $receiptPayload | ConvertTo-Json -Depth 20 -Compress
 $receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
 $receiptStream = [IO.File]::Open($receiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
 try {
