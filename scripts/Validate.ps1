@@ -3469,7 +3469,7 @@ function Invoke-NativeChecked {
                 }
                 & $addLinuxReadonlyBindPath -Path $chrootPath
                 & $addLinuxReadonlyBindPath -Path $setprivPath
-                foreach ($readOnlyPath in @($ReadOnlyPaths)) {
+                foreach ($readOnlyPath in $ReadOnlyPaths) {
                     $readOnlyFullPath = [IO.Path]::GetFullPath([string]$readOnlyPath)
                     if (-not (Test-Path -LiteralPath $readOnlyFullPath)) {
                         throw "$Context trusted read-only child path is missing: $readOnlyFullPath"

@@ -10,6 +10,41 @@ Describe 'Darktide bootstrap transition' {
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:Layout = Get-TestRepositoryLayout -RepositoryRoot $script:RepositoryRoot
 
+        function New-LinuxReadOnlyBindProbe {
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+            if (@($parseErrors).Count -ne 0) { throw 'The production supervisor must parse before constructing the bind probe.' }
+            $nativeFunction = $ast.Find({ param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+                }, $true)
+            $parameters = @($nativeFunction.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'ReadOnlyPaths' })
+            $loops = @($nativeFunction.FindAll({ param($node)
+                    $node -is [Management.Automation.Language.ForEachStatementAst] -and
+                    $node.Variable.VariablePath.UserPath -ceq 'readOnlyPath' -and
+                    $node.Condition.Extent.Text.Contains('$ReadOnlyPaths')
+                }, $true))
+            if ($parameters.Count -ne 1 -or $loops.Count -ne 1) { throw 'Expected one production read-only path parameter and loop.' }
+            $source = [Collections.Generic.List[string]]::new()
+            foreach ($name in @('Test-PathEqual', 'Assert-NoReparseAncestors')) {
+                $functionAst = $ast.Find({ param($node)
+                        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+                    }, $true)
+                if ($null -eq $functionAst) { throw "Missing production path guard: $name" }
+                $source.Add($functionAst.Extent.Text)
+            }
+            $source.Add('function Invoke-LinuxReadOnlyBindProbe {')
+            $source.Add('param(' + $parameters[0].Extent.Text + ')')
+            $source.Add('$ErrorActionPreference = ''Stop''')
+            $source.Add('$Context = ''Linux read-only bind regression''')
+            $source.Add('$linuxReadonlyBindPaths = [Collections.Generic.List[string]]::new()')
+            $source.Add($loops[0].Extent.Text)
+            $source.Add('$linuxReadonlyBindPaths.ToArray()')
+            $source.Add('}')
+            $source.Add('Export-ModuleMember -Function @()')
+            New-Module -ScriptBlock ([scriptblock]::Create($source -join [Environment]::NewLine))
+        }
+
         function New-ValidatorGitSnapshot {
             param([Parameter(Mandatory = $true)][string] $Destination)
 
@@ -805,6 +840,49 @@ steps:
         }
         finally {
             [Environment]::SetEnvironmentVariable('PSModulePath', $originalModulePath, [EnvironmentVariableTarget]::Process)
+            Remove-Module $probeModule -Force
+        }
+    }
+
+    It 'UnitT76_AllowsOmittedOptionalLinuxReadOnlyPathCollection' {
+        # Scenario: Bootstrap supplies no extra read-only paths, or supplies an empty collection.
+        # Purpose: Treat absence as zero bind requests instead of converting a null entry into an invalid empty path.
+        $probeModule = New-LinuxReadOnlyBindProbe
+        try {
+            @(& $probeModule { Invoke-LinuxReadOnlyBindProbe }).Count | Should -Be 0
+            @(& $probeModule { Invoke-LinuxReadOnlyBindProbe -ReadOnlyPaths @() }).Count | Should -Be 0
+            @(& $probeModule { Invoke-LinuxReadOnlyBindProbe -ReadOnlyPaths $null }).Count | Should -Be 0
+        }
+        finally {
+            Remove-Module $probeModule -Force
+        }
+    }
+
+    It 'UnitT77_PreservesExplicitLinuxReadOnlyPathValidation' {
+        # Scenario: Extra read-only paths contain regular entries, duplicates, a missing entry, a blank entry, or a reparse point.
+        # Purpose: Preserve ordered unique binds and fail closed for every invalid explicitly requested path.
+        $probeModule = New-LinuxReadOnlyBindProbe
+        $directory = Join-Path $TestDrive 'readonly-directory'
+        $file = Join-Path $TestDrive 'readonly-file.txt'
+        $missing = Join-Path $TestDrive 'readonly-missing'
+        $link = Join-Path $TestDrive 'readonly-link'
+        [void](New-Item -ItemType Directory -Path $directory)
+        [IO.File]::WriteAllText($file, 'read-only fixture')
+        New-TestReparsePoint -Path $link -Target $directory | Out-Null
+        try {
+            $actual = @(& $probeModule {
+                    param([string[]] $Paths)
+                    Invoke-LinuxReadOnlyBindProbe -ReadOnlyPaths $Paths
+                } @($directory, $file, $directory))
+            $actual | Should -Be @([IO.Path]::GetFullPath($directory), [IO.Path]::GetFullPath($file))
+            { & $probeModule { param($Path) Invoke-LinuxReadOnlyBindProbe -ReadOnlyPaths @($Path) } $missing } |
+                Should -Throw '*trusted read-only child path is missing*'
+            { & $probeModule { Invoke-LinuxReadOnlyBindProbe -ReadOnlyPaths @('') } } |
+                Should -Throw '*GetFullPath*empty*'
+            { & $probeModule { param($Path) Invoke-LinuxReadOnlyBindProbe -ReadOnlyPaths @($Path) } $link } |
+                Should -Throw '*backed by a reparse point*'
+        }
+        finally {
             Remove-Module $probeModule -Force
         }
     }
