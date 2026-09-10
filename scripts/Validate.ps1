@@ -3507,7 +3507,11 @@ do
             # namespace user's ownership.  Archive-style copies of /etc are
             # unsafe here: entries such as shadow may be unreadable and
             # preserving host-root ownership is invalid in a user namespace.
-            "$find_path" "$system_root" -xdev -type d -readable -exec /bin/sh -eu -c '
+            # Account skeletons are new-user home templates, not runtime
+            # configuration, and hosted images may include large tool caches.
+            # Prune inaccessible subtrees before discovery; unexpected traversal
+            # or selected-copy failures must still fail the launcher.
+            "$find_path" "$system_root" -xdev \( -path "$system_root/skel" -o \( -type d \( ! -readable -o ! -executable \) \) \) -prune -o -type d -readable -exec /bin/sh -eu -c '
                 root="$1"
                 target="$2"
                 shift 2
@@ -3515,8 +3519,8 @@ do
                     relative="${source#"$root"}"
                     mkdir -p "$target$relative"
                 done
-            ' sh "$system_root" "$target" {} + 2>/dev/null || true
-            "$find_path" "$system_root" -xdev -type f -readable -exec /bin/sh -eu -c '
+            ' sh "$system_root" "$target" {} +
+            "$find_path" "$system_root" -xdev \( -path "$system_root/skel" -o \( -type d \( ! -readable -o ! -executable \) \) \) -prune -o -type f -readable -exec /bin/sh -eu -c '
                 root="$1"
                 target="$2"
                 shift 2
@@ -3526,7 +3530,7 @@ do
                     mkdir -p "$(dirname "$destination")"
                     /bin/cat -- "$source" > "$destination"
                 done
-            ' sh "$system_root" "$target" {} + 2>/dev/null || true
+            ' sh "$system_root" "$target" {} +
             rm -f "$target/resolv.conf"
             if [ -e "$system_root/resolv.conf" ]; then
                 /bin/cat -- "$system_root/resolv.conf" > "$target/resolv.conf"

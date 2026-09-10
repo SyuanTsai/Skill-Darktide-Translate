@@ -45,6 +45,68 @@ Describe 'Darktide bootstrap transition' {
             New-Module -ScriptBlock ([scriptblock]::Create($source -join [Environment]::NewLine))
         }
 
+        function Invoke-LinuxEtcProjectionProbe {
+            param(
+                [Parameter(Mandatory = $true)][string] $SourceRoot,
+                [Parameter(Mandatory = $true)][string] $DestinationRoot,
+                [Parameter(Mandatory = $true)]
+                [ValidateSet('DirectorySelection', 'FileSelection', 'DirectoryCopy', 'FileCopy')][string] $Mode
+            )
+
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+            if (@($parseErrors).Count -ne 0) { throw 'The supervisor must parse before constructing the etc probe.' }
+            $nativeFunction = $ast.Find({ param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+                }, $true)
+            $payloads = @($nativeFunction.FindAll({ param($node)
+                    $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                    $node.Value.Contains('for system_root in /usr ')
+                }, $true))
+            if ($payloads.Count -ne 1) { throw 'Expected one actual Linux native launcher payload.' }
+            $blocks = @([regex]::Matches($payloads[0].Value,
+                    '(?ms)^ {12}"\$find_path" "\$system_root" [^\r\n]* -exec /bin/sh -eu -c ''\r?\n.*?^ {12}'' sh "\$system_root" "\$target" \{\} \+[^\r\n]*'))
+            if ($blocks.Count -ne 2) { throw 'Expected the actual directory and file projection batches.' }
+            $blockIndex = if ($Mode.StartsWith('Directory')) { 0 } else { 1 }
+            $commandText = $blocks[$blockIndex].Value
+            if ($Mode.EndsWith('Selection')) {
+                $commandText = ($commandText -split ' -exec ', 2)[0] + ' -print'
+            }
+            $shellPath = $null
+            if ($IsWindows) {
+                $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+                $gitParent = Split-Path -Parent $gitCommand.Path
+                for ($depth = 0; $depth -lt 3 -and $null -eq $shellPath; $depth++) {
+                    $candidateShell = Join-Path $gitParent 'usr/bin/sh.exe'
+                    if (Test-Path -LiteralPath $candidateShell -PathType Leaf) { $shellPath = $candidateShell }
+                    $gitParent = Split-Path -Parent $gitParent
+                }
+                if ($null -eq $shellPath) { throw 'The etc regression requires the POSIX shell included with Git for Windows.' }
+            }
+            else {
+                $shellPath = (Get-Command sh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path
+            }
+            $probePath = Join-Path $TestDrive ('etc-probe-' + [guid]::NewGuid().ToString('N') + '.sh')
+            $header = @'
+set -eu
+PATH=/usr/bin:/bin
+export PATH
+system_root="$1"
+target="$2"
+find_path=/usr/bin/find
+'@
+            [IO.File]::WriteAllText($probePath, ($header + "`n" + $commandText + "`n").Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+            $priorErrorAction = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $output = @(& $shellPath $probePath.Replace('\', '/') $SourceRoot.Replace('\', '/') $DestinationRoot.Replace('\', '/') 2>&1)
+                $exitCode = $LASTEXITCODE
+            }
+            finally { $ErrorActionPreference = $priorErrorAction }
+            [pscustomobject]@{ ExitCode = $exitCode; Output = @($output | ForEach-Object { [string]$_ }) }
+        }
+
         function New-ValidatorGitSnapshot {
             param([Parameter(Mandatory = $true)][string] $Destination)
 
@@ -923,6 +985,62 @@ steps:
         $supervisor | Should -Match '-type f -readable'
         $supervisor | Should -Match '/bin/cat -- "\$source"'
         $supervisor | Should -Not -Match '/bin/cp -a'
+    }
+
+    It 'UnitT81_ExcludesAccountSkeletonFromActualLinuxProjectionSelections' {
+        # Scenario: Host configuration includes account skeleton descendants and a similarly named ordinary configuration directory.
+        # Purpose: Execute both real find selections so a home template cannot consume the private etc tmpfs while other configuration remains visible.
+        $sourceRoot = Join-Path $TestDrive 'etc-selection-source'
+        $targetRoot = Join-Path $TestDrive 'etc-selection-target'
+        New-Item -ItemType Directory -Path (Join-Path $sourceRoot 'skel/nested'),
+            (Join-Path $sourceRoot 'skel-extra'), (Join-Path $sourceRoot 'ssl/certs'), $targetRoot -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $sourceRoot 'skel/nested/template.bin') -Value 'excluded template'
+        Set-Content -LiteralPath (Join-Path $sourceRoot 'skel-extra/retained.conf') -Value 'retained configuration'
+        Set-Content -LiteralPath (Join-Path $sourceRoot 'ssl/certs/ca.crt') -Value 'fixture certificate'
+        $normalizedRoot = $sourceRoot.Replace('\', '/')
+
+        $directories = Invoke-LinuxEtcProjectionProbe -SourceRoot $sourceRoot -DestinationRoot $targetRoot -Mode DirectorySelection
+        $directories.ExitCode | Should -Be 0
+        $directories.Output | Should -Contain "$normalizedRoot/ssl/certs"
+        $directories.Output | Should -Contain "$normalizedRoot/skel-extra"
+        $directories.Output | Should -Not -Contain "$normalizedRoot/skel"
+        $directories.Output | Should -Not -Contain "$normalizedRoot/skel/nested"
+
+        $files = Invoke-LinuxEtcProjectionProbe -SourceRoot $sourceRoot -DestinationRoot $targetRoot -Mode FileSelection
+        $files.ExitCode | Should -Be 0
+        $files.Output | Should -Contain "$normalizedRoot/ssl/certs/ca.crt"
+        $files.Output | Should -Contain "$normalizedRoot/skel-extra/retained.conf"
+        $files.Output | Should -Not -Contain "$normalizedRoot/skel/nested/template.bin"
+    }
+
+    It 'UnitT82_PropagatesActualLinuxFileProjectionCopyFailures' {
+        # Scenario: The actual file batch copies normal and empty files, then encounters a directory where an output file belongs.
+        # Purpose: A failed selected copy must make the launcher fail instead of leaving an incomplete configuration projection marked successful.
+        $sourceRoot = Join-Path $TestDrive 'etc-copy-source'
+        $targetRoot = Join-Path $TestDrive 'etc-copy-target'
+        $collisionRoot = Join-Path $TestDrive 'etc-copy-collision'
+        New-Item -ItemType Directory -Path $sourceRoot, $targetRoot, (Join-Path $collisionRoot 'config') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $sourceRoot 'config'), 'configuration bytes')
+        [IO.File]::WriteAllText((Join-Path $sourceRoot 'empty'), '')
+
+        $success = Invoke-LinuxEtcProjectionProbe -SourceRoot $sourceRoot -DestinationRoot $targetRoot -Mode FileCopy
+        $success.ExitCode | Should -Be 0
+        [IO.File]::ReadAllText((Join-Path $targetRoot 'config')) | Should -BeExactly 'configuration bytes'
+        (Get-Item -LiteralPath (Join-Path $targetRoot 'empty')).Length | Should -Be 0
+        $failure = Invoke-LinuxEtcProjectionProbe -SourceRoot $sourceRoot -DestinationRoot $collisionRoot -Mode FileCopy
+        $failure.ExitCode | Should -Not -Be 0
+    }
+
+    It 'UnitT83_PropagatesActualLinuxDirectoryProjectionCopyFailures' {
+        # Scenario: A selected source directory collides with a regular file in the private destination.
+        # Purpose: Prove the directory batch propagates mkdir failure through find and the outer set-e launcher.
+        $sourceRoot = Join-Path $TestDrive 'etc-directory-source'
+        $targetRoot = Join-Path $TestDrive 'etc-directory-collision'
+        New-Item -ItemType Directory -Path (Join-Path $sourceRoot 'nested'), $targetRoot -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $targetRoot 'nested') -Value 'directory collision'
+
+        $failure = Invoke-LinuxEtcProjectionProbe -SourceRoot $sourceRoot -DestinationRoot $targetRoot -Mode DirectoryCopy
+        $failure.ExitCode | Should -Not -Be 0
     }
 
     It 'UnitT90SeparatesChildOutputAndTrustedPesterContent' {
