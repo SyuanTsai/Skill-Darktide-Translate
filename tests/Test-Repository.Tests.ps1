@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 SyuanTsai
+﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Darktide Translate Standard v1 repository contract' {
     BeforeAll {

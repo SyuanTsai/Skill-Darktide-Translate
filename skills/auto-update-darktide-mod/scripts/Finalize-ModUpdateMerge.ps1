@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 SyuanTsai
+﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop

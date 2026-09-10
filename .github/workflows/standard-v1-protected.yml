@@ -124,7 +124,16 @@ jobs:
             }
             $tokens = $null
             $errors = $null
-            [Management.Automation.Language.Parser]::ParseFile($candidatePath, [ref]$tokens, [ref]$errors) | Out-Null
+            $candidateSource = [IO.File]::ReadAllText(
+              $candidatePath,
+              [Text.UTF8Encoding]::new($false, $true)
+            )
+            [Management.Automation.Language.Parser]::ParseInput(
+              $candidateSource,
+              $candidatePath,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
             if (@($errors).Count -gt 0) {
               throw "Candidate PowerShell file does not parse under Windows PowerShell 5.1: $relativePath"
             }
