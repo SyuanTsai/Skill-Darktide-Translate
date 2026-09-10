@@ -887,6 +887,33 @@ steps:
         }
     }
 
+    It 'UnitT78_UsesSupportedCapabilityDropArgumentsInBothLinuxLaunchers' {
+        # Scenario: Native and Pester-proxy Linux launchers hand their real shell payloads to util-linux setpriv.
+        # Purpose: Reject unsupported CLI options while preserving no-new-privileges and all three capability-set removals.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        foreach ($functionName in @('Invoke-NativeChecked', 'Invoke-ProtectedPesterServerProxy')) {
+            $functionAst = $ast.Find({ param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
+                }, $true)
+            $functionAst | Should -Not -BeNullOrEmpty
+            $payloads = @($functionAst.FindAll({ param($node)
+                    $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                    $node.Value.Contains('exec /usr/bin/setpriv ')
+                }, $true))
+            $payloads.Count | Should -Be 1
+            $calls = @([regex]::Matches($payloads[0].Value, 'exec /usr/bin/setpriv (?<options>[^\r\n]+?) -- "\$@"'))
+            $calls.Count | Should -Be 1
+            $options = @($calls[0].Groups['options'].Value -split '\s+')
+            $options.Count | Should -Be 4
+            foreach ($requiredOption in @('--no-new-privs', '--bounding-set=-all', '--inh-caps=-all', '--ambient-caps=-all')) {
+                $options | Should -Contain $requiredOption -Because "$functionName must use the supported privilege-dropping interface"
+            }
+        }
+    }
+
     It 'UnitT80_ProjectsLinuxEtcWithoutArchiveOwnershipCopy' {
         # Scenario: A user namespace cannot read every host /etc file or preserve host-root ownership.
         # Purpose: Build a private readable projection without mutating the host bind or aborting on archive metadata.
