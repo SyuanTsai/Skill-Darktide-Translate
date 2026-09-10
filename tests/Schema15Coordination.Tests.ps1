@@ -3,11 +3,12 @@
 Describe 'Schema 15 multi-process coordination contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
-        $skillRoot = Join-Path $repoRoot 'skills/auto-update-darktide-mod'
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $layout = Get-TestRepositoryLayout -RepositoryRoot $repoRoot
+        $skillRoot = $layout.SkillRoot
         $scriptRoot = Join-Path $skillRoot 'scripts'
         $runnerPath = Join-Path $scriptRoot 'mod-update.ps1'
         $coordinationModule = Join-Path $scriptRoot 'SharedCoordinationLock.psm1'
-        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:skillSourcePinPath = New-TestSkillSourcePin -SkillRoot $skillRoot `
             -OutputPath (Join-Path $TestDrive 'coordination-skill-source-pin.json')
     }

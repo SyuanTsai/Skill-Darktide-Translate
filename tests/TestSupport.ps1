@@ -60,13 +60,110 @@ function ConvertFrom-TestJson {
     }
 }
 
+function Get-TestRepositoryLayout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $RepositoryRoot
+    )
+
+    $root = [IO.Path]::GetFullPath($RepositoryRoot)
+    $legacyCatalogPath = Join-Path $root 'catalog/skills-catalog.json'
+    $legacySkillRoot = Join-Path $root '.agents/skills/auto-update-darktide-mod'
+    $standardSourcePath = Join-Path $root 'catalog/source.json'
+    $standardAdapterPath = Join-Path $root 'config/standard-v1.json'
+    $standardSkillRoot = Join-Path $root 'skills/auto-update-darktide-mod'
+
+    $hasLegacyCatalog = Test-Path -LiteralPath $legacyCatalogPath -PathType Leaf
+    $hasLegacySkill = Test-Path -LiteralPath $legacySkillRoot -PathType Container
+    $hasStandardSource = Test-Path -LiteralPath $standardSourcePath -PathType Leaf
+    $hasStandardAdapter = Test-Path -LiteralPath $standardAdapterPath -PathType Leaf
+    $hasStandardSkill = Test-Path -LiteralPath $standardSkillRoot -PathType Container
+    $hasLegacyMarker = $hasLegacyCatalog -or $hasLegacySkill
+    $hasStandardMarker = $hasStandardSource -or $hasStandardAdapter -or $hasStandardSkill
+
+    if ($hasLegacyMarker -and $hasStandardMarker) {
+        throw 'Repository layout is mixed; legacy and Standard v1 source-owned structures cannot coexist.'
+    }
+    if ($hasLegacyCatalog -and $hasLegacySkill -and -not $hasStandardMarker) {
+        return [pscustomobject][ordered]@{
+            Name = 'legacy'
+            SkillsRootRelative = '.agents/skills'
+            SkillPath = '.agents/skills/auto-update-darktide-mod'
+            SkillsRoot = Join-Path $root '.agents/skills'
+            SkillRoot = $legacySkillRoot
+            ScriptRoot = Join-Path $legacySkillRoot 'scripts'
+            CatalogPath = 'catalog/skills-catalog.json'
+            ProfilePath = 'catalog/skills-catalog.json'
+            SourcePath = $null
+            AdapterPath = $null
+            WorkflowPath = '.github/workflows/validate.yml'
+            QualityWorkflowPath = '.github/workflows/skill-validator.yml'
+        }
+    }
+    if ($hasStandardSource -and $hasStandardAdapter -and $hasStandardSkill -and -not $hasLegacyMarker) {
+        return [pscustomobject][ordered]@{
+            Name = 'standard-v1'
+            SkillsRootRelative = 'skills'
+            SkillPath = 'skills/auto-update-darktide-mod'
+            SkillsRoot = Join-Path $root 'skills'
+            SkillRoot = $standardSkillRoot
+            ScriptRoot = Join-Path $standardSkillRoot 'scripts'
+            CatalogPath = 'catalog/profiles.json'
+            ProfilePath = 'catalog/profiles.json'
+            SourcePath = 'catalog/source.json'
+            AdapterPath = 'config/standard-v1.json'
+            WorkflowPath = '.github/workflows/standard-v1-protected.yml'
+            QualityWorkflowPath = $null
+        }
+    }
+
+    throw 'Repository layout is incomplete or unauthorized; only the complete legacy or Standard v1 structure is accepted.'
+}
+
+function Get-TestSkillRepositoryPath {
+    param(
+        [Parameter(Mandatory)][string] $SkillRoot
+    )
+
+    $provenancePath = Join-Path $SkillRoot 'references/source-provenance.json'
+    if (Test-Path -LiteralPath $provenancePath -PathType Leaf) {
+        try {
+            $provenance = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json
+            $candidate = [string]$provenance.skillRepositoryPath
+            if ($candidate -in @('.agents/skills/auto-update-darktide-mod', 'skills/auto-update-darktide-mod')) {
+                return $candidate
+            }
+        }
+        catch {
+            # Fall back to the bounded physical-path inference below.
+        }
+    }
+
+    $skillRootFull = [IO.Path]::GetFullPath($SkillRoot)
+    $skillsRoot = Split-Path -Parent $skillRootFull
+    $skillsParent = Split-Path -Parent $skillsRoot
+    if ((Split-Path -Leaf $skillsParent) -ceq '.agents') {
+        return '.agents/skills/auto-update-darktide-mod'
+    }
+    return 'skills/auto-update-darktide-mod'
+}
+
 function New-TestSkillSourcePin {
     param(
         [Parameter(Mandatory)][string] $SkillRoot,
-        [Parameter(Mandatory)][string] $OutputPath
+        [Parameter(Mandatory)][string] $OutputPath,
+        [string] $RepositorySkillPath
     )
 
-    $skillPath = 'skills/auto-update-darktide-mod'
+    $skillPath = if ([string]::IsNullOrWhiteSpace($RepositorySkillPath)) {
+        Get-TestSkillRepositoryPath -SkillRoot $SkillRoot
+    }
+    else {
+        $RepositorySkillPath.Replace('\', '/')
+    }
+    if ($skillPath -notin @('.agents/skills/auto-update-darktide-mod', 'skills/auto-update-darktide-mod')) {
+        throw "Unsupported Skill source path for test pin: $skillPath"
+    }
     $files = @(
         Get-ChildItem -LiteralPath $SkillRoot -File -Recurse | ForEach-Object {
             $bytes = [IO.File]::ReadAllBytes($_.FullName)
@@ -125,7 +222,8 @@ function Set-TestRunSkillSourcePin {
 function New-TestPinnedCompletedStageRun {
     param(
         [Parameter(Mandatory)][string] $SkillRoot,
-        [Parameter(Mandatory)][string] $FixtureRoot
+        [Parameter(Mandatory)][string] $FixtureRoot,
+        [string] $RepositorySkillPath
     )
 
     $installedParent = Join-Path $FixtureRoot 'installed'
@@ -173,7 +271,8 @@ function New-TestPinnedCompletedStageRun {
         }
     }
     $runPinPath = New-TestSkillSourcePin -SkillRoot $installedSkillRoot `
-        -OutputPath (Join-Path $runRoot 'review-artifacts/skill-source-pin.json')
+        -OutputPath (Join-Path $runRoot 'review-artifacts/skill-source-pin.json') `
+        -RepositorySkillPath $RepositorySkillPath
     $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $runPinPath
     [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
 
