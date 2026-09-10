@@ -7,30 +7,113 @@ Describe 'Darktide bootstrap transition' {
         $script:RepositoryValidator = Join-Path $script:RepositoryRoot 'scripts/Test-Repository.ps1'
         $script:Supervisor = Join-Path $script:RepositoryRoot 'scripts/Validate.ps1'
         $script:ProtectedWorkflow = Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml'
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $script:Layout = Get-TestRepositoryLayout -RepositoryRoot $script:RepositoryRoot
+
+        function New-ValidatorGitSnapshot {
+            param([Parameter(Mandatory = $true)][string] $Destination)
+
+            New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+            foreach ($item in @(Get-ChildItem -LiteralPath $script:RepositoryRoot -Force |
+                    Where-Object { $_.Name -cne '.git' })) {
+                Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force
+            }
+            & git -C $Destination init --quiet --initial-branch=main
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to initialize the validator Git snapshot.' }
+            & git -C $Destination config user.name 'Protected Validator Snapshot'
+            & git -C $Destination config user.email 'protected-validator@example.invalid'
+            & git -C $Destination add --all
+            & git -C $Destination commit --quiet -m 'protected validator snapshot'
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to commit the validator Git snapshot.' }
+            return $Destination
+        }
+
+        $script:ValidatorRepositoryRoot = New-ValidatorGitSnapshot `
+            -Destination (Join-Path $TestDrive 'validator-repository-snapshot')
     }
 
-    It 'UnitT10_ValidatesTheCurrentLegacyLayoutOnlyThroughAnExplicitTransition' {
-        # Scenario: The bootstrap commit still uses the current source catalog and .agents/skills package root.
-        # Purpose: Prove the trusted repository validator has an explicit, bounded transition path before Standard v1 promotion.
-        $reportPath = Join-Path $TestDrive 'bootstrap-repository-report.json'
-        $output = @(& $script:RepositoryValidator `
-                -RepositoryRoot $script:RepositoryRoot `
-                -BootstrapTransition `
-                -OutputPath $reportPath)
-        $result = ($output | Select-Object -Last 1) | ConvertFrom-Json
+    It 'UnitT10_ValidatesExactlyOneBoundedRepositoryLayout' {
+        # Scenario: The protected suite runs against either the current legacy tree or a Standard v1 migration candidate.
+        # Purpose: Keep both accepted structures explicit while requiring the matching validator mode.
+        if ($script:Layout.Name -ceq 'legacy') {
+            $reportPath = Join-Path $TestDrive 'bootstrap-repository-report.json'
+            $output = @(& $script:RepositoryValidator `
+                    -RepositoryRoot $script:ValidatorRepositoryRoot `
+                    -BootstrapTransition `
+                    -OutputPath $reportPath)
+            $result = ($output | Select-Object -Last 1) | ConvertFrom-Json
 
-        $result.result | Should -Be 'passed'
-        $result.validationMode | Should -Be 'bootstrap-transition'
-        $result.skillsRoot | Should -Be '.agents/skills'
-        $result.activeSkillCount | Should -Be 1
-        Test-Path -LiteralPath $reportPath -PathType Leaf | Should -BeTrue
+            $result.result | Should -Be 'passed'
+            $result.validationMode | Should -Be 'bootstrap-transition'
+            $result.skillsRoot | Should -Be '.agents/skills'
+            $result.activeSkillCount | Should -Be 1
+            Test-Path -LiteralPath $reportPath -PathType Leaf | Should -BeTrue
+        }
+        else {
+            $reportPath = Join-Path $TestDrive 'standard-v1-repository-report.json'
+            $output = @(& $script:RepositoryValidator `
+                    -RepositoryRoot $script:ValidatorRepositoryRoot `
+                    -OutputPath $reportPath)
+            $result = ($output | Select-Object -Last 1) | ConvertFrom-Json
+
+            $result.result | Should -Be 'passed'
+            $result.sourceId | Should -Be 'darktide-translate'
+            $result.skillsRoot | Should -Be 'skills'
+            $result.activeSkillCount | Should -Be 1
+            Test-Path -LiteralPath $reportPath -PathType Leaf | Should -BeTrue
+        }
     }
 
-    It 'UnitT20_DoesNotPromoteTheLegacyLayoutWithoutTheTransitionFlag' {
-        # Scenario: A caller omits the explicit transition authorization.
-        # Purpose: Prevent a missing Standard v1 adapter from silently becoming a successful validation mode.
-        { & $script:RepositoryValidator -RepositoryRoot $script:RepositoryRoot } |
-            Should -Throw '*Standard v1*'
+    It 'UnitT20_RejectsAnUnauthorizedValidatorMode' {
+        # Scenario: A caller selects a validator mode that does not belong to the repository's bounded layout.
+        # Purpose: Prevent legacy authorization from being reused after Standard v1 promotion and prevent normal validation from bypassing legacy transition authorization.
+        if ($script:Layout.Name -ceq 'legacy') {
+            { & $script:RepositoryValidator -RepositoryRoot $script:ValidatorRepositoryRoot } |
+                Should -Throw '*Standard v1*'
+        }
+        else {
+            { & $script:RepositoryValidator -RepositoryRoot $script:ValidatorRepositoryRoot -BootstrapTransition } |
+                Should -Throw '*catalog/skills-catalog.json fixture*'
+        }
+    }
+
+    It 'UnitT25_RejectsMixedMissingAndUnauthorizedLayouts' {
+        # Scenario: A migration candidate has both layout markers, only part of a layout, or an unrelated source root.
+        # Purpose: Prove the protected test resolver does not widen the migration path to arbitrary directories or silently accept missing configuration.
+        $mixedRoot = Join-Path $TestDrive 'mixed-layout'
+        New-Item -ItemType Directory -Path (Join-Path $mixedRoot 'catalog'), (Join-Path $mixedRoot 'config'),
+            (Join-Path $mixedRoot '.agents/skills/auto-update-darktide-mod'), (Join-Path $mixedRoot 'skills/auto-update-darktide-mod') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $mixedRoot 'catalog/skills-catalog.json') -Value '{}'
+        Set-Content -LiteralPath (Join-Path $mixedRoot 'catalog/source.json') -Value '{}'
+        Set-Content -LiteralPath (Join-Path $mixedRoot 'config/standard-v1.json') -Value '{}'
+        { Get-TestRepositoryLayout -RepositoryRoot $mixedRoot } |
+            Should -Throw '*mixed*'
+
+        $incompleteRoot = Join-Path $TestDrive 'incomplete-layout'
+        New-Item -ItemType Directory -Path (Join-Path $incompleteRoot 'catalog') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $incompleteRoot 'catalog/source.json') -Value '{}'
+        { Get-TestRepositoryLayout -RepositoryRoot $incompleteRoot } |
+            Should -Throw '*incomplete or unauthorized*'
+
+        $unauthorizedRoot = Join-Path $TestDrive 'unauthorized-layout'
+        New-Item -ItemType Directory -Path (Join-Path $unauthorizedRoot 'catalog'), (Join-Path $unauthorizedRoot 'extensions/skills/auto-update-darktide-mod') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $unauthorizedRoot 'catalog/source.json') -Value '{}'
+        { Get-TestRepositoryLayout -RepositoryRoot $unauthorizedRoot } |
+            Should -Throw '*incomplete or unauthorized*'
+
+        if ($script:Layout.Name -ceq 'standard-v1') {
+            $missingConfigRoot = New-ValidatorGitSnapshot `
+                -Destination (Join-Path $TestDrive 'standard-v1-missing-config')
+            Remove-Item -LiteralPath (Join-Path $missingConfigRoot 'config/standard-v1.json') -Force
+            { & $script:RepositoryValidator -RepositoryRoot $missingConfigRoot } |
+                Should -Throw '*standard-v1.json*'
+
+            $mixedCandidateRoot = New-ValidatorGitSnapshot `
+                -Destination (Join-Path $TestDrive 'standard-v1-mixed-candidate')
+            Set-Content -LiteralPath (Join-Path $mixedCandidateRoot 'catalog/skills-catalog.json') -Value '{}'
+            { & $script:RepositoryValidator -RepositoryRoot $mixedCandidateRoot } |
+                Should -Throw '*must not coexist*'
+        }
     }
 
     It 'UnitT30_SelectsBootstrapOnlyWhenTheCandidateHasNotMigratedToStandardV1' {
@@ -119,6 +202,8 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'Expand-TrustedGitArchive'
         $supervisor | Should -Match 'Assert-TrustedGitTreeFile'
         $supervisor | Should -Match '\$trustedPesterCommit'
+        $supervisor | Should -Match '(?s)Expand-TrustedGitArchive.*?-Revision \$trustedPesterCommit.*?-PathSpec @\(''tests''\).*?-Context ''Trusted base Pester tests'''
+        $supervisor | Should -Match '(?s)\$candidateMirrorTestsRoot.*?Remove-Item'
         $supervisor | Should -Match '\$readOnlyPaths = @\('
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
         $supervisor | Should -Match 'CreateOutOfProcessRunspace'

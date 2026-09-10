@@ -3,10 +3,11 @@
 Describe 'Deterministic Darktide MOD update automation' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
-        $skillRoot = Join-Path $repoRoot '.agents/skills/auto-update-darktide-mod'
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $layout = Get-TestRepositoryLayout -RepositoryRoot $repoRoot
+        $skillRoot = $layout.SkillRoot
         $runnerPath = Join-Path $skillRoot 'scripts/mod-update.ps1'
         $validatorPath = Join-Path $skillRoot 'scripts/Test-ModUpdateCandidate.ps1'
-        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:skillSourcePinPath = New-TestSkillSourcePin -SkillRoot $skillRoot -OutputPath (Join-Path $TestDrive 'skill-source-pin.json')
     }
 
