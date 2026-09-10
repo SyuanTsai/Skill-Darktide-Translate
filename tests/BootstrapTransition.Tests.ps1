@@ -74,6 +74,131 @@ Describe 'Darktide bootstrap transition' {
             New-Module -ScriptBlock ([scriptblock]::Create($source -join [Environment]::NewLine))
         }
 
+        function New-LinuxChildReapingProbe {
+            param(
+                [Parameter(Mandatory = $true)][hashtable] $Records,
+                [Parameter()][int] $OpenResult = 71,
+                [Parameter()][int] $SendResult = 0,
+                [Parameter()][int] $ReapResult = 0,
+                [Parameter()][bool] $ReapRemovesIdentity = $true,
+                [Parameter()][bool] $IdentityChangesAfterOpen = $false
+            )
+
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+            if (@($parseErrors).Count -ne 0) { throw 'The production supervisor must parse before constructing the child-reaping probe.' }
+            $stopUnix = $ast.Find({ param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Stop-UnixProcessByIdentity'
+                }, $true)
+            $stopTree = $ast.Find({ param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Stop-ProcessTree'
+                }, $true)
+            if ($null -eq $stopUnix -or $null -eq $stopTree) { throw 'Missing production process-cleanup function.' }
+
+            $typeSuffix = [guid]::NewGuid().ToString('N')
+            $className = "FakeUnixBoundary_$typeSuffix"
+            $typeName = "Syp158.TestDoubles.$className"
+            $nativeSource = @"
+namespace Syp158.TestDoubles {
+    public static class $className {
+        public static int OpenResult { get; set; }
+        public static int SendResult { get; set; }
+        public static int ReapResult { get; set; }
+        public static int OpenCount { get; set; }
+        public static int SendCount { get; set; }
+        public static int ReapCount { get; set; }
+        public static int CloseCount { get; set; }
+        public static int LastOpenedProcessId { get; set; }
+        public static int LastReapedProcessId { get; set; }
+        public static int OpenProcessFileDescriptor(int processId) { OpenCount++; LastOpenedProcessId = processId; return OpenResult; }
+        public static int SendProcessSignal(int fileDescriptor, int signal) { SendCount++; return SendResult; }
+        public static int ReapExitedProcessFileDescriptor(int fileDescriptor) { ReapCount++; LastReapedProcessId = LastOpenedProcessId; return ReapResult; }
+        public static int CloseProcessFileDescriptor(int fileDescriptor) { CloseCount++; return 0; }
+    }
+}
+"@
+            $nativeType = @(Add-Type -TypeDefinition $nativeSource -PassThru)[0]
+            $nativeType::OpenResult = $OpenResult
+            $nativeType::SendResult = $SendResult
+            $nativeType::ReapResult = $ReapResult
+
+            $source = [Collections.Generic.List[string]]::new()
+            $source.Add(@'
+function Enable-UnixChildSubreaper { }
+function Test-ProcessIdentity {
+    param([int] $ProcessId, [string] $Identity)
+    $record = $script:FakeRecords[[int]$ProcessId]
+    if ($null -eq $record -or -not [bool]$record.exists) { return $false }
+    if ($script:ReapRemovesIdentity -and $script:FakeNativeType::ReapResult -eq 0 -and
+        $script:FakeNativeType::LastReapedProcessId -eq $ProcessId) { return $false }
+    return ([string]$record.identity -ceq $Identity)
+}
+function Get-ProcessIdentity {
+    param([int] $ProcessId)
+    $record = $script:FakeRecords[[int]$ProcessId]
+    if ($null -eq $record -or -not [bool]$record.exists -or
+        ($script:ReapRemovesIdentity -and $script:FakeNativeType::ReapResult -eq 0 -and
+            $script:FakeNativeType::LastReapedProcessId -eq $ProcessId)) {
+        throw "Process $ProcessId is absent."
+    }
+    if ($script:IdentityChangesAfterOpen -and $script:FakeNativeType::OpenCount -gt 0) {
+        return ([string]$record.identity + '-replaced')
+    }
+    return [string]$record.identity
+}
+function Get-UnixProcessInfo {
+    param([int] $ProcessId)
+    $record = $script:FakeRecords[[int]$ProcessId]
+    if ($null -eq $record -or -not [bool]$record.exists) { throw "Process $ProcessId is absent." }
+    return [pscustomobject]@{
+        processId = $ProcessId
+        parentProcessId = [int]$record.parentProcessId
+        processGroupId = [int]$record.processGroupId
+        startTime = 'fake-start'
+        state = [string]$record.state
+    }
+}
+function Test-ProcessIdExists {
+    param([int] $ProcessId)
+    $record = $script:FakeRecords[[int]$ProcessId]
+    return ($null -ne $record -and [bool]$record.exists -and
+        -not ($script:ReapRemovesIdentity -and $script:FakeNativeType::ReapResult -eq 0 -and
+            $script:FakeNativeType::LastReapedProcessId -eq $ProcessId))
+}
+function Get-UnixProcessGroupId { param([int] $ProcessId) return 0 }
+function Get-UnixProcessGroupProcessIds { param([int] $ProcessGroupId) return @() }
+function Add-ObservedProcessIds { param([int] $RootProcessId, $ObservedProcessIdentities, [int] $ProcessGroupId) }
+'@)
+            $source.Add($stopUnix.Extent.Text.Replace('Codex.Validation.UnixProcessBoundary', $typeName))
+            $source.Add($stopTree.Extent.Text)
+            $source.Add('Export-ModuleMember -Function @()')
+            $module = New-Module -ScriptBlock ([scriptblock]::Create($source -join [Environment]::NewLine))
+            return [pscustomobject]@{
+                Module = $module; NativeType = $nativeType; Records = $Records
+                ReapRemovesIdentity = $ReapRemovesIdentity; IdentityChangesAfterOpen = $IdentityChangesAfterOpen
+            }
+        }
+
+        function Invoke-LinuxChildReapingProbe {
+            param(
+                [Parameter(Mandatory = $true)] $Probe,
+                [Parameter(Mandatory = $true)][scriptblock] $Action,
+                [Parameter()][object[]] $Arguments = @()
+            )
+            & $Probe.Module {
+                param($Records, $NativeType, $ReapRemovesIdentity, $IdentityChangesAfterOpen, $ActionText, $Arguments)
+                $script:IsWindowsHost = $false
+                $script:IsLinuxHost = $true
+                $script:IsSupportedProcessBoundaryHost = $true
+                $script:FakeRecords = $Records
+                $script:FakeNativeType = $NativeType
+                $script:ReapRemovesIdentity = $ReapRemovesIdentity
+                $script:IdentityChangesAfterOpen = $IdentityChangesAfterOpen
+                & ([scriptblock]::Create($ActionText)) @Arguments
+            } $Probe.Records $Probe.NativeType $Probe.ReapRemovesIdentity $Probe.IdentityChangesAfterOpen $Action.ToString() $Arguments
+        }
+
         function Invoke-LinuxEtcProjectionProbe {
             param(
                 [Parameter(Mandatory = $true)][string] $SourceRoot,
@@ -1116,6 +1241,99 @@ steps:
         finally {
             if ($null -eq $previousArena) { $previousArena = [NullString]::Value }
             [Environment]::SetEnvironmentVariable('MALLOC_ARENA_MAX', $previousArena)
+        }
+    }
+
+    It 'UnitT86_ReapsAnObservedLinuxZombieThroughTheCompleteProcessTree' {
+        # Scenario: An observed descendant has exited, remains a zombie, and has been adopted by the supervisor.
+        # Purpose: Make the actual tree cleanup opt in to pidfd reaping without sending a signal to that exited child.
+        $childProcessId = 7293
+        $childIdentity = 'child-start-time'
+        $records = @{
+            $childProcessId = [pscustomobject]@{
+                exists = $true; identity = $childIdentity; state = 'Z'; parentProcessId = $PID; processGroupId = 0
+            }
+        }
+        $probe = New-LinuxChildReapingProbe -Records $records
+        try {
+            $observed = @{$childProcessId = $childIdentity}
+            {
+                Invoke-LinuxChildReapingProbe -Probe $probe -Action {
+                    param($RootProcessId, $Observed)
+                    Stop-ProcessTree -RootProcessId $RootProcessId -RootProcessIdentity 'root-start-time' -ObservedProcessIdentities $Observed
+                } -Arguments @(7292, $observed)
+            } | Should -Not -Throw
+            $probe.NativeType::OpenCount | Should -Be 1
+            $probe.NativeType::ReapCount | Should -Be 1
+            $probe.NativeType::SendCount | Should -Be 0
+            $probe.NativeType::CloseCount | Should -Be 1
+        }
+        finally {
+            Remove-Module $probe.Module -Force
+        }
+    }
+
+    It 'UnitT87_ReapsOnlyEligibleLinuxExitedChildren <Name>' -TestCases @(
+        @{ Name = 'default-is-disabled'; State = 'Z'; ParentProcessId = $PID; ReapExitedChild = $false; OpenResult = 71; ReapResult = 0; ReapRemovesIdentity = $true; IdentityChangesAfterOpen = $false; Exists = $true; ExpectedResult = $true; ExpectedOpen = 1; ExpectedReap = 0; ExpectedSignal = 1; ExpectedClose = 1 },
+        @{ Name = 'active-process'; State = 'R'; ParentProcessId = $PID; ReapExitedChild = $true; OpenResult = 71; ReapResult = 0; ReapRemovesIdentity = $true; IdentityChangesAfterOpen = $false; Exists = $true; ExpectedResult = $true; ExpectedOpen = 1; ExpectedReap = 0; ExpectedSignal = 1; ExpectedClose = 1 },
+        @{ Name = 'foreign-parent-zombie'; State = 'Z'; ParentProcessId = ($PID + 1); ReapExitedChild = $true; OpenResult = 71; ReapResult = 0; ReapRemovesIdentity = $true; IdentityChangesAfterOpen = $false; Exists = $true; ExpectedResult = $true; ExpectedOpen = 1; ExpectedReap = 0; ExpectedSignal = 1; ExpectedClose = 1 },
+        @{ Name = 'identity-changes-after-pidfd-open'; State = 'Z'; ParentProcessId = $PID; ReapExitedChild = $true; OpenResult = 71; ReapResult = 0; ReapRemovesIdentity = $true; IdentityChangesAfterOpen = $true; Exists = $true; ExpectedResult = $false; ExpectedOpen = 1; ExpectedReap = 0; ExpectedSignal = 0; ExpectedClose = 1 },
+        @{ Name = 'pidfd-open-fails'; State = 'Z'; ParentProcessId = $PID; ReapExitedChild = $true; OpenResult = -1; ReapResult = 0; ReapRemovesIdentity = $true; IdentityChangesAfterOpen = $false; Exists = $true; ExpectedResult = $false; ExpectedOpen = 1; ExpectedReap = 0; ExpectedSignal = 0; ExpectedClose = 0 },
+        @{ Name = 'reap-fails'; State = 'Z'; ParentProcessId = $PID; ReapExitedChild = $true; OpenResult = 71; ReapResult = -1; ReapRemovesIdentity = $true; IdentityChangesAfterOpen = $false; Exists = $true; ExpectedResult = $false; ExpectedOpen = 1; ExpectedReap = 1; ExpectedSignal = 0; ExpectedClose = 1 },
+        @{ Name = 'reap-leaves-identity-present'; State = 'Z'; ParentProcessId = $PID; ReapExitedChild = $true; OpenResult = 71; ReapResult = 0; ReapRemovesIdentity = $false; IdentityChangesAfterOpen = $false; Exists = $true; ExpectedResult = $false; ExpectedOpen = 1; ExpectedReap = 1; ExpectedSignal = 0; ExpectedClose = 1 },
+        @{ Name = 'identity-is-already-absent'; State = 'Z'; ParentProcessId = $PID; ReapExitedChild = $true; OpenResult = 71; ReapResult = 0; ReapRemovesIdentity = $true; IdentityChangesAfterOpen = $false; Exists = $false; ExpectedResult = $true; ExpectedOpen = 0; ExpectedReap = 0; ExpectedSignal = 0; ExpectedClose = 0 }
+    ) {
+        # Scenario: pidfd cleanup sees an exited child, a live or foreign process, or a race at one of its identity boundaries.
+        # Purpose: Reap only an opt-in supervisor-owned zombie and fail closed whenever identity or reaping cannot prove completion.
+        param($Name, $State, $ParentProcessId, $ReapExitedChild, $OpenResult, $ReapResult, $ReapRemovesIdentity, $IdentityChangesAfterOpen, $Exists, $ExpectedResult, $ExpectedOpen, $ExpectedReap, $ExpectedSignal, $ExpectedClose)
+        $childProcessId = 7293
+        $childIdentity = 'child-start-time'
+        $records = @{
+            $childProcessId = [pscustomobject]@{
+                exists = $Exists; identity = $childIdentity; state = $State; parentProcessId = $ParentProcessId; processGroupId = 0
+            }
+        }
+        $probe = New-LinuxChildReapingProbe -Records $records -OpenResult $OpenResult -ReapResult $ReapResult `
+            -ReapRemovesIdentity $ReapRemovesIdentity -IdentityChangesAfterOpen $IdentityChangesAfterOpen
+        try {
+            $actual = Invoke-LinuxChildReapingProbe -Probe $probe -Action {
+                param($ProcessId, $Identity, $Reap)
+                Stop-UnixProcessByIdentity -ProcessId $ProcessId -Identity $Identity -Signal 15 -ReapExitedChild:$Reap
+            } -Arguments @($childProcessId, $childIdentity, $ReapExitedChild)
+            $actual | Should -Be $ExpectedResult
+            $probe.NativeType::OpenCount | Should -Be $ExpectedOpen
+            $probe.NativeType::ReapCount | Should -Be $ExpectedReap
+            $probe.NativeType::SendCount | Should -Be $ExpectedSignal
+            $probe.NativeType::CloseCount | Should -Be $ExpectedClose
+        }
+        finally {
+            Remove-Module $probe.Module -Force
+        }
+    }
+
+    It 'UnitT88_RejectsAForeignLinuxZombieFromTheCompleteProcessTree' {
+        # Scenario: An observed zombie is parented by a process other than the trusted supervisor.
+        # Purpose: Keep complete-tree cleanup fail closed instead of reaping or accepting a foreign descendant.
+        $childProcessId = 7293
+        $childIdentity = 'foreign-child-start-time'
+        $records = @{
+            $childProcessId = [pscustomobject]@{
+                exists = $true; identity = $childIdentity; state = 'Z'; parentProcessId = ($PID + 1); processGroupId = 0
+            }
+        }
+        $probe = New-LinuxChildReapingProbe -Records $records
+        try {
+            $observed = @{$childProcessId = $childIdentity}
+            {
+                Invoke-LinuxChildReapingProbe -Probe $probe -Action {
+                    param($RootProcessId, $Observed)
+                    Stop-ProcessTree -RootProcessId $RootProcessId -RootProcessIdentity 'root-start-time' -ObservedProcessIdentities $Observed
+                } -Arguments @(7292, $observed)
+            } | Should -Throw '*Could not terminate the complete candidate process boundary*'
+            $probe.NativeType::ReapCount | Should -Be 0
+        }
+        finally {
+            Remove-Module $probe.Module -Force
         }
     }
 

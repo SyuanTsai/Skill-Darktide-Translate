@@ -278,6 +278,7 @@ function Get-UnixProcessInfo {
     }
     return [pscustomobject][ordered]@{
         processId = $ProcessId
+        state = [string]$fields[0]
         parentProcessId = [int]$fields[1]
         processGroupId = [int]$fields[2]
         startTime = [string]$fields[19]
@@ -654,7 +655,8 @@ function Stop-UnixProcessByIdentity {
     param(
         [Parameter(Mandatory = $true)][int] $ProcessId,
         [Parameter(Mandatory = $true)][string] $Identity,
-        [Parameter(Mandatory = $true)][int] $Signal
+        [Parameter(Mandatory = $true)][int] $Signal,
+        [Parameter()][switch] $ReapExitedChild
     )
     if ($ProcessId -le 0 -or [string]::IsNullOrWhiteSpace($Identity) -or $Signal -le 0) {
         return $false
@@ -689,6 +691,21 @@ function Stop-UnixProcessByIdentity {
         }
         if ($actualIdentity -cne $Identity) {
             return $false
+        }
+        if ($ReapExitedChild) {
+            try {
+                $processInfo = Get-UnixProcessInfo -ProcessId $ProcessId
+            }
+            catch {
+                return (-not (Test-ProcessIdentity -ProcessId $ProcessId -Identity $Identity))
+            }
+            if ($processInfo.state -ceq 'Z' -and $processInfo.parentProcessId -eq $PID) {
+                # Only adopted, exited descendants opt in. The root's exit
+                # status remains owned by its existing .NET Process object.
+                $reapResult = $nativeType::ReapExitedProcessFileDescriptor($fileDescriptor)
+                if ($reapResult -ne 0) { return $false }
+                return (-not (Test-ProcessIdentity -ProcessId $ProcessId -Identity $Identity))
+            }
         }
         $result = $nativeType::SendProcessSignal($fileDescriptor, $Signal)
         if ($result -eq 0) {
@@ -1874,12 +1891,22 @@ namespace Codex.Validation {
         [DllImport("libc.so.6", EntryPoint = "close", SetLastError = true)]
         private static extern int CloseFileDescriptor(int fileDescriptor);
 
+        [DllImport("libc.so.6", EntryPoint = "waitid", SetLastError = true)]
+        private static extern int WaitForExitedChild(int idType, uint id, [Out] byte[] signalInfo, int options);
+
         public static int OpenProcessFileDescriptor(int processId) {
             return (int)InvokePidfdOpen(434, processId, 0);
         }
 
         public static int SendProcessSignal(int processFileDescriptor, int signal) {
             return (int)InvokePidfdSendSignal(424, processFileDescriptor, signal, IntPtr.Zero, 0);
+        }
+
+        public static int ReapExitedProcessFileDescriptor(int processFileDescriptor) {
+            if (processFileDescriptor < 0) { throw new ArgumentOutOfRangeException("processFileDescriptor"); }
+            // Linux: P_PIDFD=3, WEXITED=4, WNOHANG=1, sizeof(siginfo_t)=128.
+            // The marshaler pins the zeroed buffer for this bounded native call.
+            return WaitForExitedChild(3, (uint)processFileDescriptor, new byte[128], 4 | 1);
         }
 
         public static int CloseProcessFileDescriptor(int processFileDescriptor) {
@@ -2051,7 +2078,7 @@ function Stop-ProcessTree {
                 [void](Stop-UnixProcessByIdentity -ProcessId $RootProcessId -Identity $RootProcessIdentity -Signal $signalNumber)
             }
             foreach ($processId in $targets) {
-                [void](Stop-UnixProcessByIdentity -ProcessId ([int]$processId) -Identity ([string]$ObservedProcessIdentities[[int]$processId]) -Signal $signalNumber)
+                [void](Stop-UnixProcessByIdentity -ProcessId ([int]$processId) -Identity ([string]$ObservedProcessIdentities[[int]$processId]) -Signal $signalNumber -ReapExitedChild)
             }
         }
         Start-Sleep -Milliseconds 100
