@@ -378,13 +378,13 @@ jobs:
           }
           $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
           $trustedValidator = Join-Path $env:TRUSTED_SUPERVISOR_ROOT 'scripts/Validate.ps1'
-          $validatorArguments = @(
-            '-RepositoryRoot', (Get-Location).Path,
-            '-ArtifactsRoot', $env:RUNNER_TEMP,
-            '-BaseCommit', $baseCommit,
-            '-ExpectedGoRuntimeVersion', $env:STANDARD_GO_RUNTIME_VERSION,
-            '-OutputPath', $outputPath
-          )
+          $validatorArguments = @{
+            RepositoryRoot = (Get-Location).Path
+            ArtifactsRoot = $env:RUNNER_TEMP
+            BaseCommit = $baseCommit
+            ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION
+            OutputPath = $outputPath
+          }
           $isBootstrapTransition =
             (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'catalog/skills-catalog.json') -PathType Leaf) -and
             (-not (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'catalog/source.json') -PathType Leaf)) -and
@@ -392,7 +392,7 @@ jobs:
           if ($isBootstrapTransition) {
             # The trusted validator rechecks the exact current-layout fixture and
             # refuses a mixed or post-migration tree before producing evidence.
-            $validatorArguments += '-BootstrapTransition'
+            $validatorArguments.BootstrapTransition = $true
           }
           & $trustedValidator @validatorArguments
 
@@ -444,8 +444,13 @@ jobs:
         id: export-evidence
         if: ${{ success() }}
         shell: pwsh
+        env:
+          EXPECTED_EVIDENCE_SHA256: ${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:EXPECTED_EVIDENCE_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Canonical validation did not emit one lowercase evidence SHA-256 output.'
+          }
           $evidencePath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
           $evidenceItem = Get-Item -LiteralPath $evidencePath -Force -ErrorAction Stop
           if ($evidenceItem.PSIsContainer -or ($evidenceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -455,7 +460,14 @@ jobs:
           $evidenceBytes = [IO.File]::ReadAllBytes($evidencePath)
           $evidenceBase64 = [Convert]::ToBase64String($evidenceBytes)
           if ($evidenceBase64.Length -gt 800000) { throw 'Canonical evidence exceeds the GitHub output transport limit.' }
-          $evidenceSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToLowerInvariant()
+          $evidenceHasher = [Security.Cryptography.SHA256]::Create()
+          try {
+            $evidenceSha256 = [BitConverter]::ToString($evidenceHasher.ComputeHash($evidenceBytes)).Replace('-', '').ToLowerInvariant()
+          }
+          finally { $evidenceHasher.Dispose() }
+          if ($evidenceSha256 -cne $env:EXPECTED_EVIDENCE_SHA256) {
+            throw 'Canonical evidence digest does not match the canonical validation output.'
+          }
           $githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
           [IO.File]::AppendAllText($githubOutputPath, "evidence_base64=$evidenceBase64$([Environment]::NewLine)evidence_sha256=$evidenceSha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
 

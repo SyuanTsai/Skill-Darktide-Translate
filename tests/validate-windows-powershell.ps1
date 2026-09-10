@@ -65,6 +65,26 @@ function Assert-StrictUtf8PowerShellFile {
     }
 }
 
+function Assert-WorkflowEvidenceDigestBinding {
+    param([Parameter(Mandatory = $true)][string] $Workflow)
+
+    $steps = [regex]::Matches($Workflow, '(?ms)^(?<indent> *)- name: Export canonical evidence for clean upload\r?\n(?<body>.*?)(?=^\k<indent>- |\z)')
+    if ($steps.Count -ne 1) { throw 'The clean evidence export step must be unique.' }
+    $body = $steps[0].Groups['body'].Value
+    $propertyIndent = $steps[0].Groups['indent'].Value + '  '
+    $valueIndent = $propertyIndent + '  '
+    $run = [regex]::Matches($body, '(?m)^' + [regex]::Escape($propertyIndent) + 'run:[^\r\n]*\r?$')
+    if ($run.Count -ne 1) { throw 'The clean evidence export run block must be unique.' }
+    $metadata = $body.Substring(0, $run[0].Index)
+    $environment = [regex]::Matches($metadata, '(?m)^' + [regex]::Escape($propertyIndent) + 'env:\r?\n(?<values>(?:' + [regex]::Escape($valueIndent) + '[^\r\n]*\r?\n)+)')
+    if ($environment.Count -ne 1) { throw 'The clean evidence export requires its own digest environment binding.' }
+    $bindings = [regex]::Matches($environment[0].Groups['values'].Value, '(?m)^' + [regex]::Escape($valueIndent) + 'EXPECTED_EVIDENCE_SHA256:[ \t]*(?<value>[^\r\n]*)\r?$')
+    $expected = '${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}'
+    if ($bindings.Count -ne 1 -or $bindings[0].Groups['value'].Value.Trim() -cne $expected) {
+        throw 'The clean evidence export digest must bind the canonical validation step output.'
+    }
+}
+
 Assert-True ($PSVersionTable.PSVersion.Major -eq 5) 'This contract must execute under Windows PowerShell 5.1.'
 
 $files = @()
@@ -122,6 +142,7 @@ else {
 }
 
 $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+Assert-WorkflowEvidenceDigestBinding -Workflow $workflow
 Assert-True ($workflow -match 'shell: powershell') 'The required Windows PowerShell 5.1 contract is missing.'
 Assert-True ($workflow -match "Join-Path\s+\`$PSHOME\s+'powershell\.exe'") 'The Windows PowerShell wrapper must resolve the child executable from the active Windows PowerShell installation.'
 Assert-True ($workflow -match '&\s+\$windowsPowerShellPath\s+@protectedContractArguments') 'The Windows PowerShell wrapper must execute the trusted contract in an isolated child process.'

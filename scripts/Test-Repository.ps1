@@ -182,6 +182,7 @@ function Get-GitBlobSha256 {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardInput = $true
     foreach ($argument in @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot", '-C', $RepositoryRoot, 'cat-file', 'blob', $ObjectId)) {
         [void]$startInfo.ArgumentList.Add($argument)
     }
@@ -190,6 +191,7 @@ function Get-GitBlobSha256 {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         if (-not $process.Start()) { throw "Could not start Git blob reader for '$ObjectId'." }
+        $process.StandardInput.Close()
         $hash = $hasher.ComputeHash($process.StandardOutput.BaseStream)
         $stderr = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
@@ -575,8 +577,31 @@ function Get-ContentInventory {
     if ([string]::IsNullOrWhiteSpace($gitPath)) { throw 'Trusted Git executable was not bound before repository validation.' }
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
     $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    $gitOutput = [string]((& $gitPath @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- $skillRootRelative) -join '')
-    if ($LASTEXITCODE -ne 0) { throw "Git inventory lookup failed for '$SkillId'." }
+    # Decode Git's NUL-delimited UTF-8 paths independently of the caller's
+    # console code page, including a protected remoting worker on Windows.
+    $indexStartInfo = [Diagnostics.ProcessStartInfo]::new()
+    $indexStartInfo.FileName = $gitPath
+    $indexStartInfo.UseShellExecute = $false
+    $indexStartInfo.CreateNoWindow = $true
+    $indexStartInfo.RedirectStandardInput = $true
+    $indexStartInfo.RedirectStandardOutput = $true
+    $indexStartInfo.RedirectStandardError = $true
+    $indexStartInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    foreach ($argument in @($gitConfigArguments + @('-C', $RepositoryRoot, 'ls-files', '-s', '-z', '--', $skillRootRelative))) {
+        [void]$indexStartInfo.ArgumentList.Add($argument)
+    }
+    $indexProcess = [Diagnostics.Process]::new()
+    $indexProcess.StartInfo = $indexStartInfo
+    try {
+        if (-not $indexProcess.Start()) { throw "Could not start Git inventory lookup for '$SkillId'." }
+        $indexProcess.StandardInput.Close()
+        $indexErrorTask = $indexProcess.StandardError.ReadToEndAsync()
+        $gitOutput = $indexProcess.StandardOutput.ReadToEnd()
+        $indexError = $indexErrorTask.GetAwaiter().GetResult()
+        $indexProcess.WaitForExit()
+        if ($indexProcess.ExitCode -ne 0) { throw "Git inventory lookup failed for '$SkillId': $indexError" }
+    }
+    finally { $indexProcess.Dispose() }
     foreach ($record in @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })) {
         if ([string]$record -cnotmatch '^(?<mode>[0-9]{6}) (?<objectId>[0-9a-f]{40}) (?<stage>[0-3])\t(?<path>[^\x00\r\n]+)$') {
             throw "Git returned malformed index entry for '$SkillId': $record"

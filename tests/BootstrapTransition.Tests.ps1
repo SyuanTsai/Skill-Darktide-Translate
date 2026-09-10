@@ -153,6 +153,584 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'Bootstrap transition bounded cancellation probe'
     }
 
+    It 'UnitT52_AllowsExactBootstrapMaintenancePathsWithoutRequiringAnchorEdits' {
+        # Scenario: A reviewed maintenance PR changes exactly one trusted test while every anchor remains a regular blob in both commits.
+        # Purpose: Permit the fixed twelve-suite and TestSupport foundation without widening bootstrap to catalog, config, or Skill content.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-BootstrapTransitionChangedPaths'
+        }, $true))
+        $functionAst.Count | Should -Be 1
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst[0].Extent.Text))
+
+        $gitPath = [IO.Path]::GetFullPath([string](Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path)
+        $maintenancePaths = @(
+            'tests/BootstrapTransition.Tests.ps1', 'tests/CanonicalValidation.Tests.ps1',
+            'tests/LocalizationWorkset.Tests.ps1', 'tests/ModUpdateAutomation.Tests.ps1',
+            'tests/RepositoryContract.Tests.ps1', 'tests/RepositoryValidation.Tests.ps1',
+            'tests/Schema15Coordination.Tests.ps1', 'tests/Schema15SourceAcquisition.Tests.ps1',
+            'tests/SkillContract.Tests.ps1', 'tests/SourcePin.Tests.ps1',
+            'tests/StandardV1Conformance.Tests.ps1', 'tests/Test-Repository.Tests.ps1',
+            'tests/TestSupport.ps1'
+        )
+        try {
+            foreach ($maintenancePath in $maintenancePaths) {
+                $fixture = Join-Path $TestDrive ("bootstrap-maintenance-" + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+                foreach ($anchor in @(
+                    '.github/workflows/standard-v1-protected.yml', 'scripts/Test-Repository.ps1',
+                    'scripts/Validate.ps1', 'tests/validate-windows-powershell.ps1'
+                )) {
+                    $anchorPath = Join-Path $fixture $anchor
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                    [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+                }
+                $path = Join-Path $fixture $maintenancePath
+                New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+                [IO.File]::WriteAllText($path, 'base test', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture init --quiet --initial-branch=main
+                & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+                & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+                & $gitPath -C $fixture add --all
+                & $gitPath -C $fixture commit --quiet -m base
+                $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+
+                [IO.File]::WriteAllText($path, 'maintenance update', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture add -- $maintenancePath
+                & $gitPath -C $fixture commit --quiet -m maintenance
+                $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+
+                {
+                    & $guardModule {
+                        param($GitPath, $RepositoryRoot, $BaseCommit, $CandidateCommit)
+                        Assert-BootstrapTransitionChangedPaths -GitPath $GitPath -RepositoryRoot $RepositoryRoot -BaseCommit $BaseCommit -CandidateCommit $CandidateCommit
+                    } $gitPath $fixture $baseCommit $candidateCommit
+                } | Should -Not -Throw
+            }
+        }
+        finally {
+            Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT54_RejectsBootstrapPathsAndStatusesOutsideTheExactContract' {
+        # Scenario: A bootstrap range contains a catalog, Skill, or unknown path change, a deletion, or a rename.
+        # Purpose: Keep maintenance within the exact allowed paths and A/M statuses.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-BootstrapTransitionChangedPaths'
+        }, $true))
+        $functionAst.Count | Should -Be 1
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst[0].Extent.Text))
+        $gitPath = [IO.Path]::GetFullPath([string](Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path)
+        try {
+            foreach ($case in @(
+                [pscustomobject]@{ Name = 'catalog'; Path = 'catalog/source.json'; Action = 'modify' },
+                [pscustomobject]@{ Name = 'skill'; Path = 'skills/auto-update-darktide-mod/SKILL.md'; Action = 'modify' },
+                [pscustomobject]@{ Name = 'unknown'; Path = 'docs/unrelated.md'; Action = 'modify' },
+                [pscustomobject]@{ Name = 'delete'; Path = 'tests/TestSupport.ps1'; Action = 'delete' },
+                [pscustomobject]@{ Name = 'rename'; Path = 'tests/TestSupport.ps1'; Action = 'rename' }
+            )) {
+                $fixture = Join-Path $TestDrive ("bootstrap-reject-$($case.Name)-" + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+                foreach ($anchor in @(
+                    '.github/workflows/standard-v1-protected.yml', 'scripts/Test-Repository.ps1',
+                    'scripts/Validate.ps1', 'tests/validate-windows-powershell.ps1'
+                )) {
+                    $anchorPath = Join-Path $fixture $anchor
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                    [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+                }
+                $casePath = Join-Path $fixture $case.Path
+                New-Item -ItemType Directory -Path (Split-Path -Parent $casePath) -Force | Out-Null
+                [IO.File]::WriteAllText($casePath, 'base payload', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture init --quiet --initial-branch=main
+                & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+                & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+                & $gitPath -C $fixture add --all
+                & $gitPath -C $fixture commit --quiet -m base
+                $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+
+                switch ($case.Action) {
+                    'modify' { [IO.File]::WriteAllText($casePath, 'changed payload', [Text.UTF8Encoding]::new($false)) }
+                    'delete' { Remove-Item -LiteralPath $casePath -Force }
+                    'rename' { Move-Item -LiteralPath $casePath -Destination ($casePath + '.renamed') }
+                }
+                & $gitPath -C $fixture add --all
+                & $gitPath -C $fixture commit --quiet -m $case.Name
+                $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+                {
+                    & $guardModule {
+                        param($GitPath, $RepositoryRoot, $BaseCommit, $CandidateCommit)
+                        Assert-BootstrapTransitionChangedPaths -GitPath $GitPath -RepositoryRoot $RepositoryRoot -BaseCommit $BaseCommit -CandidateCommit $CandidateCommit
+                    } $gitPath $fixture $baseCommit $candidateCommit
+                } | Should -Throw
+            }
+        }
+        finally {
+            Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT55_RejectsCredentialBackedSemanticValidationOnWindowsBeforeEnvironmentCapture' {
+        # Scenario: A Windows protected-Pester boundary receives a nonblank semantic credential name.
+        # Purpose: Reject the request before any environment value is read, because that boundary does not establish credential confidentiality.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $protectorAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Protect-ProcessCredentialEnvironment'
+        }, $true))
+        $protectorAst.Count | Should -Be 1
+        $hostSupportAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-SemanticCredentialHostSupport'
+        }, $true))
+        $expectedError = 'Credential-backed semantic validation is not supported on Windows because the protected Pester boundary does not establish credential confidentiality.'
+        $syntheticCredentialName = 'SEMANTIC_CREDENTIAL_TEST_' + [guid]::NewGuid().ToString('N')
+        (Test-Path -LiteralPath ("Env:$syntheticCredentialName")) | Should -BeFalse
+
+        $moduleSource = '$script:IsWindowsHost = $true' + [Environment]::NewLine
+        if ($hostSupportAst.Count -eq 1) { $moduleSource += $hostSupportAst[0].Extent.Text + [Environment]::NewLine }
+        $moduleSource += $protectorAst[0].Extent.Text
+        $credentialModule = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $failures = [Collections.Generic.List[string]]::new()
+        try {
+            if ($hostSupportAst.Count -ne 1) {
+                $failures.Add('Assert-SemanticCredentialHostSupport must exist exactly once.')
+            }
+            else {
+                $hostSupportText = $hostSupportAst[0].Extent.Text
+                if ($hostSupportText -notmatch '(?s)\[string\[\]\]\s+\$SemanticCredentialNames') {
+                    $failures.Add('Assert-SemanticCredentialHostSupport must declare [string[]] $SemanticCredentialNames.')
+                }
+                foreach ($case in @(
+                    [pscustomobject]@{ Name = 'null'; Names = $null },
+                    [pscustomobject]@{ Name = 'empty'; Names = [string[]]@() },
+                    [pscustomobject]@{ Name = 'whitespace'; Names = [string[]]@('', ' ', "`t") }
+                )) {
+                    try {
+                        & $credentialModule {
+                            param($names)
+                            $script:IsWindowsHost = $true
+                            Assert-SemanticCredentialHostSupport -SemanticCredentialNames $names
+                        } $case.Names
+                    }
+                    catch {
+                        $failures.Add("Windows $($case.Name) semantic credential names must be accepted: $($_.Exception.Message)")
+                    }
+                }
+                $windowsFailure = $null
+                try {
+                    & $credentialModule {
+                        $script:IsWindowsHost = $true
+                        Assert-SemanticCredentialHostSupport -SemanticCredentialNames @('SEMANTIC_CREDENTIAL_TEST')
+                    }
+                }
+                catch { $windowsFailure = $_ }
+                if ($null -eq $windowsFailure -or $windowsFailure.Exception.Message -cne $expectedError) {
+                    $actual = if ($null -eq $windowsFailure) { 'no error' } else { $windowsFailure.Exception.Message }
+                    $failures.Add("Windows nonblank semantic credential names must throw the exact unsupported-host error; actual=$actual")
+                }
+                try {
+                    & $credentialModule {
+                        $script:IsWindowsHost = $false
+                        Assert-SemanticCredentialHostSupport -SemanticCredentialNames @('SEMANTIC_CREDENTIAL_TEST')
+                    }
+                }
+                catch {
+                    $failures.Add("Linux semantic credential names must be accepted: $($_.Exception.Message)")
+                }
+            }
+
+            $protectorFailure = $null
+            try {
+                & $credentialModule {
+                    param($name)
+                    $script:IsWindowsHost = $true
+                    Protect-ProcessCredentialEnvironment -SemanticCredentialNames @($name)
+                } $syntheticCredentialName
+            }
+            catch { $protectorFailure = $_ }
+            if ($null -eq $protectorFailure -or $protectorFailure.Exception.Message -cne $expectedError) {
+                $actual = if ($null -eq $protectorFailure) { 'no error' } else { $protectorFailure.Exception.Message }
+                $failures.Add("Protect-ProcessCredentialEnvironment must reject before reading the absent synthetic environment name; actual=$actual")
+            }
+
+            if ($failures.Count -gt 0) { throw ($failures -join [Environment]::NewLine) }
+        }
+        finally {
+            Remove-Module $credentialModule -Force
+        }
+    }
+
+    It 'UnitT56_RequiresEveryBootstrapAnchorToBeARegularTrackedBlobAtBothRangeEnds' {
+        # Scenario: A maintenance-only diff retains an absent, directory, or symbolic-link anchor at both range ends; a separate legacy-shaped range restores a missing base anchor while changing all four anchors.
+        # Purpose: Keep all four trust anchors as tracked regular blobs at both endpoints of maintenance and legacy four-anchor updates.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-BootstrapTransitionChangedPaths'
+        }, $true))
+        $functionAst.Count | Should -Be 1
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst[0].Extent.Text))
+        $gitPath = [IO.Path]::GetFullPath([string](Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path)
+        $anchors = @(
+            '.github/workflows/standard-v1-protected.yml', 'scripts/Test-Repository.ps1',
+            'scripts/Validate.ps1', 'tests/validate-windows-powershell.ps1'
+        )
+        $invokeGuard = {
+            param($GitPath, $GuardModule, $Fixture, $BaseCommit, $CandidateCommit)
+            & $GuardModule {
+                param($InnerGitPath, $RepositoryRoot, $InnerBaseCommit, $InnerCandidateCommit)
+                Assert-BootstrapTransitionChangedPaths -GitPath $InnerGitPath -RepositoryRoot $RepositoryRoot -BaseCommit $InnerBaseCommit -CandidateCommit $InnerCandidateCommit
+            } $GitPath $Fixture $BaseCommit $CandidateCommit
+        }
+        try {
+            foreach ($case in @('missing', 'tree', 'symlink')) {
+                $fixture = Join-Path $TestDrive ("bootstrap-anchor-$case-" + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+                foreach ($anchor in $anchors) {
+                    $anchorPath = Join-Path $fixture $anchor
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                    [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+                }
+                $supportPath = Join-Path $fixture 'tests/TestSupport.ps1'
+                [IO.File]::WriteAllText($supportPath, 'base support', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture init --quiet --initial-branch=main
+                & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+                & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+                $anchorPath = Join-Path $fixture 'scripts/Validate.ps1'
+                $symlinkObjectId = ''
+                switch ($case) {
+                    'missing' { Remove-Item -LiteralPath $anchorPath -Force }
+                    'tree' {
+                        Remove-Item -LiteralPath $anchorPath -Force
+                        New-Item -ItemType Directory -Path $anchorPath -Force | Out-Null
+                        [IO.File]::WriteAllText((Join-Path $anchorPath 'nested.ps1'), 'nested', [Text.UTF8Encoding]::new($false))
+                    }
+                    'symlink' {
+                        $symlinkObjectId = ('symlink-target' | & $gitPath -C $fixture hash-object -w --stdin).Trim()
+                    }
+                }
+                & $gitPath -C $fixture add --all
+                if ($case -ceq 'symlink') {
+                    & $gitPath -C $fixture update-index --add --cacheinfo "120000,$symlinkObjectId,scripts/Validate.ps1"
+                }
+                & $gitPath -C $fixture commit --quiet -m "base-$case"
+                $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+
+                [IO.File]::WriteAllText($supportPath, 'maintenance support', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture add -- 'tests/TestSupport.ps1'
+                & $gitPath -C $fixture commit --quiet -m "maintenance-$case"
+                $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+                $failure = $null
+                try {
+                    & $invokeGuard $gitPath $guardModule $fixture $baseCommit $candidateCommit
+                }
+                catch {
+                    $failure = $_
+                }
+                $failure | Should -Not -BeNullOrEmpty
+                $failure.Exception.Message | Should -Match 'tracked regular trust anchor'
+            }
+
+            $fixture = Join-Path $TestDrive ('bootstrap-anchor-base-missing-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+            foreach ($anchor in $anchors) {
+                $anchorPath = Join-Path $fixture $anchor
+                New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+            }
+            $supportPath = Join-Path $fixture 'tests/TestSupport.ps1'
+            [IO.File]::WriteAllText($supportPath, 'base support', [Text.UTF8Encoding]::new($false))
+            Remove-Item -LiteralPath (Join-Path $fixture 'scripts/Validate.ps1') -Force
+            & $gitPath -C $fixture init --quiet --initial-branch=main
+            & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+            & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+            & $gitPath -C $fixture add --all
+            & $gitPath -C $fixture commit --quiet -m base-missing-anchor
+            $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+            foreach ($anchor in $anchors) {
+                $anchorPath = Join-Path $fixture $anchor
+                New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                [IO.File]::WriteAllText($anchorPath, "candidate $anchor", [Text.UTF8Encoding]::new($false))
+            }
+            & $gitPath -C $fixture add --all
+            & $gitPath -C $fixture commit --quiet -m candidate-restores-anchor
+            $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+            $failure = $null
+            try {
+                & $invokeGuard $gitPath $guardModule $fixture $baseCommit $candidateCommit
+            }
+            catch {
+                $failure = $_
+            }
+            $failure | Should -Not -BeNullOrEmpty
+            $failure.Exception.Message | Should -Match 'tracked regular trust anchor'
+
+            $fixture = Join-Path $TestDrive ('bootstrap-anchor-legacy-success-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+            foreach ($anchor in $anchors) {
+                $anchorPath = Join-Path $fixture $anchor
+                New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+            }
+            & $gitPath -C $fixture init --quiet --initial-branch=main
+            & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+            & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+            & $gitPath -C $fixture add --all
+            & $gitPath -C $fixture commit --quiet -m base
+            $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+            foreach ($anchor in $anchors) {
+                [IO.File]::WriteAllText((Join-Path $fixture $anchor), "candidate $anchor", [Text.UTF8Encoding]::new($false))
+            }
+            & $gitPath -C $fixture add --all
+            & $gitPath -C $fixture commit --quiet -m candidate-all-anchors
+            $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+            {
+                & $invokeGuard $gitPath $guardModule $fixture $baseCommit $candidateCommit
+            } | Should -Not -Throw
+        }
+        finally {
+            Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT57_BindsCanonicalWorkflowValidatorArgumentsByNameForBothLayouts' {
+        # Scenario: The protected workflow invokes the trusted validator from candidate roots and runner paths containing spaces.
+        # Purpose: Require its real call-site fragment to bind the repository, artifacts, comparison base, Go runtime, output, and bootstrap switch by their declared parameter names.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+        $snippetStart = $workflow.IndexOf("`$outputPath = Join-Path `$env:RUNNER_TEMP 'darktide-translate-conformance-report.json'", [StringComparison]::Ordinal)
+        $snippetEndMarker = '& $trustedValidator @validatorArguments'
+        $snippetEnd = $workflow.IndexOf($snippetEndMarker, $snippetStart, [StringComparison]::Ordinal)
+        $snippetStart | Should -BeGreaterOrEqual 0
+        $snippetEnd | Should -BeGreaterThan $snippetStart
+        $workflowSnippet = [scriptblock]::Create($workflow.Substring($snippetStart, $snippetEnd + $snippetEndMarker.Length - $snippetStart))
+
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $validatorParamBlock = $validatorAst.ParamBlock.Extent.Text
+        $validatorParamBlock | Should -Match '\[switch\] \$BootstrapTransition'
+
+        $environmentNames = @('RUNNER_TEMP', 'TRUSTED_SUPERVISOR_ROOT', 'STANDARD_GO_RUNTIME_VERSION')
+        $environmentBefore = @{}
+        foreach ($name in $environmentNames) {
+            $environmentBefore[$name] = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
+        }
+
+        try {
+            foreach ($fixture in @(
+                [pscustomobject]@{ Name = 'legacy bootstrap'; BootstrapTransition = $true },
+                [pscustomobject]@{ Name = 'standard v1'; BootstrapTransition = $false }
+            )) {
+                $fixtureRoot = Join-Path $TestDrive ("workflow binding $($fixture.Name) with spaces")
+                $candidateRoot = Join-Path $fixtureRoot 'candidate repository with spaces'
+                $runnerTemp = Join-Path $fixtureRoot 'runner temp with spaces'
+                $trustedRoot = Join-Path $fixtureRoot 'trusted supervisor with spaces'
+                $trustedScriptsRoot = Join-Path $trustedRoot 'scripts'
+                New-Item -ItemType Directory -Path $candidateRoot, $runnerTemp, $trustedScriptsRoot -Force | Out-Null
+
+                if ($fixture.BootstrapTransition) {
+                    $legacyCatalog = Join-Path $candidateRoot 'catalog'
+                    New-Item -ItemType Directory -Path $legacyCatalog -Force | Out-Null
+                    [IO.File]::WriteAllText((Join-Path $legacyCatalog 'skills-catalog.json'), '{}', [Text.UTF8Encoding]::new($false))
+                }
+                else {
+                    $standardCatalog = Join-Path $candidateRoot 'catalog'
+                    $standardConfig = Join-Path $candidateRoot 'config'
+                    New-Item -ItemType Directory -Path $standardCatalog, $standardConfig -Force | Out-Null
+                    [IO.File]::WriteAllText((Join-Path $standardCatalog 'source.json'), '{}', [Text.UTF8Encoding]::new($false))
+                    [IO.File]::WriteAllText((Join-Path $standardConfig 'standard-v1.json'), '{}', [Text.UTF8Encoding]::new($false))
+                }
+
+                $collectorPath = Join-Path $trustedScriptsRoot 'Validate.ps1'
+                $collectorBody = @'
+$bound = [ordered]@{
+    RepositoryRoot = $RepositoryRoot
+    ArtifactsRoot = $ArtifactsRoot
+    BaseCommit = $BaseCommit
+    ExpectedGoRuntimeVersion = $ExpectedGoRuntimeVersion
+    OutputPath = $OutputPath
+    BootstrapTransition = [bool]$BootstrapTransition
+}
+$bound | ConvertTo-Json -Compress
+'@
+                [IO.File]::WriteAllText($collectorPath, $validatorParamBlock + [Environment]::NewLine + $collectorBody, [Text.UTF8Encoding]::new($false))
+
+                $baseCommit = '0123456789abcdef0123456789abcdef01234567'
+                $runtimeVersion = '1.24.3'
+                [Environment]::SetEnvironmentVariable('RUNNER_TEMP', $runnerTemp, [EnvironmentVariableTarget]::Process)
+                [Environment]::SetEnvironmentVariable('TRUSTED_SUPERVISOR_ROOT', $trustedRoot, [EnvironmentVariableTarget]::Process)
+                [Environment]::SetEnvironmentVariable('STANDARD_GO_RUNTIME_VERSION', $runtimeVersion, [EnvironmentVariableTarget]::Process)
+                Push-Location -LiteralPath $candidateRoot
+                try {
+                    $bound = (@(& $workflowSnippet) | Select-Object -Last 1) | ConvertFrom-Json
+                }
+                finally {
+                    Pop-Location
+                }
+
+                $bound.RepositoryRoot | Should -Be $candidateRoot
+                $bound.ArtifactsRoot | Should -Be $runnerTemp
+                $bound.BaseCommit | Should -Be $baseCommit
+                $bound.ExpectedGoRuntimeVersion | Should -Be $runtimeVersion
+                $bound.OutputPath | Should -Be (Join-Path $runnerTemp 'darktide-translate-conformance-report.json')
+                $bound.BootstrapTransition | Should -Be $fixture.BootstrapTransition
+            }
+        }
+        finally {
+            foreach ($name in $environmentNames) {
+                [Environment]::SetEnvironmentVariable($name, $environmentBefore[$name], [EnvironmentVariableTarget]::Process)
+            }
+        }
+    }
+
+    It 'UnitT58_BindsTheCanonicalEvidenceDigestInsideTheNamedExportStep' {
+        # Scenario: Workflow text omits, changes, or places the canonical evidence digest outside its clean export step.
+        # Purpose: Bind the exported evidence bytes to the canonical-validation digest at the only step allowed to publish them.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1'),
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        @($parseErrors).Count | Should -Be 0
+        $assertTrueAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-True'
+        }, $true))
+        $bindingAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-WorkflowEvidenceDigestBinding'
+        }, $true))
+        $assertTrueAst.Count | Should -Be 1
+        $bindingAst.Count | Should -Be 1
+        $contractSource = @($assertTrueAst[0].Extent.Text, $bindingAst[0].Extent.Text) -join [Environment]::NewLine
+        $contractModule = New-Module -ScriptBlock ([scriptblock]::Create($contractSource))
+        try {
+            $validWorkflow = @'
+steps:
+  - name: Export canonical evidence for clean upload
+    id: export-evidence
+    if: ${{ success() }}
+    shell: pwsh
+    env:
+      EXPECTED_EVIDENCE_SHA256: ${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}
+    run: echo export
+'@
+            {
+                & $contractModule { param($Workflow) Assert-WorkflowEvidenceDigestBinding -Workflow $Workflow } $validWorkflow
+            } | Should -Not -Throw
+            foreach ($invalidWorkflow in @(
+                ($validWorkflow -replace '(?m)^\s*EXPECTED_EVIDENCE_SHA256:.*\r?\n', ''),
+                ($validWorkflow -replace 'steps\.canonical-validation\.outputs\.standard_v1_evidence_sha256', 'steps.other.outputs.evidence_sha256'),
+@'
+steps:
+  - name: Verify canonical validation evidence
+    env:
+      EXPECTED_EVIDENCE_SHA256: ${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}
+    run: echo verify
+  - name: Export canonical evidence for clean upload
+    id: export-evidence
+    if: ${{ success() }}
+    shell: pwsh
+    run: echo export
+'@
+            )) {
+                {
+                    & $contractModule { param($Workflow) Assert-WorkflowEvidenceDigestBinding -Workflow $Workflow } $invalidWorkflow
+                } | Should -Throw
+            }
+        }
+        finally {
+            Remove-Module $contractModule -Force
+        }
+    }
+
+    It 'UnitT59_ValidatesTheCanonicalDigestBeforeExportingEvidence' {
+        # Scenario: A normal JSON evidence file is exported with the correct, wrong, absent, and malformed canonical digest values.
+        # Purpose: Bind both exported values to the exact bytes and canonical digest emitted by validation.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+        $stepMatch = [regex]::Match(
+            $workflow,
+            '(?ms)^ {6}- name: Export canonical evidence for clean upload\r?\n(?<step>.*?)(?=^ {6}- name:|\z)'
+        )
+        $stepMatch.Success | Should -BeTrue
+        $runMatch = [regex]::Match(
+            $stepMatch.Groups['step'].Value,
+            '(?ms)^ {8}run:\s*\|\r?\n(?<script>(?:^ {10}.*(?:\r?\n|$))+)'
+        )
+        $runMatch.Success | Should -BeTrue
+        $exportScript = [regex]::Replace($runMatch.Groups['script'].Value, '(?m)^ {10}', '')
+        $exportBlock = [scriptblock]::Create($exportScript)
+
+        $evidencePath = Join-Path $TestDrive 'darktide-translate-conformance-report.json'
+        $githubOutputPath = Join-Path $TestDrive 'github-output.txt'
+        $evidenceBytes = [Text.UTF8Encoding]::new($false).GetBytes('{"result":"passed"}')
+        [IO.File]::WriteAllBytes($evidencePath, $evidenceBytes)
+        [IO.File]::WriteAllText($githubOutputPath, '', [Text.UTF8Encoding]::new($false))
+        $expectedDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToLowerInvariant()
+        $wrongDigest = if ($expectedDigest -ceq ('0' * 64)) { '1' * 64 } else { '0' * 64 }
+
+        $savedRunnerTemp = [Environment]::GetEnvironmentVariable('RUNNER_TEMP', [EnvironmentVariableTarget]::Process)
+        $savedGithubOutput = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
+        $savedExpectedDigest = [Environment]::GetEnvironmentVariable('EXPECTED_EVIDENCE_SHA256', [EnvironmentVariableTarget]::Process)
+        try {
+            [Environment]::SetEnvironmentVariable('RUNNER_TEMP', $TestDrive, [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable('GITHUB_OUTPUT', $githubOutputPath, [EnvironmentVariableTarget]::Process)
+
+            [Environment]::SetEnvironmentVariable('EXPECTED_EVIDENCE_SHA256', $expectedDigest, [EnvironmentVariableTarget]::Process)
+            { & $exportBlock } | Should -Not -Throw
+            $exportOutput = Get-Content -LiteralPath $githubOutputPath -Raw
+            $base64Matches = @([regex]::Matches($exportOutput, '(?m)^evidence_base64=(?<value>[A-Za-z0-9+/=]*)\r?$'))
+            $digestMatches = @([regex]::Matches($exportOutput, '(?m)^evidence_sha256=(?<value>[0-9a-f]{64})\r?$'))
+            $base64Matches.Count | Should -Be 1
+            $digestMatches.Count | Should -Be 1
+            $decodedEvidenceBytes = [Convert]::FromBase64String($base64Matches[0].Groups['value'].Value)
+            [BitConverter]::ToString($decodedEvidenceBytes) | Should -Be ([BitConverter]::ToString($evidenceBytes))
+            $digestMatches[0].Groups['value'].Value | Should -Be $expectedDigest
+
+            foreach ($invalidCase in @(
+                [pscustomobject]@{ Digest = $wrongDigest; ExpectedMessage = 'Canonical evidence digest does not match the canonical validation output.' },
+                [pscustomobject]@{ Digest = $null; ExpectedMessage = 'Canonical validation did not emit one lowercase evidence SHA-256 output.' },
+                [pscustomobject]@{ Digest = 'not-a-sha256'; ExpectedMessage = 'Canonical validation did not emit one lowercase evidence SHA-256 output.' }
+            )) {
+                [IO.File]::WriteAllText($githubOutputPath, '', [Text.UTF8Encoding]::new($false))
+                [Environment]::SetEnvironmentVariable('EXPECTED_EVIDENCE_SHA256', $invalidCase.Digest, [EnvironmentVariableTarget]::Process)
+                $failure = $null
+                try {
+                    & $exportBlock
+                }
+                catch {
+                    $failure = $_
+                }
+                $failure | Should -Not -BeNullOrEmpty
+                $failure.Exception.Message | Should -Be $invalidCase.ExpectedMessage
+                (Get-Item -LiteralPath $githubOutputPath -Force).Length | Should -Be 0
+            }
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable('RUNNER_TEMP', $savedRunnerTemp, [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable('GITHUB_OUTPUT', $savedGithubOutput, [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable('EXPECTED_EVIDENCE_SHA256', $savedExpectedDigest, [EnvironmentVariableTarget]::Process)
+        }
+    }
+
     It 'UnitT60_UsesAWindowsLowIntegrityBoundaryForCandidateWrites' {
         # Scenario: The candidate runs under the same runner account as the trusted supervisor.
         # Purpose: Require a mandatory-integrity boundary so candidate code cannot write up into supervisor-owned roots.
@@ -175,7 +753,11 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match "'BootstrapTransition\.Tests\.ps1'"
         $supervisor | Should -Match "'RepositoryValidation\.Tests\.ps1'"
         $supervisor | Should -Match '\$requiredPesterPaths'
-        $supervisor | Should -Match 'Invoke-Pester -Path \$requiredPesterPaths'
+        $supervisor | Should -Match '\$pesterConfiguration = New-PesterConfiguration'
+        $supervisor | Should -Match '\$pesterConfiguration\.Run\.Path = \$requiredPesterPaths'
+        $supervisor | Should -Match '\$pesterConfiguration\.Run\.PassThru = \$true'
+        $supervisor | Should -Match '\$pesterConfiguration\.TestRegistry\.Enabled = \$false'
+        $supervisor | Should -Match 'Invoke-Pester -Configuration \$pesterConfiguration'
         $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
     }
 
@@ -464,4 +1046,5 @@ Describe 'Darktide bootstrap transition' {
         $strictUtf8.GetString([byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B), 3, 4) |
             Should -Be '# ok'
     }
+
 }
