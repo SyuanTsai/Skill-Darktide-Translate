@@ -10,6 +10,35 @@ Describe 'Darktide bootstrap transition' {
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:Layout = Get-TestRepositoryLayout -RepositoryRoot $script:RepositoryRoot
 
+        function Invoke-ContainedEnvironmentProbe {
+            param([string] $DiagnosticRoot, [bool] $LinuxHost)
+
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+            if (@($parseErrors).Count -ne 0) { throw 'The supervisor must parse before constructing the environment probe.' }
+            $source = [Collections.Generic.List[string]]::new()
+            foreach ($name in @('Test-PathEqual', 'Assert-NoReparseAncestors', 'New-ContainedProcessEnvironment')) {
+                $functionAst = $ast.Find({ param($node)
+                        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+                    }, $true)
+                if ($null -eq $functionAst) { throw "Missing production environment function: $name" }
+                $source.Add($functionAst.Extent.Text)
+            }
+            # Environment behavior uses the actual directory guards; native Windows ACL handling has separate coverage.
+            $source.Add('function Set-WindowsLowIntegrityDirectory { param([string] $Path) }')
+            $source.Add('Export-ModuleMember -Function @()')
+            $module = New-Module -ScriptBlock ([scriptblock]::Create($source -join [Environment]::NewLine))
+            try {
+                & $module {
+                    param($Root, $Linux)
+                    $script:IsLinuxHost = $Linux
+                    New-ContainedProcessEnvironment -DiagnosticRoot $Root
+                } $DiagnosticRoot $LinuxHost
+            }
+            finally { Remove-Module $module -Force }
+        }
+
         function New-LinuxReadOnlyBindProbe {
             $tokens = $null
             $parseErrors = $null
@@ -1041,6 +1070,53 @@ steps:
 
         $failure = Invoke-LinuxEtcProjectionProbe -SourceRoot $sourceRoot -DestinationRoot $targetRoot -Mode DirectoryCopy
         $failure.ExitCode | Should -Not -Be 0
+    }
+
+    It 'UnitT84_PinsLinuxMallocArenasWithoutInheritingParentTuning' {
+        # Scenario: Linux child environments are created with absent or excessive parent allocator settings.
+        # Purpose: Keep runtime startup within the existing address-space bound without importing parent GC tuning.
+        $previousArena = [Environment]::GetEnvironmentVariable('MALLOC_ARENA_MAX')
+        $previousHeap = [Environment]::GetEnvironmentVariable('DOTNET_GCHeapHardLimit')
+        try {
+            [Environment]::SetEnvironmentVariable('DOTNET_GCHeapHardLimit', '10000000')
+            foreach ($parentArena in @($null, '64')) {
+                if ($null -eq $parentArena) {
+                    [Environment]::SetEnvironmentVariable('MALLOC_ARENA_MAX', [NullString]::Value)
+                }
+                else { [Environment]::SetEnvironmentVariable('MALLOC_ARENA_MAX', $parentArena) }
+                $environment = Invoke-ContainedEnvironmentProbe -DiagnosticRoot $TestDrive -LinuxHost $true
+                $environment['MALLOC_ARENA_MAX'] | Should -BeExactly '2'
+                $environment.Contains('DOTNET_GCHeapHardLimit') | Should -BeFalse
+                $environment.Contains('DOTNET_GCRegionRange') | Should -BeFalse
+                Test-Path -LiteralPath $environment['HOME'] -PathType Container | Should -BeTrue
+                [Environment]::GetEnvironmentVariable('MALLOC_ARENA_MAX') | Should -Be $parentArena
+                [Environment]::GetEnvironmentVariable('DOTNET_GCHeapHardLimit') | Should -BeExactly '10000000'
+            }
+        }
+        finally {
+            if ($null -eq $previousArena) { $previousArena = [NullString]::Value }
+            if ($null -eq $previousHeap) { $previousHeap = [NullString]::Value }
+            [Environment]::SetEnvironmentVariable('MALLOC_ARENA_MAX', $previousArena)
+            [Environment]::SetEnvironmentVariable('DOTNET_GCHeapHardLimit', $previousHeap)
+        }
+    }
+
+    It 'UnitT85_PreservesNonLinuxAllocatorEnvironmentBehavior' {
+        # Scenario: The same production environment builder runs for a non-Linux host with parent allocator tuning.
+        # Purpose: Avoid adding Linux-specific allocator or GC settings to Windows child processes.
+        $previousArena = [Environment]::GetEnvironmentVariable('MALLOC_ARENA_MAX')
+        try {
+            [Environment]::SetEnvironmentVariable('MALLOC_ARENA_MAX', '64')
+            $environment = Invoke-ContainedEnvironmentProbe -DiagnosticRoot $TestDrive -LinuxHost $false
+            $environment.Contains('MALLOC_ARENA_MAX') | Should -BeFalse
+            $environment.Contains('DOTNET_GCHeapHardLimit') | Should -BeFalse
+            $environment.Contains('DOTNET_GCRegionRange') | Should -BeFalse
+            [Environment]::GetEnvironmentVariable('MALLOC_ARENA_MAX') | Should -BeExactly '64'
+        }
+        finally {
+            if ($null -eq $previousArena) { $previousArena = [NullString]::Value }
+            [Environment]::SetEnvironmentVariable('MALLOC_ARENA_MAX', $previousArena)
+        }
     }
 
     It 'UnitT90SeparatesChildOutputAndTrustedPesterContent' {

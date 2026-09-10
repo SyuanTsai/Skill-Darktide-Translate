@@ -2740,6 +2740,11 @@ function New-ContainedProcessEnvironment {
     $environment['XDG_DATA_HOME'] = $dataPath
     $environment['RUNNER_TEMP'] = $tempPath
     $environment['GIT_NO_REPLACE_OBJECTS'] = '1'
+    if ($script:IsLinuxHost) {
+        # Bound glibc arena reservations so PowerShell can start within the
+        # existing address-space limit; do not inherit parent allocator tuning.
+        $environment['MALLOC_ARENA_MAX'] = '2'
+    }
     $environment.Remove('GITHUB_TOKEN')
     $environment.Remove('GH_TOKEN')
     $environment.Remove('ACTIONS_RUNTIME_TOKEN')
