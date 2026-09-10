@@ -32,7 +32,7 @@ function New-TestReparsePoint {
         [Parameter(Mandatory)][string] $Target
     )
 
-    $itemType = if ([OperatingSystem]::IsWindows()) { 'Junction' } else { 'SymbolicLink' }
+    $itemType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
     New-Item -ItemType $itemType -Path $Path -Target $Target
 }
 
