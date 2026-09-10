@@ -5,6 +5,80 @@ Describe 'Darktide Translate repository contract' {
         $repoRoot = Split-Path -Parent $PSScriptRoot
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $layout = Get-TestRepositoryLayout -RepositoryRoot $repoRoot
+
+        function New-WindowsCheckoutEvidence {
+            param(
+                [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+                [Parameter(Mandatory = $true)][string] $FixtureRoot,
+                [Parameter(Mandatory = $true)][string[]] $ModulePaths
+            )
+
+            if ($ModulePaths.Count -eq 0) { throw 'The checkout evidence fixture requires at least one PowerShell module.' }
+            $normalizedModulePaths = @($ModulePaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
+            $attributePathSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            [void]$attributePathSet.Add('.gitattributes')
+            foreach ($modulePath in $normalizedModulePaths) {
+                $segments = @($modulePath -split '/')
+                $relativeDirectory = ''
+                for ($index = 0; $index -lt $segments.Count - 1; $index++) {
+                    $relativeDirectory = if ([string]::IsNullOrEmpty($relativeDirectory)) {
+                        [string]$segments[$index]
+                    }
+                    else {
+                        "$relativeDirectory/$($segments[$index])"
+                    }
+                    $candidateAttributePath = "$relativeDirectory/.gitattributes"
+                    if (Test-Path -LiteralPath (Join-Path $RepositoryRoot $candidateAttributePath) -PathType Leaf) {
+                        [void]$attributePathSet.Add($candidateAttributePath)
+                    }
+                }
+            }
+            $attributePaths = @($attributePathSet | Sort-Object)
+            if (-not (Test-Path -LiteralPath (Join-Path $RepositoryRoot '.gitattributes') -PathType Leaf)) {
+                throw 'The checkout evidence fixture requires the repository root .gitattributes file.'
+            }
+
+            $sourceRepository = Join-Path $FixtureRoot 'windows-git-source'
+            $freshCheckout = Join-Path $FixtureRoot 'windows-git-checkout'
+            New-Item -ItemType Directory -Path $sourceRepository -Force | Out-Null
+            foreach ($relativePath in @($attributePaths + $normalizedModulePaths | Sort-Object -Unique)) {
+                $sourcePath = Join-Path $RepositoryRoot $relativePath
+                $fixturePath = Join-Path $sourceRepository $relativePath
+                New-Item -ItemType Directory -Path (Split-Path -Parent $fixturePath) -Force | Out-Null
+                Copy-Item -LiteralPath $sourcePath -Destination $fixturePath
+            }
+
+            & git -C $sourceRepository init --quiet --initial-branch=main
+            if ($LASTEXITCODE -ne 0) { throw 'Could not initialize the checkout evidence source repository.' }
+            & git -C $sourceRepository config user.name 'EOL Contract Test'
+            & git -C $sourceRepository config user.email 'eol-contract@example.invalid'
+            & git -C $sourceRepository config core.autocrlf true
+            & git -C $sourceRepository add --all
+            & git -C $sourceRepository commit --quiet -m 'fixture LF source'
+            if ($LASTEXITCODE -ne 0) { throw 'Could not commit the checkout evidence source repository.' }
+            & git -c core.autocrlf=true clone --quiet $sourceRepository $freshCheckout
+            if ($LASTEXITCODE -ne 0) { throw 'Could not clone the checkout evidence source repository.' }
+
+            $modules = foreach ($modulePath in $normalizedModulePaths) {
+                $attribute = [string]((& git -C $sourceRepository check-attr eol -- $modulePath) -join '')
+                if ($LASTEXITCODE -ne 0) { throw "Could not resolve the effective eol attribute for '$modulePath'." }
+                $sourceBlobOid = [string]((& git -C $sourceRepository rev-parse "HEAD:$modulePath") -join '')
+                if ($LASTEXITCODE -ne 0) { throw "Could not resolve the source blob for '$modulePath'." }
+                $checkoutRawOid = [string]((& git -C $freshCheckout hash-object --no-filters -- $modulePath) -join '')
+                if ($LASTEXITCODE -ne 0) { throw "Could not hash the checkout bytes for '$modulePath'." }
+                [pscustomobject][ordered]@{
+                    path = $modulePath
+                    attribute = $attribute.Trim()
+                    sourceBlobOid = $sourceBlobOid.Trim()
+                    checkoutRawOid = $checkoutRawOid.Trim()
+                }
+            }
+
+            return [pscustomobject][ordered]@{
+                attributePaths = @($attributePaths | Sort-Object -Unique)
+                modules = @($modules)
+            }
+        }
     }
 
     # Scenario: A consumer discovers this repository through its stable catalog.
@@ -113,7 +187,7 @@ Describe 'Darktide Translate repository contract' {
         $attributes = Get-Content -LiteralPath $attributesPath -Raw
         $attributes | Should -Match '(?m)^\*\.psm1 text eol=lf\r?$'
 
-        $modulePaths = @(Get-ChildItem -LiteralPath $repoRoot -Recurse -File -Filter '*.psm1' |
+        $modulePaths = @(Get-ChildItem -LiteralPath $layout.SkillRoot -Recurse -File -Filter '*.psm1' |
             ForEach-Object { [IO.Path]::GetRelativePath($repoRoot, $_.FullName).Replace('\', '/') })
         $modulePaths.Count | Should -BeGreaterThan 0
         foreach ($modulePath in $modulePaths) {
@@ -125,32 +199,38 @@ Describe 'Darktide Translate repository contract' {
             }
         }
 
-        $sourceRepository = Join-Path $TestDrive 'windows-git-source'
-        $freshCheckout = Join-Path $TestDrive 'windows-git-checkout'
-        New-Item -ItemType Directory -Path $sourceRepository -Force | Out-Null
-        Copy-Item -LiteralPath $attributesPath -Destination (Join-Path $sourceRepository '.gitattributes')
-        foreach ($modulePath in $modulePaths) {
-            $sourcePath = Join-Path $repoRoot $modulePath
-            $fixturePath = Join-Path $sourceRepository $modulePath
-            New-Item -ItemType Directory -Path (Split-Path -Parent $fixturePath) -Force | Out-Null
-            Copy-Item -LiteralPath $sourcePath -Destination $fixturePath
+        $checkoutEvidence = New-WindowsCheckoutEvidence `
+            -RepositoryRoot $repoRoot `
+            -FixtureRoot $TestDrive `
+            -ModulePaths $modulePaths
+        $checkoutEvidence.attributePaths | Should -Contain '.gitattributes'
+        foreach ($module in @($checkoutEvidence.modules)) {
+            $module.attribute | Should -Match ': eol: lf$' -Because $module.path
+            $module.checkoutRawOid | Should -Be $module.sourceBlobOid -Because $module.path
         }
-        & git -C $sourceRepository init --quiet --initial-branch=main
-        & git -C $sourceRepository config user.name 'EOL Contract Test'
-        & git -C $sourceRepository config user.email 'eol-contract@example.invalid'
-        & git -C $sourceRepository config core.autocrlf true
-        & git -C $sourceRepository add --all
-        & git -C $sourceRepository commit --quiet -m 'fixture LF source'
-        $LASTEXITCODE | Should -Be 0
-        & git -c core.autocrlf=true clone --quiet $sourceRepository $freshCheckout
-        $LASTEXITCODE | Should -Be 0
+    }
 
-        foreach ($modulePath in $modulePaths) {
-            $sourceBlobOid = (& git -C $sourceRepository rev-parse "HEAD:$modulePath").Trim()
-            $checkoutRawOid = (& git -C $freshCheckout hash-object --no-filters -- $modulePath).Trim()
-            $LASTEXITCODE | Should -Be 0
-            $checkoutRawOid | Should -Be $sourceBlobOid -Because $modulePath
-        }
+    # Scenario: A nested .gitattributes overrides the repository-level LF rule for one PowerShell module.
+    # Purpose: Prove checkout evidence preserves nested attributes and detects bytes that would differ from the immutable Git blob.
+    It 'UnitT23_DetectsNestedGitattributesOverridesThatChangeWindowsCheckoutBytes' {
+        $nestedFixtureRoot = Join-Path $TestDrive 'nested-attribute-fixture'
+        $nestedModuleRoot = Join-Path $nestedFixtureRoot 'skills/example/scripts'
+        New-Item -ItemType Directory -Path $nestedModuleRoot -Force | Out-Null
+        $utf8 = [Text.UTF8Encoding]::new($false)
+        [IO.File]::WriteAllText((Join-Path $nestedFixtureRoot '.gitattributes'), "*.psm1 text eol=lf`n", $utf8)
+        [IO.File]::WriteAllText((Join-Path $nestedModuleRoot '.gitattributes'), "*.psm1 text eol=crlf`n", $utf8)
+        [IO.File]::WriteAllText((Join-Path $nestedModuleRoot 'Nested.psm1'), "function Get-NestedValue { 'value' }`n", $utf8)
+
+        $checkoutEvidence = New-WindowsCheckoutEvidence `
+            -RepositoryRoot $nestedFixtureRoot `
+            -FixtureRoot (Join-Path $TestDrive 'nested-attribute-evidence') `
+            -ModulePaths @('skills/example/scripts/Nested.psm1')
+        $module = @($checkoutEvidence.modules | Where-Object { $_.path -ceq 'skills/example/scripts/Nested.psm1' })
+
+        $checkoutEvidence.attributePaths | Should -Contain 'skills/example/scripts/.gitattributes'
+        $module.Count | Should -Be 1
+        $module[0].attribute | Should -Match ': eol: crlf$'
+        $module[0].checkoutRawOid | Should -Not -Be $module[0].sourceBlobOid
     }
 
     # Scenario: The independent source remains intentionally outside AI-Instructions fan-out.

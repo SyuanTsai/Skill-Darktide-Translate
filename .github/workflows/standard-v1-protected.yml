@@ -75,10 +75,23 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $global:LASTEXITCODE = $null
-          & $env:TRUSTED_WINDOWS_CONTRACT -RepositoryRoot (Get-Location).Path
+          $windowsPowerShellPath = [IO.Path]::GetFullPath((Join-Path $PSHOME 'powershell.exe'))
+          $windowsPowerShellItem = Get-Item -LiteralPath $windowsPowerShellPath -Force -ErrorAction Stop
+          if ($windowsPowerShellItem.PSIsContainer -or
+              ($windowsPowerShellItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'The protected Windows PowerShell executable must be a regular non-reparse file.'
+          }
+          $protectedContractArguments = @(
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $env:TRUSTED_WINDOWS_CONTRACT,
+            '-RepositoryRoot', (Get-Location).Path
+          )
+          & $windowsPowerShellPath @protectedContractArguments
           $protectedContractExitCode = $LASTEXITCODE
-          if ($null -ne $protectedContractExitCode -and $protectedContractExitCode -ne 0) {
+          if ($protectedContractExitCode -ne 0) {
             throw 'The protected Windows PowerShell compatibility contract failed.'
           }
 
