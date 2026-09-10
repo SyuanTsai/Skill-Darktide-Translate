@@ -260,4 +260,65 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Not -Match '-StandardInput \$pesterWorkerMarker'
         $supervisor | Should -Not -Match '\$pesterSupervisorPath\s*='
     }
+
+    It 'UnitT100_BindsReplacementObjectDiscoveryToTheCandidateWorktree' {
+        # Scenario: Git does not trust the runner checkout through ambient global configuration.
+        # Purpose: Make the replacement-object preflight use the same explicit repository trust boundary as every later Git read.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $supervisor | Should -Match '(?s)function Assert-NoGitReplacementObjects.*?safe\.directory=\$RepositoryRoot.*?core\.worktree=\$RepositoryRoot.*?rev-parse --git-path refs/replace'
+        $workflow | Should -Match '(?s)\$gitPath\s*=.*?\$gitArguments\s*=\s*@\(.*?safe\.directory=\$repositoryRoot.*?core\.worktree=\$repositoryRoot.*?rev-parse HEAD.*?merge-base --is-ancestor'
+
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $script:Supervisor,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Assert-NoGitReplacementObjects'
+            }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+
+        $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+        $emptyGitConfig = Join-Path $TestDrive 'empty-git-config'
+        New-Item -ItemType File -Path $emptyGitConfig -Force | Out-Null
+        $savedAssumeDifferentOwner = $env:GIT_TEST_ASSUME_DIFFERENT_OWNER
+        $savedGlobalConfig = $env:GIT_CONFIG_GLOBAL
+        $savedSystemConfig = $env:GIT_CONFIG_SYSTEM
+        $savedNoSystemConfig = $env:GIT_CONFIG_NOSYSTEM
+        try {
+            $env:GIT_TEST_ASSUME_DIFFERENT_OWNER = '1'
+            $env:GIT_CONFIG_GLOBAL = $emptyGitConfig
+            $env:GIT_CONFIG_SYSTEM = $emptyGitConfig
+            $env:GIT_CONFIG_NOSYSTEM = '1'
+
+            & $gitPath -C $script:ValidatorRepositoryRoot rev-parse --git-path refs/replace 2>$null | Out-Null
+            $LASTEXITCODE | Should -Not -Be 0
+
+            {
+                & $guardModule {
+                    param($ResolvedGitPath, $RepositoryRoot)
+                    Assert-NoGitReplacementObjects `
+                        -GitPath $ResolvedGitPath `
+                        -RepositoryRoot $RepositoryRoot `
+                        -Context 'Unit test candidate'
+                } $gitPath $script:ValidatorRepositoryRoot
+            } | Should -Not -Throw
+        }
+        finally {
+            $env:GIT_TEST_ASSUME_DIFFERENT_OWNER = $savedAssumeDifferentOwner
+            $env:GIT_CONFIG_GLOBAL = $savedGlobalConfig
+            $env:GIT_CONFIG_SYSTEM = $savedSystemConfig
+            $env:GIT_CONFIG_NOSYSTEM = $savedNoSystemConfig
+            Remove-Module $guardModule -Force
+        }
+    }
 }

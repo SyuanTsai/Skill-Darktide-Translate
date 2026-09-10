@@ -121,7 +121,16 @@ jobs:
             }
             $tokens = $null
             $errors = $null
-            [Management.Automation.Language.Parser]::ParseFile($candidatePath, [ref]$tokens, [ref]$errors) | Out-Null
+            $candidateSource = [IO.File]::ReadAllText(
+              $candidatePath,
+              [Text.UTF8Encoding]::new($false, $true)
+            )
+            [Management.Automation.Language.Parser]::ParseInput(
+              $candidateSource,
+              $candidatePath,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
             if (@($errors).Count -gt 0) {
               throw "Candidate PowerShell file does not parse under Windows PowerShell 5.1: $relativePath"
             }
@@ -333,10 +342,18 @@ jobs:
           else {
             ''
           }
-          $candidateHead = ((git rev-parse HEAD 2>$null) | Select-Object -First 1).Trim()
+          $repositoryRoot = (Get-Location).Path
+          $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+          $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          $gitArguments = @(
+            '-c', "safe.directory=$repositoryRoot",
+            '-c', "core.worktree=$repositoryRoot",
+            '-C', $repositoryRoot
+          )
+          $candidateHead = ([string]((& $gitPath @gitArguments rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
           $baseCommit = ''
           if ($baseCandidate -match '^[0-9a-f]{40}$' -and $candidateHead -match '^[0-9a-f]{40}$') {
-            & git merge-base --is-ancestor $baseCandidate $candidateHead 2>$null
+            & $gitPath @gitArguments merge-base --is-ancestor $baseCandidate $candidateHead 2>$null
             $ancestryExitCode = $LASTEXITCODE
             if ($ancestryExitCode -eq 0 -and $baseCandidate -cne $candidateHead) {
               $baseCommit = $baseCandidate

@@ -3170,7 +3170,8 @@ function Assert-NoGitReplacementObjects {
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
         [Parameter(Mandatory = $true)][string] $Context
     )
-    $replacePathOutput = @(& $GitPath -C $RepositoryRoot rev-parse --git-path refs/replace 2>$null)
+    $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
+    $replacePathOutput = @(& $GitPath @gitConfigArguments -C $RepositoryRoot rev-parse --git-path refs/replace 2>$null)
     $replacePathExitCode = $LASTEXITCODE
     if ($replacePathExitCode -ne 0 -or $replacePathOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$replacePathOutput[0])) {
         throw "$Context could not resolve the candidate Git replacement-object directory."
