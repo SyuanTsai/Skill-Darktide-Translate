@@ -3445,7 +3445,7 @@ function Invoke-NativeChecked {
                     & $addLinuxReadonlyBindPath -Path $env:PSHOME
                 }
                 foreach ($modulePath in @(([string]$env:PSModulePath -split ':') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-                    if (Test-Path -LiteralPath $modulePath -PathType Container) {
+                    if (Test-Path -LiteralPath $modulePath -PathType Container -ErrorAction SilentlyContinue) {
                         & $addLinuxReadonlyBindPath -Path $modulePath
                     }
                 }

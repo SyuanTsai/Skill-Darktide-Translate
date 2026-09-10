@@ -761,6 +761,54 @@ steps:
         $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
     }
 
+    It 'UnitT75_IgnoresUnavailableOptionalLinuxModuleDirectories' {
+        # Scenario: Linux PSModulePath includes missing, unreadable, blank, and readable directories under Stop error policy.
+        # Purpose: Keep inherited optional paths from aborting containment setup while retaining every readable bind source.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $moduleLoops = @($ast.FindAll({ param($node)
+                    $node -is [Management.Automation.Language.ForEachStatementAst] -and
+                    $node.Variable.VariablePath.UserPath -ceq 'modulePath' -and
+                    $node.Condition.Extent.Text.Contains('$env:PSModulePath')
+                }, $true))
+        $moduleLoops.Count | Should -Be 1
+        $moduleLoop = [scriptblock]::Create($moduleLoops[0].Extent.Text)
+        $probeModule = New-Module -ScriptBlock {
+            $script:ErrorActionPreference = 'Stop'
+            $script:RecordedBinds = [Collections.Generic.List[string]]::new()
+            function Test-Path {
+                [CmdletBinding()]
+                param([string] $LiteralPath, [string] $PathType)
+                if ($LiteralPath -ceq '/root/.local/share/powershell/Modules') {
+                    Write-Error -Exception ([UnauthorizedAccessException]::new('Optional module directory is inaccessible.')) -Category PermissionDenied
+                    return $false
+                }
+                return $PathType -ceq 'Container' -and $LiteralPath -cin @('/modules/first', '/modules/last')
+            }
+            $script:addLinuxReadonlyBindPath = {
+                param([string] $Path)
+                [void]$script:RecordedBinds.Add($Path)
+            }
+            Export-ModuleMember -Function @()
+        }
+        $originalModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', [EnvironmentVariableTarget]::Process)
+        try {
+            [Environment]::SetEnvironmentVariable('PSModulePath', '/modules/missing:/modules/first:/root/.local/share/powershell/Modules::/modules/last', [EnvironmentVariableTarget]::Process)
+            $actual = @(& $probeModule {
+                    param([scriptblock] $Loop)
+                    & $Loop
+                    $script:RecordedBinds.ToArray()
+                } $moduleLoop)
+            $actual | Should -Be @('/modules/first', '/modules/last')
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable('PSModulePath', $originalModulePath, [EnvironmentVariableTarget]::Process)
+            Remove-Module $probeModule -Force
+        }
+    }
+
     It 'UnitT80_ProjectsLinuxEtcWithoutArchiveOwnershipCopy' {
         # Scenario: A user namespace cannot read every host /etc file or preserve host-root ownership.
         # Purpose: Build a private readable projection without mutating the host bind or aborting on archive metadata.
