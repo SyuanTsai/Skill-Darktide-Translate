@@ -58,13 +58,33 @@ function Assert-NoDuplicateJsonProperties {
     }
 }
 
+function Read-StrictUtf8File {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $offset = if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF) {
+        3
+    }
+    else {
+        0
+    }
+    return [Text.UTF8Encoding]::new($false, $true).GetString(
+        $bytes,
+        $offset,
+        $bytes.Length - $offset
+    )
+}
+
 function Read-StrictJson {
     param([Parameter(Mandatory = $true)][string] $Path)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Required JSON file is missing: $Path"
     }
-    $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
+    $text = Read-StrictUtf8File -Path $Path
     try {
         $document = [System.Text.Json.JsonDocument]::Parse($text)
     }
@@ -235,7 +255,7 @@ function Read-SkillFrontmatter {
         [Parameter(Mandatory = $true)][string] $ExpectedSkillId
     )
 
-    $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true)).Replace("`r`n", "`n").Replace("`r", "`n")
+    $text = (Read-StrictUtf8File -Path $Path).Replace("`r`n", "`n").Replace("`r", "`n")
     if ($text -cnotmatch '(?s)\A---\n(?<frontmatter>.*?)\n---\n(?<body>.*)\z') {
         throw "SKILL.md for '$ExpectedSkillId' must contain closed YAML frontmatter."
     }
@@ -325,7 +345,7 @@ function Read-OpenAiMetadata {
         [Parameter(Mandatory = $true)][string] $ExpectedSkillId
     )
 
-    $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true)).Replace("`r`n", "`n").Replace("`r", "`n")
+    $text = (Read-StrictUtf8File -Path $Path).Replace("`r`n", "`n").Replace("`r", "`n")
     if ($text.Contains("`t")) { throw "agents/openai.yaml for '$ExpectedSkillId' must not contain tabs." }
 
     $topSections = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -478,7 +498,7 @@ function Assert-BootstrapOpenAiMetadata {
 
     $item = Get-Item -LiteralPath $Path -Force
     Assert-RegularFileForHash -Item $item -Context "Bootstrap metadata for '$ExpectedSkillId'"
-    $text = [IO.File]::ReadAllText($item.FullName, [Text.UTF8Encoding]::new($false, $true))
+    $text = Read-StrictUtf8File -Path $item.FullName
     if ($text -notmatch '(?m)^\s*display_name:\s+"Auto Update Darktide MOD"\s*$') {
         throw "Bootstrap agents/openai.yaml display_name is invalid for '$ExpectedSkillId'."
     }

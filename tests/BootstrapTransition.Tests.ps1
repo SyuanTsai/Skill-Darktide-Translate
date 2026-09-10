@@ -260,4 +260,208 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Not -Match '-StandardInput \$pesterWorkerMarker'
         $supervisor | Should -Not -Match '\$pesterSupervisorPath\s*='
     }
+
+    It 'UnitT100_BindsReplacementObjectDiscoveryToTheCandidateWorktree' {
+        # Scenario: Git does not trust the runner checkout through ambient global configuration.
+        # Purpose: Make the replacement-object preflight use the same explicit repository trust boundary as every later Git read.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $supervisor | Should -Match '(?s)function Assert-NoGitReplacementObjects.*?safe\.directory=\$RepositoryRoot.*?core\.worktree=\$RepositoryRoot.*?rev-parse --git-path refs/replace'
+        $workflow | Should -Match '(?s)\$gitPath\s*=.*?\$gitArguments\s*=\s*@\(.*?safe\.directory=\$repositoryRoot.*?core\.worktree=\$repositoryRoot.*?rev-parse HEAD.*?merge-base --is-ancestor'
+
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $script:Supervisor,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Assert-NoGitReplacementObjects'
+            }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+
+        $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+        $emptyGitConfig = Join-Path $TestDrive 'empty-git-config'
+        New-Item -ItemType File -Path $emptyGitConfig -Force | Out-Null
+        $savedAssumeDifferentOwner = $env:GIT_TEST_ASSUME_DIFFERENT_OWNER
+        $savedGlobalConfig = $env:GIT_CONFIG_GLOBAL
+        $savedSystemConfig = $env:GIT_CONFIG_SYSTEM
+        $savedNoSystemConfig = $env:GIT_CONFIG_NOSYSTEM
+        try {
+            $env:GIT_TEST_ASSUME_DIFFERENT_OWNER = '1'
+            $env:GIT_CONFIG_GLOBAL = $emptyGitConfig
+            $env:GIT_CONFIG_SYSTEM = $emptyGitConfig
+            $env:GIT_CONFIG_NOSYSTEM = '1'
+
+            & $gitPath -C $script:ValidatorRepositoryRoot rev-parse --git-path refs/replace 2>$null | Out-Null
+            $LASTEXITCODE | Should -Not -Be 0
+
+            {
+                & $guardModule {
+                    param($ResolvedGitPath, $RepositoryRoot)
+                    Assert-NoGitReplacementObjects `
+                        -GitPath $ResolvedGitPath `
+                        -RepositoryRoot $RepositoryRoot `
+                        -Context 'Unit test candidate'
+                } $gitPath $script:ValidatorRepositoryRoot
+            } | Should -Not -Throw
+        }
+        finally {
+            $env:GIT_TEST_ASSUME_DIFFERENT_OWNER = $savedAssumeDifferentOwner
+            $env:GIT_CONFIG_GLOBAL = $savedGlobalConfig
+            $env:GIT_CONFIG_SYSTEM = $savedSystemConfig
+            $env:GIT_CONFIG_NOSYSTEM = $savedNoSystemConfig
+            Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT110_RejectsNonUtf8PowerShellSourceBytes' {
+        # Scenario: Windows PowerShell 5.1 parses trusted local source fixtures encoded as UTF-8 with or without a BOM, while UTF-16 and UTF-32 source is rejected.
+        # Purpose: Prevent host ANSI source interpretation from accepting malformed candidate PowerShell while preserving non-ASCII UTF-8 code.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $workflow | Should -Match '\[IO\.File\]::ReadAllBytes\(\$candidatePath\)'
+        $workflow | Should -Not -Match '\$candidateSource\s*=\s*\[IO\.File\]::ReadAllText\('
+        $workflow | Should -Match '(?s)\$candidateBytes\[0\] -eq 0xEF.*?\$candidateBytes\[1\] -eq 0xBB.*?\$candidateBytes\[2\] -eq 0xBF'
+        $workflow | Should -Match '(?s)\[Text\.UTF8Encoding\]::new\(\$false, \$true\)\.GetString\(.*?\$candidateBytes.*?\$candidateOffset.*?\$candidateBytes\.Length - \$candidateOffset'
+
+        $compatibilityTokens = $null
+        $compatibilityParseErrors = $null
+        $compatibilityAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1'),
+            [ref]$compatibilityTokens,
+            [ref]$compatibilityParseErrors
+        )
+        @($compatibilityParseErrors).Count | Should -Be 0
+        $sourceParserAst = $compatibilityAst.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Assert-StrictUtf8PowerShellFile'
+            }, $true)
+        $sourceParserAst | Should -Not -BeNullOrEmpty
+
+        $fixtureRoot = Join-Path $TestDrive 'windows-powershell-utf8-fixtures'
+        New-Item -ItemType Directory -Path $fixtureRoot -Force | Out-Null
+        $plainPath = Join-Path $fixtureRoot 'plain-utf8.ps1'
+        $bomPath = Join-Path $fixtureRoot 'bom-utf8.ps1'
+        $utf16Path = Join-Path $fixtureRoot 'utf16.ps1'
+        $utf32Path = Join-Path $fixtureRoot 'utf32.ps1'
+        $malformedPath = Join-Path $fixtureRoot 'malformed-utf8.ps1'
+        $fixtureSource = "`$message = '" + [string][char]0x6E2C + [char]0x8A66 + "'"
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        $utf16 = [Text.Encoding]::Unicode
+        $utf32 = [Text.UTF32Encoding]::new($false, $true)
+        [IO.File]::WriteAllBytes($plainPath, $utf8.GetBytes($fixtureSource))
+        [IO.File]::WriteAllBytes($bomPath, ([byte[]]@(0xEF, 0xBB, 0xBF) + $utf8.GetBytes($fixtureSource)))
+        [IO.File]::WriteAllBytes($utf16Path, ($utf16.GetPreamble() + $utf16.GetBytes($fixtureSource)))
+        [IO.File]::WriteAllBytes($utf32Path, ($utf32.GetPreamble() + $utf32.GetBytes($fixtureSource)))
+        [IO.File]::WriteAllBytes($malformedPath, $utf8.GetBytes('if ('))
+
+        $sourceParserModule = New-Module -ScriptBlock ([scriptblock]::Create($sourceParserAst.Extent.Text))
+        try {
+            foreach ($validPath in @($plainPath, $bomPath)) {
+                {
+                    & $sourceParserModule {
+                        param($Path)
+                        Assert-StrictUtf8PowerShellFile -Path $Path
+                    } $validPath
+                } | Should -Not -Throw
+            }
+            foreach ($invalidPath in @($utf16Path, $utf32Path, $malformedPath)) {
+                {
+                    & $sourceParserModule {
+                        param($Path)
+                        Assert-StrictUtf8PowerShellFile -Path $Path
+                    } $invalidPath
+                } | Should -Throw
+            }
+        }
+        finally {
+            Remove-Module $sourceParserModule -Force
+        }
+
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+            $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+            $systemRoot | Should -Not -BeNullOrEmpty
+            $windowsPowerShellPath = [IO.Path]::GetFullPath((Join-Path $systemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+            Test-Path -LiteralPath $windowsPowerShellPath -PathType Leaf | Should -BeTrue
+            $runnerPath = Join-Path $fixtureRoot 'parse-fixtures.ps1'
+            $runnerSource = @(
+                'param([string] $PlainPath, [string] $BomPath, [string] $Utf16Path, [string] $Utf32Path, [string] $MalformedPath)'
+                '$ErrorActionPreference = ''Stop'''
+                $sourceParserAst.Extent.Text
+                'Assert-StrictUtf8PowerShellFile -Path $PlainPath'
+                'Assert-StrictUtf8PowerShellFile -Path $BomPath'
+                'foreach ($invalidPath in @($Utf16Path, $Utf32Path, $MalformedPath)) { try { Assert-StrictUtf8PowerShellFile -Path $invalidPath; throw "Expected strict UTF-8 parsing to reject $invalidPath." } catch { if ($_.Exception.Message -like "Expected strict UTF-8 parsing*") { throw } } }'
+            ) -join [Environment]::NewLine
+            [IO.File]::WriteAllText($runnerPath, $runnerSource, [Text.UTF8Encoding]::new($false))
+            & $windowsPowerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runnerPath $plainPath $bomPath $utf16Path $utf32Path $malformedPath
+            $LASTEXITCODE | Should -Be 0
+        }
+
+        foreach ($validatorPath in @($script:Supervisor, $script:RepositoryValidator)) {
+            $validatorSource = Get-Content -LiteralPath $validatorPath -Raw
+            $validatorSource | Should -Match 'Read-StrictUtf8File -Path'
+            $validatorSource | Should -Not -Match '\[IO\.File\]::ReadAllText\([^\r\n]+\[Text\.UTF8Encoding\]::new\(\$false,\s*\$true\)\)'
+            $tokens = $null
+            $parseErrors = $null
+            $validatorAst = [Management.Automation.Language.Parser]::ParseFile(
+                $validatorPath,
+                [ref]$tokens,
+                [ref]$parseErrors
+            )
+            @($parseErrors).Count | Should -Be 0
+            $readerAst = $validatorAst.Find({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                        $node.Name -eq 'Read-StrictUtf8File'
+                }, $true)
+            $readerAst | Should -Not -BeNullOrEmpty
+            $readerAst.Extent.Text | Should -Match '\[IO\.File\]::ReadAllBytes\(\$Path\)'
+            $readerAst.Extent.Text | Should -Match '(?s)\$bytes\[0\] -eq 0xEF.*?\$bytes\[1\] -eq 0xBB.*?\$bytes\[2\] -eq 0xBF'
+            $readerAst.Extent.Text | Should -Match '\[Text\.UTF8Encoding\]::new\(\$false, \$true\)\.GetString\('
+
+            $readerModule = New-Module -ScriptBlock ([scriptblock]::Create($readerAst.Extent.Text))
+            try {
+                $validatorName = [IO.Path]::GetFileNameWithoutExtension($validatorPath)
+                $invalidPath = Join-Path $TestDrive "$validatorName-utf16.txt"
+                $plainPath = Join-Path $TestDrive "$validatorName-utf8.txt"
+                $bomPath = Join-Path $TestDrive "$validatorName-utf8-bom.txt"
+                [IO.File]::WriteAllBytes($invalidPath, [byte[]]@(0xFF, 0xFE, 0x23, 0x00))
+                [IO.File]::WriteAllBytes($plainPath, [byte[]]@(0x23, 0x20, 0x6F, 0x6B))
+                [IO.File]::WriteAllBytes($bomPath, [byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B))
+
+                { & $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $invalidPath } |
+                    Should -Throw
+                (& $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $plainPath) |
+                    Should -Be '# ok'
+                (& $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $bomPath) |
+                    Should -Be '# ok'
+            }
+            finally {
+                Remove-Module $readerModule -Force
+            }
+        }
+
+        $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+        { $strictUtf8.GetString([byte[]]@(0xFF, 0xFE, 0x23, 0x00), 0, 4) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0xFE, 0xFF, 0x00, 0x23), 0, 4) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0xFF, 0xFE, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00), 0, 8) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x23), 0, 8) } |
+            Should -Throw
+        $strictUtf8.GetString([byte[]]@(0x23, 0x20, 0x6F, 0x6B), 0, 4) |
+            Should -Be '# ok'
+        $strictUtf8.GetString([byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B), 3, 4) |
+            Should -Be '# ok'
+    }
 }

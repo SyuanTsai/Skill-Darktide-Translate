@@ -34,6 +34,37 @@ function Assert-ExactPropertySet {
         @($actual | Where-Object { $Expected -cnotcontains $_ }).Count -eq 0) "$Context has an invalid property set."
 }
 
+function Assert-StrictUtf8PowerShellFile {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $offset = if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF) {
+        3
+    }
+    else {
+        0
+    }
+    $source = [Text.UTF8Encoding]::new($false, $true).GetString(
+        $bytes,
+        $offset,
+        $bytes.Length - $offset
+    )
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseInput(
+        $source,
+        $Path,
+        [ref]$tokens,
+        [ref]$errors
+    ) | Out-Null
+    if (@($errors).Count -ne 0) {
+        throw "PowerShell parse failed for '$Path': $(@($errors | ForEach-Object { $_.Message }) -join '; ')"
+    }
+}
+
 Assert-True ($PSVersionTable.PSVersion.Major -eq 5) 'This contract must execute under Windows PowerShell 5.1.'
 
 $files = @()
@@ -47,10 +78,7 @@ foreach ($relativeRoot in @('scripts', '.agents/skills', 'skills')) {
 $files += @(Get-Item -LiteralPath $PSCommandPath)
 Assert-True (@($files).Count -gt 0) 'No PowerShell compatibility files were found.'
 foreach ($file in $files) {
-    $tokens = $null
-    $errors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
-    Assert-True (@($errors).Count -eq 0) "PowerShell parse failed for '$($file.FullName)': $(@($errors | ForEach-Object { $_.Message }) -join '; ')"
+    Assert-StrictUtf8PowerShellFile -Path $file.FullName
 }
 
 $legacyCatalogPath = Join-Path $repositoryRoot 'catalog/skills-catalog.json'
@@ -99,6 +127,11 @@ Assert-True ($workflow -match "Join-Path\s+\`$PSHOME\s+'powershell\.exe'") 'The 
 Assert-True ($workflow -match '&\s+\$windowsPowerShellPath\s+@protectedContractArguments') 'The Windows PowerShell wrapper must execute the trusted contract in an isolated child process.'
 Assert-True ($workflow -match '\$protectedContractExitCode\s*=\s*\$LASTEXITCODE') 'The Windows PowerShell wrapper must capture the trusted script native exit state.'
 Assert-True ($workflow -match 'if\s*\(\$protectedContractExitCode\s+-ne\s+0\)') 'The Windows PowerShell wrapper must reject a non-zero child process exit code.'
+Assert-True ($workflow -match '\[IO\.File\]::ReadAllBytes\(\$candidatePath\)') 'The candidate parser must read raw PowerShell source bytes before decoding.'
+Assert-True ($workflow -notmatch '\$candidateSource\s*=\s*\[IO\.File\]::ReadAllText\(') 'The candidate parser must not permit ReadAllText BOM auto-detection to select another encoding.'
+Assert-True ($workflow -match '(?s)\$candidateBytes\[0\] -eq 0xEF.*?\$candidateBytes\[1\] -eq 0xBB.*?\$candidateBytes\[2\] -eq 0xBF') 'The candidate parser must recognize only the optional UTF-8 BOM.'
+Assert-True ($workflow -match '(?s)\[Text\.UTF8Encoding\]::new\(\$false,\s*\$true\)\.GetString\(.*?\$candidateBytes.*?\$candidateOffset.*?\$candidateBytes\.Length - \$candidateOffset') 'The candidate parser must reject non-UTF-8 source bytes without encoding auto-detection.'
+Assert-True ($workflow -match '\[Management\.Automation\.Language\.Parser\]::ParseInput\(') 'The candidate parser must parse the explicitly decoded UTF-8 source.'
 Assert-True ($workflow -match "go-version: 'stable'") 'The workflow must use the latest stable Go channel.'
 Assert-True ($workflow -match 'check-latest: true') 'The workflow must resolve the latest stable Go runtime per run.'
 Assert-True ($workflow -notmatch "go-version: '[0-9]+\.[0-9]+\.[0-9]+'") 'The workflow must not pin a Go patch version.'
