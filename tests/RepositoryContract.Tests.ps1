@@ -88,19 +88,34 @@ Describe 'Darktide Translate repository contract' {
         Test-Path -LiteralPath $catalogPath | Should -Be $true
 
         $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
-        $catalog.schemaVersion | Should -Be 1
-        $catalog.catalogId | Should -Be 'darktide-translate'
-        @($catalog.sources).Count | Should -Be 1
-        $catalog.sources[0].id | Should -Be 'darktide-translate'
-        $catalog.sources[0].repository | Should -Be 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+        if ($layout.Name -ceq 'legacy') {
+            $catalog.schemaVersion | Should -Be 1
+            $catalog.catalogId | Should -Be 'darktide-translate'
+            @($catalog.sources).Count | Should -Be 1
+            $catalog.sources[0].id | Should -Be 'darktide-translate'
+            $catalog.sources[0].repository | Should -Be 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
 
-        @($catalog.skills).Count | Should -Be 1
-        $skill = @($catalog.skills)[0]
-        $skill.id | Should -Be 'auto-update-darktide-mod'
-        $skill.source.sourceId | Should -Be 'darktide-translate'
-        $skill.source.path | Should -Be $layout.SkillPath
-        @($skill.profiles).Count | Should -Be 1
-        $skill.profiles[0] | Should -Be 'darktide-mod-maintenance'
+            @($catalog.skills).Count | Should -Be 1
+            $skill = @($catalog.skills)[0]
+            $skill.id | Should -Be 'auto-update-darktide-mod'
+            $skill.source.sourceId | Should -Be 'darktide-translate'
+            $skill.source.path | Should -Be $layout.SkillPath
+            @($skill.profiles).Count | Should -Be 1
+            $skill.profiles[0] | Should -Be 'darktide-mod-maintenance'
+        }
+        else {
+            $sourcePath = Join-Path $repoRoot $layout.SourcePath
+            Test-Path -LiteralPath $sourcePath -PathType Leaf | Should -Be $true
+
+            $source = Get-Content -LiteralPath $sourcePath -Raw | ConvertFrom-Json
+            $source.schemaVersion | Should -Be 2
+            $source.sourceId | Should -Be 'darktide-translate'
+            $source.repository | Should -Be 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+            $source.skillsRoot | Should -Be 'skills'
+            @($source.skills).Count | Should -Be 1
+            $source.skills[0] | Should -Be 'auto-update-darktide-mod'
+            "$($source.skillsRoot)/$($source.skills[0])" | Should -Be $layout.SkillPath
+        }
 
         @($catalog.profiles).Count | Should -Be 1
         $profile = @($catalog.profiles)[0]
@@ -237,11 +252,19 @@ Describe 'Darktide Translate repository contract' {
     # Purpose: Prevent the Darktide Skill from being reintroduced into an unrelated consumer Catalog or bootstrap contract.
     It 'UnitT25_RemainsAnIndependentRepositorySource' {
         $readme = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
-        $catalog = Get-Content -LiteralPath (Join-Path $repoRoot $layout.CatalogPath) -Raw | ConvertFrom-Json
 
         $readme | Should -Match 'not added to the AI-Instructions Catalog, Lock, bootstrap, or fan-out'
-        @($catalog.sources).Count | Should -Be 1
-        $catalog.sources[0].id | Should -Be 'darktide-translate'
+        if ($layout.Name -ceq 'legacy') {
+            $catalog = Get-Content -LiteralPath (Join-Path $repoRoot $layout.CatalogPath) -Raw | ConvertFrom-Json
+            @($catalog.sources).Count | Should -Be 1
+            $catalog.sources[0].id | Should -Be 'darktide-translate'
+        }
+        else {
+            $source = Get-Content -LiteralPath (Join-Path $repoRoot $layout.SourcePath) -Raw | ConvertFrom-Json
+            $source.sourceId | Should -Be 'darktide-translate'
+            @($source.skills).Count | Should -Be 1
+            $source.skills[0] | Should -Be 'auto-update-darktide-mod'
+        }
     }
 
     # Scenario: A release process resolves the repository version before pin generation.
