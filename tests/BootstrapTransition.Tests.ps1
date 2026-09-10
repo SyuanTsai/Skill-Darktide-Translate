@@ -153,6 +153,330 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'Bootstrap transition bounded cancellation probe'
     }
 
+    It 'UnitT52_AllowsExactBootstrapMaintenancePathsWithoutRequiringAnchorEdits' {
+        # Scenario: A reviewed maintenance PR changes exactly one trusted test while every anchor remains a regular blob in both commits.
+        # Purpose: Permit the fixed twelve-suite and TestSupport foundation without widening bootstrap to catalog, config, or Skill content.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-BootstrapTransitionChangedPaths'
+        }, $true))
+        $functionAst.Count | Should -Be 1
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst[0].Extent.Text))
+
+        $gitPath = [IO.Path]::GetFullPath([string](Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path)
+        $maintenancePaths = @(
+            'tests/BootstrapTransition.Tests.ps1', 'tests/CanonicalValidation.Tests.ps1',
+            'tests/LocalizationWorkset.Tests.ps1', 'tests/ModUpdateAutomation.Tests.ps1',
+            'tests/RepositoryContract.Tests.ps1', 'tests/RepositoryValidation.Tests.ps1',
+            'tests/Schema15Coordination.Tests.ps1', 'tests/Schema15SourceAcquisition.Tests.ps1',
+            'tests/SkillContract.Tests.ps1', 'tests/SourcePin.Tests.ps1',
+            'tests/StandardV1Conformance.Tests.ps1', 'tests/Test-Repository.Tests.ps1',
+            'tests/TestSupport.ps1'
+        )
+        try {
+            foreach ($maintenancePath in $maintenancePaths) {
+                $fixture = Join-Path $TestDrive ("bootstrap-maintenance-" + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+                foreach ($anchor in @(
+                    '.github/workflows/standard-v1-protected.yml', 'scripts/Test-Repository.ps1',
+                    'scripts/Validate.ps1', 'tests/validate-windows-powershell.ps1'
+                )) {
+                    $anchorPath = Join-Path $fixture $anchor
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                    [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+                }
+                $path = Join-Path $fixture $maintenancePath
+                New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+                [IO.File]::WriteAllText($path, 'base test', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture init --quiet --initial-branch=main
+                & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+                & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+                & $gitPath -C $fixture add --all
+                & $gitPath -C $fixture commit --quiet -m base
+                $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+
+                [IO.File]::WriteAllText($path, 'maintenance update', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture add -- $maintenancePath
+                & $gitPath -C $fixture commit --quiet -m maintenance
+                $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+
+                {
+                    & $guardModule {
+                        param($GitPath, $RepositoryRoot, $BaseCommit, $CandidateCommit)
+                        Assert-BootstrapTransitionChangedPaths -GitPath $GitPath -RepositoryRoot $RepositoryRoot -BaseCommit $BaseCommit -CandidateCommit $CandidateCommit
+                    } $gitPath $fixture $baseCommit $candidateCommit
+                } | Should -Not -Throw
+            }
+        }
+        finally {
+            Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT54_RejectsBootstrapPathsAndStatusesOutsideTheExactContract' {
+        # Scenario: A bootstrap range contains a catalog, Skill, or unknown path change, a deletion, or a rename.
+        # Purpose: Keep maintenance within the exact allowed paths and A/M statuses.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-BootstrapTransitionChangedPaths'
+        }, $true))
+        $functionAst.Count | Should -Be 1
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst[0].Extent.Text))
+        $gitPath = [IO.Path]::GetFullPath([string](Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path)
+        try {
+            foreach ($case in @(
+                [pscustomobject]@{ Name = 'catalog'; Path = 'catalog/source.json'; Action = 'modify' },
+                [pscustomobject]@{ Name = 'skill'; Path = 'skills/auto-update-darktide-mod/SKILL.md'; Action = 'modify' },
+                [pscustomobject]@{ Name = 'unknown'; Path = 'docs/unrelated.md'; Action = 'modify' },
+                [pscustomobject]@{ Name = 'delete'; Path = 'tests/TestSupport.ps1'; Action = 'delete' },
+                [pscustomobject]@{ Name = 'rename'; Path = 'tests/TestSupport.ps1'; Action = 'rename' }
+            )) {
+                $fixture = Join-Path $TestDrive ("bootstrap-reject-$($case.Name)-" + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+                foreach ($anchor in @(
+                    '.github/workflows/standard-v1-protected.yml', 'scripts/Test-Repository.ps1',
+                    'scripts/Validate.ps1', 'tests/validate-windows-powershell.ps1'
+                )) {
+                    $anchorPath = Join-Path $fixture $anchor
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                    [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+                }
+                $casePath = Join-Path $fixture $case.Path
+                New-Item -ItemType Directory -Path (Split-Path -Parent $casePath) -Force | Out-Null
+                [IO.File]::WriteAllText($casePath, 'base payload', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture init --quiet --initial-branch=main
+                & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+                & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+                & $gitPath -C $fixture add --all
+                & $gitPath -C $fixture commit --quiet -m base
+                $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+
+                switch ($case.Action) {
+                    'modify' { [IO.File]::WriteAllText($casePath, 'changed payload', [Text.UTF8Encoding]::new($false)) }
+                    'delete' { Remove-Item -LiteralPath $casePath -Force }
+                    'rename' { Move-Item -LiteralPath $casePath -Destination ($casePath + '.renamed') }
+                }
+                & $gitPath -C $fixture add --all
+                & $gitPath -C $fixture commit --quiet -m $case.Name
+                $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+                {
+                    & $guardModule {
+                        param($GitPath, $RepositoryRoot, $BaseCommit, $CandidateCommit)
+                        Assert-BootstrapTransitionChangedPaths -GitPath $GitPath -RepositoryRoot $RepositoryRoot -BaseCommit $BaseCommit -CandidateCommit $CandidateCommit
+                    } $gitPath $fixture $baseCommit $candidateCommit
+                } | Should -Throw
+            }
+        }
+        finally {
+            Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT56_RequiresEveryBootstrapAnchorToBeARegularTrackedBlobAtBothRangeEnds' {
+        # Scenario: A maintenance-only diff retains an absent, directory, or symbolic-link anchor at both range ends; a separate legacy-shaped range restores a missing base anchor while changing all four anchors.
+        # Purpose: Keep all four trust anchors as tracked regular blobs at both endpoints of maintenance and legacy four-anchor updates.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-BootstrapTransitionChangedPaths'
+        }, $true))
+        $functionAst.Count | Should -Be 1
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst[0].Extent.Text))
+        $gitPath = [IO.Path]::GetFullPath([string](Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path)
+        $anchors = @(
+            '.github/workflows/standard-v1-protected.yml', 'scripts/Test-Repository.ps1',
+            'scripts/Validate.ps1', 'tests/validate-windows-powershell.ps1'
+        )
+        $invokeGuard = {
+            param($GitPath, $GuardModule, $Fixture, $BaseCommit, $CandidateCommit)
+            & $GuardModule {
+                param($InnerGitPath, $RepositoryRoot, $InnerBaseCommit, $InnerCandidateCommit)
+                Assert-BootstrapTransitionChangedPaths -GitPath $InnerGitPath -RepositoryRoot $RepositoryRoot -BaseCommit $InnerBaseCommit -CandidateCommit $InnerCandidateCommit
+            } $GitPath $Fixture $BaseCommit $CandidateCommit
+        }
+        try {
+            foreach ($case in @('missing', 'tree', 'symlink')) {
+                $fixture = Join-Path $TestDrive ("bootstrap-anchor-$case-" + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+                foreach ($anchor in $anchors) {
+                    $anchorPath = Join-Path $fixture $anchor
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                    [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+                }
+                $supportPath = Join-Path $fixture 'tests/TestSupport.ps1'
+                [IO.File]::WriteAllText($supportPath, 'base support', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture init --quiet --initial-branch=main
+                & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+                & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+                $anchorPath = Join-Path $fixture 'scripts/Validate.ps1'
+                $symlinkObjectId = ''
+                switch ($case) {
+                    'missing' { Remove-Item -LiteralPath $anchorPath -Force }
+                    'tree' {
+                        Remove-Item -LiteralPath $anchorPath -Force
+                        New-Item -ItemType Directory -Path $anchorPath -Force | Out-Null
+                        [IO.File]::WriteAllText((Join-Path $anchorPath 'nested.ps1'), 'nested', [Text.UTF8Encoding]::new($false))
+                    }
+                    'symlink' {
+                        $symlinkObjectId = ('symlink-target' | & $gitPath -C $fixture hash-object -w --stdin).Trim()
+                    }
+                }
+                & $gitPath -C $fixture add --all
+                if ($case -ceq 'symlink') {
+                    & $gitPath -C $fixture update-index --add --cacheinfo "120000,$symlinkObjectId,scripts/Validate.ps1"
+                }
+                & $gitPath -C $fixture commit --quiet -m "base-$case"
+                $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+
+                [IO.File]::WriteAllText($supportPath, 'maintenance support', [Text.UTF8Encoding]::new($false))
+                & $gitPath -C $fixture add -- 'tests/TestSupport.ps1'
+                & $gitPath -C $fixture commit --quiet -m "maintenance-$case"
+                $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+                $failure = $null
+                try {
+                    & $invokeGuard $gitPath $guardModule $fixture $baseCommit $candidateCommit
+                }
+                catch {
+                    $failure = $_
+                }
+                $failure | Should -Not -BeNullOrEmpty
+                $failure.Exception.Message | Should -Match 'tracked regular trust anchor'
+            }
+
+            $fixture = Join-Path $TestDrive ('bootstrap-anchor-base-missing-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+            foreach ($anchor in $anchors) {
+                $anchorPath = Join-Path $fixture $anchor
+                New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+            }
+            $supportPath = Join-Path $fixture 'tests/TestSupport.ps1'
+            [IO.File]::WriteAllText($supportPath, 'base support', [Text.UTF8Encoding]::new($false))
+            Remove-Item -LiteralPath (Join-Path $fixture 'scripts/Validate.ps1') -Force
+            & $gitPath -C $fixture init --quiet --initial-branch=main
+            & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+            & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+            & $gitPath -C $fixture add --all
+            & $gitPath -C $fixture commit --quiet -m base-missing-anchor
+            $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+            foreach ($anchor in $anchors) {
+                $anchorPath = Join-Path $fixture $anchor
+                New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                [IO.File]::WriteAllText($anchorPath, "candidate $anchor", [Text.UTF8Encoding]::new($false))
+            }
+            & $gitPath -C $fixture add --all
+            & $gitPath -C $fixture commit --quiet -m candidate-restores-anchor
+            $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+            $failure = $null
+            try {
+                & $invokeGuard $gitPath $guardModule $fixture $baseCommit $candidateCommit
+            }
+            catch {
+                $failure = $_
+            }
+            $failure | Should -Not -BeNullOrEmpty
+            $failure.Exception.Message | Should -Match 'tracked regular trust anchor'
+
+            $fixture = Join-Path $TestDrive ('bootstrap-anchor-legacy-success-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+            foreach ($anchor in $anchors) {
+                $anchorPath = Join-Path $fixture $anchor
+                New-Item -ItemType Directory -Path (Split-Path -Parent $anchorPath) -Force | Out-Null
+                [IO.File]::WriteAllText($anchorPath, "base $anchor", [Text.UTF8Encoding]::new($false))
+            }
+            & $gitPath -C $fixture init --quiet --initial-branch=main
+            & $gitPath -C $fixture config user.name 'Bootstrap fixture'
+            & $gitPath -C $fixture config user.email 'bootstrap@example.invalid'
+            & $gitPath -C $fixture add --all
+            & $gitPath -C $fixture commit --quiet -m base
+            $baseCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+            foreach ($anchor in $anchors) {
+                [IO.File]::WriteAllText((Join-Path $fixture $anchor), "candidate $anchor", [Text.UTF8Encoding]::new($false))
+            }
+            & $gitPath -C $fixture add --all
+            & $gitPath -C $fixture commit --quiet -m candidate-all-anchors
+            $candidateCommit = (& $gitPath -C $fixture rev-parse HEAD).Trim()
+            {
+                & $invokeGuard $gitPath $guardModule $fixture $baseCommit $candidateCommit
+            } | Should -Not -Throw
+        }
+        finally {
+            Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT58_BindsTheCanonicalEvidenceDigestInsideTheNamedExportStep' {
+        # Scenario: Workflow text omits, changes, or places the canonical evidence digest outside its clean export step.
+        # Purpose: Bind the exported evidence bytes to the canonical-validation digest at the only step allowed to publish them.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1'),
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        @($parseErrors).Count | Should -Be 0
+        $assertTrueAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-True'
+        }, $true))
+        $bindingAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-WorkflowEvidenceDigestBinding'
+        }, $true))
+        $assertTrueAst.Count | Should -Be 1
+        $bindingAst.Count | Should -Be 1
+        $contractSource = @($assertTrueAst[0].Extent.Text, $bindingAst[0].Extent.Text) -join [Environment]::NewLine
+        $contractModule = New-Module -ScriptBlock ([scriptblock]::Create($contractSource))
+        try {
+            $validWorkflow = @'
+steps:
+  - name: Export canonical evidence for clean upload
+    id: export-evidence
+    if: ${{ success() }}
+    shell: pwsh
+    env:
+      EXPECTED_EVIDENCE_SHA256: ${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}
+    run: echo export
+'@
+            {
+                & $contractModule { param($Workflow) Assert-WorkflowEvidenceDigestBinding -Workflow $Workflow } $validWorkflow
+            } | Should -Not -Throw
+            foreach ($invalidWorkflow in @(
+                ($validWorkflow -replace '(?m)^\s*EXPECTED_EVIDENCE_SHA256:.*\r?\n', ''),
+                ($validWorkflow -replace 'steps\.canonical-validation\.outputs\.standard_v1_evidence_sha256', 'steps.other.outputs.evidence_sha256'),
+@'
+steps:
+  - name: Verify canonical validation evidence
+    env:
+      EXPECTED_EVIDENCE_SHA256: ${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}
+    run: echo verify
+  - name: Export canonical evidence for clean upload
+    id: export-evidence
+    if: ${{ success() }}
+    shell: pwsh
+    run: echo export
+'@
+            )) {
+                {
+                    & $contractModule { param($Workflow) Assert-WorkflowEvidenceDigestBinding -Workflow $Workflow } $invalidWorkflow
+                } | Should -Throw
+            }
+        }
+        finally {
+            Remove-Module $contractModule -Force
+        }
+    }
+
     It 'UnitT60_UsesAWindowsLowIntegrityBoundaryForCandidateWrites' {
         # Scenario: The candidate runs under the same runner account as the trusted supervisor.
         # Purpose: Require a mandatory-integrity boundary so candidate code cannot write up into supervisor-owned roots.
@@ -175,7 +499,11 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match "'BootstrapTransition\.Tests\.ps1'"
         $supervisor | Should -Match "'RepositoryValidation\.Tests\.ps1'"
         $supervisor | Should -Match '\$requiredPesterPaths'
-        $supervisor | Should -Match 'Invoke-Pester -Path \$requiredPesterPaths'
+        $supervisor | Should -Match '\$pesterConfiguration = New-PesterConfiguration'
+        $supervisor | Should -Match '\$pesterConfiguration\.Run\.Path = \$requiredPesterPaths'
+        $supervisor | Should -Match '\$pesterConfiguration\.Run\.PassThru = \$true'
+        $supervisor | Should -Match '\$pesterConfiguration\.TestRegistry\.Enabled = \$false'
+        $supervisor | Should -Match 'Invoke-Pester -Configuration \$pesterConfiguration'
         $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
     }
 
@@ -464,4 +792,5 @@ Describe 'Darktide bootstrap transition' {
         $strictUtf8.GetString([byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B), 3, 4) |
             Should -Be '# ok'
     }
+
 }

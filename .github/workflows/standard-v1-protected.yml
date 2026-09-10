@@ -444,6 +444,8 @@ jobs:
         id: export-evidence
         if: ${{ success() }}
         shell: pwsh
+        env:
+          EXPECTED_EVIDENCE_SHA256: ${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           $evidencePath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
