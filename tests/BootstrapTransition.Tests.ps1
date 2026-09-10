@@ -477,6 +477,75 @@ steps:
         }
     }
 
+    It 'UnitT59_ValidatesTheCanonicalDigestBeforeExportingEvidence' {
+        # Scenario: A normal JSON evidence file is exported with the correct, wrong, absent, and malformed canonical digest values.
+        # Purpose: Bind both exported values to the exact bytes and canonical digest emitted by validation.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+        $stepMatch = [regex]::Match(
+            $workflow,
+            '(?ms)^ {6}- name: Export canonical evidence for clean upload\r?\n(?<step>.*?)(?=^ {6}- name:|\z)'
+        )
+        $stepMatch.Success | Should -BeTrue
+        $runMatch = [regex]::Match(
+            $stepMatch.Groups['step'].Value,
+            '(?ms)^ {8}run:\s*\|\r?\n(?<script>(?:^ {10}.*(?:\r?\n|$))+)'
+        )
+        $runMatch.Success | Should -BeTrue
+        $exportScript = [regex]::Replace($runMatch.Groups['script'].Value, '(?m)^ {10}', '')
+        $exportBlock = [scriptblock]::Create($exportScript)
+
+        $evidencePath = Join-Path $TestDrive 'darktide-translate-conformance-report.json'
+        $githubOutputPath = Join-Path $TestDrive 'github-output.txt'
+        $evidenceBytes = [Text.UTF8Encoding]::new($false).GetBytes('{"result":"passed"}')
+        [IO.File]::WriteAllBytes($evidencePath, $evidenceBytes)
+        [IO.File]::WriteAllText($githubOutputPath, '', [Text.UTF8Encoding]::new($false))
+        $expectedDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToLowerInvariant()
+        $wrongDigest = if ($expectedDigest -ceq ('0' * 64)) { '1' * 64 } else { '0' * 64 }
+
+        $savedRunnerTemp = [Environment]::GetEnvironmentVariable('RUNNER_TEMP', [EnvironmentVariableTarget]::Process)
+        $savedGithubOutput = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
+        $savedExpectedDigest = [Environment]::GetEnvironmentVariable('EXPECTED_EVIDENCE_SHA256', [EnvironmentVariableTarget]::Process)
+        try {
+            [Environment]::SetEnvironmentVariable('RUNNER_TEMP', $TestDrive, [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable('GITHUB_OUTPUT', $githubOutputPath, [EnvironmentVariableTarget]::Process)
+
+            [Environment]::SetEnvironmentVariable('EXPECTED_EVIDENCE_SHA256', $expectedDigest, [EnvironmentVariableTarget]::Process)
+            { & $exportBlock } | Should -Not -Throw
+            $exportOutput = Get-Content -LiteralPath $githubOutputPath -Raw
+            $base64Matches = @([regex]::Matches($exportOutput, '(?m)^evidence_base64=(?<value>[A-Za-z0-9+/=]*)\r?$'))
+            $digestMatches = @([regex]::Matches($exportOutput, '(?m)^evidence_sha256=(?<value>[0-9a-f]{64})\r?$'))
+            $base64Matches.Count | Should -Be 1
+            $digestMatches.Count | Should -Be 1
+            $decodedEvidenceBytes = [Convert]::FromBase64String($base64Matches[0].Groups['value'].Value)
+            [BitConverter]::ToString($decodedEvidenceBytes) | Should -Be ([BitConverter]::ToString($evidenceBytes))
+            $digestMatches[0].Groups['value'].Value | Should -Be $expectedDigest
+
+            foreach ($invalidCase in @(
+                [pscustomobject]@{ Digest = $wrongDigest; ExpectedMessage = 'Canonical evidence digest does not match the canonical validation output.' },
+                [pscustomobject]@{ Digest = $null; ExpectedMessage = 'Canonical validation did not emit one lowercase evidence SHA-256 output.' },
+                [pscustomobject]@{ Digest = 'not-a-sha256'; ExpectedMessage = 'Canonical validation did not emit one lowercase evidence SHA-256 output.' }
+            )) {
+                [IO.File]::WriteAllText($githubOutputPath, '', [Text.UTF8Encoding]::new($false))
+                [Environment]::SetEnvironmentVariable('EXPECTED_EVIDENCE_SHA256', $invalidCase.Digest, [EnvironmentVariableTarget]::Process)
+                $failure = $null
+                try {
+                    & $exportBlock
+                }
+                catch {
+                    $failure = $_
+                }
+                $failure | Should -Not -BeNullOrEmpty
+                $failure.Exception.Message | Should -Be $invalidCase.ExpectedMessage
+                (Get-Item -LiteralPath $githubOutputPath -Force).Length | Should -Be 0
+            }
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable('RUNNER_TEMP', $savedRunnerTemp, [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable('GITHUB_OUTPUT', $savedGithubOutput, [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable('EXPECTED_EVIDENCE_SHA256', $savedExpectedDigest, [EnvironmentVariableTarget]::Process)
+        }
+    }
+
     It 'UnitT60_UsesAWindowsLowIntegrityBoundaryForCandidateWrites' {
         # Scenario: The candidate runs under the same runner account as the trusted supervisor.
         # Purpose: Require a mandatory-integrity boundary so candidate code cannot write up into supervisor-owned roots.
