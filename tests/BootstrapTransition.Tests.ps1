@@ -280,6 +280,100 @@ Describe 'Darktide bootstrap transition' {
         }
     }
 
+    It 'UnitT55_RejectsCredentialBackedSemanticValidationOnWindowsBeforeEnvironmentCapture' {
+        # Scenario: A Windows protected-Pester boundary receives a nonblank semantic credential name.
+        # Purpose: Reject the request before any environment value is read, because that boundary does not establish credential confidentiality.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $protectorAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Protect-ProcessCredentialEnvironment'
+        }, $true))
+        $protectorAst.Count | Should -Be 1
+        $hostSupportAst = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-SemanticCredentialHostSupport'
+        }, $true))
+        $expectedError = 'Credential-backed semantic validation is not supported on Windows because the protected Pester boundary does not establish credential confidentiality.'
+        $syntheticCredentialName = 'SEMANTIC_CREDENTIAL_TEST_' + [guid]::NewGuid().ToString('N')
+        (Test-Path -LiteralPath ("Env:$syntheticCredentialName")) | Should -BeFalse
+
+        $moduleSource = '$script:IsWindowsHost = $true' + [Environment]::NewLine
+        if ($hostSupportAst.Count -eq 1) { $moduleSource += $hostSupportAst[0].Extent.Text + [Environment]::NewLine }
+        $moduleSource += $protectorAst[0].Extent.Text
+        $credentialModule = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $failures = [Collections.Generic.List[string]]::new()
+        try {
+            if ($hostSupportAst.Count -ne 1) {
+                $failures.Add('Assert-SemanticCredentialHostSupport must exist exactly once.')
+            }
+            else {
+                $hostSupportText = $hostSupportAst[0].Extent.Text
+                if ($hostSupportText -notmatch '(?s)\[string\[\]\]\s+\$SemanticCredentialNames') {
+                    $failures.Add('Assert-SemanticCredentialHostSupport must declare [string[]] $SemanticCredentialNames.')
+                }
+                foreach ($case in @(
+                    [pscustomobject]@{ Name = 'null'; Names = $null },
+                    [pscustomobject]@{ Name = 'empty'; Names = [string[]]@() },
+                    [pscustomobject]@{ Name = 'whitespace'; Names = [string[]]@('', ' ', "`t") }
+                )) {
+                    try {
+                        & $credentialModule {
+                            param($names)
+                            $script:IsWindowsHost = $true
+                            Assert-SemanticCredentialHostSupport -SemanticCredentialNames $names
+                        } $case.Names
+                    }
+                    catch {
+                        $failures.Add("Windows $($case.Name) semantic credential names must be accepted: $($_.Exception.Message)")
+                    }
+                }
+                $windowsFailure = $null
+                try {
+                    & $credentialModule {
+                        $script:IsWindowsHost = $true
+                        Assert-SemanticCredentialHostSupport -SemanticCredentialNames @('SEMANTIC_CREDENTIAL_TEST')
+                    }
+                }
+                catch { $windowsFailure = $_ }
+                if ($null -eq $windowsFailure -or $windowsFailure.Exception.Message -cne $expectedError) {
+                    $actual = if ($null -eq $windowsFailure) { 'no error' } else { $windowsFailure.Exception.Message }
+                    $failures.Add("Windows nonblank semantic credential names must throw the exact unsupported-host error; actual=$actual")
+                }
+                try {
+                    & $credentialModule {
+                        $script:IsWindowsHost = $false
+                        Assert-SemanticCredentialHostSupport -SemanticCredentialNames @('SEMANTIC_CREDENTIAL_TEST')
+                    }
+                }
+                catch {
+                    $failures.Add("Linux semantic credential names must be accepted: $($_.Exception.Message)")
+                }
+            }
+
+            $protectorFailure = $null
+            try {
+                & $credentialModule {
+                    param($name)
+                    $script:IsWindowsHost = $true
+                    Protect-ProcessCredentialEnvironment -SemanticCredentialNames @($name)
+                } $syntheticCredentialName
+            }
+            catch { $protectorFailure = $_ }
+            if ($null -eq $protectorFailure -or $protectorFailure.Exception.Message -cne $expectedError) {
+                $actual = if ($null -eq $protectorFailure) { 'no error' } else { $protectorFailure.Exception.Message }
+                $failures.Add("Protect-ProcessCredentialEnvironment must reject before reading the absent synthetic environment name; actual=$actual")
+            }
+
+            if ($failures.Count -gt 0) { throw ($failures -join [Environment]::NewLine) }
+        }
+        finally {
+            Remove-Module $credentialModule -Force
+        }
+    }
+
     It 'UnitT56_RequiresEveryBootstrapAnchorToBeARegularTrackedBlobAtBothRangeEnds' {
         # Scenario: A maintenance-only diff retains an absent, directory, or symbolic-link anchor at both range ends; a separate legacy-shaped range restores a missing base anchor while changing all four anchors.
         # Purpose: Keep all four trust anchors as tracked regular blobs at both endpoints of maintenance and legacy four-anchor updates.
@@ -413,6 +507,97 @@ Describe 'Darktide bootstrap transition' {
         }
         finally {
             Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT57_BindsCanonicalWorkflowValidatorArgumentsByNameForBothLayouts' {
+        # Scenario: The protected workflow invokes the trusted validator from candidate roots and runner paths containing spaces.
+        # Purpose: Require its real call-site fragment to bind the repository, artifacts, comparison base, Go runtime, output, and bootstrap switch by their declared parameter names.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+        $snippetStart = $workflow.IndexOf("`$outputPath = Join-Path `$env:RUNNER_TEMP 'darktide-translate-conformance-report.json'", [StringComparison]::Ordinal)
+        $snippetEndMarker = '& $trustedValidator @validatorArguments'
+        $snippetEnd = $workflow.IndexOf($snippetEndMarker, $snippetStart, [StringComparison]::Ordinal)
+        $snippetStart | Should -BeGreaterOrEqual 0
+        $snippetEnd | Should -BeGreaterThan $snippetStart
+        $workflowSnippet = [scriptblock]::Create($workflow.Substring($snippetStart, $snippetEnd + $snippetEndMarker.Length - $snippetStart))
+
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $validatorParamBlock = $validatorAst.ParamBlock.Extent.Text
+        $validatorParamBlock | Should -Match '\[switch\] \$BootstrapTransition'
+
+        $environmentNames = @('RUNNER_TEMP', 'TRUSTED_SUPERVISOR_ROOT', 'STANDARD_GO_RUNTIME_VERSION')
+        $environmentBefore = @{}
+        foreach ($name in $environmentNames) {
+            $environmentBefore[$name] = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
+        }
+
+        try {
+            foreach ($fixture in @(
+                [pscustomobject]@{ Name = 'legacy bootstrap'; BootstrapTransition = $true },
+                [pscustomobject]@{ Name = 'standard v1'; BootstrapTransition = $false }
+            )) {
+                $fixtureRoot = Join-Path $TestDrive ("workflow binding $($fixture.Name) with spaces")
+                $candidateRoot = Join-Path $fixtureRoot 'candidate repository with spaces'
+                $runnerTemp = Join-Path $fixtureRoot 'runner temp with spaces'
+                $trustedRoot = Join-Path $fixtureRoot 'trusted supervisor with spaces'
+                $trustedScriptsRoot = Join-Path $trustedRoot 'scripts'
+                New-Item -ItemType Directory -Path $candidateRoot, $runnerTemp, $trustedScriptsRoot -Force | Out-Null
+
+                if ($fixture.BootstrapTransition) {
+                    $legacyCatalog = Join-Path $candidateRoot 'catalog'
+                    New-Item -ItemType Directory -Path $legacyCatalog -Force | Out-Null
+                    [IO.File]::WriteAllText((Join-Path $legacyCatalog 'skills-catalog.json'), '{}', [Text.UTF8Encoding]::new($false))
+                }
+                else {
+                    $standardCatalog = Join-Path $candidateRoot 'catalog'
+                    $standardConfig = Join-Path $candidateRoot 'config'
+                    New-Item -ItemType Directory -Path $standardCatalog, $standardConfig -Force | Out-Null
+                    [IO.File]::WriteAllText((Join-Path $standardCatalog 'source.json'), '{}', [Text.UTF8Encoding]::new($false))
+                    [IO.File]::WriteAllText((Join-Path $standardConfig 'standard-v1.json'), '{}', [Text.UTF8Encoding]::new($false))
+                }
+
+                $collectorPath = Join-Path $trustedScriptsRoot 'Validate.ps1'
+                $collectorBody = @'
+$bound = [ordered]@{
+    RepositoryRoot = $RepositoryRoot
+    ArtifactsRoot = $ArtifactsRoot
+    BaseCommit = $BaseCommit
+    ExpectedGoRuntimeVersion = $ExpectedGoRuntimeVersion
+    OutputPath = $OutputPath
+    BootstrapTransition = [bool]$BootstrapTransition
+}
+$bound | ConvertTo-Json -Compress
+'@
+                [IO.File]::WriteAllText($collectorPath, $validatorParamBlock + [Environment]::NewLine + $collectorBody, [Text.UTF8Encoding]::new($false))
+
+                $baseCommit = '0123456789abcdef0123456789abcdef01234567'
+                $runtimeVersion = '1.24.3'
+                [Environment]::SetEnvironmentVariable('RUNNER_TEMP', $runnerTemp, [EnvironmentVariableTarget]::Process)
+                [Environment]::SetEnvironmentVariable('TRUSTED_SUPERVISOR_ROOT', $trustedRoot, [EnvironmentVariableTarget]::Process)
+                [Environment]::SetEnvironmentVariable('STANDARD_GO_RUNTIME_VERSION', $runtimeVersion, [EnvironmentVariableTarget]::Process)
+                Push-Location -LiteralPath $candidateRoot
+                try {
+                    $bound = (@(& $workflowSnippet) | Select-Object -Last 1) | ConvertFrom-Json
+                }
+                finally {
+                    Pop-Location
+                }
+
+                $bound.RepositoryRoot | Should -Be $candidateRoot
+                $bound.ArtifactsRoot | Should -Be $runnerTemp
+                $bound.BaseCommit | Should -Be $baseCommit
+                $bound.ExpectedGoRuntimeVersion | Should -Be $runtimeVersion
+                $bound.OutputPath | Should -Be (Join-Path $runnerTemp 'darktide-translate-conformance-report.json')
+                $bound.BootstrapTransition | Should -Be $fixture.BootstrapTransition
+            }
+        }
+        finally {
+            foreach ($name in $environmentNames) {
+                [Environment]::SetEnvironmentVariable($name, $environmentBefore[$name], [EnvironmentVariableTarget]::Process)
+            }
         }
     }
 

@@ -2748,10 +2748,23 @@ function New-ContainedProcessEnvironment {
     return $environment
 }
 
+function Assert-SemanticCredentialHostSupport {
+    param(
+        [Parameter()][AllowNull()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
+    )
+    if (-not $script:IsWindowsHost) { return }
+    foreach ($name in $SemanticCredentialNames) {
+        if (-not [string]::IsNullOrWhiteSpace($name)) {
+            throw 'Credential-backed semantic validation is not supported on Windows because the protected Pester boundary does not establish credential confidentiality.'
+        }
+    }
+}
+
 function Protect-ProcessCredentialEnvironment {
     param(
         [Parameter()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
     )
+    Assert-SemanticCredentialHostSupport -SemanticCredentialNames $SemanticCredentialNames
     $credentialNamePattern = '(?i)(^|_)(API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIALS?|AUTH)(_|$)'
     $exactCredentialNames = @(
         'GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN',

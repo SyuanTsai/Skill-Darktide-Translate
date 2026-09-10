@@ -378,13 +378,13 @@ jobs:
           }
           $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
           $trustedValidator = Join-Path $env:TRUSTED_SUPERVISOR_ROOT 'scripts/Validate.ps1'
-          $validatorArguments = @(
-            '-RepositoryRoot', (Get-Location).Path,
-            '-ArtifactsRoot', $env:RUNNER_TEMP,
-            '-BaseCommit', $baseCommit,
-            '-ExpectedGoRuntimeVersion', $env:STANDARD_GO_RUNTIME_VERSION,
-            '-OutputPath', $outputPath
-          )
+          $validatorArguments = @{
+            RepositoryRoot = (Get-Location).Path
+            ArtifactsRoot = $env:RUNNER_TEMP
+            BaseCommit = $baseCommit
+            ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION
+            OutputPath = $outputPath
+          }
           $isBootstrapTransition =
             (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'catalog/skills-catalog.json') -PathType Leaf) -and
             (-not (Test-Path -LiteralPath (Join-Path (Get-Location).Path 'catalog/source.json') -PathType Leaf)) -and
@@ -392,7 +392,7 @@ jobs:
           if ($isBootstrapTransition) {
             # The trusted validator rechecks the exact current-layout fixture and
             # refuses a mixed or post-migration tree before producing evidence.
-            $validatorArguments += '-BootstrapTransition'
+            $validatorArguments.BootstrapTransition = $true
           }
           & $trustedValidator @validatorArguments
 
