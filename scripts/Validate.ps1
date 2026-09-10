@@ -2085,6 +2085,22 @@ function Stop-ProcessTree {
         if ($rootIsCandidate) {
             Add-ObservedProcessIds -RootProcessId $RootProcessId -ObservedProcessIdentities $ObservedProcessIdentities -ProcessGroupId $ProcessGroupId
         }
+        if ($script:IsLinuxHost) {
+            # A descendant can become an adopted zombie only after this
+            # round's signal, including the final KILL round.
+            foreach ($processId in @($ObservedProcessIdentities.Keys)) {
+                if ([int]$processId -le 0 -or [int]$processId -eq $RootProcessId) { continue }
+                try {
+                    $exitedChildInfo = Get-UnixProcessInfo -ProcessId ([int]$processId)
+                }
+                catch {
+                    continue
+                }
+                if ($exitedChildInfo.state -ceq 'Z' -and $exitedChildInfo.parentProcessId -eq $PID) {
+                    [void](Stop-UnixProcessByIdentity -ProcessId ([int]$processId) -Identity ([string]$ObservedProcessIdentities[[int]$processId]) -Signal $signalNumber -ReapExitedChild)
+                }
+            }
+        }
         $remainingRoot = if ([string]::IsNullOrWhiteSpace($RootProcessIdentity)) {
             Test-ProcessIdExists -ProcessId $RootProcessId
         }

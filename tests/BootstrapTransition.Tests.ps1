@@ -81,7 +81,9 @@ Describe 'Darktide bootstrap transition' {
                 [Parameter()][int] $SendResult = 0,
                 [Parameter()][int] $ReapResult = 0,
                 [Parameter()][bool] $ReapRemovesIdentity = $true,
-                [Parameter()][bool] $IdentityChangesAfterOpen = $false
+                [Parameter()][bool] $IdentityChangesAfterOpen = $false,
+                [Parameter()][int] $ZombieAfterFinalSignalProcessId = 0,
+                [Parameter()][int] $ZombieAfterFinalSignalParentProcessId = 0
             )
 
             $tokens = $null
@@ -111,8 +113,10 @@ namespace Syp158.TestDoubles {
         public static int CloseCount { get; set; }
         public static int LastOpenedProcessId { get; set; }
         public static int LastReapedProcessId { get; set; }
+        public static System.Collections.Generic.List<int> SignalValues { get; } = new System.Collections.Generic.List<int>();
+        public static System.Collections.Generic.List<int> SignalProcessIds { get; } = new System.Collections.Generic.List<int>();
         public static int OpenProcessFileDescriptor(int processId) { OpenCount++; LastOpenedProcessId = processId; return OpenResult; }
-        public static int SendProcessSignal(int fileDescriptor, int signal) { SendCount++; return SendResult; }
+        public static int SendProcessSignal(int fileDescriptor, int signal) { SendCount++; SignalValues.Add(signal); SignalProcessIds.Add(LastOpenedProcessId); return SendResult; }
         public static int ReapExitedProcessFileDescriptor(int fileDescriptor) { ReapCount++; LastReapedProcessId = LastOpenedProcessId; return ReapResult; }
         public static int CloseProcessFileDescriptor(int fileDescriptor) { CloseCount++; return 0; }
     }
@@ -169,6 +173,21 @@ function Test-ProcessIdExists {
 function Get-UnixProcessGroupId { param([int] $ProcessId) return 0 }
 function Get-UnixProcessGroupProcessIds { param([int] $ProcessGroupId) return @() }
 function Add-ObservedProcessIds { param([int] $RootProcessId, $ObservedProcessIdentities, [int] $ProcessGroupId) }
+function Start-Sleep {
+    param([int] $Milliseconds)
+    if ($script:ZombieAfterFinalSignalProcessId -gt 0 -and
+        $script:FakeNativeType::SignalValues.Count -gt 0 -and
+        $script:FakeNativeType::SignalValues[$script:FakeNativeType::SignalValues.Count - 1] -eq 9) {
+        $record = $script:FakeRecords[[int]$script:ZombieAfterFinalSignalProcessId]
+        if ($null -ne $record) {
+            $record.state = 'Z'
+            $record.parentProcessId = if ($script:ZombieAfterFinalSignalParentProcessId -gt 0) {
+                $script:ZombieAfterFinalSignalParentProcessId
+            }
+            else { $PID }
+        }
+    }
+}
 '@)
             $source.Add($stopUnix.Extent.Text.Replace('Codex.Validation.UnixProcessBoundary', $typeName))
             $source.Add($stopTree.Extent.Text)
@@ -177,6 +196,8 @@ function Add-ObservedProcessIds { param([int] $RootProcessId, $ObservedProcessId
             return [pscustomobject]@{
                 Module = $module; NativeType = $nativeType; Records = $Records
                 ReapRemovesIdentity = $ReapRemovesIdentity; IdentityChangesAfterOpen = $IdentityChangesAfterOpen
+                ZombieAfterFinalSignalProcessId = $ZombieAfterFinalSignalProcessId
+                ZombieAfterFinalSignalParentProcessId = $ZombieAfterFinalSignalParentProcessId
             }
         }
 
@@ -187,7 +208,7 @@ function Add-ObservedProcessIds { param([int] $RootProcessId, $ObservedProcessId
                 [Parameter()][object[]] $Arguments = @()
             )
             & $Probe.Module {
-                param($Records, $NativeType, $ReapRemovesIdentity, $IdentityChangesAfterOpen, $ActionText, $Arguments)
+                param($Records, $NativeType, $ReapRemovesIdentity, $IdentityChangesAfterOpen, $ZombieAfterFinalSignalProcessId, $ZombieAfterFinalSignalParentProcessId, $ActionText, $Arguments)
                 $script:IsWindowsHost = $false
                 $script:IsLinuxHost = $true
                 $script:IsSupportedProcessBoundaryHost = $true
@@ -195,8 +216,10 @@ function Add-ObservedProcessIds { param([int] $RootProcessId, $ObservedProcessId
                 $script:FakeNativeType = $NativeType
                 $script:ReapRemovesIdentity = $ReapRemovesIdentity
                 $script:IdentityChangesAfterOpen = $IdentityChangesAfterOpen
+                $script:ZombieAfterFinalSignalProcessId = $ZombieAfterFinalSignalProcessId
+                $script:ZombieAfterFinalSignalParentProcessId = $ZombieAfterFinalSignalParentProcessId
                 & ([scriptblock]::Create($ActionText)) @Arguments
-            } $Probe.Records $Probe.NativeType $Probe.ReapRemovesIdentity $Probe.IdentityChangesAfterOpen $Action.ToString() $Arguments
+            } $Probe.Records $Probe.NativeType $Probe.ReapRemovesIdentity $Probe.IdentityChangesAfterOpen $Probe.ZombieAfterFinalSignalProcessId $Probe.ZombieAfterFinalSignalParentProcessId $Action.ToString() $Arguments
         }
 
         function Invoke-LinuxEtcProjectionProbe {
@@ -1331,6 +1354,55 @@ steps:
                 } -Arguments @(7292, $observed)
             } | Should -Throw '*Could not terminate the complete candidate process boundary*'
             $probe.NativeType::ReapCount | Should -Be 0
+        }
+        finally {
+            Remove-Module $probe.Module -Force
+        }
+    }
+
+    It 'UnitT89_ReapsOnlySupervisorZombiesThatAppearAfterTheFinalSignal <Name>' -TestCases @(
+        @{ Name = 'supervisor-zombie-after-signal-9'; Transition = $true; TransitionParentProcessId = 0; ReapResult = 0; ReapRemovesIdentity = $true; ShouldComplete = $true; ExpectedReap = 1 },
+        @{ Name = 'still-live-after-signal-9'; Transition = $false; TransitionParentProcessId = 0; ReapResult = 0; ReapRemovesIdentity = $true; ShouldComplete = $false; ExpectedReap = 0 },
+        @{ Name = 'foreign-zombie-after-signal-9'; Transition = $true; TransitionParentProcessId = ($PID + 1); ReapResult = 0; ReapRemovesIdentity = $true; ShouldComplete = $false; ExpectedReap = 0 },
+        @{ Name = 'wait-fails-after-signal-9'; Transition = $true; TransitionParentProcessId = 0; ReapResult = -1; ReapRemovesIdentity = $true; ShouldComplete = $false; ExpectedReap = 1 },
+        @{ Name = 'wait-leaves-identity-after-signal-9'; Transition = $true; TransitionParentProcessId = 0; ReapResult = 0; ReapRemovesIdentity = $false; ShouldComplete = $false; ExpectedReap = 1 }
+    ) {
+        # Scenario: An observed child is live through the existing TERM rounds and changes state only after the final KILL signal.
+        # Purpose: Reap only a supervisor-owned final-round zombie without changing signal rounds, touching the root, or accepting an unproved cleanup.
+        param($Name, $Transition, $TransitionParentProcessId, $ReapResult, $ReapRemovesIdentity, $ShouldComplete, $ExpectedReap)
+        $rootProcessId = 7215
+        $childProcessId = 7216
+        $childIdentity = 'delayed-child-start-time'
+        $records = @{
+            $childProcessId = [pscustomobject]@{
+                exists = $true; identity = $childIdentity; state = 'S'; parentProcessId = ($PID + 1); processGroupId = 0
+            }
+        }
+        $transitionProcessId = if ($Transition) { $childProcessId } else { 0 }
+        $probe = New-LinuxChildReapingProbe -Records $records -ReapResult $ReapResult `
+            -ReapRemovesIdentity $ReapRemovesIdentity -ZombieAfterFinalSignalProcessId $transitionProcessId `
+            -ZombieAfterFinalSignalParentProcessId $TransitionParentProcessId
+        try {
+            $observed = @{
+                $rootProcessId = 'root-start-time'
+                $childProcessId = $childIdentity
+            }
+            $cleanup = {
+                Invoke-LinuxChildReapingProbe -Probe $probe -Action {
+                    param($RootProcessId, $Observed)
+                    Stop-ProcessTree -RootProcessId $RootProcessId -RootProcessIdentity 'root-start-time' -ObservedProcessIdentities $Observed
+                } -Arguments @($rootProcessId, $observed)
+            }
+            if ($ShouldComplete) {
+                $cleanup | Should -Not -Throw
+            }
+            else {
+                $cleanup | Should -Throw '*Could not terminate the complete candidate process boundary*'
+            }
+            @($probe.NativeType::SignalValues) | Should -Be @(15, 15, 9)
+            @($probe.NativeType::SignalProcessIds) | Should -Be @($childProcessId, $childProcessId, $childProcessId)
+            $probe.NativeType::ReapCount | Should -Be $ExpectedReap
+            $probe.NativeType::LastReapedProcessId | Should -Be $(if ($ExpectedReap -eq 1) { $childProcessId } else { 0 })
         }
         finally {
             Remove-Module $probe.Module -Force
