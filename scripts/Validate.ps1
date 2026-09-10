@@ -62,6 +62,27 @@ function Assert-NoDuplicateJsonProperties {
         }
     }
 }
+
+function Read-StrictUtf8File {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $offset = if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF) {
+        3
+    }
+    else {
+        0
+    }
+    return [Text.UTF8Encoding]::new($false, $true).GetString(
+        $bytes,
+        $offset,
+        $bytes.Length - $offset
+    )
+}
+
 function Read-JsonFile {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -69,7 +90,7 @@ function Read-JsonFile {
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Context is missing: $Path" }
     try {
-        $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
+        $text = Read-StrictUtf8File -Path $Path
         $document = [System.Text.Json.JsonDocument]::Parse($text)
         try { Assert-NoDuplicateJsonProperties -Element $document.RootElement -Context $Context }
         finally { $document.Dispose() }

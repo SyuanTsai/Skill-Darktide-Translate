@@ -34,6 +34,37 @@ function Assert-ExactPropertySet {
         @($actual | Where-Object { $Expected -cnotcontains $_ }).Count -eq 0) "$Context has an invalid property set."
 }
 
+function Assert-StrictUtf8PowerShellFile {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $offset = if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF) {
+        3
+    }
+    else {
+        0
+    }
+    $source = [Text.UTF8Encoding]::new($false, $true).GetString(
+        $bytes,
+        $offset,
+        $bytes.Length - $offset
+    )
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseInput(
+        $source,
+        $Path,
+        [ref]$tokens,
+        [ref]$errors
+    ) | Out-Null
+    if (@($errors).Count -ne 0) {
+        throw "PowerShell parse failed for '$Path': $(@($errors | ForEach-Object { $_.Message }) -join '; ')"
+    }
+}
+
 Assert-True ($PSVersionTable.PSVersion.Major -eq 5) 'This contract must execute under Windows PowerShell 5.1.'
 
 $files = @()
@@ -47,10 +78,7 @@ foreach ($relativeRoot in @('scripts', '.agents/skills', 'skills')) {
 $files += @(Get-Item -LiteralPath $PSCommandPath)
 Assert-True (@($files).Count -gt 0) 'No PowerShell compatibility files were found.'
 foreach ($file in $files) {
-    $tokens = $null
-    $errors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
-    Assert-True (@($errors).Count -eq 0) "PowerShell parse failed for '$($file.FullName)': $(@($errors | ForEach-Object { $_.Message }) -join '; ')"
+    Assert-StrictUtf8PowerShellFile -Path $file.FullName
 }
 
 $legacyCatalogPath = Join-Path $repositoryRoot 'catalog/skills-catalog.json'
