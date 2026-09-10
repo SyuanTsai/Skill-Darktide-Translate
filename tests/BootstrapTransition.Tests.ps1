@@ -321,4 +321,29 @@ Describe 'Darktide bootstrap transition' {
             Remove-Module $guardModule -Force
         }
     }
+
+    It 'UnitT110_RejectsNonUtf8PowerShellSourceBytes' {
+        # Scenario: A candidate trust anchor uses UTF-16 or UTF-32 bytes that ReadAllText would auto-detect despite its UTF-8 argument.
+        # Purpose: Bind the protected parser to raw bytes and allow only strict UTF-8, with or without its own BOM.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $workflow | Should -Match '\[IO\.File\]::ReadAllBytes\(\$candidatePath\)'
+        $workflow | Should -Not -Match '\$candidateSource\s*=\s*\[IO\.File\]::ReadAllText\('
+        $workflow | Should -Match '(?s)\$candidateBytes\[0\] -eq 0xEF.*?\$candidateBytes\[1\] -eq 0xBB.*?\$candidateBytes\[2\] -eq 0xBF'
+        $workflow | Should -Match '(?s)\[Text\.UTF8Encoding\]::new\(\$false, \$true\)\.GetString\(.*?\$candidateBytes.*?\$candidateOffset.*?\$candidateBytes\.Length - \$candidateOffset'
+
+        $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+        { $strictUtf8.GetString([byte[]]@(0xFF, 0xFE, 0x23, 0x00), 0, 4) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0xFE, 0xFF, 0x00, 0x23), 0, 4) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0xFF, 0xFE, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00), 0, 8) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x23), 0, 8) } |
+            Should -Throw
+        $strictUtf8.GetString([byte[]]@(0x23, 0x20, 0x6F, 0x6B), 0, 4) |
+            Should -Be '# ok'
+        $strictUtf8.GetString([byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B), 3, 4) |
+            Should -Be '# ok'
+    }
 }

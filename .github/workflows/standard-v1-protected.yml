@@ -121,9 +121,20 @@ jobs:
             }
             $tokens = $null
             $errors = $null
-            $candidateSource = [IO.File]::ReadAllText(
-              $candidatePath,
-              [Text.UTF8Encoding]::new($false, $true)
+            $candidateBytes = [IO.File]::ReadAllBytes($candidatePath)
+            $candidateOffset = if ($candidateBytes.Length -ge 3 -and
+                $candidateBytes[0] -eq 0xEF -and
+                $candidateBytes[1] -eq 0xBB -and
+                $candidateBytes[2] -eq 0xBF) {
+              3
+            }
+            else {
+              0
+            }
+            $candidateSource = [Text.UTF8Encoding]::new($false, $true).GetString(
+              $candidateBytes,
+              $candidateOffset,
+              $candidateBytes.Length - $candidateOffset
             )
             [Management.Automation.Language.Parser]::ParseInput(
               $candidateSource,
