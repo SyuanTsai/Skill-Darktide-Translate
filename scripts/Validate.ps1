@@ -3937,6 +3937,7 @@ function Test-SecurityRelevantSkillChange {
 function Get-RequiredPesterTests {
     return @(
         'BootstrapTransition.Tests.ps1'
+        'CanonicalValidation.Tests.ps1'
         'LocalizationWorkset.Tests.ps1'
         'ModUpdateAutomation.Tests.ps1'
         'RepositoryContract.Tests.ps1'
@@ -3945,6 +3946,8 @@ function Get-RequiredPesterTests {
         'Schema15SourceAcquisition.Tests.ps1'
         'SkillContract.Tests.ps1'
         'SourcePin.Tests.ps1'
+        'StandardV1Conformance.Tests.ps1'
+        'Test-Repository.Tests.ps1'
     )
 }
 

@@ -173,14 +173,18 @@ local side_effect = os.time()
         $sideEffectDocument.isIoDofileOnlyLoader | Should -Be $false
     }
 
-    # Scenario: One localization expression is large enough for tokenization and hashing to cross multiple heartbeat chunks.
+    # Scenario: A quoted localization expression and a long source comment cross tokenization and hash heartbeat chunks.
     # Purpose: Keep the immutable MOD reservation fresh during CPU-bound Lua scanning, not only file and child-process waits.
     It 'UnitT26_HeartbeatsDuringLargeCpuBoundLuaScans' {
         Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
         $counter = [Runtime.CompilerServices.StrongBox[int]]::new(0)
         $heartbeat = { $counter.Value++; 'heartbeat-noise-must-not-escape' }.GetNewClosure()
-        $largeExpression = 'return { key = { en = "' + [string]::new('a', (2MB + 17)) + '", ["zh-tw"] = "保留" } }'
+        # Eight 0x4000 tokenization chunks plus a non-aligned tail exercise repeated
+        # scanner heartbeats. The separate 2 MiB long comment crosses hash stream chunks.
+        $largeExpression = 'return { key = { en = "' + [string]::new('a', (128KB + 17)) + '", ["zh-tw"] = "保留" } }' + "`n--[[" + [string]::new('b', (2MB + 17)) + ']]'
         $bytes = [Text.UTF8Encoding]::new($false).GetBytes($largeExpression)
+
+        $bytes.Length | Should -BeGreaterThan 2MB
 
         $document = Get-LuaLocalizationDocument -Bytes $bytes -DisplayPath '<large-heartbeat>' `
             -SourceId 'large-heartbeat' -HeartbeatAction $heartbeat
@@ -671,7 +675,7 @@ return {
         $outsideWorkset = Join-Path $TestDrive 'workset-output-reparse-target'
         $linkedReviewArtifacts = Join-Path $repository 'AI Auto Update/In Progress/output-reparse/review-artifacts'
         New-Item -ItemType Directory -Path (Split-Path -Parent $linkedReviewArtifacts), $outsideWorkset -Force | Out-Null
-        New-Item -ItemType Junction -Path $linkedReviewArtifacts -Target $outsideWorkset | Out-Null
+        New-TestReparsePoint -Path $linkedReviewArtifacts -Target $outsideWorkset | Out-Null
         { & (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') `
                 -RepositoryRoot $repository -BaseOid $baseOid -ModRelativePath 'mods/ExampleMod' `
                 -StagingModPath $staging -OutputPath (Join-Path $linkedReviewArtifacts 'localization-workset.json') `
@@ -679,7 +683,7 @@ return {
 
         $outside = Join-Path $TestDrive 'reparse-outside'
         Move-Item -LiteralPath $nested -Destination $outside
-        New-Item -ItemType Junction -Path $nested -Target $outside | Out-Null
+        New-TestReparsePoint -Path $nested -Target $outside | Out-Null
 
         { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru } |
             Should -Throw '*reparse*'
@@ -1115,7 +1119,7 @@ return localization
 
         $outside = Join-Path $TestDrive 'workset-deletion-outside'
         Move-Item -LiteralPath $reviewArtifacts -Destination $outside
-        New-Item -ItemType Junction -Path $reviewArtifacts -Target $outside | Out-Null
+        New-TestReparsePoint -Path $reviewArtifacts -Target $outside | Out-Null
 
         { & $finalizer -StatePath $statePath -PassThru } | Should -Throw '*reparse*'
         Test-Path -LiteralPath (Join-Path $outside 'localization-workset.json') -PathType Leaf | Should -Be $true

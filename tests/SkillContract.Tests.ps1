@@ -140,7 +140,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
         $outsideAssets = Join-Path $TestDrive 'reparse-reference-assets'
         Move-Item -LiteralPath (Join-Path $fixtureRoot 'assets') -Destination $outsideAssets
-        New-Item -ItemType Junction -Path (Join-Path $fixtureRoot 'assets') -Target $outsideAssets | Out-Null
+        New-TestReparsePoint -Path (Join-Path $fixtureRoot 'assets') -Target $outsideAssets | Out-Null
         { & (Join-Path $fixtureRoot 'scripts/Test-ReferenceIntegrity.ps1') -PassThru } |
             Should -Throw '*reparse*'
 
@@ -148,7 +148,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $linkedPin = Join-Path $TestDrive 'reparse-pin-link'
         New-Item -ItemType Directory -Path $outsidePin -Force | Out-Null
         Copy-Item -LiteralPath $script:skillSourcePinPath -Destination (Join-Path $outsidePin 'skill-source-pin.json')
-        New-Item -ItemType Junction -Path $linkedPin -Target $outsidePin | Out-Null
+        New-TestReparsePoint -Path $linkedPin -Target $outsidePin | Out-Null
         { & (Join-Path $skillRoot 'scripts/Test-ReferenceIntegrity.ps1') `
                 -SkillSourcePinPath (Join-Path $linkedPin 'skill-source-pin.json') -PassThru } |
             Should -Throw '*reparse*'
