@@ -10,6 +10,7 @@ on:
     branches:
       - main
   pull_request_target:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -590,8 +591,17 @@ jobs:
       - canonical-validation
     runs-on: ubuntu-latest
     steps:
-      - name: Deprecated base-bound context
-        run: echo 'This base-bound compatibility context is intentionally retained only for bootstrap transition.'
+      - name: Mirror canonical validation result
+        shell: bash
+        env:
+          CANONICAL_RESULT: ${{ needs['canonical-validation'].result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CANONICAL_RESULT" != 'success' ]]; then
+            echo "Canonical validation result was '$CANONICAL_RESULT'." >&2
+            exit 1
+          fi
+          echo 'repository-contract mirrors canonical-validation.'
 
   skill-validator:
     name: skill-validator
@@ -600,8 +610,17 @@ jobs:
       - canonical-validation
     runs-on: ubuntu-latest
     steps:
-      - name: Deprecated base-bound context
-        run: echo 'This base-bound compatibility context is intentionally retained only for bootstrap transition.'
+      - name: Mirror canonical validation result
+        shell: bash
+        env:
+          CANONICAL_RESULT: ${{ needs['canonical-validation'].result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CANONICAL_RESULT" != 'success' ]]; then
+            echo "Canonical validation result was '$CANONICAL_RESULT'." >&2
+            exit 1
+          fi
+          echo 'skill-validator mirrors canonical-validation.'
 
   skill-tools:
     name: skill-tools
@@ -610,8 +629,17 @@ jobs:
       - canonical-validation
     runs-on: ubuntu-latest
     steps:
-      - name: Deprecated base-bound context
-        run: echo 'This base-bound compatibility context is intentionally retained only for bootstrap transition.'
+      - name: Mirror canonical validation result
+        shell: bash
+        env:
+          CANONICAL_RESULT: ${{ needs['canonical-validation'].result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CANONICAL_RESULT" != 'success' ]]; then
+            echo "Canonical validation result was '$CANONICAL_RESULT'." >&2
+            exit 1
+          fi
+          echo 'skill-tools mirrors canonical-validation.'
 
   publish-head-required-checks:
     name: publish head-bound required checks

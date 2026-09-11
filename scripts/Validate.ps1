@@ -2245,6 +2245,85 @@ function Assert-NoReparseTree {
     }
 }
 
+function Write-ExclusiveUtf8File {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Text,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+
+    $Path = [IO.Path]::GetFullPath($Path)
+    $outputDirectory = Split-Path -Parent $Path
+    if ([string]::IsNullOrWhiteSpace($outputDirectory)) {
+        throw "$Context has no parent directory: $Path"
+    }
+    # Inspect the nearest existing ancestor before creating any missing
+    # directory. This prevents a reparse-point parent from being traversed
+    # during directory creation while still allowing a new nested output
+    # directory.
+    $existingDirectory = $outputDirectory
+    while (-not (Test-Path -LiteralPath $existingDirectory)) {
+        $parentDirectory = Split-Path -Parent $existingDirectory
+        if ([string]::IsNullOrWhiteSpace($parentDirectory) -or
+            (Test-PathEqual -Left $parentDirectory -Right $existingDirectory)) {
+            throw "$Context directory has no existing ancestor: $outputDirectory"
+        }
+        $existingDirectory = $parentDirectory
+    }
+    $existingDirectoryItem = Get-Item -LiteralPath $existingDirectory -Force -ErrorAction Stop
+    if (-not $existingDirectoryItem.PSIsContainer) {
+        throw "$Context output parent is not a directory: $existingDirectory"
+    }
+    Assert-NoReparseAncestors -Path $existingDirectory -Context "$Context directory"
+    if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $outputDirectory -Force)
+    }
+    Assert-NoReparseAncestors -Path $outputDirectory -Context "$Context directory"
+    if ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        throw "$Context path already exists; evidence must not overwrite prior content: $Path"
+    }
+
+    $encoding = [Text.UTF8Encoding]::new($false)
+    $bytes = $encoding.GetBytes($Text)
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        throw "$Context could not be created exclusively: $($_.Exception.Message)"
+    }
+
+    Assert-NoReparseAncestors -Path $Path -Context $Context
+    $writtenBytes = [IO.File]::ReadAllBytes($Path)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $expectedSha256 = ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+        $actualSha256 = ([BitConverter]::ToString($hasher.ComputeHash($writtenBytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+    }
+    if ($actualSha256 -cne $expectedSha256) {
+        throw "$Context changed during immediate readback: $Path"
+    }
+    return [pscustomobject][ordered]@{
+        path = $Path
+        sha256 = $actualSha256
+    }
+}
+
 function Expand-TrustedGitArchive {
     param(
         [Parameter(Mandatory = $true)][string] $GitPath,
@@ -3081,11 +3160,6 @@ function Invoke-BootstrapTransitionValidation {
     else {
         Assert-PathWithinRoot -Path ([IO.Path]::GetFullPath($OutputPath)) -Root $artifactsRootPath -Context 'Bootstrap transition output'
     }
-    $summaryDirectory = Split-Path -Parent $summaryPath
-    if (-not [string]::IsNullOrWhiteSpace($summaryDirectory)) {
-        [void](New-Item -ItemType Directory -Path $summaryDirectory -Force)
-        Assert-NoReparseAncestors -Path $summaryDirectory -Context 'Bootstrap transition output directory'
-    }
     if (Test-Path -LiteralPath $summaryPath) { throw 'Bootstrap transition output path already exists; evidence must not overwrite prior content.' }
     $summaryEncoding = [Text.UTF8Encoding]::new($false)
     $summaryBytes = $summaryEncoding.GetBytes($summaryJson + [Environment]::NewLine)
@@ -3094,12 +3168,7 @@ function Invoke-BootstrapTransitionValidation {
         $summarySha256 = ([BitConverter]::ToString($summaryHasher.ComputeHash($summaryBytes)) -replace '-', '').ToLowerInvariant()
     }
     finally { $summaryHasher.Dispose() }
-    $summaryStream = [IO.File]::Open($summaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-    try {
-        $summaryStream.Write($summaryBytes, 0, $summaryBytes.Length)
-        $summaryStream.Flush($true)
-    }
-    finally { $summaryStream.Dispose() }
+    [void](Write-ExclusiveUtf8File -Path $summaryPath -Text ($summaryJson + [Environment]::NewLine) -Context 'Bootstrap transition output')
     Assert-NoReparseAncestors -Path $summaryPath -Context 'Bootstrap transition output'
     $writtenSummarySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $summaryPath).Hash.ToLowerInvariant()
     if ($writtenSummarySha256 -cne $summarySha256) {
@@ -4355,6 +4424,8 @@ function Invoke-ProtectedPesterSupervisor {
         'Schema15SourceAcquisition.Tests.ps1'
         'SkillContract.Tests.ps1'
         'SourcePin.Tests.ps1'
+        'ValidationTransition.Tests.ps1'
+        'AtomicValidationOutput.Tests.ps1'
     )
     Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
     Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
@@ -4554,8 +4625,8 @@ if ($BootstrapTransition) {
 $adapterPath = Join-Path $repoRoot 'config/standard-v1.json'
 $adapter = Read-JsonFile -Path $adapterPath -Context 'Standard v1 repository adapter'
 $approvedAuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
-$approvedAuthorityCommit = '5ff96a358a51788a3764b27c31def842d5aee55d'
-$approvedAuthorityArchiveSha256 = '36aa50ec00697dd5b06c83aef9a591f0f4f4a553a8ecc5b165308de908161d80'
+$approvedAuthorityCommit = 'd38eba3faf967504751aba759f38102e7538a519'
+$approvedAuthorityArchiveSha256 = 'ca1b20dc79ae978d30cc7f400aa6ebd3dbe321e96e526cfbb2b421d6a477f38f'
 if ($adapter.schemaVersion -ne 1 -or $adapter.standardVersion -cne 'v1' -or $adapter.deviations -cne 'None') {
     throw 'Standard v1 repository adapter identity or deviation contract is invalid.'
 }
@@ -4971,6 +5042,8 @@ $requiredPesterTests = @(
     'Schema15SourceAcquisition.Tests.ps1'
     'SkillContract.Tests.ps1'
     'SourcePin.Tests.ps1'
+    'ValidationTransition.Tests.ps1'
+    'AtomicValidationOutput.Tests.ps1'
 )
 $trustedPesterCommit = [string]$BaseCommit
 if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
@@ -5050,6 +5123,8 @@ $requiredPesterTests = @(
     'Schema15SourceAcquisition.Tests.ps1'
     'SkillContract.Tests.ps1'
     'SourcePin.Tests.ps1'
+    'ValidationTransition.Tests.ps1'
+    'AtomicValidationOutput.Tests.ps1'
 )
 $requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
     $testPath = Join-Path $testsRoot $_
@@ -5365,11 +5440,6 @@ $summaryPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 else {
     Assert-PathWithinRoot -Path ([IO.Path]::GetFullPath($OutputPath)) -Root $artifactsRootPath -Context 'Conformance output'
 }
-$summaryDirectory = Split-Path -Parent $summaryPath
-if (-not [string]::IsNullOrWhiteSpace($summaryDirectory)) {
-    [void](New-Item -ItemType Directory -Path $summaryDirectory -Force)
-    Assert-NoReparseAncestors -Path $summaryDirectory -Context 'Conformance output directory'
-}
 if (Test-Path -LiteralPath $summaryPath) { throw 'Conformance output path already exists; evidence must not overwrite prior content.' }
 $summaryEncoding = [Text.UTF8Encoding]::new($false)
 $summaryText = $summaryJson + [Environment]::NewLine
@@ -5381,24 +5451,7 @@ try {
 finally {
     $summaryHasher.Dispose()
 }
-try {
-    $summaryStream = [IO.File]::Open(
-        $summaryPath,
-        [IO.FileMode]::CreateNew,
-        [IO.FileAccess]::Write,
-        [IO.FileShare]::Read
-    )
-    try {
-        $summaryStream.Write($summaryBytes, 0, $summaryBytes.Length)
-        $summaryStream.Flush($true)
-    }
-    finally {
-        $summaryStream.Dispose()
-    }
-}
-catch {
-    throw "Could not create supervisor-owned conformance evidence: $($_.Exception.Message)"
-}
+[void](Write-ExclusiveUtf8File -Path $summaryPath -Text $summaryText -Context 'Supervisor-owned conformance evidence')
 Assert-NoReparseAncestors -Path $summaryPath -Context 'Conformance output'
 $writtenSummaryBytes = [IO.File]::ReadAllBytes($summaryPath)
 $readbackHasher = [Security.Cryptography.SHA256]::Create()

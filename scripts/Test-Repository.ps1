@@ -619,6 +619,82 @@ function Get-ContentInventory {
     }
 }
 
+function Assert-NoReparseAncestors {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $current = $fullPath
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Context contains a reparse-point ancestor: $current"
+            }
+        }
+        $parent = Split-Path -Parent $current
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $current) { break }
+        $current = $parent
+    }
+}
+
+function Write-ExclusiveUtf8File {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Text
+    )
+
+    $Path = [IO.Path]::GetFullPath($Path)
+    $outputDirectory = Split-Path -Parent $Path
+    if ([string]::IsNullOrWhiteSpace($outputDirectory)) {
+        throw "Validation output path has no parent directory: $Path"
+    }
+    Assert-NoReparseAncestors -Path $outputDirectory -Context 'Validation output directory'
+    if ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        throw "Validation output path already exists; evidence must not overwrite prior content: $Path"
+    }
+    [void](New-Item -ItemType Directory -Path $outputDirectory -Force)
+    Assert-NoReparseAncestors -Path $outputDirectory -Context 'Validation output directory'
+
+    $encoding = [Text.UTF8Encoding]::new($false)
+    $bytes = $encoding.GetBytes($Text)
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        throw "Could not create exclusive validation output '$Path': $($_.Exception.Message)"
+    }
+
+    Assert-NoReparseAncestors -Path $Path -Context 'Validation output'
+    $writtenBytes = [IO.File]::ReadAllBytes($Path)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $expectedSha256 = ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+        $actualSha256 = ([BitConverter]::ToString($hasher.ComputeHash($writtenBytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+    }
+    if ($actualSha256 -cne $expectedSha256) {
+        throw "Validation output changed during immediate readback: $Path"
+    }
+}
+
 function Write-RepositoryValidationResult {
     param(
         [Parameter(Mandatory = $true)] $Result,
@@ -628,12 +704,7 @@ function Write-RepositoryValidationResult {
 
     $json = $Result | ConvertTo-Json -Depth 30
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
-        $outputFullPath = [IO.Path]::GetFullPath($OutputPath)
-        $outputDirectory = Split-Path -Parent $outputFullPath
-        if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
-            [void](New-Item -ItemType Directory -Path $outputDirectory -Force)
-        }
-        [IO.File]::WriteAllText($outputFullPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        Write-ExclusiveUtf8File -Path $OutputPath -Text ($json + [Environment]::NewLine)
     }
     Write-Host $SuccessMessage
     return $json
