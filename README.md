@@ -47,7 +47,6 @@ catalog/skills-catalog.json
 docs/RELEASE.md
 docs/ROLLBACK.md
 scripts/Get-SourcePin.ps1
-scripts/Invoke-PrePushValidation.ps1
 scripts/Test-CleanRepositoryHead.ps1
 tests/
 .github/workflows/
@@ -56,18 +55,9 @@ VERSION
 
 ## Validation
 
-Run from the repository root:
+The legacy pre-push, repository validation, Skill Quality Gate, and protected Standard v1 workflows are retired. Their commands are no longer development or merge prerequisites. Validator components and tests remain available as source.
 
-Repository contract tests require Pester 5 or later.
-Commit the intended snapshot, ensure the working tree and index are clean, then run the same gate used by GitHub before pushing:
-
-```powershell
-pwsh -File ./scripts/Invoke-PrePushValidation.ps1
-```
-
-The gate binds tests, packaged-reference integrity, and the reproducible source pin to one unchanged HEAD. Run the component commands directly only when diagnosing a failed gate.
-
-GitHub Actions also runs strict `skill-validator` and `skill-tools` Quality Gates using versions resolved once per workflow run and reported in logs and the job summary.
+The replacement canonical architecture has not been completed on `main`. Retirement does not establish release readiness or claim that tests or validators have passed.
 
 ## Versioning and rollback
 
