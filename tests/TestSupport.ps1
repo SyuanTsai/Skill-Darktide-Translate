@@ -85,8 +85,8 @@ function Get-TestRepositoryLayout {
             ProfilePath = 'catalog/skills-catalog.json'
             SourcePath = $null
             AdapterPath = $null
-            WorkflowPath = '.github/workflows/validate.yml'
-            QualityWorkflowPath = '.github/workflows/skill-validator.yml'
+            WorkflowPath = '.github/workflows/validation-rebuild.yml'
+            QualityWorkflowPath = $null
         }
     }
     if ($hasStandardSource -and $hasStandardAdapter -and $hasStandardSkill -and -not $hasLegacyMarker) {

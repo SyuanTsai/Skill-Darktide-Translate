@@ -8,7 +8,7 @@ param(
     [string] $OutputPath,
     [string] $TrustedGitPath,
     [string] $TrustedStatPath,
-    [switch] $BootstrapTransition,
+    [switch] $ValidationTransition,
     [switch] $NoFilters
 )
 
@@ -684,7 +684,7 @@ function Write-RepositoryValidationResult {
     return $json
 }
 
-function Invoke-BootstrapTransitionRepositoryValidation {
+function Invoke-ValidationTransitionRepositoryValidation {
     param(
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
         [Parameter()][string] $OutputPath,
@@ -696,12 +696,12 @@ function Invoke-BootstrapTransitionRepositoryValidation {
     $standardAdapterPath = Join-Path $RepositoryRoot 'config/standard-v1.json'
     $standardSkillsRoot = Join-Path $RepositoryRoot 'skills'
     if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) {
-        throw 'Bootstrap transition requires the current catalog/skills-catalog.json fixture.'
+        throw 'Validation rebuild transition requires the current catalog/skills-catalog.json fixture.'
     }
     if ((Test-Path -LiteralPath $legacySourcePath -PathType Leaf) -or
         (Test-Path -LiteralPath $standardAdapterPath -PathType Leaf) -or
         (Test-Path -LiteralPath $standardSkillsRoot -PathType Container)) {
-        throw 'Bootstrap transition is valid only before the Standard v1 source inventory, adapter, or skills/ root is promoted.'
+        throw 'Validation rebuild transition is valid only before the Standard v1 source inventory, adapter, or skills/ root is promoted.'
     }
 
     $catalog = Read-StrictJson -Path $catalogPath
@@ -788,14 +788,16 @@ function Invoke-BootstrapTransitionRepositoryValidation {
     $package = Get-ContentInventory -RepositoryRoot $RepositoryRoot -SkillId 'auto-update-darktide-mod' -SkillsRoot $skillsRootRelative -NoFilters:$NoFilters
     $result = [pscustomobject][ordered]@{
         schemaVersion = 1
-        validationMode = 'bootstrap-transition'
+        validationMode = 'validation-rebuild-maintenance'
+        formalValidationStatus = 'pending-rebuild'
+        releaseEligible = $false
         catalogId = 'darktide-translate'
         skillsRoot = $skillsRootRelative
         activeSkillCount = 1
         skills = @($package)
         result = 'passed'
     }
-    return Write-RepositoryValidationResult -Result $result -OutputPath $OutputPath -SuccessMessage 'Darktide Translate bootstrap transition repository validation passed.'
+    return Write-RepositoryValidationResult -Result $result -OutputPath $OutputPath -SuccessMessage 'Darktide Translate validation rebuild repository checks passed; formal validation remains pending.'
 }
 
 if ([string]::IsNullOrWhiteSpace($script:TrustedGitPath)) {
@@ -820,8 +822,8 @@ $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
 }
 else { [IO.Path]::GetFullPath($RepositoryRoot) }
 
-if ($BootstrapTransition) {
-    return Invoke-BootstrapTransitionRepositoryValidation `
+if ($ValidationTransition) {
+    return Invoke-ValidationTransitionRepositoryValidation `
         -RepositoryRoot $repoRoot `
         -OutputPath $OutputPath `
         -NoFilters:$NoFilters
@@ -829,7 +831,7 @@ if ($BootstrapTransition) {
 
 $sourcePath = Join-Path $repoRoot 'catalog/source.json'
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-    throw 'Standard v1 source inventory is missing; use -BootstrapTransition only for the explicit current-layout promotion.'
+    throw 'Standard v1 source inventory is missing; use -ValidationTransition only for rebuild-maintenance checks.'
 }
 $inventory = Read-StrictJson -Path $sourcePath
 Assert-ExactPropertySet -Value $inventory -Expected @('schemaVersion', 'sourceId', 'repository', 'skillsRoot', 'skills') -Context 'catalog/source.json'

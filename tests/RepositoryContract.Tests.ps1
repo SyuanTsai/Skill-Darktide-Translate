@@ -166,8 +166,11 @@ Describe 'Darktide Translate repository contract' {
         )
         if ($layout.Name -ceq 'legacy') {
             $expectedPaths += @(
-                '.github/workflows/validate.yml',
-                '.github/workflows/skill-validator.yml',
+                '.github/workflows/validation-rebuild.yml',
+                '.github/workflows/standard-v1-protected.yml',
+                'scripts/Test-Repository.ps1',
+                'scripts/Test-ValidationTransition.ps1',
+                'scripts/Validate.ps1',
                 'catalog/skills-catalog.json'
             )
         }
@@ -295,28 +298,25 @@ Describe 'Darktide Translate repository contract' {
     # Purpose: Prevent the repository from silently pinning stale quality tools or weakening the required gates.
     It 'UnitT40_PreservesTheSharedLatestAtRunTimeQualityGate' {
         if ($layout.Name -ceq 'legacy') {
-            $qualityPath = Join-Path $repoRoot $layout.QualityWorkflowPath
-            $validatePath = Join-Path $repoRoot $layout.WorkflowPath
-            Test-Path -LiteralPath $qualityPath | Should -Be $true
-            Test-Path -LiteralPath $validatePath | Should -Be $true
+            $workflowPath = Join-Path $repoRoot $layout.WorkflowPath
+            Test-Path -LiteralPath $workflowPath | Should -Be $true
 
-            $quality = Get-Content -LiteralPath $qualityPath -Raw
-            $quality | Should -Match 'go-version: stable'
-            $quality | Should -Match 'check-latest: true'
-            $quality | Should -Match 'skill-validator/cmd/skill-validator@latest'
-            $quality | Should -Match "node-version: 'lts/\*'"
-            $quality | Should -Match 'skill-tools@latest'
-            $quality | Should -Match 'check --strict --allow-dirs=agents --emit-annotations'
-            $quality | Should -Match '--fail-on warning'
-            $quality | Should -Match '--min-score 91'
-
-            $validate = Get-Content -LiteralPath $validatePath -Raw
-            $validate | Should -Match 'MinimumVersion 5\.0\.0'
-            $validate | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
+            $workflow = Get-Content -LiteralPath $workflowPath -Raw
+            $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
+            $workflow | Should -Match 'persist-credentials:\s*false'
+            $workflow | Should -Match 'go-version: stable'
+            $workflow | Should -Match 'check-latest: true'
+            $workflow | Should -Match 'skill-validator/cmd/skill-validator@latest'
+            $workflow | Should -Match "node-version: 'lts/\*'"
+            $workflow | Should -Match 'skill-tools@latest'
+            $workflow | Should -Match 'check --strict --allow-dirs=agents --emit-annotations'
+            $workflow | Should -Match '--fail-on warning'
+            $workflow | Should -Match '--min-score 91'
+            $workflow | Should -Match 'MinimumVersion 5\.0\.0'
+            $workflow | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
 
             $exactHeadRef = 'ref: ${{ github.event_name == ''pull_request'' && github.event.pull_request.head.sha || github.sha }}'
-            $validate | Should -Match ([regex]::Escape($exactHeadRef))
-            ([regex]::Matches($quality, [regex]::Escape($exactHeadRef))).Count | Should -Be 2
+            ([regex]::Matches($workflow, [regex]::Escape($exactHeadRef))).Count | Should -Be 3
         }
         else {
             $workflow = Get-Content -LiteralPath (Join-Path $repoRoot $layout.WorkflowPath) -Raw

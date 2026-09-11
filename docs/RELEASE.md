@@ -8,9 +8,15 @@ SPDX-License-Identifier: Apache-2.0
 
 This repository is versioned independently from the target DARKTIDE MOD repository and from AI-Instructions consumers. Use SemVer-compatible tags (`vMAJOR.MINOR.PATCH`) and keep `VERSION` equal to the tag without the leading `v`.
 
+## Validation rebuild freeze
+
+Formal Standard v1 validation is being rebuilt. A successful `scripts/Invoke-PrePushValidation.ps1` run currently proves only the explicitly reported rebuild-maintenance scope: clean candidate identity, preserved product inventory, applicable domain regression, package/reference integrity, and the transition release block. It is not a formal validation result and never makes a candidate release eligible.
+
+`scripts/Validate.ps1` is the formal entry and intentionally exits nonzero with `formalValidationStatus: pending-rebuild` and `releaseEligible: false`. Until the rebuilt validator has independent trusted control, complete Windows and Linux lifecycle evidence, the full Standard v1 toolchain, code/security review, and Human Approval, do not create a product release or tag, update a consumer production pin, or recommend a reconstruction commit for installation. Existing immutable release pins remain valid and unchanged.
+
 ## Release checklist
 
-1. Commit the intended release snapshot, require a clean working tree and index, and run `pwsh -File ./scripts/Invoke-PrePushValidation.ps1` before push. This is the same clean-HEAD gate used by GitHub and binds the complete test suite, packaged-reference integrity, and source-pin validation to one unchanged commit.
+1. Keep the release frozen while `scripts/Validate.ps1` reports `pending-rebuild`. During the rebuild, commit the intended maintenance snapshot, require a clean working tree and index, and run `pwsh -File ./scripts/Invoke-PrePushValidation.ps1` before push; this is a maintenance check only and does not satisfy the remaining release checklist.
 2. Run `pwsh -File ./scripts/Get-SourcePin.ps1 -Ref HEAD` and retain the complete JSON: resolved commit, content SHA-256, Skill path, and per-file blob/SHA-256 manifest.
 3. Confirm the catalog exposes only `auto-update-darktide-mod` through the opt-in `darktide-mod-maintenance` profile.
 4. Confirm Schema 15 acquisition and multi-process tests cover known unsupported extensions before download, signature detection, partial downloads, URL sanitization, receipt verification, same-run claim, loader preflight, queue deduplication, the concurrency ceiling, distinct-MOD isolation, competing generations, stale-owner recovery, and old-token rejection.

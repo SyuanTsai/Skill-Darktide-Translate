@@ -57,6 +57,8 @@ Describe 'Repository pre-push validation' {
             Should -Throw '*HEAD changed during pre-push validation*'
     }
 
+    # Scenario: Local and hosted rebuild maintenance both validate one exact clean candidate through the same pre-push script.
+    # Purpose: Prevent workflow-only behavior or duplicated validation decisions during the transition.
     It 'UnitT40_UsesOnePrePushEntrypointForTheLocalAndCiContract' {
         Test-Path -LiteralPath $script:prePushPath | Should -Be $true
         $prePush = Get-Content -LiteralPath $script:prePushPath -Raw
@@ -65,8 +67,10 @@ Describe 'Repository pre-push validation' {
         if ($script:layout.Name -ceq 'legacy') {
             $prePush | Should -Match 'Test-CleanRepositoryHead\.ps1'
             $prePush | Should -Match 'tests/Invoke-Tests\.ps1'
+            $prePush | Should -Match 'scripts/Test-Repository\.ps1'
             $prePush | Should -Match 'Test-ReferenceIntegrity\.ps1'
             $prePush | Should -Match 'scripts/Get-SourcePin\.ps1'
+            $prePush | Should -Match 'scripts/Test-ValidationTransition\.ps1'
             ([regex]::Matches($prePush, 'Test-CleanRepositoryHead\.ps1')).Count | Should -Be 2
             $workflow | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
         }
@@ -81,15 +85,17 @@ Describe 'Repository pre-push validation' {
         $workflow | Should -Not -Match 'run: \./tests/Invoke-Tests\.ps1'
     }
 
+    # Scenario: A pull request head and the resulting main commit each trigger the rebuild workflow.
+    # Purpose: Preserve candidate and post-merge evidence while formal validation remains unavailable.
     It 'UnitT50_RunsEachPullRequestHeadOnceAndRevalidatesMainAfterMerge' {
         if ($script:layout.Name -ceq 'legacy') {
-            foreach ($workflowName in @('validate.yml', 'skill-validator.yml')) {
-                $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot ".github/workflows/$workflowName") -Raw
-
-                $workflow | Should -Match '(?m)^  push:\r?$'
-                $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
-                $workflow | Should -Match '(?m)^  pull_request:'
-            }
+            $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
+            $workflow | Should -Match '(?m)^  push:\r?$'
+            $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
+            $workflow | Should -Match '(?m)^  pull_request:'
+            $workflow | Should -Match '(?m)^  rebuild-repository-contract:'
+            $workflow | Should -Match '(?m)^  rebuild-skill-validator:'
+            $workflow | Should -Match '(?m)^  rebuild-skill-tools:'
         }
         else {
             $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
