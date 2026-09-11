@@ -3204,7 +3204,7 @@ function Assert-RegularFileForHash {
         finally {
             [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
         }
-        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
+        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cnotin @('regular file', 'regular empty file')) {
             throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
         }
     }

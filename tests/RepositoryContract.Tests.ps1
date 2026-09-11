@@ -330,4 +330,11 @@ Describe 'Darktide Translate repository contract' {
             $workflow | Should -Match 'scripts/Validate\.ps1'
         }
     }
+
+    It 'UnitT45_AcceptsGnuStatClassificationForEmptyRegularFiles' {
+        foreach ($path in @('scripts/Validate.ps1', 'scripts/Test-Repository.ps1')) {
+            $validator = Get-Content -LiteralPath (Join-Path $repoRoot $path) -Raw
+            $validator | Should -Match "-cnotin @\('regular file', 'regular empty file'\)"
+        }
+    }
 }
