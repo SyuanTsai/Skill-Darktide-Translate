@@ -67,10 +67,10 @@ Repository contract tests require Pester 5 or later.
 Commit the intended snapshot, ensure the working tree and index are clean, then run the one complete local Standard v1 gate used by GitHub before pushing:
 
 ```powershell
-pwsh -NoLogo -NoProfile -File ./scripts/Validate.ps1
+pwsh -NoLogo -NoProfile -File ./scripts/Invoke-PrePushValidation.ps1
 ```
 
-The gate binds the central Standard v1 authority, controlled tool acquisition, package integrity, SkillSpector, repository/domain tests, and the reproducible source pin to one unchanged HEAD. `scripts/Invoke-PrePushValidation.ps1` is retained only as a thin pre-push wrapper around this same `scripts/Validate.ps1` entry point. `scripts/Test-Repository.ps1`, domain tests, and other component commands are diagnostic components, not alternate release gates. The `.agents/skills/*` directories are managed consumer projections declared by `.codex/ai-instructions.manifest.json`; they are not Darktide source packages and are not part of `catalog/source.json`.
+The wrapper binds the central Standard v1 authority, controlled tool acquisition, package integrity, SkillSpector, repository/domain tests, and the reproducible source pin to one unchanged HEAD by deriving `HEAD^` as the comparison base. `scripts/Validate.ps1` is the canonical validator invoked by the wrapper; `scripts/Test-Repository.ps1`, domain tests, and other component commands are diagnostic components, not alternate release gates. The `.agents/skills/*` directories are managed consumer projections declared by `.codex/ai-instructions.manifest.json`; they are not Darktide source packages and are not part of `catalog/source.json`.
 
 GitHub Actions calls the same `scripts/Validate.ps1` entry point and records the resolved formal tools and security-gate evidence in the run artifacts.
 

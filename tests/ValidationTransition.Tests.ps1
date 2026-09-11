@@ -114,7 +114,7 @@ Describe 'Standard v1 migration and canonical validation contracts' {
             $text | Should -Match 'component'
         }
         (Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'README.md') -Raw) |
-            Should -Match 'pwsh -NoLogo -NoProfile -File ./scripts/Validate\.ps1'
+            Should -Match 'pwsh -NoLogo -NoProfile -File ./scripts/Invoke-PrePushValidation\.ps1'
     }
 
     # Scenario: The repository validator receives a caller-selected output path.
@@ -128,5 +128,16 @@ Describe 'Standard v1 migration and canonical validation contracts' {
             $source | Should -Match '(?s)try\s*\{.*?\.Flush\(\$true\).*?finally\s*\{.*?Dispose\(\)'
         }
         $repositoryValidator | Should -Not -Match '\[IO\.File\]::WriteAllText\(\$outputFullPath'
+    }
+
+    It 'keeps the protected Pester inventory complete across supervisor, parent, and worker lists' {
+        $canonicalValidator = Get-Content -LiteralPath $script:CanonicalValidatorPath -Raw
+        foreach ($requiredTest in @(
+            'CanonicalValidation.Tests.ps1'
+            'StandardV1Conformance.Tests.ps1'
+            'Test-Repository.Tests.ps1'
+        )) {
+            ([regex]::Matches($canonicalValidator, [regex]::Escape("'$requiredTest'"))).Count | Should -Be 3
+        }
     }
 }

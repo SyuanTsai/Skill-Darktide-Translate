@@ -3212,7 +3212,7 @@ function Assert-RegularFileForHash {
         finally {
             [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
         }
-        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
+        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cnotin @('regular file', 'regular empty file')) {
             throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
         }
     }
@@ -4426,6 +4426,9 @@ function Invoke-ProtectedPesterSupervisor {
         'SourcePin.Tests.ps1'
         'ValidationTransition.Tests.ps1'
         'AtomicValidationOutput.Tests.ps1'
+        'CanonicalValidation.Tests.ps1'
+        'StandardV1Conformance.Tests.ps1'
+        'Test-Repository.Tests.ps1'
     )
     Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
     Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
@@ -5044,6 +5047,9 @@ $requiredPesterTests = @(
     'SourcePin.Tests.ps1'
     'ValidationTransition.Tests.ps1'
     'AtomicValidationOutput.Tests.ps1'
+    'CanonicalValidation.Tests.ps1'
+    'StandardV1Conformance.Tests.ps1'
+    'Test-Repository.Tests.ps1'
 )
 $trustedPesterCommit = [string]$BaseCommit
 if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
@@ -5125,6 +5131,9 @@ $requiredPesterTests = @(
     'SourcePin.Tests.ps1'
     'ValidationTransition.Tests.ps1'
     'AtomicValidationOutput.Tests.ps1'
+    'CanonicalValidation.Tests.ps1'
+    'StandardV1Conformance.Tests.ps1'
+    'Test-Repository.Tests.ps1'
 )
 $requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
     $testPath = Join-Path $testsRoot $_

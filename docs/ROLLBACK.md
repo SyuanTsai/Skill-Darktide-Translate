@@ -15,7 +15,7 @@ Rollback is source-pin based. Do not rewrite a released tag, force-update consum
 5. Resume an existing MOD run only with the exact Workflow/Baseline tuple recorded in that state. Schema 15 also requires its recorded extension, source request, source receipt, verified source, and localization-workset evidence tuple.
 6. Remove only files managed by the newer source pin. Do not delete unrelated Skills, the `.agents/skills/*` managed projections, or target MOD run evidence.
 
-After restoring a pin, use `pwsh -NoLogo -NoProfile -File ./scripts/Validate.ps1` as the complete local validation gate. Repository, domain, and tool checks are component diagnostics within that gate and must not be substituted with a separate release policy.
+After restoring a pin, use `pwsh -NoLogo -NoProfile -File ./scripts/Invoke-PrePushValidation.ps1` as the complete local validation gate. The wrapper derives `HEAD^` as the comparison base and invokes canonical `scripts/Validate.ps1`; repository, domain, and tool checks are component diagnostics within that gate and must not be substituted with a separate release policy.
 
 Version 0.2.x cannot resume a Schema 15 state. Restore an exact compatible 0.3.x source pin or leave the run stopped for explicit recovery. Preserve `.incoming-<run-id>` retained evidence, `verified-source`, `review-artifacts/source-receipt.json`, acquisition records, reservations, state, worktree, branch, and any pre-publication localization workset.
 
