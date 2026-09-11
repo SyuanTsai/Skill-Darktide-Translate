@@ -57,6 +57,12 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'is backed by a reparse point'
     }
 
+    It 'skips unreadable optional Linux module search paths without weakening required paths' {
+        $script:Validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
+        $script:Validator | Should -Match 'catch \[UnauthorizedAccessException\]'
+        $script:Validator | Should -Match 'Inherited PSModulePath entries are optional'
+    }
+
     It 'verifies host runtimes by absolute path and hash while keeping package files run-owned' {
         $script:Validator | Should -Match 'function Assert-ExternalReceiptFile'
         $script:Validator | Should -Match ([regex]::Escape("Assert-ExternalReceiptFile -Receipt `$receipts.'skill-tools' -PathProperty 'nodePath'"))
