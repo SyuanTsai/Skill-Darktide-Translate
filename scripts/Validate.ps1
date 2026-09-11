@@ -3445,7 +3445,16 @@ function Invoke-NativeChecked {
                     & $addLinuxReadonlyBindPath -Path $env:PSHOME
                 }
                 foreach ($modulePath in @(([string]$env:PSModulePath -split ':') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-                    if (Test-Path -LiteralPath $modulePath -PathType Container) {
+                    try {
+                        $modulePathExists = Test-Path -LiteralPath $modulePath -PathType Container -ErrorAction Stop
+                    }
+                    catch [UnauthorizedAccessException] {
+                        # Inherited PSModulePath entries are optional. Do not
+                        # fail the security gate merely because one is not
+                        # readable by the isolated runner identity.
+                        continue
+                    }
+                    if ($modulePathExists) {
                         & $addLinuxReadonlyBindPath -Path $modulePath
                     }
                 }

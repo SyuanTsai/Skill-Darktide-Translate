@@ -337,4 +337,11 @@ Describe 'Darktide Translate repository contract' {
             $validator | Should -Match "-cnotin @\('regular file', 'regular empty file'\)"
         }
     }
+
+    It 'UnitT46_SkipsUnreadableOptionalLinuxModulePaths' {
+        $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
+        $validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
+        $validator | Should -Match 'catch \[UnauthorizedAccessException\]'
+        $validator | Should -Match 'Inherited PSModulePath entries are optional'
+    }
 }
