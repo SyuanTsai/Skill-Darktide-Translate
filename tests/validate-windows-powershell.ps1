@@ -34,6 +34,26 @@ function Assert-ExactPropertySet {
         @($actual | Where-Object { $Expected -cnotcontains $_ }).Count -eq 0) "$Context has an invalid property set."
 }
 
+function Assert-WorkflowEvidenceDigestBinding {
+    param([Parameter(Mandatory = $true)][string] $Workflow)
+
+    $steps = [regex]::Matches($Workflow, '(?ms)^(?<indent> *)- name: Export canonical evidence for clean upload\r?\n(?<body>.*?)(?=^\k<indent>- |\z)')
+    if ($steps.Count -ne 1) { throw 'The clean evidence export step must be unique.' }
+    $body = $steps[0].Groups['body'].Value
+    $propertyIndent = $steps[0].Groups['indent'].Value + '  '
+    $valueIndent = $propertyIndent + '  '
+    $run = [regex]::Matches($body, '(?m)^' + [regex]::Escape($propertyIndent) + 'run:[^\r\n]*\r?$')
+    if ($run.Count -ne 1) { throw 'The clean evidence export run block must be unique.' }
+    $metadata = $body.Substring(0, $run[0].Index)
+    $environment = [regex]::Matches($metadata, '(?m)^' + [regex]::Escape($propertyIndent) + 'env:\r?\n(?<values>(?:' + [regex]::Escape($valueIndent) + '[^\r\n]*\r?\n)+)')
+    if ($environment.Count -ne 1) { throw 'The clean evidence export requires its own digest environment binding.' }
+    $bindings = [regex]::Matches($environment[0].Groups['values'].Value, '(?m)^' + [regex]::Escape($valueIndent) + 'EXPECTED_EVIDENCE_SHA256:[ \t]*(?<value>[^\r\n]*)\r?$')
+    $expected = '${{ steps.canonical-validation.outputs.standard_v1_evidence_sha256 }}'
+    if ($bindings.Count -ne 1 -or $bindings[0].Groups['value'].Value.Trim() -cne $expected) {
+        throw 'The clean evidence export digest must bind the canonical validation step output.'
+    }
+}
+
 Assert-True ($PSVersionTable.PSVersion.Major -eq 5) 'This contract must execute under Windows PowerShell 5.1.'
 
 $files = @()
@@ -94,13 +114,16 @@ else {
 }
 
 $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+Assert-WorkflowEvidenceDigestBinding -Workflow $workflow
 Assert-True ($workflow -match 'shell: powershell') 'The required Windows PowerShell 5.1 contract is missing.'
 Assert-True ($workflow -match "Join-Path\s+\`$PSHOME\s+'powershell\.exe'") 'The Windows PowerShell wrapper must resolve the child executable from the active Windows PowerShell installation.'
 Assert-True ($workflow -match '&\s+\$windowsPowerShellPath\s+@protectedContractArguments') 'The Windows PowerShell wrapper must execute the trusted contract in an isolated child process.'
 Assert-True ($workflow -match '\$protectedContractExitCode\s*=\s*\$LASTEXITCODE') 'The Windows PowerShell wrapper must capture the trusted script native exit state.'
 Assert-True ($workflow -match 'if\s*\(\$protectedContractExitCode\s+-ne\s+0\)') 'The Windows PowerShell wrapper must reject a non-zero child process exit code.'
-Assert-True ($workflow -match '\[IO\.File\]::ReadAllText\(') 'The candidate parser must read PowerShell source with an explicit encoding.'
-Assert-True ($workflow -match '\[Text\.UTF8Encoding\]::new\(\$false,\s*\$true\)') 'The candidate parser must reject invalid UTF-8 source bytes.'
+Assert-True ($workflow -match '\[IO\.File\]::ReadAllBytes\(\$candidatePath\)') 'The candidate parser must read raw PowerShell source bytes before decoding.'
+Assert-True ($workflow -notmatch '\$candidateSource\s*=\s*\[IO\.File\]::ReadAllText\(') 'The candidate parser must not permit ReadAllText BOM auto-detection to select another encoding.'
+Assert-True ($workflow -match '(?s)\$candidateBytes\[0\] -eq 0xEF.*?\$candidateBytes\[1\] -eq 0xBB.*?\$candidateBytes\[2\] -eq 0xBF') 'The candidate parser must recognize only the optional UTF-8 BOM.'
+Assert-True ($workflow -match '(?s)\[Text\.UTF8Encoding\]::new\(\$false,\s*\$true\)\.GetString\(.*?\$candidateBytes.*?\$candidateOffset.*?\$candidateBytes\.Length - \$candidateOffset') 'The candidate parser must reject non-UTF-8 source bytes without encoding auto-detection.'
 Assert-True ($workflow -match '\[Management\.Automation\.Language\.Parser\]::ParseInput\(') 'The candidate parser must parse the explicitly decoded UTF-8 source.'
 Assert-True ($workflow -match "go-version: 'stable'") 'The workflow must use the latest stable Go channel.'
 Assert-True ($workflow -match 'check-latest: true') 'The workflow must resolve the latest stable Go runtime per run.'
