@@ -10,13 +10,13 @@ This repository is versioned independently from the target DARKTIDE MOD reposito
 
 ## Release checklist
 
-1. Commit the intended release snapshot, require a clean working tree and index, and run `pwsh -File ./scripts/Invoke-PrePushValidation.ps1` before push. This is the same clean-HEAD gate used by GitHub and binds the complete test suite, packaged-reference integrity, and source-pin validation to one unchanged commit.
+1. Commit the intended release snapshot and require a clean working tree and index. The legacy pre-push validation command is retired and is no longer a push prerequisite.
 2. Run `pwsh -File ./scripts/Get-SourcePin.ps1 -Ref HEAD` and retain the complete JSON: resolved commit, content SHA-256, Skill path, and per-file blob/SHA-256 manifest.
 3. Confirm the catalog exposes only `auto-update-darktide-mod` through the opt-in `darktide-mod-maintenance` profile.
 4. Confirm Schema 15 acquisition and multi-process tests cover known unsupported extensions before download, signature detection, partial downloads, URL sanitization, receipt verification, same-run claim, loader preflight, queue deduplication, the concurrency ceiling, distinct-MOD isolation, competing generations, stale-owner recovery, and old-token rejection.
 5. Confirm localization-workset tests cover deterministic classification (including missing zh-tw and fully locale-resolved `Localize(...)` expressions), curated unchanged-source zh-tw preservation, English-first natural translation guidance, byte spans, AI-only edit authorization, pure-loader exclusion, independent receipt-plan recomputation, idempotence, and Candidate Gate rejection outside approved edits.
 6. Confirm merge-finalization tests cover open/closed/merged PR classification, changed-head state reconciliation, missing optional state properties, Windows worktree identity, formal fingerprint paths, atomic remote-branch leases, exact cleanup construction, and owner-checked reservation release; exercise the reviewed-F GitHub path in an authorized release smoke test when credentials and a disposable merged branch are available.
-7. Confirm the GitHub `Validate` and `Skill Quality Gate` workflows pass on the exact PR head.
+7. The legacy `Validate`, `Skill Quality Gate`, and protected Standard v1 workflows are retired; their checks are no longer merge prerequisites. The replacement canonical architecture is not complete, and retirement alone does not establish release readiness.
 8. Merge the approved release commit to `main`.
 9. Create an annotated tag matching `VERSION`, resolve it to an immutable commit, and regenerate the source content hash.
 10. Consumers retain that source-pin JSON outside the installed Skill and target repository, verify it with `Test-ReferenceIntegrity.ps1 -SkillSourcePinPath`, and pass it to every new `mod-update.ps1` run. The runner archives a run-owned copy.
