@@ -70,7 +70,7 @@ Commit the intended snapshot, ensure the working tree and index are clean, then 
 pwsh -NoLogo -NoProfile -File ./scripts/Invoke-PrePushValidation.ps1
 ```
 
-The wrapper binds the central Standard v1 authority, controlled tool acquisition, package integrity, SkillSpector, repository/domain tests, and the reproducible source pin to one unchanged HEAD by deriving `HEAD^` as the comparison base. `scripts/Validate.ps1` is the canonical validator invoked by the wrapper; `scripts/Test-Repository.ps1`, domain tests, and other component commands are diagnostic components, not alternate release gates. This repository validates only its own `skills/auto-update-darktide-mod/` package; external consumer projections and instruction manifests are outside this repository's inventory.
+The wrapper binds the central Standard v1 authority, controlled tool acquisition, package integrity, SkillSpector, repository/domain tests, and the reproducible source pin to one unchanged HEAD by using an explicit base commit or the local clone's immutable merge-base with its remote default branch. `scripts/Validate.ps1` is the canonical validator invoked by the wrapper; `scripts/Test-Repository.ps1`, domain tests, and other component commands are diagnostic components, not alternate release gates. This repository validates only its own `skills/auto-update-darktide-mod/` package; external consumer projections and instruction manifests are outside this repository's inventory.
 
 GitHub Actions calls the same `scripts/Validate.ps1` entry point and records the resolved formal tools and security-gate evidence in the run artifacts.
 

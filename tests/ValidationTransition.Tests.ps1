@@ -82,6 +82,16 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $prePush | Should -Not -Match 'Test-CleanRepositoryHead|Test-Repository|Test-ReferenceIntegrity|Invoke-Pester|skill-validator|skill-tools|SkillSpector|security'
     }
 
+    # Scenario: A multi-commit branch is validated locally before it is pushed.
+    # Purpose: Compare the complete branch against the remote default branch instead of only HEAD's parent.
+    It 'UnitT35_UsesTheRemoteDefaultBranchMergeBaseForImplicitComparison' {
+        $prePush = Get-Content -LiteralPath $script:PrePushPath -Raw
+        $prePush | Should -Match 'symbolic-ref --quiet --short refs/remotes/origin/HEAD'
+        $prePush | Should -Match 'merge-base --all'
+        $prePush | Should -Match 'specify -BaseCommit explicitly'
+        $prePush | Should -Not -Match 'HEAD\^'
+    }
+
     # Scenario: Protected pull requests, trusted pushes, and manually dispatched runs enter the same validation contract.
     # Purpose: Preserve one candidate execution while allowing only trigger/security-adapter differences.
     It 'UnitT40_MapsProtectedTrustedAndManualEventsToOneCanonicalValidator' {

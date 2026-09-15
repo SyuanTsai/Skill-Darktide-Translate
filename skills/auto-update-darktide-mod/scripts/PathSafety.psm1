@@ -23,7 +23,11 @@ namespace SyuanTsai {
         private const uint FileShareDelete = 0x00000004;
         private const uint OpenExisting = 3;
         private const uint FileFlagBackupSemantics = 0x02000000;
-        private const int FileCaseSensitiveInformation = 71;
+        // NtQueryInformationFile uses the native FILE_INFORMATION_CLASS value,
+        // while GetFileInformationByHandleEx uses the Win32
+        // FILE_INFO_BY_HANDLE_CLASS value for the same information.
+        private const int NtFileCaseSensitiveInformation = 71;
+        private const int Win32FileCaseSensitiveInformation = 23;
         private const uint CaseSensitiveDirectoryFlag = 0x00000001;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -110,10 +114,10 @@ namespace SyuanTsai {
                     out ioStatusBlock,
                     out information,
                     (uint)Marshal.SizeOf(typeof(FileCaseSensitiveInformationBuffer)),
-                    FileCaseSensitiveInformation);
+                    NtFileCaseSensitiveInformation);
                 if (status != 0 && !GetFileInformationByHandleEx(
                     handle,
-                    FileCaseSensitiveInformation,
+                    Win32FileCaseSensitiveInformation,
                     out information,
                     (uint)Marshal.SizeOf(typeof(FileCaseSensitiveInformationBuffer)))) {
                     return false;

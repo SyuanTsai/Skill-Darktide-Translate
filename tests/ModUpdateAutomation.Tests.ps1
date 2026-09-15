@@ -44,10 +44,11 @@ Describe 'Deterministic Darktide MOD update automation' {
     # Scenario: A tree iterator passes the provider's authoritative directory entry.
     # Purpose: Avoid repeating an ancestor walk for every existing item while keeping
     # the missing-path fallback responsible for detecting broken-link ancestors.
-    It 'UnitT106_SkipsRedundantAncestorWalkForAnAuthoritativeItem' {
+    It 'UnitT106_InspectsRawAncestorsAfterProviderResolution' {
         $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
         $pathSafety = Get-Content -LiteralPath $pathSafetyPath -Raw
-        $pathSafety | Should -Match '\$inspectProviderItem \$Item\) \{ return \$true \}\s*if \(\$null -ne \$Item\) \{ return \$false \}'
+        $pathSafety | Should -Match '(?s)if \(& \$inspectProviderItem \$Item\) \{ return \$true \}.*?always walk raw lexical ancestors even when \$Item exists'
+        $pathSafety | Should -Not -Match 'if \(\$null -ne \$Item\) \{ return \$false \}'
         $pathSafety | Should -Not -Match 'knownSafePhysicalPaths'
     }
 
@@ -59,6 +60,18 @@ Describe 'Deterministic Darktide MOD update automation' {
         $pathSafety | Should -Match 'Test-PortablePhysicalIdentity'
         $runner | Should -Match 'Test-PortablePhysicalIdentity'
         $runner | Should -Match '\$samePhysicalPath'
+    }
+
+    # Scenario: The native case-sensitivity query is unavailable and the Win32 fallback is used.
+    # Purpose: Pass each API its own information-class enum value; the numeric values are not interchangeable.
+    It 'UnitT108_UsesDistinctNativeAndWin32CaseSensitivityClasses' {
+        $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
+
+        $pathSafety | Should -Match 'private const int NtFileCaseSensitiveInformation = 71;'
+        $pathSafety | Should -Match 'private const int Win32FileCaseSensitiveInformation = 23;'
+        $pathSafety | Should -Match '(?s)NtQueryInformationFile\(.*?NtFileCaseSensitiveInformation\)'
+        $pathSafety | Should -Match '(?s)GetFileInformationByHandleEx\(.*?Win32FileCaseSensitiveInformation\s*,'
+        $pathSafety | Should -Not -Match '(?s)GetFileInformationByHandleEx\(\s*handle,\s*FileCaseSensitiveInformation\s*,'
     }
 
     # Scenario: A caller invokes a single stage or resumes the same run.
