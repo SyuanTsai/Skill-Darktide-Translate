@@ -4461,6 +4461,7 @@ do
     : > "$sandbox_root/dev/$device"
     "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
 done
+: > "$sandbox_root/dev/console"
 "$mount_path" --bind /dev/null "$sandbox_root/dev/console"
 exec chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
 '@
