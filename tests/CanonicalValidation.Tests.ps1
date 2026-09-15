@@ -80,6 +80,11 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
     }
 
+    It 'uses the portable setpriv syntax for clearing ambient capabilities' {
+        $script:Validator | Should -Match ([regex]::Escape('--ambient-caps=-all'))
+        $script:Validator | Should -Not -Match ([regex]::Escape('--ambient-clear'))
+    }
+
     It 'skips unreadable optional Linux module search paths without weakening required paths' {
         $script:Validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
         $script:Validator | Should -Match 'catch \[UnauthorizedAccessException\]'
