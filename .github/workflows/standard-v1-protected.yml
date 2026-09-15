@@ -471,11 +471,11 @@ jobs:
           if ($evidenceItem.PSIsContainer -or ($evidenceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw 'Canonical evidence must be a regular non-reparse file before export.'
           }
-          if ($evidenceItem.Length -gt 150000) { throw 'Canonical evidence exceeds the 150000-byte export limit.' }
+          if ($evidenceItem.Length -gt 75000) { throw 'Canonical evidence exceeds the 75000-byte export limit.' }
           $evidenceBytes = [IO.File]::ReadAllBytes($evidencePath)
           $evidenceBase64 = [Convert]::ToBase64String($evidenceBytes)
-          if ($evidenceBase64.Length -gt 200000) { throw 'Canonical evidence exceeds the per-payload GitHub output transport limit.' }
-          $combinedOutputBudget = 400000
+          if ($evidenceBase64.Length -gt 100000) { throw 'Canonical evidence exceeds the per-payload GitHub output transport limit.' }
+          $combinedOutputBudget = 200000
           if ($evidenceBase64.Length -gt $combinedOutputBudget) { throw 'Canonical evidence exceeds the combined GitHub output budget.' }
           $evidenceHasher = [Security.Cryptography.SHA256]::Create()
           try {
@@ -496,7 +496,7 @@ jobs:
           EVIDENCE_BASE64_LENGTH: ${{ steps.export-evidence.outputs.evidence_base64_length || 0 }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $combinedOutputBudget = 400000
+          $combinedOutputBudget = 200000
           $evidenceBase64Length = 0
           if ([string]$env:EVIDENCE_BASE64_LENGTH -notmatch '^[0-9]+$') {
             throw 'Canonical evidence output length is invalid.'
@@ -519,10 +519,10 @@ jobs:
           if ($summaryItem.PSIsContainer -or ($summaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw 'Validation diagnostics must be a regular non-reparse file before export.'
           }
-          if ($summaryItem.Length -gt 150000) { throw 'Validation diagnostics exceed the 150000-byte export limit.' }
+          if ($summaryItem.Length -gt 75000) { throw 'Validation diagnostics exceed the 75000-byte export limit.' }
           $bytes = [IO.File]::ReadAllBytes($summaryPath)
           $base64 = [Convert]::ToBase64String($bytes)
-          if ($base64.Length -gt 200000) { throw 'Validation diagnostics exceed the per-payload GitHub output transport limit.' }
+          if ($base64.Length -gt 100000) { throw 'Validation diagnostics exceed the per-payload GitHub output transport limit.' }
           if (($evidenceBase64Length + $base64.Length) -gt $combinedOutputBudget) {
             throw 'Canonical evidence and validation diagnostics exceed the combined GitHub output budget.'
           }
@@ -549,7 +549,7 @@ jobs:
             echo 'Canonical evidence SHA-256 output is invalid.' >&2
             exit 1
           fi
-          if (( ${#EVIDENCE_BASE64} > 200000 )); then
+          if (( ${#EVIDENCE_BASE64} > 100000 )); then
             echo 'Canonical evidence exceeds the clean-job transport limit.' >&2
             exit 1
           fi
@@ -589,7 +589,7 @@ jobs:
             echo 'Validation diagnostics SHA-256 output is invalid.' >&2
             exit 1
           fi
-          if (( ${#DIAGNOSTICS_BASE64} > 200000 )); then
+          if (( ${#DIAGNOSTICS_BASE64} > 100000 )); then
             echo 'Validation diagnostics exceed the clean-job transport limit.' >&2
             exit 1
           fi
