@@ -63,6 +63,8 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $workflow | Should -Match 'scripts/Validate\.ps1'
         $workflow | Should -Match 'pull_request_target:'
         $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.sha \}\}'
+        $workflow | Should -Match '\$validatorArguments = @\{'
+        $workflow | Should -Match '& \$trustedValidator @validatorArguments'
         $workflow | Should -Match 'persist-credentials:\s*false'
         $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
         $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
