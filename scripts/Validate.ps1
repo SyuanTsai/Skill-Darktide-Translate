@@ -315,12 +315,31 @@ function Get-LinuxProcessResourceUsage {
         $memoryBytes = [int64]$memoryMatch.Groups['kilobytes'].Value * 1024
     }
     else {
-        # A zombie remains visible in /proc until its parent reaps it, but it
-        # has no resident pages left to account. Keep it in the process-count
-        # boundary while treating its resident-memory contribution as zero.
-        $stateMatch = [regex]::Match($status, '(?m)^State:\s+(?<state>[A-Z])(?:\s|\()')
-        if (-not $stateMatch.Success -or [string]$stateMatch.Groups['state'].Value -cne 'Z') {
-            throw "Could not parse Linux resident memory for process ${ProcessId}."
+        # Some short-lived Linux processes expose no VmRSS line while their
+        # status record is being finalized. Use procfs statm's resident-page
+        # field as a bounded kernel-provided fallback before classifying the
+        # process as an unrecoverable parse failure.
+        $statmPath = Join-Path '/proc' "$ProcessId/statm"
+        $statmMemoryBytes = $null
+        try {
+            $statmFields = @([regex]::Split(([IO.File]::ReadAllText($statmPath)).Trim(), '\s+'))
+            if ($statmFields.Count -ge 2 -and
+                [string]$statmFields[1] -match '^[0-9]+$') {
+                $statmMemoryBytes = [int64]$statmFields[1] * [int64][Environment]::SystemPageSize
+            }
+        }
+        catch { }
+        if ($null -ne $statmMemoryBytes) {
+            $memoryBytes = [int64]$statmMemoryBytes
+        }
+        else {
+            # A zombie remains visible in /proc until its parent reaps it, but
+            # it has no resident pages left to account. Keep it in the
+            # process-count boundary while treating its memory as zero.
+            $stateMatch = [regex]::Match($status, '(?m)^State:\s+(?<state>[A-Z])(?:\s|\()')
+            if (-not $stateMatch.Success -or [string]$stateMatch.Groups['state'].Value -cne 'Z') {
+                throw "Could not parse Linux resident memory for process ${ProcessId}."
+            }
         }
     }
     return [pscustomobject][ordered]@{

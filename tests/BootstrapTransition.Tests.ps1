@@ -226,6 +226,8 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'Proxy startup diagnostics:'
         $supervisor | Should -Match 'stateMatch = \[regex\]::Match'
         $supervisor | Should -Match "-cne 'Z'"
+        $supervisor | Should -Match 'statmPath = Join-Path ''/proc'''
+        $supervisor | Should -Match 'statmMemoryBytes'
         $supervisor | Should -Match 'Assert-LinuxAggregateResourceUsage'
         $supervisor | Should -Match 'Get-LinuxAggregateClockTicksPerSecond'
         $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage'
