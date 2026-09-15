@@ -76,6 +76,19 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match '(?s)if \(\(\$entry\.Attributes.*?ReparsePoint.*?\) -ne 0\).*?Get-InstalledSafeUnixSymlinkEntry.*?continue'
     }
 
+    It 'counts safe Unix symlink payloads toward bounded writable-root usage' {
+        $usageStart = $script:Validator.IndexOf('function Get-LinuxWritableRootUsage', [StringComparison]::Ordinal)
+        $usageEnd = $script:Validator.IndexOf('function Assert-LinuxWritableRootUsage', $usageStart, [StringComparison]::Ordinal)
+        $usageFunction = $script:Validator.Substring($usageStart, $usageEnd - $usageStart)
+
+        $usageFunction | Should -Match '\$symlinkEntry = Get-InstalledSafeUnixSymlinkEntry'
+        $usageFunction | Should -Match '\$entryCount\+\+'
+        $usageFunction | Should -Match '\$symlinkBytes = \[int64\]\$symlinkEntry\.storageBytes'
+        $usageFunction | Should -Match '\$bytes \+= \$symlinkBytes'
+        $usageFunction | Should -Match 'writable-entry-count limit of 100000'
+        $script:Validator | Should -Match '\$storageBytes = \[Text\.Encoding\]::UTF8\.GetByteCount\(\$target\)'
+    }
+
     It 'sizes the private Linux etc projection for hosted runner images' {
         $script:Validator | Should -Match 'size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
     }

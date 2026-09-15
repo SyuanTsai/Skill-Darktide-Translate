@@ -611,27 +611,34 @@ function Get-LinuxWritableRootUsage {
     $pending = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
     $pending.Push([IO.DirectoryInfo]$rootItem)
     $bytes = [int64]0
-    $fileCount = 0
+    $entryCount = 0
     while ($pending.Count -gt 0) {
         $directory = $pending.Pop()
         foreach ($entry in @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)) {
             if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                [void](Get-InstalledSafeUnixSymlinkEntry -Item $entry -Root $rootPath -Context $Context)
+                $symlinkEntry = Get-InstalledSafeUnixSymlinkEntry -Item $entry -Root $rootPath -Context $Context
+                $entryCount++
+                if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
+                $symlinkBytes = [int64]$symlinkEntry.storageBytes
+                if ($symlinkBytes -gt 0 -and $symlinkBytes -gt ([int64]::MaxValue - $bytes)) {
+                    throw "$Context writable-root size overflowed the bounded accounting range."
+                }
+                $bytes += $symlinkBytes
                 continue
             }
             if ($entry.PSIsContainer) {
                 $pending.Push([IO.DirectoryInfo]$entry)
                 continue
             }
-            $fileCount++
-            if ($fileCount -gt 100000) { throw "$Context exceeded the aggregate writable-file-count limit of 100000." }
+            $entryCount++
+            if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
             if ($entry.Length -gt 0 -and [int64]$entry.Length -gt ([int64]::MaxValue - $bytes)) {
                 throw "$Context writable-root size overflowed the bounded accounting range."
             }
             $bytes += [int64]$entry.Length
         }
     }
-    return [pscustomobject][ordered]@{ bytes = $bytes; fileCount = $fileCount }
+    return [pscustomobject][ordered]@{ bytes = $bytes; fileCount = $entryCount }
 }
 
 function Assert-LinuxWritableRootUsage {
@@ -2729,9 +2736,11 @@ function Get-InstalledSafeUnixSymlinkEntry {
     Assert-InstalledClosureSafeRelativePath -Value $relativeTarget -Context "$Context symbolic-link target"
     $relativePath = $Item.FullName.Substring($rootFull.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $relativePath = $relativePath.Replace([IO.Path]::DirectorySeparatorChar, '/').Replace([IO.Path]::AltDirectorySeparatorChar, '/')
+    $storageBytes = [Text.Encoding]::UTF8.GetByteCount($target)
     return [pscustomobject][ordered]@{
         path = $relativePath
         sha256 = Get-InstalledClosureSymlinkIdentitySha256 -Target $target -ResolvedRelativeTarget $relativeTarget
+        storageBytes = $storageBytes
     }
 }
 
