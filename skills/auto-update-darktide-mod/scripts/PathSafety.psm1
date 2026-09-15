@@ -261,11 +261,12 @@ function Test-PortableReparseItem {
     }
 
     if (& $inspectProviderItem $Item) { return $true }
-    if ($null -ne $Item) { return $false }
 
     # FileInfo/DirectoryInfo.LinkTarget reads the directory entry itself and does
-    # not follow a symlink. Walk lexical ancestors so a missing child below a
-    # symlink is still rejected before it can be treated as ordinary absence.
+    # not follow a symlink. Some Unix providers return the symlink target as the
+    # provider item, so always walk raw lexical ancestors even when $Item exists.
+    # This also ensures a missing child below a symlink is rejected before it can
+    # be treated as ordinary absence.
     $probe = [IO.Path]::GetFullPath($Path)
     # This comparison only terminates the lexical ancestor walk; it does not
     # authorize containment. Containment is established by the caller's
