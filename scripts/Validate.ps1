@@ -310,10 +310,22 @@ function Get-LinuxProcessResourceUsage {
         throw "Could not parse Linux CPU usage for process ${ProcessId}."
     }
     $memoryMatch = [regex]::Match($status, '(?m)^VmRSS:\s+(?<kilobytes>[0-9]+)\s+kB\s*$')
-    if (-not $memoryMatch.Success) { throw "Could not parse Linux resident memory for process ${ProcessId}." }
+    $memoryBytes = [int64]0
+    if ($memoryMatch.Success) {
+        $memoryBytes = [int64]$memoryMatch.Groups['kilobytes'].Value * 1024
+    }
+    else {
+        # A zombie remains visible in /proc until its parent reaps it, but it
+        # has no resident pages left to account. Keep it in the process-count
+        # boundary while treating its resident-memory contribution as zero.
+        $stateMatch = [regex]::Match($status, '(?m)^State:\s+(?<state>[A-Z])(?:\s|\()')
+        if (-not $stateMatch.Success -or [string]$stateMatch.Groups['state'].Value -cne 'Z') {
+            throw "Could not parse Linux resident memory for process ${ProcessId}."
+        }
+    }
     return [pscustomobject][ordered]@{
         processId = $ProcessId
-        memoryBytes = [int64]$memoryMatch.Groups['kilobytes'].Value * 1024
+        memoryBytes = $memoryBytes
         # utime/stime cover the live process; cutime/cstime preserve CPU
         # consumed by children that have already been reaped by this process.
         # Summing them across live processes does not double-count live

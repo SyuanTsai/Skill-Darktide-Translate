@@ -221,6 +221,8 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match ': > "\$sandbox_root/dev/console"'
         $supervisor | Should -Match 'protected-pester-proxy\.log'
         $supervisor | Should -Match 'Proxy startup diagnostics:'
+        $supervisor | Should -Match 'stateMatch = \[regex\]::Match'
+        $supervisor | Should -Match "-cne 'Z'"
         $supervisor | Should -Match 'Assert-LinuxAggregateResourceUsage'
         $supervisor | Should -Match 'Get-LinuxAggregateClockTicksPerSecond'
         $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage'
