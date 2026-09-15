@@ -90,6 +90,11 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $prePush | Should -Match 'merge-base --all'
         $prePush | Should -Match 'specify -BaseCommit explicitly'
         $prePush | Should -Not -Match 'HEAD\^'
+        foreach ($path in @('README.md', 'docs/RELEASE.md', 'docs/ROLLBACK.md')) {
+            $documentation = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot $path) -Raw
+            $documentation | Should -Match 'merge-base'
+            $documentation | Should -Not -Match 'HEAD\^'
+        }
     }
 
     # Scenario: Protected pull requests, trusted pushes, and manually dispatched runs enter the same validation contract.
