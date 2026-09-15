@@ -5491,7 +5491,33 @@ $result = Invoke-Pester -Configuration $pesterConfiguration
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
     [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
-    throw 'Pester repository regression did not complete successfully.'
+    $failedTestDetails = @($result.Failed | ForEach-Object {
+        $name = ''
+        foreach ($propertyName in @('ExpandedPath', 'Path', 'Name')) {
+            $property = $_.PSObject.Properties[$propertyName]
+            if ($null -ne $property -and $null -ne $property.Value -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                $name = [string]$property.Value
+                break
+            }
+        }
+        $message = ''
+        $errorProperty = $_.PSObject.Properties['ErrorRecord']
+        if ($null -ne $errorProperty -and $null -ne $errorProperty.Value) {
+            $exceptionProperty = $errorProperty.Value.PSObject.Properties['Exception']
+            if ($null -ne $exceptionProperty -and $null -ne $exceptionProperty.Value) {
+                $messageProperty = $exceptionProperty.Value.PSObject.Properties['Message']
+                if ($null -ne $messageProperty -and $null -ne $messageProperty.Value) {
+                    $message = [string]$messageProperty.Value
+                }
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$_ }
+        if ([string]::IsNullOrWhiteSpace($message)) { $name } else { "$name :: $message" }
+    })
+    if ($failedTestDetails.Count -eq 0) { $failedTestDetails = @('No bounded Pester failure detail was exposed.') }
+    $failureSummary = ($failedTestDetails -join ' | ')
+    if ($failureSummary.Length -gt 32768) { $failureSummary = $failureSummary.Substring(0, 32768) }
+    throw "Pester repository regression did not complete successfully. Total=$([int64]$result.TotalCount); Passed=$([int64]$result.PassedCount); Failed=$([int64]$result.FailedCount); Skipped=$([int64]$result.SkippedCount); FailedTests=$failureSummary"
 }
 
 $completionPayload = [ordered]@{

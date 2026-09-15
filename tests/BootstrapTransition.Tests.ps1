@@ -178,6 +178,7 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$pesterConfiguration = New-PesterConfiguration'
         $supervisor | Should -Match '\$pesterConfiguration\.Run\.Path = \$requiredPesterPaths'
         $supervisor | Should -Match 'Invoke-Pester -Configuration \$pesterConfiguration'
+        $supervisor | Should -Match 'FailedTests='
         $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
         $supervisor | Should -Match '(?s)Trusted base Pester tests.*?\$requiredPesterTests = @\(\$requiredPesterTests \| Where-Object'
         $supervisor | Should -Match 'Join-Path \$trustedPesterTestsRoot \$_'
