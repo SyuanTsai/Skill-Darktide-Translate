@@ -65,6 +65,12 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'symbolicLinkTarget='
     }
 
+    It 'does not resolve an omitted Linux read-only path as an empty filesystem path' {
+        $script:Validator | Should -Match '\$readOnlyPathText = \[string\]\$readOnlyPath'
+        $script:Validator | Should -Match 'IsNullOrWhiteSpace\(\$readOnlyPathText\)\) \{ continue \}'
+        $script:Validator | Should -Match 'GetFullPath\(\$readOnlyPathText\)'
+    }
+
     It 'skips unreadable optional Linux module search paths without weakening required paths' {
         $script:Validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
         $script:Validator | Should -Match 'catch \[UnauthorizedAccessException\]'
