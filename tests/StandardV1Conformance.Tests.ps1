@@ -53,6 +53,8 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $validator | Should -Match 'repositoryValidatorBytes'
         $validator | Should -Match 'postPesterRepositoryValidatorScript'
         $validator | Should -Match '\[scriptblock\]::Create'
+        $validator | Should -Match 'rev-parse --git-common-dir'
+        $validator | Should -Match 'Git common metadata directory'
         $validator | Should -Not -Match 'postPesterRepositoryValidatorPath'
     }
 

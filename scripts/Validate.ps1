@@ -3245,10 +3245,36 @@ function Assert-NoGitReplacementObjects {
     )
     $replacePathOutput = @(& $GitPath @gitConfigArguments -C $RepositoryRoot rev-parse --git-path refs/replace 2>$null)
     $replacePathExitCode = $LASTEXITCODE
-    if ($replacePathExitCode -ne 0 -or $replacePathOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$replacePathOutput[0])) {
-        throw "$Context could not resolve the candidate Git replacement-object directory."
+    $replacePath = $null
+    if ($replacePathExitCode -eq 0 -and $replacePathOutput.Count -eq 1 -and
+        -not [string]::IsNullOrWhiteSpace([string]$replacePathOutput[0])) {
+        $replacePath = [string]$replacePathOutput[0].Trim()
     }
-    $replacePath = [string]$replacePathOutput[0].Trim()
+    else {
+        # Some hosted Git checkouts do not return a single value for
+        # --git-path refs/replace. Resolve the common metadata directory
+        # explicitly while keeping the same fail-closed metadata checks.
+        $gitCommonDirOutput = @(& $GitPath @gitConfigArguments -C $RepositoryRoot rev-parse --git-common-dir 2>$null)
+        $gitCommonDirExitCode = $LASTEXITCODE
+        if ($gitCommonDirExitCode -ne 0 -or $gitCommonDirOutput.Count -ne 1 -or
+            [string]::IsNullOrWhiteSpace([string]$gitCommonDirOutput[0])) {
+            throw "$Context could not resolve the candidate Git common metadata directory."
+        }
+        $gitCommonDir = [string]$gitCommonDirOutput[0].Trim()
+        if (-not [IO.Path]::IsPathRooted($gitCommonDir)) {
+            $gitCommonDir = Join-Path $RepositoryRoot $gitCommonDir
+        }
+        $gitCommonDir = [IO.Path]::GetFullPath($gitCommonDir)
+        if (-not (Test-Path -LiteralPath $gitCommonDir -PathType Container)) {
+            throw "$Context Git common metadata directory is missing: $gitCommonDir"
+        }
+        $gitCommonDirItem = Get-Item -LiteralPath $gitCommonDir -Force
+        if (($gitCommonDirItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Context Git common metadata directory is a reparse point: $gitCommonDir"
+        }
+        Assert-NoReparseAncestors -Path $gitCommonDir -Context "$Context Git common metadata directory"
+        $replacePath = Join-Path $gitCommonDir 'refs/replace'
+    }
     if (-not [IO.Path]::IsPathRooted($replacePath)) {
         $replacePath = Join-Path $RepositoryRoot $replacePath
     }
