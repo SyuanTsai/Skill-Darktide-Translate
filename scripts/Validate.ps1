@@ -4697,6 +4697,12 @@ function Invoke-ProtectedPesterSupervisor {
         'StandardV1Conformance.Tests.ps1'
         'Test-Repository.Tests.ps1'
     )
+    $requiredPesterTests = @($requiredPesterTests | Where-Object {
+        Test-Path -LiteralPath (Join-Path $TestsRoot $_) -PathType Leaf
+    })
+    if ($requiredPesterTests.Count -eq 0) {
+        throw 'The trusted Pester test root contains none of the required regression tests.'
+    }
     Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
     Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
     $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
@@ -5346,6 +5352,15 @@ Expand-TrustedGitArchive `
     -PathSpec @('tests') `
     -Context 'Trusted base Pester tests'
 $trustedPesterTestsRoot = Join-Path $pesterMirrorRoot 'tests'
+# A pull-request validation may introduce new tests that are not present in the
+# immutable base yet. Candidate-owned tests remain excluded from the protected
+# run; only fixed inventory entries present in the trusted archive are eligible.
+$requiredPesterTests = @($requiredPesterTests | Where-Object {
+    Test-Path -LiteralPath (Join-Path $trustedPesterTestsRoot $_) -PathType Leaf
+})
+if ($requiredPesterTests.Count -eq 0) {
+    throw 'The trusted base Pester archive contains none of the required regression tests.'
+}
 foreach ($requiredPesterTest in $requiredPesterTests) {
     Assert-TrustedGitTreeFile `
         -GitPath $gitPath `
@@ -5402,6 +5417,12 @@ $requiredPesterTests = @(
     'StandardV1Conformance.Tests.ps1'
     'Test-Repository.Tests.ps1'
 )
+$requiredPesterTests = @($requiredPesterTests | Where-Object {
+    Test-Path -LiteralPath (Join-Path $testsRoot $_) -PathType Leaf
+})
+if ($requiredPesterTests.Count -eq 0) {
+    throw 'The trusted Pester test root contains none of the required regression tests.'
+}
 $requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
     $testPath = Join-Path $testsRoot $_
     $testItem = Get-Item -LiteralPath $testPath -Force -ErrorAction Stop

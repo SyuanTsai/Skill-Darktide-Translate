@@ -177,6 +177,10 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$requiredPesterPaths'
         $supervisor | Should -Match 'Invoke-Pester -Path \$requiredPesterPaths'
         $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
+        $supervisor | Should -Match '(?s)Trusted base Pester tests.*?\$requiredPesterTests = @\(\$requiredPesterTests \| Where-Object'
+        $supervisor | Should -Match 'Join-Path \$trustedPesterTestsRoot \$_'
+        $supervisor | Should -Match 'Join-Path \$TestsRoot \$_'
+        $supervisor | Should -Match 'Join-Path \$testsRoot \$_'
     }
 
     It 'UnitT80_ProjectsLinuxEtcWithoutArchiveOwnershipCopy' {
