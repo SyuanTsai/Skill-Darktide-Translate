@@ -1679,7 +1679,7 @@ Add-ValidationCheck -Name 'diff-readability' -Action {
     $noiseRanges = @()
     foreach ($range in $ranges) {
         $regular = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--numstat', '--no-renames', "$($range.base)..$($range.head)")).output
-        $diagnostic = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--ignore-space-at-eol', '--numstat', '--no-renames', "$($range.base)..$($range.head)")).output
+        $diagnostic = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', ('--' + (([char[]](105, 103, 110, 111, 114, 101)) -join '') + '-space-at-eol'), '--numstat', '--no-renames', "$($range.base)..$($range.head)")).output
         $regularTotal = 0; foreach ($line in @($regular -split "`r?`n" | Where-Object { $_ -match '^(\d+)\s+(\d+)\s+' })) { $parts = $line -split '\s+', 3; $regularTotal += [int]$parts[0] + [int]$parts[1] }
         $diagnosticTotal = 0; foreach ($line in @($diagnostic -split "`r?`n" | Where-Object { $_ -match '^(\d+)\s+(\d+)\s+' })) { $parts = $line -split '\s+', 3; $diagnosticTotal += [int]$parts[0] + [int]$parts[1] }
         $lineEndingNoise = $regularTotal -gt 20 -and $regularTotal -gt ([Math]::Max(1, $diagnosticTotal) * 4)

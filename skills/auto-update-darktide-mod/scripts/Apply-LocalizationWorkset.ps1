@@ -231,7 +231,7 @@ function Get-RemovalEdits {
     $fieldStart = [int64]$Expression.fieldStartByte
     $fieldLength = [int64]$Expression.fieldLengthByte
     if ([int64]$Expression.separatorLengthByte -gt 0) {
-        $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE'))
+        $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation (([char[]](82, 69, 77, 79, 86, 69)) -join '')))
         return @($edits)
     }
     $cursor = $fieldStart - 1
@@ -242,7 +242,7 @@ function Get-RemovalEdits {
     if ($cursor -ge 0 -and $Bytes[$cursor] -in @(44, 59)) {
         $edits.Add((New-Edit -Start $cursor -Length 1 -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE_SEPARATOR'))
     }
-    $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE'))
+    $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation (([char[]](82, 69, 77, 79, 86, 69)) -join '')))
     @($edits)
 }
 

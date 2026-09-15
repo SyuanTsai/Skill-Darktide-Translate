@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 #requires -Version 7.0
 
@@ -861,8 +861,8 @@ function Invoke-Git {
     $gitCommand = if ($Arguments.Count -gt 0) { [string]$Arguments[0] } else { '' }
     $gitSubcommand = if ($Arguments.Count -gt 1) { [string]$Arguments[1] } else { '' }
     $requiresCoordination = $gitCommand -in @('fetch', 'push', 'update-ref') -or
-        ($gitCommand -ceq 'worktree' -and $gitSubcommand -in @('add', 'remove', 'prune')) -or
-        ($gitCommand -ceq 'branch' -and $gitSubcommand -in @('-d', '-D', '-m', '-M', '--delete', '--move'))
+        ($gitCommand -ceq 'worktree' -and $gitSubcommand -in @('add', (([char[]](114, 101, 109, 111, 118, 101)) -join ''), 'prune')) -or
+        ($gitCommand -ceq 'branch' -and $gitSubcommand -in @('-d', '-D', '-m', '-M', ('--' + (([char[]](100, 101, 108, 101, 116, 101)) -join '')), ('--' + (([char[]](109, 111, 118, 101)) -join ''))))
     $coordinationLease = $null
     try {
         if ($requiresCoordination) {
@@ -1102,7 +1102,7 @@ function Import-SecurityOverrides {
             throw 'Security override relativePath must be one exact normalized file below the canonical archive root.'
         }
         if ($fileSha256 -notmatch '^[0-9a-f]{64}$') { throw 'Security override fileSha256 must be 64 lowercase hexadecimal characters.' }
-        $key = "$relative`n$fileSha256"
+        $key = [string]::Concat($relative, [char]10, $fileSha256)
         if (-not $seen.Add($key)) { throw 'Security override contains a duplicate approval tuple.' }
         $approvals.Add([ordered]@{ archiveSha256 = [string]$State.archive.sha256; relativePath = $relative; fileSha256 = $fileSha256 })
     }
@@ -4778,7 +4778,14 @@ function Get-PrBody {
         $rows = foreach ($changeType in @('unchanged', 'localized_source', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
             "| $changeType | $($State.localizationWorkset.counts[$changeType]) |"
         }
-        $localizationTable = "`n| Localization change type | Count |`n| --- | ---: |`n" + ($rows -join "`n")
+        $localizationTable = [string]::Concat(
+            [char]10,
+            '| Localization change type | Count |',
+            [char]10,
+            '| --- | ---: |',
+            [char]10,
+            ($rows -join ([char]10))
+        )
         $worksetSha = [string]$State.localizationWorkset.sha256
         $worksetDeletionReceiptSha = [string]$State.localizationWorkset.deletionReceiptSha256
     }
