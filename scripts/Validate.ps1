@@ -553,7 +553,8 @@ function Get-LinuxWritableRootUsage {
         $directory = $pending.Pop()
         foreach ($entry in @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)) {
             if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "$Context writable root contains a reparse entry: $($entry.FullName)"
+                [void](Get-InstalledSafeUnixSymlinkEntry -Item $entry -Root $rootPath -Context $Context)
+                continue
             }
             if ($entry.PSIsContainer) {
                 $pending.Push([IO.DirectoryInfo]$entry)

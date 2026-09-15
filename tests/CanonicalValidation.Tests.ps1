@@ -71,6 +71,11 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'GetFullPath\(\$readOnlyPathText\)'
     }
 
+    It 'accounts for safe Unix symlinks in the bounded Linux writable-root scan' {
+        $script:Validator | Should -Match 'Get-InstalledSafeUnixSymlinkEntry -Item \$entry -Root \$rootPath -Context \$Context'
+        $script:Validator | Should -Match '(?s)if \(\(\$entry\.Attributes.*?ReparsePoint.*?\) -ne 0\).*?Get-InstalledSafeUnixSymlinkEntry.*?continue'
+    }
+
     It 'skips unreadable optional Linux module search paths without weakening required paths' {
         $script:Validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
         $script:Validator | Should -Match 'catch \[UnauthorizedAccessException\]'
