@@ -76,6 +76,10 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match '(?s)if \(\(\$entry\.Attributes.*?ReparsePoint.*?\) -ne 0\).*?Get-InstalledSafeUnixSymlinkEntry.*?continue'
     }
 
+    It 'sizes the private Linux etc projection for hosted runner images' {
+        $script:Validator | Should -Match 'size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
+    }
+
     It 'skips unreadable optional Linux module search paths without weakening required paths' {
         $script:Validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
         $script:Validator | Should -Match 'catch \[UnauthorizedAccessException\]'
