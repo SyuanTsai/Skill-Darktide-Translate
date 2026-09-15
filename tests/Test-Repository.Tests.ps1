@@ -219,6 +219,14 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*profile identity or membership*'
     }
 
+    It 'rejects a non-Boolean product-local profile default' {
+        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
+        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+        $catalog.profiles[0].default = 0
+        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*profile identity or membership*'
+    }
+
     It 'rejects a product-local profile source path that leaves the canonical source package' {
         $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
         $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json

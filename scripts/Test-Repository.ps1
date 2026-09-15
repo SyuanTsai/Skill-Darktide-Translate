@@ -67,7 +67,8 @@ function Invoke-ProfileCatalogValidation {
     Assert-ExactPropertySet -Value $profile -Expected @('id', 'description', 'default', 'includes', 'excludes') -Context 'catalog/profiles.json profile'
     if ($profile.id -isnot [string] -or [string]$profile.id -cne 'darktide-mod-maintenance' -or
         $profile.description -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$profile.description) -or
-        $profile.default -ne $false -or $profile.includes -isnot [array] -or @($profile.includes).Count -ne 1 -or
+        $profile.default -isnot [bool] -or $profile.default -ne $false -or
+        $profile.includes -isnot [array] -or @($profile.includes).Count -ne 1 -or
         [string]@($profile.includes)[0] -cne 'auto-update-darktide-mod' -or
         $profile.excludes -isnot [array] -or @($profile.excludes).Count -ne 0) {
         throw 'Profile catalog profile identity or membership is invalid.'
