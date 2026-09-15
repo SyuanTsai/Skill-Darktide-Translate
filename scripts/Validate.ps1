@@ -4637,6 +4637,14 @@ function Invoke-ProtectedPesterRunspace {
         return $workerResult.Substring($workerResultPrefix.Length)
     }
     finally {
+        if ($null -ne $powerShell) {
+            try { $powerShell.Stop() } catch { }
+            try { $powerShell.Dispose() } catch { }
+        }
+        if ($null -ne $runspace) {
+            try { $runspace.Close() } catch { }
+            try { $runspace.Dispose() } catch { }
+        }
         if ($null -ne $serverProcessInstance.Process) {
             try {
                 if (-not $serverProcessInstance.HasExited) {
@@ -4649,8 +4657,6 @@ function Invoke-ProtectedPesterRunspace {
         $linuxPesterCgroupCleanupException = $null
         try { Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath }
         catch { $linuxPesterCgroupCleanupException = $_.Exception }
-        if ($null -ne $powerShell) { $powerShell.Dispose() }
-        if ($null -ne $runspace) { $runspace.Dispose() }
         if ($null -ne $serverProcessInstance) { $serverProcessInstance.Dispose() }
         if ($null -ne $linuxPesterCgroupCleanupException) { throw $linuxPesterCgroupCleanupException }
     }

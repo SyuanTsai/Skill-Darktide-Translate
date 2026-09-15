@@ -213,6 +213,8 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'CreateOutOfProcessRunspace'
         $supervisor | Should -Match 'AddScript\(\$workerScriptText\)'
         $supervisor | Should -Match 'InvocationStateInfo\.State'
+        $supervisor | Should -Match '\$powerShell\.Stop\(\)'
+        $supervisor | Should -Match '\$runspace\.Close\(\)'
         $supervisor | Should -Match 'serverProcessInstance\.Process\.WaitForExit\(5000\)'
         $supervisor | Should -Match 'Assert-LinuxAggregateResourceUsage'
         $supervisor | Should -Match 'Get-LinuxAggregateClockTicksPerSecond'
