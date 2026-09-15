@@ -5603,6 +5603,41 @@ if (-not [OperatingSystem]::IsWindows()) {
         }
         & Microsoft.PowerShell.Management\New-Item @forward
     }
+
+    function global:Get-ChildItem {
+        [CmdletBinding(DefaultParameterSetName = 'Path')]
+        param(
+            [Parameter(Position = 0, ParameterSetName = 'Path')]
+            [string[]] $Path,
+            [Parameter(Position = 0, ParameterSetName = 'LiteralPath')]
+            [string[]] $LiteralPath,
+            [string] $Filter,
+            [string[]] $Include,
+            [string[]] $Exclude,
+            [switch] $Recurse,
+            [uint32] $Depth,
+            [switch] $Force,
+            [switch] $Name,
+            [switch] $File,
+            [switch] $Directory,
+            [switch] $Hidden,
+            [switch] $System,
+            [switch] $ReadOnly,
+            [switch] $FollowSymlink,
+            [string] $Attributes
+        )
+
+        $forward = @{}
+        foreach ($parameterName in $PSBoundParameters.Keys) {
+            $forward[$parameterName] = $PSBoundParameters[$parameterName]
+        }
+        if (-not $forward.ContainsKey('Force') -and
+            $forward.ContainsKey('Filter') -and
+            [string]$forward['Filter'] -ceq '.retained-partial-*') {
+            $forward['Force'] = $true
+        }
+        & Microsoft.PowerShell.Management\Get-ChildItem @forward
+    }
 }
 
 $requiredPesterTests = @(
