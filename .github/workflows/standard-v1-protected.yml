@@ -471,10 +471,12 @@ jobs:
           if ($evidenceItem.PSIsContainer -or ($evidenceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw 'Canonical evidence must be a regular non-reparse file before export.'
           }
-          if ($evidenceItem.Length -gt 350000) { throw 'Canonical evidence exceeds the 350000-byte export limit.' }
+          if ($evidenceItem.Length -gt 150000) { throw 'Canonical evidence exceeds the 150000-byte export limit.' }
           $evidenceBytes = [IO.File]::ReadAllBytes($evidencePath)
           $evidenceBase64 = [Convert]::ToBase64String($evidenceBytes)
-          if ($evidenceBase64.Length -gt 500000) { throw 'Canonical evidence exceeds the GitHub output transport limit.' }
+          if ($evidenceBase64.Length -gt 200000) { throw 'Canonical evidence exceeds the per-payload GitHub output transport limit.' }
+          $combinedOutputBudget = 400000
+          if ($evidenceBase64.Length -gt $combinedOutputBudget) { throw 'Canonical evidence exceeds the combined GitHub output budget.' }
           $evidenceHasher = [Security.Cryptography.SHA256]::Create()
           try {
             $evidenceSha256 = [BitConverter]::ToString($evidenceHasher.ComputeHash($evidenceBytes)).Replace('-', '').ToLowerInvariant()
@@ -484,14 +486,25 @@ jobs:
             throw 'Canonical evidence digest does not match the canonical validation output.'
           }
           $githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
-          [IO.File]::AppendAllText($githubOutputPath, "evidence_base64=$evidenceBase64$([Environment]::NewLine)evidence_sha256=$evidenceSha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+          [IO.File]::AppendAllText($githubOutputPath, "evidence_base64=$evidenceBase64$([Environment]::NewLine)evidence_sha256=$evidenceSha256$([Environment]::NewLine)evidence_base64_length=$($evidenceBase64.Length)$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
 
       - name: Export bounded validation diagnostics for clean upload
         id: export-diagnostics
         if: ${{ always() }}
         shell: pwsh
+        env:
+          EVIDENCE_BASE64_LENGTH: ${{ steps.export-evidence.outputs.evidence_base64_length || 0 }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $combinedOutputBudget = 400000
+          $evidenceBase64Length = 0
+          if ([string]$env:EVIDENCE_BASE64_LENGTH -notmatch '^[0-9]+$') {
+            throw 'Canonical evidence output length is invalid.'
+          }
+          $evidenceBase64Length = [int64]$env:EVIDENCE_BASE64_LENGTH
+          if ($evidenceBase64Length -gt $combinedOutputBudget) {
+            throw 'Canonical evidence already exceeds the combined GitHub output budget.'
+          }
           $outputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
           $summaryPaths = @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory -Filter 'sgv1-*' -Force -ErrorAction SilentlyContinue |
             ForEach-Object { Join-Path $_.FullName 'security-preflight-summary.json' } |
@@ -506,10 +519,13 @@ jobs:
           if ($summaryItem.PSIsContainer -or ($summaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw 'Validation diagnostics must be a regular non-reparse file before export.'
           }
-          if ($summaryItem.Length -gt 350000) { throw 'Validation diagnostics exceed the 350000-byte export limit.' }
+          if ($summaryItem.Length -gt 150000) { throw 'Validation diagnostics exceed the 150000-byte export limit.' }
           $bytes = [IO.File]::ReadAllBytes($summaryPath)
           $base64 = [Convert]::ToBase64String($bytes)
-          if ($base64.Length -gt 500000) { throw 'Validation diagnostics exceed the GitHub output transport limit.' }
+          if ($base64.Length -gt 200000) { throw 'Validation diagnostics exceed the per-payload GitHub output transport limit.' }
+          if (($evidenceBase64Length + $base64.Length) -gt $combinedOutputBudget) {
+            throw 'Canonical evidence and validation diagnostics exceed the combined GitHub output budget.'
+          }
           $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $summaryPath).Hash.ToLowerInvariant()
           [IO.File]::AppendAllText($outputPath, "diagnostics_base64=$base64$([Environment]::NewLine)diagnostics_sha256=$sha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
 
@@ -533,7 +549,7 @@ jobs:
             echo 'Canonical evidence SHA-256 output is invalid.' >&2
             exit 1
           fi
-          if (( ${#EVIDENCE_BASE64} > 500000 )); then
+          if (( ${#EVIDENCE_BASE64} > 200000 )); then
             echo 'Canonical evidence exceeds the clean-job transport limit.' >&2
             exit 1
           fi
@@ -573,7 +589,7 @@ jobs:
             echo 'Validation diagnostics SHA-256 output is invalid.' >&2
             exit 1
           fi
-          if (( ${#DIAGNOSTICS_BASE64} > 500000 )); then
+          if (( ${#DIAGNOSTICS_BASE64} > 200000 )); then
             echo 'Validation diagnostics exceed the clean-job transport limit.' >&2
             exit 1
           fi
@@ -693,6 +709,7 @@ jobs:
     needs:
       - repository-contract-windows-powershell
       - canonical-validation
+      - upload-canonical-validation-evidence
       - github-copilot-agent-skills
     runs-on: ubuntu-latest
     permissions:
@@ -706,6 +723,7 @@ jobs:
           HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
           WINDOWS_RESULT: ${{ needs['repository-contract-windows-powershell'].result }}
           CANONICAL_RESULT: ${{ needs['canonical-validation'].result }}
+          EVIDENCE_UPLOAD_RESULT: ${{ needs['upload-canonical-validation-evidence'].result }}
           PUBLICATION_RESULT: ${{ needs['github-copilot-agent-skills'].result }}
         run: |
           set -euo pipefail
@@ -714,7 +732,7 @@ jobs:
             exit 1
           fi
            conclusion='failure'
-           if [[ "$WINDOWS_RESULT" == 'success' && "$CANONICAL_RESULT" == 'success' && "$PUBLICATION_RESULT" == 'success' ]]; then
+           if [[ "$WINDOWS_RESULT" == 'success' && "$CANONICAL_RESULT" == 'success' && "$EVIDENCE_UPLOAD_RESULT" == 'success' && "$PUBLICATION_RESULT" == 'success' ]]; then
             conclusion='success'
           fi
           details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
