@@ -471,10 +471,10 @@ jobs:
           if ($evidenceItem.PSIsContainer -or ($evidenceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw 'Canonical evidence must be a regular non-reparse file before export.'
           }
-          if ($evidenceItem.Length -gt 524288) { throw 'Canonical evidence exceeds the 512 KiB export limit.' }
+          if ($evidenceItem.Length -gt 350000) { throw 'Canonical evidence exceeds the 350000-byte export limit.' }
           $evidenceBytes = [IO.File]::ReadAllBytes($evidencePath)
           $evidenceBase64 = [Convert]::ToBase64String($evidenceBytes)
-          if ($evidenceBase64.Length -gt 800000) { throw 'Canonical evidence exceeds the GitHub output transport limit.' }
+          if ($evidenceBase64.Length -gt 500000) { throw 'Canonical evidence exceeds the GitHub output transport limit.' }
           $evidenceHasher = [Security.Cryptography.SHA256]::Create()
           try {
             $evidenceSha256 = [BitConverter]::ToString($evidenceHasher.ComputeHash($evidenceBytes)).Replace('-', '').ToLowerInvariant()
@@ -506,10 +506,10 @@ jobs:
           if ($summaryItem.PSIsContainer -or ($summaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw 'Validation diagnostics must be a regular non-reparse file before export.'
           }
-          if ($summaryItem.Length -gt 524288) { throw 'Validation diagnostics exceed the 512 KiB export limit.' }
+          if ($summaryItem.Length -gt 350000) { throw 'Validation diagnostics exceed the 350000-byte export limit.' }
           $bytes = [IO.File]::ReadAllBytes($summaryPath)
           $base64 = [Convert]::ToBase64String($bytes)
-          if ($base64.Length -gt 800000) { throw 'Validation diagnostics exceed the GitHub output transport limit.' }
+          if ($base64.Length -gt 500000) { throw 'Validation diagnostics exceed the GitHub output transport limit.' }
           $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $summaryPath).Hash.ToLowerInvariant()
           [IO.File]::AppendAllText($outputPath, "diagnostics_base64=$base64$([Environment]::NewLine)diagnostics_sha256=$sha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
 
@@ -533,7 +533,7 @@ jobs:
             echo 'Canonical evidence SHA-256 output is invalid.' >&2
             exit 1
           fi
-          if (( ${#EVIDENCE_BASE64} > 800000 )); then
+          if (( ${#EVIDENCE_BASE64} > 500000 )); then
             echo 'Canonical evidence exceeds the clean-job transport limit.' >&2
             exit 1
           fi
@@ -573,7 +573,7 @@ jobs:
             echo 'Validation diagnostics SHA-256 output is invalid.' >&2
             exit 1
           fi
-          if (( ${#DIAGNOSTICS_BASE64} > 800000 )); then
+          if (( ${#DIAGNOSTICS_BASE64} > 500000 )); then
             echo 'Validation diagnostics exceed the clean-job transport limit.' >&2
             exit 1
           fi
@@ -621,7 +621,11 @@ jobs:
         run: |
           set -euo pipefail
           gh --version
-          gh skill publish --dry-run .
+          skill_publish_root='.'
+          if [[ -d '.agents/skills' && ! -d 'skills' ]]; then
+            skill_publish_root='.agents/skills'
+          fi
+          gh skill publish --dry-run "$skill_publish_root"
 
   # GitHub attaches pull_request_target workflow jobs to the base commit. Publish
   # the exact required contexts explicitly against the immutable PR head instead
