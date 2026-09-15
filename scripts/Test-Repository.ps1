@@ -58,33 +58,13 @@ function Assert-NoDuplicateJsonProperties {
     }
 }
 
-function Read-StrictUtf8File {
-    param([Parameter(Mandatory = $true)][string] $Path)
-
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $offset = if ($bytes.Length -ge 3 -and
-        $bytes[0] -eq 0xEF -and
-        $bytes[1] -eq 0xBB -and
-        $bytes[2] -eq 0xBF) {
-        3
-    }
-    else {
-        0
-    }
-    return [Text.UTF8Encoding]::new($false, $true).GetString(
-        $bytes,
-        $offset,
-        $bytes.Length - $offset
-    )
-}
-
 function Read-StrictJson {
     param([Parameter(Mandatory = $true)][string] $Path)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Required JSON file is missing: $Path"
     }
-    $text = Read-StrictUtf8File -Path $Path
+    $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
     try {
         $document = [System.Text.Json.JsonDocument]::Parse($text)
     }
@@ -182,7 +162,6 @@ function Get-GitBlobSha256 {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.RedirectStandardInput = $true
     foreach ($argument in @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot", '-C', $RepositoryRoot, 'cat-file', 'blob', $ObjectId)) {
         [void]$startInfo.ArgumentList.Add($argument)
     }
@@ -191,7 +170,6 @@ function Get-GitBlobSha256 {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         if (-not $process.Start()) { throw "Could not start Git blob reader for '$ObjectId'." }
-        $process.StandardInput.Close()
         $hash = $hasher.ComputeHash($process.StandardOutput.BaseStream)
         $stderr = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
@@ -245,7 +223,7 @@ function Assert-RegularFileForHash {
         finally {
             [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
         }
-        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
+        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cnotin @('regular file', 'regular empty file')) {
             throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
         }
     }
@@ -257,7 +235,7 @@ function Read-SkillFrontmatter {
         [Parameter(Mandatory = $true)][string] $ExpectedSkillId
     )
 
-    $text = (Read-StrictUtf8File -Path $Path).Replace("`r`n", "`n").Replace("`r", "`n")
+    $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true)).Replace("`r`n", "`n").Replace("`r", "`n")
     if ($text -cnotmatch '(?s)\A---\n(?<frontmatter>.*?)\n---\n(?<body>.*)\z') {
         throw "SKILL.md for '$ExpectedSkillId' must contain closed YAML frontmatter."
     }
@@ -347,7 +325,7 @@ function Read-OpenAiMetadata {
         [Parameter(Mandatory = $true)][string] $ExpectedSkillId
     )
 
-    $text = (Read-StrictUtf8File -Path $Path).Replace("`r`n", "`n").Replace("`r", "`n")
+    $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true)).Replace("`r`n", "`n").Replace("`r", "`n")
     if ($text.Contains("`t")) { throw "agents/openai.yaml for '$ExpectedSkillId' must not contain tabs." }
 
     $topSections = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -500,7 +478,7 @@ function Assert-BootstrapOpenAiMetadata {
 
     $item = Get-Item -LiteralPath $Path -Force
     Assert-RegularFileForHash -Item $item -Context "Bootstrap metadata for '$ExpectedSkillId'"
-    $text = Read-StrictUtf8File -Path $item.FullName
+    $text = [IO.File]::ReadAllText($item.FullName, [Text.UTF8Encoding]::new($false, $true))
     if ($text -notmatch '(?m)^\s*display_name:\s+"Auto Update Darktide MOD"\s*$') {
         throw "Bootstrap agents/openai.yaml display_name is invalid for '$ExpectedSkillId'."
     }
@@ -577,31 +555,8 @@ function Get-ContentInventory {
     if ([string]::IsNullOrWhiteSpace($gitPath)) { throw 'Trusted Git executable was not bound before repository validation.' }
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
     $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    # Decode Git's NUL-delimited UTF-8 paths independently of the caller's
-    # console code page, including a protected remoting worker on Windows.
-    $indexStartInfo = [Diagnostics.ProcessStartInfo]::new()
-    $indexStartInfo.FileName = $gitPath
-    $indexStartInfo.UseShellExecute = $false
-    $indexStartInfo.CreateNoWindow = $true
-    $indexStartInfo.RedirectStandardInput = $true
-    $indexStartInfo.RedirectStandardOutput = $true
-    $indexStartInfo.RedirectStandardError = $true
-    $indexStartInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
-    foreach ($argument in @($gitConfigArguments + @('-C', $RepositoryRoot, 'ls-files', '-s', '-z', '--', $skillRootRelative))) {
-        [void]$indexStartInfo.ArgumentList.Add($argument)
-    }
-    $indexProcess = [Diagnostics.Process]::new()
-    $indexProcess.StartInfo = $indexStartInfo
-    try {
-        if (-not $indexProcess.Start()) { throw "Could not start Git inventory lookup for '$SkillId'." }
-        $indexProcess.StandardInput.Close()
-        $indexErrorTask = $indexProcess.StandardError.ReadToEndAsync()
-        $gitOutput = $indexProcess.StandardOutput.ReadToEnd()
-        $indexError = $indexErrorTask.GetAwaiter().GetResult()
-        $indexProcess.WaitForExit()
-        if ($indexProcess.ExitCode -ne 0) { throw "Git inventory lookup failed for '$SkillId': $indexError" }
-    }
-    finally { $indexProcess.Dispose() }
+    $gitOutput = [string]((& $gitPath @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- $skillRootRelative) -join '')
+    if ($LASTEXITCODE -ne 0) { throw "Git inventory lookup failed for '$SkillId'." }
     foreach ($record in @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })) {
         if ([string]$record -cnotmatch '^(?<mode>[0-9]{6}) (?<objectId>[0-9a-f]{40}) (?<stage>[0-3])\t(?<path>[^\x00\r\n]+)$') {
             throw "Git returned malformed index entry for '$SkillId': $record"
@@ -664,6 +619,82 @@ function Get-ContentInventory {
     }
 }
 
+function Assert-NoReparseAncestors {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $current = $fullPath
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Context contains a reparse-point ancestor: $current"
+            }
+        }
+        $parent = Split-Path -Parent $current
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $current) { break }
+        $current = $parent
+    }
+}
+
+function Write-ExclusiveUtf8File {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Text
+    )
+
+    $Path = [IO.Path]::GetFullPath($Path)
+    $outputDirectory = Split-Path -Parent $Path
+    if ([string]::IsNullOrWhiteSpace($outputDirectory)) {
+        throw "Validation output path has no parent directory: $Path"
+    }
+    Assert-NoReparseAncestors -Path $outputDirectory -Context 'Validation output directory'
+    if ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        throw "Validation output path already exists; evidence must not overwrite prior content: $Path"
+    }
+    [void](New-Item -ItemType Directory -Path $outputDirectory -Force)
+    Assert-NoReparseAncestors -Path $outputDirectory -Context 'Validation output directory'
+
+    $encoding = [Text.UTF8Encoding]::new($false)
+    $bytes = $encoding.GetBytes($Text)
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        throw "Could not create exclusive validation output '$Path': $($_.Exception.Message)"
+    }
+
+    Assert-NoReparseAncestors -Path $Path -Context 'Validation output'
+    $writtenBytes = [IO.File]::ReadAllBytes($Path)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $expectedSha256 = ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+        $actualSha256 = ([BitConverter]::ToString($hasher.ComputeHash($writtenBytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+    }
+    if ($actualSha256 -cne $expectedSha256) {
+        throw "Validation output changed during immediate readback: $Path"
+    }
+}
+
 function Write-RepositoryValidationResult {
     param(
         [Parameter(Mandatory = $true)] $Result,
@@ -673,12 +704,7 @@ function Write-RepositoryValidationResult {
 
     $json = $Result | ConvertTo-Json -Depth 30
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
-        $outputFullPath = [IO.Path]::GetFullPath($OutputPath)
-        $outputDirectory = Split-Path -Parent $outputFullPath
-        if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
-            [void](New-Item -ItemType Directory -Path $outputDirectory -Force)
-        }
-        [IO.File]::WriteAllText($outputFullPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        Write-ExclusiveUtf8File -Path $OutputPath -Text ($json + [Environment]::NewLine)
     }
     Write-Host $SuccessMessage
     return $json

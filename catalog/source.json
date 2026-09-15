@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 2,
+  "sourceId": "darktide-translate",
+  "repository": "https://github.com/SyuanTsai/Skill-Darktide-Translate.git",
+  "skillsRoot": "skills",
+  "skills": [
+    "auto-update-darktide-mod"
+  ]
+}

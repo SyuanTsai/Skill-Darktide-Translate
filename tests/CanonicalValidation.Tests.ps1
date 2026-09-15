@@ -1,0 +1,230 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
+Describe 'Canonical Standard v1 validation adapter' {
+    BeforeAll {
+        $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
+        $script:ValidatorPath = Join-Path $script:RepositoryRoot 'scripts/Validate.ps1'
+        $script:Validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
+        $script:Adapter = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'config/standard-v1.json') -Raw |
+            ConvertFrom-Json -Depth 20
+    }
+
+    It 'binds the immutable candidate before any external authority or tool acquisition' {
+        $candidateIndex = $script:Validator.IndexOf('status --porcelain=v1')
+        $authorityIndex = $script:Validator.IndexOf('Invoke-WebRequest -Uri $adapter.authority.archiveUrl')
+        $resolverIndex = $script:Validator.IndexOf('& $resolverPath -PolicyPath')
+
+        $candidateIndex | Should -BeGreaterThan -1
+        $authorityIndex | Should -BeGreaterThan $candidateIndex
+        $resolverIndex | Should -BeGreaterThan $authorityIndex
+    }
+
+    It 'verifies bundle and authority file identities before invoking the central resolver' {
+        $archiveHashIndex = $script:Validator.IndexOf('$archiveHash -cne')
+        $fileHashIndex = $script:Validator.IndexOf('$fileHash -cne')
+        $resolverIndex = $script:Validator.IndexOf('& $resolverPath -PolicyPath')
+
+        $archiveHashIndex | Should -BeGreaterThan -1
+        $fileHashIndex | Should -BeGreaterThan $archiveHashIndex
+        $resolverIndex | Should -BeGreaterThan $fileHashIndex
+    }
+
+    It 'rejects ambiguous JSON evidence and repository-local artifact destinations' {
+        $script:Validator | Should -Match 'Assert-NoDuplicateJsonProperties'
+        $script:Validator | Should -Match 'not valid unambiguous UTF-8 JSON'
+        $script:Validator | Should -Match 'Artifacts root must be outside the candidate repository'
+        $script:Validator | Should -Match "Assert-PathWithinRoot.*-Context 'Conformance output'"
+    }
+
+    It 'normalizes the event base to one distinct immutable ancestor' {
+        $script:Validator | Should -Match 'rev-parse --verify --end-of-options'
+        $script:Validator | Should -Match 'merge-base --is-ancestor'
+        $script:Validator | Should -Match 'Base commit must be a distinct ancestor'
+        $script:Validator | Should -Match 'baseCommit = \$resolvedBaseCommit'
+    }
+
+    It 'scans the complete candidate tree when comparison base is absent' {
+        # Scenario: A push or manual run has no trusted event base.
+        # Purpose: Check every committed candidate path instead of only HEAD's parent.
+        $script:Validator | Should -Match 'emptyTreeObject = ''4b825dc642cb6eb9a060e54bf8d69288fbee4904'''
+        $script:Validator | Should -Match ([regex]::Escape("'diff'") + '.*' + [regex]::Escape("'--check'") + '.*' + [regex]::Escape('$emptyTreeObject') + '.*' + [regex]::Escape("'HEAD'"))
+        $script:Validator | Should -Not -Match 'diff-tree.*--root.*HEAD'
+    }
+
+    It 'rejects reparse-backed resolved tool paths before execution' {
+        $script:Validator | Should -Match 'Assert-NoReparseAncestors'
+        $script:Validator | Should -Match 'Assert-NoReparseAncestors -Path \$path -Context "\$Context installed file"'
+        $script:Validator | Should -Match 'is backed by a reparse point'
+    }
+
+    It 'skips unreadable optional Linux module search paths without weakening required paths' {
+        $script:Validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
+        $script:Validator | Should -Match 'catch \[UnauthorizedAccessException\]'
+        $script:Validator | Should -Match 'Inherited PSModulePath entries are optional'
+    }
+
+    It 'verifies host runtimes by absolute path and hash while keeping package files run-owned' {
+        $script:Validator | Should -Match 'function Assert-ExternalReceiptFile'
+        $script:Validator | Should -Match ([regex]::Escape("Assert-ExternalReceiptFile -Receipt `$receipts.'skill-tools' -PathProperty 'nodePath'"))
+        $script:Validator | Should -Match 'receipt path must be absolute'
+        $script:Validator | Should -Match 'runtime file changed after resolution'
+        $script:Validator | Should -Match ([regex]::Escape("Assert-ReceiptFile -Receipt `$receipts.'skill-tools' -PathProperty 'entryPointPath'"))
+    }
+
+    It 'freezes all four formal tools and imports the central security gate before scanning' {
+        @($script:Adapter.PSObject.Properties.Name) | Should -Not -Contain 'security'
+        $script:Validator | Should -Match '\.\s+\$authorityGatePath -DefineFunctionsOnly'
+        $script:Validator | Should -Match 'Assert-AuthorityValidationSecurityGate'
+        $script:Validator | Should -Not -Match 'adapter\.security|blockSeverities|security\.(suppressions|exceptions)'
+        $script:Validator | Should -Match "'skillspector' = 'NVIDIA/SkillSpector'"
+        $script:Validator | Should -Match "'skill-validator' = 'github.com/agent-ecosystem/skill-validator/cmd/skill-validator'"
+        $script:Validator | Should -Match "'skill-tools' = 'npm:skill-tools'"
+        $script:Validator | Should -Match "'pester' = 'PowerShellGallery:Pester'"
+        $script:Validator | Should -Match '\$resolverPath\s+-PolicyPath \$policyPath\s+-ToolName \$toolName\s+-Install\s+-InstallRoot \$installRoot\s+-ExpectedGoRuntimeVersion \$ExpectedGoRuntimeVersion'
+
+        $freezeIndex = $script:Validator.IndexOf('foreach ($toolName in $expectedSources.Keys)')
+        $packageIndex = $script:Validator.IndexOf('skill-validator package validation for')
+        $staticIndex = $script:Validator.IndexOf("'--no-llm'")
+        $repositoryIndex = $script:Validator.IndexOf('$repositoryReportPath')
+        $staticIndex | Should -BeGreaterThan $freezeIndex
+        $packageIndex | Should -BeGreaterThan $freezeIndex
+        $staticIndex | Should -BeGreaterThan $packageIndex
+        $repositoryIndex | Should -BeGreaterThan $staticIndex
+    }
+
+    It 'discovers every formal package invocation from catalog source inventory' {
+        $script:Validator | Should -Match '\$skillIds\s*=\s*@\(\$integrityReport\.skills'
+        $script:Validator | Should -Match 'Assert-SkillSpectorReport'
+        $script:Validator | Should -Match 'ExpectedInventoryPaths'
+        $script:Validator | Should -Match 'foreach \(\$skillId in \$skillIds\)'
+        $script:Validator | Should -Match "validate', 'structure', '--allow-dirs=agents'"
+        $script:Validator | Should -Match "'check', '--strict', '--allow-dirs=agents'"
+        $script:Validator | Should -Match ([regex]::Escape("'check', `$skillRoot, '--format', 'sarif'"))
+    }
+
+    It 'accepts a clean skill-tools SARIF report with no findings' {
+        $start = $script:Validator.IndexOf('function Assert-SkillToolsReport')
+        $end = $script:Validator.IndexOf('function Assert-PathWithinRoot')
+        $start | Should -BeGreaterThan -1
+        $end | Should -BeGreaterThan $start
+        $skillToolsValidator = $script:Validator.Substring($start, $end - $start)
+        $skillToolsValidator | Should -Match '\$driverName -cne ''skill-tools'''
+        $skillToolsValidator | Should -Match '\$rules -isnot \[array\]'
+        $skillToolsValidator | Should -Match '\$results -isnot \[array\]'
+        $skillToolsValidator | Should -Not -Match '\$rules\)\.Count -le 0'
+        $skillToolsValidator | Should -Not -Match '\$results\)\.Count -le 0'
+        $skillToolsValidator | Should -Match 'skill-tools SARIF contains a malformed or error-level result'
+    }
+
+    # Scenario: Canonical validation emits run-owned evidence after the security preflight.
+    # Purpose: Keep candidate-controlled paths out of evidence and retain every required review boundary.
+    It 'UnitT70_KeepsReportsInTheRunArtifactsRootAndRecordsReviewBoundaries' {
+        $script:Validator | Should -Match ([regex]::Escape("Join-Path `$runRoot 'conformance-report.json'"))
+        $script:Validator | Should -Match 'canonicalGate = \[ordered\]@'
+        $script:Validator | Should -Match 'executionBoundary = \[ordered\]@'
+        $script:Validator | Should -Match 'assertionInventory = \[ordered\]@'
+        $script:Validator | Should -Match 'security-preflight\.json'
+        $script:Validator | Should -Match 'security-preflight-summary\.json'
+        $script:Validator | Should -Match 'Get-SanitizedSecurityFindingValue'
+        $script:Validator | Should -Match 'Select-Object -First 64'
+        $script:Validator | Should -Match "policyPath = 'docs/standards/validation-security-gate.json'"
+        $script:Validator | Should -Match "aiReview = 'required-before-release'"
+        $script:Validator | Should -Match "humanApproval = 'required-before-release'"
+        $script:Validator | Should -Match "postInstallVerification = 'required-after-install'"
+        $script:Validator | Should -Match "deviations = 'None'"
+    }
+
+    # Scenario: Static candidate checks remain offline while an explicitly enabled semantic scan uses its trusted profile.
+    # Purpose: Prevent optional semantic scanning from weakening deterministic failure or credential isolation.
+    It 'UnitT80_ModelsSemanticScanAsADeterministicFailClosedConditionalStage' {
+        $script:Validator | Should -Match 'Test-SecurityRelevantSkillChange'
+        $script:Validator | Should -Match '\$staticFindingCount -gt 0'
+        $script:Validator | Should -Match 'Triggered SkillSpector semantic scan did not complete'
+        $script:Validator | Should -Match '\[switch\] \$EnableSemanticScan'
+        $script:Validator | Should -Match '\$semanticTriggered = \[bool\]\$EnableSemanticScan -and'
+        $script:Validator | Should -Match 'repository-validation-post-pester'
+        $script:Validator | Should -Match 'Invoke-ProtectedPesterRunspace'
+        $script:Validator | Should -Match 'CreateOutOfProcessRunspace'
+        $script:Validator | Should -Match '\$trustedPesterSupervisorMarker'
+        $script:Validator | Should -Match '\$completionAttestationNonce'
+        $script:Validator | Should -Match "completionAttestation = 'trusted-parent-post-exit'"
+        $script:Validator | Should -Not -Match 'NamedPipeServerStream|NamedPipeClientStream|CompletionPipeName|CompletionToken|workerResultMarker'
+        $script:Validator | Should -Match "ValidateSet\('Offline', 'TrustedSemantic'\)"
+        $script:Validator | Should -Match '-NetworkProfile Offline'
+        $script:Validator | Should -Match '-NetworkProfile TrustedSemantic'
+        $script:Validator | Should -Match 'IsolateRunnerCommandFiles'
+        $script:Validator | Should -Match 'TerminateProcessTree'
+        $script:Validator | Should -Match 'ProtectRunnerCommandFiles'
+        $script:Validator | Should -Match 'function New-ContainedProcessEnvironment'
+        $script:Validator | Should -Match 'function Protect-ProcessCredentialEnvironment'
+        $script:Validator | Should -Match 'SemanticCredentialNames'
+        $script:Validator | Should -Match 'AdditionalEnvironmentVariables'
+        $script:Validator | Should -Match 'EnvironmentVariables\.Clear\(\)'
+        $script:Validator | Should -Match 'ACTIONS_RUNTIME_TOKEN'
+        $script:Validator | Should -Match 'Assert-RunnerCommandFilesUnchanged'
+        $script:Validator | Should -Match 'standard_v1_evidence_sha256'
+        $script:Validator | Should -Not -Match 'pesterResultPath'
+        $script:Validator | Should -Not -Match ([regex]::Escape("'-OutputPath', `$pesterResultPath"))
+        $script:Validator | Should -Match 'postPesterCandidateCommit'
+        $script:Validator | Should -Match 'postPesterTree'
+        $script:Validator | Should -Match 'prePesterGitIndexSha256'
+        $script:Validator | Should -Match 'Get-RepositoryRawSnapshot'
+        $script:Validator | Should -Match 'Assert-RepositoryRawSnapshotUnchanged'
+        $script:Validator | Should -Match 'postPesterRepositoryRawSnapshot'
+        $script:Validator | Should -Match 'SkillSpector semantic scanner'
+        $script:Validator | Should -Match 'Assert-ReceiptFile -Receipt \$receipts\.skillspector'
+        $script:Validator | Should -Match 'Assert-ReceiptInstalledClosure'
+        $script:Validator | Should -Match 'installedClosureSha256'
+        $script:Validator | Should -Match 'installed closure contains a reparse-backed entry'
+        $script:Validator | Should -Match 'Get-ChildItem -LiteralPath \$root -Recurse -Force'
+        $script:Validator | Should -Match 'GIT_CONFIG_NOSYSTEM'
+        $script:Validator | Should -Match 'core\.hooksPath'
+        $script:Validator | Should -Match '\$repositoryValidatorPath'
+        $script:Validator | Should -Match 'pesterRunnerPath'
+        $script:Validator | Should -Match 'Invoke-TrustedPowerShellProcess -Command \$powerShellPath'
+        $script:Validator | Should -Match "'-NoProfile'"
+        $script:Validator | Should -Match "'route'"
+        $script:Validator | Should -Match 'skill-tools route did not return exactly one result'
+        $script:Validator | Should -Match '\$routeResults = @\(Read-JsonFile'
+        $script:Validator | Should -Not -Match '\$routeResults -isnot \[array\]'
+        $script:Validator | Should -Not -Match 'semantic.*continue|continue.*semantic'
+        $semanticIndex = $script:Validator.IndexOf('$semanticTriggerCandidate')
+        $pesterIndex = $script:Validator.IndexOf('$pesterRunnerPath')
+        $semanticIndex | Should -BeGreaterThan -1
+        $pesterIndex | Should -BeGreaterThan $semanticIndex
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+        $workflow | Should -Match 'github\.run_attempt'
+        $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
+        $workflow | Should -Match 'pull_request_target:'
+        $workflow | Should -Match 'ref: \$\{\{ github\.event_name == .pull_request_target. && github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}'
+        $workflow | Should -Match 'Materialize protected validation supervisor'
+        $workflow | Should -Match 'Materialize protected Windows compatibility contract'
+        $workflow | Should -Match 'TRUSTED_WINDOWS_CONTRACT'
+        $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.sha \}\}'
+        $workflow | Should -Match 'publish-head-required-checks'
+        $workflow | Should -Match 'HEAD_SHA'
+        $workflow | Should -Match 'Darktide Translate Standard v1'
+        $workflow | Should -Not -Match "github\.event_name == 'pull_request'"
+        $workflow | Should -Not -Match 'TRUSTED_VALIDATE_BLOB|TRUSTED_REPOSITORY_VALIDATOR_BLOB'
+        $workflow | Should -Match '\$actualBlob = .*rev-parse \$revision'
+        $workflow | Should -Match 'TRUSTED_SUPERVISOR_ROOT'
+        $workflow | Should -Match '\$trustedValidator = Join-Path \$env:TRUSTED_SUPERVISOR_ROOT'
+        $workflow | Should -Match 'id: canonical-validation'
+        $workflow | Should -Match 'Verify canonical validation evidence'
+        $workflow | Should -Match 'standard_v1_evidence_sha256'
+        $workflow | Should -Not -Match '(?m)^\s*& \.\/scripts\/Validate\.ps1'
+    }
+
+    It 'keeps required CI free of implicit LLM credentials and skipped tests' {
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+        $workflow | Should -Not -Match 'EnableSemanticScan'
+        $script:Validator | Should -Match 'credential-free and deterministic'
+        $script:Validator | Should -Match 'SkippedCount -ne 0'
+        $repositoryValidator = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Test-Repository.ps1') -Raw
+        $repositoryValidator | Should -Match 'rawSha256'
+        $repositoryValidator | Should -Match '\[string\] \$TrustedGitPath'
+        $repositoryValidator | Should -Match '\[string\] \$TrustedStatPath'
+        $repositoryValidator | Should -Match '\[switch\] \$NoFilters'
+        $repositoryValidator | Should -Match 'NoFilters:\$NoFilters'
+    }
+}

@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
+interface:
+  display_name: "Auto Update Darktide MOD"
+  short_description: "Maintain DARKTIDE MODs and release evidence"
+  default_prompt: "Use $auto-update-darktide-mod to process, resume, review, or finalize a DARKTIDE MOD update with verified evidence and natural Taiwan Traditional Chinese."

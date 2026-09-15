@@ -178,7 +178,10 @@ Describe 'Darktide Translate repository contract' {
                 'catalog/profiles.json',
                 'config/standard-v1.json',
                 'scripts/Test-Repository.ps1',
-                'scripts/Validate.ps1'
+                'scripts/Validate.ps1',
+                'tests/CanonicalValidation.Tests.ps1',
+                'tests/StandardV1Conformance.Tests.ps1',
+                'tests/Test-Repository.Tests.ps1'
             )
         }
 
@@ -329,5 +332,19 @@ Describe 'Darktide Translate repository contract' {
             $workflow | Should -Not -Match "go-version: '[0-9]+\.[0-9]+\.[0-9]+'"
             $workflow | Should -Match 'scripts/Validate\.ps1'
         }
+    }
+
+    It 'UnitT45_AcceptsGnuStatClassificationForEmptyRegularFiles' {
+        foreach ($path in @('scripts/Validate.ps1', 'scripts/Test-Repository.ps1')) {
+            $validator = Get-Content -LiteralPath (Join-Path $repoRoot $path) -Raw
+            $validator | Should -Match "-cnotin @\('regular file', 'regular empty file'\)"
+        }
+    }
+
+    It 'UnitT46_SkipsUnreadableOptionalLinuxModulePaths' {
+        $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
+        $validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
+        $validator | Should -Match 'catch \[UnauthorizedAccessException\]'
+        $validator | Should -Match 'Inherited PSModulePath entries are optional'
     }
 }

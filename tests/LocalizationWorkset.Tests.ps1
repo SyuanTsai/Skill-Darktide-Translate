@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 SyuanTsai
+﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Schema 15 localization workset' {
     BeforeAll {
@@ -671,7 +671,7 @@ return {
         $outsideWorkset = Join-Path $TestDrive 'workset-output-reparse-target'
         $linkedReviewArtifacts = Join-Path $repository 'AI Auto Update/In Progress/output-reparse/review-artifacts'
         New-Item -ItemType Directory -Path (Split-Path -Parent $linkedReviewArtifacts), $outsideWorkset -Force | Out-Null
-        New-Item -ItemType Junction -Path $linkedReviewArtifacts -Target $outsideWorkset | Out-Null
+        New-TestReparsePoint -Path $linkedReviewArtifacts -Target $outsideWorkset | Out-Null
         { & (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') `
                 -RepositoryRoot $repository -BaseOid $baseOid -ModRelativePath 'mods/ExampleMod' `
                 -StagingModPath $staging -OutputPath (Join-Path $linkedReviewArtifacts 'localization-workset.json') `
@@ -679,7 +679,7 @@ return {
 
         $outside = Join-Path $TestDrive 'reparse-outside'
         Move-Item -LiteralPath $nested -Destination $outside
-        New-Item -ItemType Junction -Path $nested -Target $outside | Out-Null
+        New-TestReparsePoint -Path $nested -Target $outside | Out-Null
 
         { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru } |
             Should -Throw '*reparse*'
@@ -1090,6 +1090,42 @@ return localization
         $finalizer | Should -Match '\[IO\.Path\]::GetFullPath\(\[string\]\$state\.statePath\) -cne \$stateFull'
     }
 
+    # Scenario: a case-only path mismatch is tested on a case-sensitive Unix filesystem.
+    # Purpose: Avoid authorizing a different tree while retaining Windows case-insensitive path behavior.
+    It 'UnitT59_UsesPlatformAppropriatePathContainmentComparison' {
+        $finalizer = Get-Content -LiteralPath (Join-Path $scriptRoot 'Finalize-LocalizationWorksetEvidence.ps1') -Raw
+        $pathSafety = Get-Content -LiteralPath (Join-Path $scriptRoot 'PathSafety.psm1') -Raw
+
+        $finalizer | Should -Match '(?s)function Assert-ContainedPath.*?\$comparison = Get-PortablePathComparison.*?StartsWith\(\$rootFull \+ \[IO\.Path\]::DirectorySeparatorChar, \$comparison\)'
+        $finalizer | Should -Match '(?s)function Assert-NoReparsePath.*?\$comparison = Get-PortablePathComparison.*?Equals\(\$rootFull, \$comparison\).*?StartsWith\(\$rootPrefix, \$comparison\)'
+        $pathSafety | Should -Match 'TryGetDirectoryCaseSensitive'
+        $pathSafety | Should -Match 'FileCaseSensitiveInformation'
+        $pathSafety | Should -Match 'Strict comparison is the safe default'
+    }
+
+    It 'UnitT60_UsesPlatformAppropriatePathContainmentInTheApplier' {
+        $applier = Get-Content -LiteralPath (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -Raw
+
+        $applier | Should -Match '(?s)function Assert-ContainedPath.*?\$comparison = Get-PortablePathComparison.*?StartsWith\(\$rootFull \+ \[IO\.Path\]::DirectorySeparatorChar, \$comparison\)'
+        $applier | Should -Match '(?s)function Assert-NoReparsePath.*?\$comparison = Get-PortablePathComparison.*?Equals\(\$rootFull, \$comparison\)'
+    }
+
+    It 'UnitT61_UsesPlatformAppropriatePathContainmentAcrossTheWorkflow' {
+        foreach ($name in @(
+            'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1',
+            'Test-LocalizationWorksetReceipt.ps1', 'Finalize-LocalizationWorksetEvidence.ps1',
+            'Test-ModUpdateCandidate.ps1', 'Test-SourceReceipt.ps1',
+            'Receive-NexusMainFile.ps1', 'Test-ReferenceIntegrity.ps1',
+            'mod-update.ps1', 'Finalize-ModUpdateMerge.ps1', 'SharedCoordinationLock.psm1'
+        )) {
+            $content = Get-Content -LiteralPath (Join-Path $scriptRoot $name) -Raw
+            $content | Should -Match 'Get-PortablePathComparison' -Because "$name must use the shared platform-aware physical path comparison."
+        }
+
+        $expander = Get-Content -LiteralPath (Join-Path $scriptRoot 'Expand-Schema14Reference.ps1') -Raw
+        $expander | Should -Match '(?s)\$pathComparison = if \(\[Environment\]::OSVersion\.Platform.*?\[StringComparison\]::OrdinalIgnoreCase.*?\[StringComparison\]::Ordinal'
+    }
+
     # Scenario: review-artifacts is swapped for a junction after validation and before transient workset deletion.
     # Purpose: Prevent finalization from deleting or writing through any reparse component outside the physical run root.
     It 'InterT58_RejectsAReparseParentBeforeWorksetDeletion' {
@@ -1115,7 +1151,7 @@ return localization
 
         $outside = Join-Path $TestDrive 'workset-deletion-outside'
         Move-Item -LiteralPath $reviewArtifacts -Destination $outside
-        New-Item -ItemType Junction -Path $reviewArtifacts -Target $outside | Out-Null
+        New-TestReparsePoint -Path $reviewArtifacts -Target $outside | Out-Null
 
         { & $finalizer -StatePath $statePath -PassThru } | Should -Throw '*reparse*'
         Test-Path -LiteralPath (Join-Path $outside 'localization-workset.json') -PathType Leaf | Should -Be $true

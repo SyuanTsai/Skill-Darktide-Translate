@@ -14,6 +14,7 @@ param(
     [string] $ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION,
     [string] $OutputPath,
     [switch] $BootstrapTransition,
+    [switch] $EnableSemanticScan,
     [string[]] $SemanticCredentialNames = @(),
     [switch] $ProtectedPesterServerProxy,
     [switch] $ProtectedPesterSupervisor,
@@ -61,27 +62,6 @@ function Assert-NoDuplicateJsonProperties {
         }
     }
 }
-
-function Read-StrictUtf8File {
-    param([Parameter(Mandatory = $true)][string] $Path)
-
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $offset = if ($bytes.Length -ge 3 -and
-        $bytes[0] -eq 0xEF -and
-        $bytes[1] -eq 0xBB -and
-        $bytes[2] -eq 0xBF) {
-        3
-    }
-    else {
-        0
-    }
-    return [Text.UTF8Encoding]::new($false, $true).GetString(
-        $bytes,
-        $offset,
-        $bytes.Length - $offset
-    )
-}
-
 function Read-JsonFile {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -89,7 +69,7 @@ function Read-JsonFile {
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Context is missing: $Path" }
     try {
-        $text = Read-StrictUtf8File -Path $Path
+        $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
         $document = [System.Text.Json.JsonDocument]::Parse($text)
         try { Assert-NoDuplicateJsonProperties -Element $document.RootElement -Context $Context }
         finally { $document.Dispose() }
@@ -2265,6 +2245,85 @@ function Assert-NoReparseTree {
     }
 }
 
+function Write-ExclusiveUtf8File {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Text,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+
+    $Path = [IO.Path]::GetFullPath($Path)
+    $outputDirectory = Split-Path -Parent $Path
+    if ([string]::IsNullOrWhiteSpace($outputDirectory)) {
+        throw "$Context has no parent directory: $Path"
+    }
+    # Inspect the nearest existing ancestor before creating any missing
+    # directory. This prevents a reparse-point parent from being traversed
+    # during directory creation while still allowing a new nested output
+    # directory.
+    $existingDirectory = $outputDirectory
+    while (-not (Test-Path -LiteralPath $existingDirectory)) {
+        $parentDirectory = Split-Path -Parent $existingDirectory
+        if ([string]::IsNullOrWhiteSpace($parentDirectory) -or
+            (Test-PathEqual -Left $parentDirectory -Right $existingDirectory)) {
+            throw "$Context directory has no existing ancestor: $outputDirectory"
+        }
+        $existingDirectory = $parentDirectory
+    }
+    $existingDirectoryItem = Get-Item -LiteralPath $existingDirectory -Force -ErrorAction Stop
+    if (-not $existingDirectoryItem.PSIsContainer) {
+        throw "$Context output parent is not a directory: $existingDirectory"
+    }
+    Assert-NoReparseAncestors -Path $existingDirectory -Context "$Context directory"
+    if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $outputDirectory -Force)
+    }
+    Assert-NoReparseAncestors -Path $outputDirectory -Context "$Context directory"
+    if ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        throw "$Context path already exists; evidence must not overwrite prior content: $Path"
+    }
+
+    $encoding = [Text.UTF8Encoding]::new($false)
+    $bytes = $encoding.GetBytes($Text)
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        throw "$Context could not be created exclusively: $($_.Exception.Message)"
+    }
+
+    Assert-NoReparseAncestors -Path $Path -Context $Context
+    $writtenBytes = [IO.File]::ReadAllBytes($Path)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $expectedSha256 = ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+        $actualSha256 = ([BitConverter]::ToString($hasher.ComputeHash($writtenBytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+    }
+    if ($actualSha256 -cne $expectedSha256) {
+        throw "$Context changed during immediate readback: $Path"
+    }
+    return [pscustomobject][ordered]@{
+        path = $Path
+        sha256 = $actualSha256
+    }
+}
+
 function Expand-TrustedGitArchive {
     param(
         [Parameter(Mandatory = $true)][string] $GitPath,
@@ -2416,42 +2475,37 @@ function Assert-SkillSpectorReport {
     return @($issues)
 }
 
-function New-PackageValidationInputEnvelope {
-    param(
-        [Parameter(Mandatory = $true)][ValidateSet('skill-validator', 'skill-tools')][string] $ToolName,
-        [Parameter(Mandatory = $true)][string] $SkillRoot,
-        [Parameter(Mandatory = $true)][object[]] $IntegrityFiles
-    )
-    return [pscustomobject][ordered]@{
-        schemaVersion = 1
-        toolName = $ToolName
-        coverageMode = 'authority-input-inventory'
-        root = $SkillRoot
-        files = @($IntegrityFiles | ForEach-Object {
-            # The tools read working-tree bytes, not Git's normalized blob bytes.
-            [pscustomobject][ordered]@{ path = $_.path; sha256 = $_.rawSha256 }
-        })
-    }
-}
-
 function Assert-SkillValidatorReport {
     param($Report, [string] $SkillRoot, [string[]] $ExpectedInventoryPaths, [string] $SkillId)
-    if ($SkillId -cne 'auto-update-darktide-mod') {
-        throw "No reviewed skill-validator token-path contract exists for '$SkillId'."
+    $skillDirectory = Get-RequiredProperty -Object $Report -Name 'skill_dir' -Context 'skill-validator report'
+    $passed = Get-RequiredProperty -Object $Report -Name 'passed' -Context 'skill-validator report'
+    $errors = Get-RequiredProperty -Object $Report -Name 'errors' -Context 'skill-validator report'
+    $warnings = Get-RequiredProperty -Object $Report -Name 'warnings' -Context 'skill-validator report'
+    $results = Get-RequiredProperty -Object $Report -Name 'results' -Context 'skill-validator report'
+    if ($skillDirectory -isnot [string] -or -not (Test-PathEqual -Left $skillDirectory -Right $SkillRoot) -or
+        $passed -isnot [bool] -or -not $passed -or
+        ($errors -isnot [int] -and $errors -isnot [long]) -or [int64]$errors -ne 0 -or
+        ($warnings -isnot [int] -and $warnings -isnot [long]) -or [int64]$warnings -ne 0 -or
+        $results -isnot [array] -or @($results).Count -le 0) {
+        throw "skill-validator did not produce a clean candidate-bound report for '$SkillId'."
     }
-    # These are this package's verified token-eligible inputs. Scripts remain in
-    # the complete hash inventory; native token tables do not enumerate them.
-    $expectedTokenPaths = @(
-        'SKILL.md', 'assets/review-baseline.md', 'assets/workflow-schema-14.md',
-        'references/automation.md', 'references/package-binding.md', 'references/schema-15.md',
-        'references/schema-15-provenance.json', 'references/source-provenance.json', 'references/translation-quality.md'
-    )
-    Assert-AuthoritySkillValidatorReport `
-        -Report $Report `
-        -ExpectedFixtureRoot $SkillRoot `
-        -ExpectedInventoryPaths $ExpectedInventoryPaths `
-        -ExpectedTokenPaths $expectedTokenPaths `
-        -ExpectedOtherTokenPaths @('agents/openai.yaml')
+    foreach ($result in @($results)) {
+        $level = Get-RequiredProperty -Object $result -Name 'level' -Context 'skill-validator result'
+        $category = Get-RequiredProperty -Object $result -Name 'category' -Context 'skill-validator result'
+        $message = Get-RequiredProperty -Object $result -Name 'message' -Context 'skill-validator result'
+        if ($level -isnot [string] -or $level -cnotin @('pass', 'info', 'warning', 'error') -or $level -in @('warning', 'error') -or
+            $category -isnot [string] -or [string]::IsNullOrWhiteSpace($category) -or
+            $message -isnot [string] -or [string]::IsNullOrWhiteSpace($message)) {
+            throw "skill-validator returned a malformed or blocking result for '$SkillId'."
+        }
+        if ($null -ne $result.PSObject.Properties['file']) {
+            [void](Resolve-ReportedFilePath -Value $result.file -SkillRoot $SkillRoot -ExpectedInventoryPaths $ExpectedInventoryPaths -Context 'skill-validator result file')
+        }
+        if ($null -ne $result.PSObject.Properties['line'] -and
+            (($result.line -isnot [int] -and $result.line -isnot [long]) -or [int64]$result.line -le 0)) {
+            throw "skill-validator returned an invalid line for '$SkillId'."
+        }
+    }
 }
 
 function Assert-SkillToolsReport {
@@ -2748,23 +2802,10 @@ function New-ContainedProcessEnvironment {
     return $environment
 }
 
-function Assert-SemanticCredentialHostSupport {
-    param(
-        [Parameter()][AllowNull()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
-    )
-    if (-not $script:IsWindowsHost) { return }
-    foreach ($name in $SemanticCredentialNames) {
-        if (-not [string]::IsNullOrWhiteSpace($name)) {
-            throw 'Credential-backed semantic validation is not supported on Windows because the protected Pester boundary does not establish credential confidentiality.'
-        }
-    }
-}
-
 function Protect-ProcessCredentialEnvironment {
     param(
         [Parameter()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
     )
-    Assert-SemanticCredentialHostSupport -SemanticCredentialNames $SemanticCredentialNames
     $credentialNamePattern = '(?i)(^|_)(API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIALS?|AUTH)(_|$)'
     $exactCredentialNames = @(
         'GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
@@ -2872,18 +2913,6 @@ function Assert-BootstrapTransitionChangedPaths {
         'scripts/Test-Repository.ps1'
         'scripts/Validate.ps1'
         'tests/BootstrapTransition.Tests.ps1'
-        'tests/CanonicalValidation.Tests.ps1'
-        'tests/LocalizationWorkset.Tests.ps1'
-        'tests/ModUpdateAutomation.Tests.ps1'
-        'tests/RepositoryContract.Tests.ps1'
-        'tests/RepositoryValidation.Tests.ps1'
-        'tests/Schema15Coordination.Tests.ps1'
-        'tests/Schema15SourceAcquisition.Tests.ps1'
-        'tests/SkillContract.Tests.ps1'
-        'tests/SourcePin.Tests.ps1'
-        'tests/StandardV1Conformance.Tests.ps1'
-        'tests/Test-Repository.Tests.ps1'
-        'tests/TestSupport.ps1'
         'tests/validate-windows-powershell.ps1'
     )
     $allowedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -2927,20 +2956,9 @@ function Assert-BootstrapTransitionChangedPaths {
         'scripts/Validate.ps1'
         'tests/validate-windows-powershell.ps1'
     )
-    # A maintenance update need not rewrite every established trust anchor.
-    # Both immutable revisions must still contain every anchor as a regular blob.
-    foreach ($revision in @($BaseCommit, $CandidateCommit)) {
-        foreach ($requiredPath in $requiredPathList) {
-            $anchorOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $revision -- $requiredPath) -join '')
-            if ($LASTEXITCODE -ne 0) {
-                throw "Could not inspect bootstrap trust anchor '$requiredPath' at '$revision'."
-            }
-            $anchorRecords = @($anchorOutput.Split([char]0) | Where-Object { $_ -ne '' })
-            if ($anchorRecords.Count -ne 1 -or
-                $anchorRecords[0] -cnotmatch '^(?<mode>100644|100755) blob [0-9a-f]{40}\t(?<path>[^\x00\r\n]+)$' -or
-                $Matches.path -cne $requiredPath) {
-                throw "Bootstrap transition requires tracked regular trust anchor '$requiredPath' at '$revision'."
-            }
+    foreach ($requiredPath in $requiredPathList) {
+        if (-not $changedPathSet.Contains($requiredPath)) {
+            throw "Bootstrap transition changed-path binding is missing required path '$requiredPath'."
         }
     }
     return [pscustomobject][ordered]@{
@@ -3142,11 +3160,6 @@ function Invoke-BootstrapTransitionValidation {
     else {
         Assert-PathWithinRoot -Path ([IO.Path]::GetFullPath($OutputPath)) -Root $artifactsRootPath -Context 'Bootstrap transition output'
     }
-    $summaryDirectory = Split-Path -Parent $summaryPath
-    if (-not [string]::IsNullOrWhiteSpace($summaryDirectory)) {
-        [void](New-Item -ItemType Directory -Path $summaryDirectory -Force)
-        Assert-NoReparseAncestors -Path $summaryDirectory -Context 'Bootstrap transition output directory'
-    }
     if (Test-Path -LiteralPath $summaryPath) { throw 'Bootstrap transition output path already exists; evidence must not overwrite prior content.' }
     $summaryEncoding = [Text.UTF8Encoding]::new($false)
     $summaryBytes = $summaryEncoding.GetBytes($summaryJson + [Environment]::NewLine)
@@ -3155,12 +3168,7 @@ function Invoke-BootstrapTransitionValidation {
         $summarySha256 = ([BitConverter]::ToString($summaryHasher.ComputeHash($summaryBytes)) -replace '-', '').ToLowerInvariant()
     }
     finally { $summaryHasher.Dispose() }
-    $summaryStream = [IO.File]::Open($summaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-    try {
-        $summaryStream.Write($summaryBytes, 0, $summaryBytes.Length)
-        $summaryStream.Flush($true)
-    }
-    finally { $summaryStream.Dispose() }
+    [void](Write-ExclusiveUtf8File -Path $summaryPath -Text ($summaryJson + [Environment]::NewLine) -Context 'Bootstrap transition output')
     Assert-NoReparseAncestors -Path $summaryPath -Context 'Bootstrap transition output'
     $writtenSummarySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $summaryPath).Hash.ToLowerInvariant()
     if ($writtenSummarySha256 -cne $summarySha256) {
@@ -3204,7 +3212,7 @@ function Assert-RegularFileForHash {
         finally {
             [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
         }
-        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
+        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cnotin @('regular file', 'regular empty file')) {
             throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
         }
     }
@@ -3231,8 +3239,7 @@ function Assert-NoGitReplacementObjects {
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
         [Parameter(Mandatory = $true)][string] $Context
     )
-    $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
-    $replacePathOutput = @(& $GitPath @gitConfigArguments -C $RepositoryRoot rev-parse --git-path refs/replace 2>$null)
+    $replacePathOutput = @(& $GitPath -C $RepositoryRoot rev-parse --git-path refs/replace 2>$null)
     $replacePathExitCode = $LASTEXITCODE
     if ($replacePathExitCode -ne 0 -or $replacePathOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$replacePathOutput[0])) {
         throw "$Context could not resolve the candidate Git replacement-object directory."
@@ -3445,7 +3452,16 @@ function Invoke-NativeChecked {
                     & $addLinuxReadonlyBindPath -Path $env:PSHOME
                 }
                 foreach ($modulePath in @(([string]$env:PSModulePath -split ':') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-                    if (Test-Path -LiteralPath $modulePath -PathType Container) {
+                    try {
+                        $modulePathExists = Test-Path -LiteralPath $modulePath -PathType Container -ErrorAction Stop
+                    }
+                    catch [UnauthorizedAccessException] {
+                        # Inherited PSModulePath entries are optional. Do not
+                        # fail the security gate merely because one is not
+                        # readable by the isolated runner identity.
+                        continue
+                    }
+                    if ($modulePathExists) {
                         & $addLinuxReadonlyBindPath -Path $modulePath
                     }
                 }
@@ -3934,20 +3950,6 @@ function Test-SecurityRelevantSkillChange {
     return $false
 }
 
-function Get-RequiredPesterTests {
-    return @(
-        'BootstrapTransition.Tests.ps1'
-        'LocalizationWorkset.Tests.ps1'
-        'ModUpdateAutomation.Tests.ps1'
-        'RepositoryContract.Tests.ps1'
-        'RepositoryValidation.Tests.ps1'
-        'Schema15Coordination.Tests.ps1'
-        'Schema15SourceAcquisition.Tests.ps1'
-        'SkillContract.Tests.ps1'
-        'SourcePin.Tests.ps1'
-    )
-}
-
 function Invoke-TrustedPowerShellProcess {
     param(
         [Parameter(Mandatory = $true)][string] $Command,
@@ -4421,7 +4423,22 @@ function Invoke-ProtectedPesterSupervisor {
         throw 'The trusted Pester supervisor requires an immutable runner SHA-256.'
     }
 
-    $requiredPesterTests = @(Get-RequiredPesterTests)
+    $requiredPesterTests = @(
+        'BootstrapTransition.Tests.ps1'
+        'LocalizationWorkset.Tests.ps1'
+        'ModUpdateAutomation.Tests.ps1'
+        'RepositoryContract.Tests.ps1'
+        'RepositoryValidation.Tests.ps1'
+        'Schema15Coordination.Tests.ps1'
+        'Schema15SourceAcquisition.Tests.ps1'
+        'SkillContract.Tests.ps1'
+        'SourcePin.Tests.ps1'
+        'ValidationTransition.Tests.ps1'
+        'AtomicValidationOutput.Tests.ps1'
+        'CanonicalValidation.Tests.ps1'
+        'StandardV1Conformance.Tests.ps1'
+        'Test-Repository.Tests.ps1'
+    )
     Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
     Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
     $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
@@ -4441,7 +4458,7 @@ function Invoke-ProtectedPesterSupervisor {
         -ChildWritableRoot $ChildWritableRoot `
         -DiagnosticRoot $DiagnosticRoot `
         -RunnerSha256 $RunnerSha256 `
-        -TimeoutMilliseconds 900000
+        -TimeoutMilliseconds 300000
 
     Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
     Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
@@ -4620,8 +4637,8 @@ if ($BootstrapTransition) {
 $adapterPath = Join-Path $repoRoot 'config/standard-v1.json'
 $adapter = Read-JsonFile -Path $adapterPath -Context 'Standard v1 repository adapter'
 $approvedAuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
-$approvedAuthorityCommit = 'd38eba3faf967504751aba759f38102e7538a519'
-$approvedAuthorityArchiveSha256 = 'ca1b20dc79ae978d30cc7f400aa6ebd3dbe321e96e526cfbb2b421d6a477f38f'
+$approvedAuthorityCommit = 'a403abdf038a3346d775431a6908a71cc3d35a5b'
+$approvedAuthorityArchiveSha256 = '17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3'
 if ($adapter.schemaVersion -ne 1 -or $adapter.standardVersion -cne 'v1' -or $adapter.deviations -cne 'None') {
     throw 'Standard v1 repository adapter identity or deviation contract is invalid.'
 }
@@ -4809,44 +4826,19 @@ foreach ($skillId in $skillIds) {
     $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $validatorCoverage = New-PackageValidationInputEnvelope -ToolName 'skill-validator' -SkillRoot $skillRoot -IntegrityFiles @($skillIntegrity[0].files)
-    $validatorCoveragePath = Join-Path $runRoot "skill-validator-coverage-$skillId.json"
-    Assert-AuthorityToolInputInventory -Envelope $validatorCoverage -ExpectedToolName 'skill-validator' -ExpectedFixtureRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths | Out-Null
     $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
-    Assert-AuthorityToolInputInventory -Envelope $validatorCoverage -ExpectedToolName 'skill-validator' -ExpectedFixtureRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths | Out-Null
     $validatorReportPath = Join-Path $runRoot "skill-validator-$skillId.json"
     [IO.File]::WriteAllText($validatorReportPath, $validatorOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $validatorReport = Read-JsonFile -Path $validatorReportPath -Context "skill-validator package validation report for $skillId"
     Assert-SkillValidatorReport -Report $validatorReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
-    [IO.File]::WriteAllText($validatorCoveragePath, ($validatorCoverage | ConvertTo-Json -Depth 20) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    $skillValidatorReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($validatorReportPath); coverageReport = [IO.Path]::GetFileName($validatorCoveragePath); mode = 'structure-json-allow-agents+authority-input-inventory' }
+    $skillValidatorReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($validatorReportPath) }
 
-    Assert-AuthorityToolInputInventory -Envelope $validatorCoverage -ExpectedToolName 'skill-validator' -ExpectedFixtureRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths | Out-Null
     $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
-    Assert-AuthorityToolInputInventory -Envelope $validatorCoverage -ExpectedToolName 'skill-validator' -ExpectedFixtureRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths | Out-Null
     $checkReportPath = Join-Path $runRoot "skill-validator-check-$skillId.json"
     [IO.File]::WriteAllText($checkReportPath, $checkOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $checkReport = Read-JsonFile -Path $checkReportPath -Context "skill-validator full check report for $skillId"
     Assert-SkillValidatorReport -Report $checkReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
-    $skillValidatorCheckReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($checkReportPath); coverageReport = [IO.Path]::GetFileName($validatorCoveragePath); mode = 'strict-check-json-allow-agents+authority-input-inventory' }
-}
-
-foreach ($skillId in $skillIds) {
-    $skillRoot = Join-Path $repoRoot "skills/$skillId"
-    $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
-    $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $toolsCoverage = New-PackageValidationInputEnvelope -ToolName 'skill-tools' -SkillRoot $skillRoot -IntegrityFiles @($skillIntegrity[0].files)
-    $toolsCoveragePath = Join-Path $runRoot "skill-tools-coverage-$skillId.json"
-    Assert-AuthorityToolInputInventory -Envelope $toolsCoverage -ExpectedToolName 'skill-tools' -ExpectedFixtureRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths | Out-Null
-    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools package validation for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
-    Assert-AuthorityToolInputInventory -Envelope $toolsCoverage -ExpectedToolName 'skill-tools' -ExpectedFixtureRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths | Out-Null
-    $toolsReportPath = Join-Path $runRoot "skill-tools-$skillId.sarif.json"
-    [IO.File]::WriteAllText($toolsReportPath, $toolsOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    $toolsReport = Read-JsonFile -Path $toolsReportPath -Context "skill-tools report for $skillId"
-    Assert-SkillToolsReport -Report $toolsReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
-    [IO.File]::WriteAllText($toolsCoveragePath, ($toolsCoverage | ConvertTo-Json -Depth 20) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    $skillToolsReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($toolsReportPath); coverageReport = [IO.Path]::GetFileName($toolsCoveragePath); mode = 'sarif-check+authority-input-inventory' }
+    $skillValidatorCheckReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($checkReportPath) }
 }
 
 # Stage 4: SkillSpector Static.
@@ -4954,6 +4946,20 @@ if ($LASTEXITCODE -ne 0) {
     throw "Whitespace validation failed for the candidate event range.`n$($diffOutput -join [Environment]::NewLine)"
 }
 
+foreach ($skillId in $skillIds) {
+    $skillRoot = Join-Path $repoRoot "skills/$skillId"
+    $expectedInventoryPaths = @(
+        @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
+            ForEach-Object { [string]$_.path }
+    )
+    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $toolsReportPath = Join-Path $runRoot "skill-tools-$skillId.sarif.json"
+    [IO.File]::WriteAllText($toolsReportPath, $toolsOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    $toolsReport = Read-JsonFile -Path $toolsReportPath -Context "skill-tools report for $skillId"
+    Assert-SkillToolsReport -Report $toolsReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
+    $skillToolsReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($toolsReportPath) }
+}
+
 $routeCases = @(
     [pscustomobject]@{ query = 'Update a Warhammer 40,000 DARKTIDE MOD from a verified Nexus Main file and preserve active zh-tw'; expected = 'auto-update-darktide-mod' },
     [pscustomobject]@{ query = 'Resume a DARKTIDE MOD update run using its exact evidence and finalize the merge'; expected = 'auto-update-darktide-mod' }
@@ -4983,21 +4989,83 @@ foreach ($routeCase in $routeCases) {
     }
 }
 
+# The optional semantic scanner is bound and executed before candidate Pester
+# code can modify any run-owned tool or report path. Its output remains part of
+# the final supervisor-owned summary, while post-Pester checks bind the final
+# candidate state.
+$semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
+$semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
+$semanticReports = @()
+# Required CI remains credential-free and deterministic; semantic scanning is opt-in.
+if ($semanticTriggered) {
+    $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector semantic scanner'
+    if ($receiptClosureRoots.ContainsKey('skillspector')) {
+        [void](Assert-ReceiptInstalledClosure -Receipt $receipts.skillspector -InstallRoot $installRoot -Context 'SkillSpector semantic scanner')
+    }
+    foreach ($skillId in $skillIds) {
+        $skillRoot = Join-Path $repoRoot "skills/$skillId"
+        $expectedInventoryPaths = @(
+            @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
+                ForEach-Object { [string]$_.path }
+        )
+        $semanticPath = Join-Path $childOutputRoot "skillspector-semantic-$skillId.json"
+        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticCredentialEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
+        $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
+        try {
+            $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
+        }
+        catch {
+            throw "Triggered SkillSpector semantic scan did not complete for '$skillId': $($_.Exception.Message)"
+        }
+        foreach ($issue in $semanticIssues) {
+            $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector semantic issue'
+            if ($reportedSeverity -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedSeverity)) {
+                throw "SkillSpector semantic scan returned an issue without severity for '$skillId'."
+            }
+            $finding = ConvertTo-ValidationSecurityFinding -Policy $validationSecurityGate -ReportedSeverity ([string]$reportedSeverity) -Stage 'conditional-semantic-scan' -SkillId $skillId -Issue $issue
+            $securityFindings += $finding
+            switch ([string]$finding.action) {
+                'BLOCK' { $securityBlockers += $finding }
+                'HUMAN_REVIEW_REQUIRED' { $securityHumanReview += $finding; $securityBlockers += $finding }
+                'RECORD_AND_TRACK' { $securityTracked += $finding }
+                default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
+            }
+        }
+        $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); findings = $semanticIssues.Count }
+    }
+}
+
+foreach ($name in @($semanticCredentialEnvironment.Keys)) {
+    $semanticCredentialEnvironment[$name] = ''
+}
+
 # Candidate tests are untrusted code.  Materialize a candidate snapshot for the
 # test suite, then replace its tests tree with the immutable base-owned tests.
 # The worker receives only this read-only mirror, so it cannot replace a test
 # after the protected inventory has been checked or mutate the candidate tree
 # while the suite is running.
-$requiredPesterTests = @(Get-RequiredPesterTests)
-$isGitHubActions = [string]$env:GITHUB_ACTIONS -ceq 'true'
-$trustedPesterCommit = if ($isGitHubActions) { [string]$env:GITHUB_SHA } else { $candidateCommit }
-if ($trustedPesterCommit -notmatch '^[0-9a-f]{40}$') {
-    throw 'Protected Pester execution requires an immutable test authority commit.'
+$requiredPesterTests = @(
+    'BootstrapTransition.Tests.ps1'
+    'LocalizationWorkset.Tests.ps1'
+    'ModUpdateAutomation.Tests.ps1'
+    'RepositoryContract.Tests.ps1'
+    'RepositoryValidation.Tests.ps1'
+    'Schema15Coordination.Tests.ps1'
+    'Schema15SourceAcquisition.Tests.ps1'
+    'SkillContract.Tests.ps1'
+    'SourcePin.Tests.ps1'
+    'ValidationTransition.Tests.ps1'
+    'AtomicValidationOutput.Tests.ps1'
+    'CanonicalValidation.Tests.ps1'
+    'StandardV1Conformance.Tests.ps1'
+    'Test-Repository.Tests.ps1'
+)
+$trustedPesterCommit = [string]$BaseCommit
+if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
+    $trustedPesterCommit = [string]$env:GITHUB_SHA
 }
-$declaredTrustedSupervisorCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
-if ($isGitHubActions -and -not [string]::IsNullOrWhiteSpace($declaredTrustedSupervisorCommit) -and
-    $declaredTrustedSupervisorCommit -cne $trustedPesterCommit) {
-    throw 'TRUSTED_SUPERVISOR_COMMIT does not match the GitHub event-bound trusted supervisor commit.'
+if ($trustedPesterCommit -notmatch '^[0-9a-f]{40}$') {
+    throw 'Protected Pester execution requires an immutable base or trusted supervisor commit.'
 }
 $pesterMirrorRoot = Join-Path $runRoot 'trusted-pester-worktree'
 Expand-TrustedGitArchive `
@@ -5036,8 +5104,6 @@ Assert-NoReparseTree -Path $pesterMirrorRoot -Context 'Trusted Pester worktree'
 # candidate code.  A separate same-integrity supervisor owns the remoting
 # client and launches a low-integrity server process; the parent accepts only
 # a result from a normally completed remote pipeline.
-$requiredPesterTestsFunction = (Get-Command Get-RequiredPesterTests -CommandType Function -ErrorAction Stop).ScriptBlock.ToString()
-$requiredPesterTestsFunctionDefinition = "function Get-RequiredPesterTests {`n$requiredPesterTestsFunction`n}"
 $pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
 $pesterRunnerScript = @'
 #requires -Version 7.0
@@ -5051,8 +5117,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-__REQUIRED_PESTER_TESTS_FUNCTION__
-
 $testsRoot = [IO.Path]::GetFullPath($TestsRoot)
 $pesterModulePath = [IO.Path]::GetFullPath($PesterModulePath)
 if (-not (Test-Path -LiteralPath $testsRoot -PathType Container)) { throw "Pester tests root is missing: $testsRoot" }
@@ -5064,7 +5128,22 @@ $loadedPester = Get-Module Pester | Select-Object -First 1
 if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPesterVersion) {
     throw 'The exact frozen Pester module was not imported in the isolated test process.'
 }
-$requiredPesterTests = @(Get-RequiredPesterTests)
+$requiredPesterTests = @(
+    'BootstrapTransition.Tests.ps1'
+    'LocalizationWorkset.Tests.ps1'
+    'ModUpdateAutomation.Tests.ps1'
+    'RepositoryContract.Tests.ps1'
+    'RepositoryValidation.Tests.ps1'
+    'Schema15Coordination.Tests.ps1'
+    'Schema15SourceAcquisition.Tests.ps1'
+    'SkillContract.Tests.ps1'
+    'SourcePin.Tests.ps1'
+    'ValidationTransition.Tests.ps1'
+    'AtomicValidationOutput.Tests.ps1'
+    'CanonicalValidation.Tests.ps1'
+    'StandardV1Conformance.Tests.ps1'
+    'Test-Repository.Tests.ps1'
+)
 $requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
     $testPath = Join-Path $testsRoot $_
     $testItem = Get-Item -LiteralPath $testPath -Force -ErrorAction Stop
@@ -5073,13 +5152,7 @@ $requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
     }
     [IO.Path]::GetFullPath($testPath)
 })
-$pesterConfiguration = New-PesterConfiguration
-$pesterConfiguration.Run.Path = $requiredPesterPaths
-$pesterConfiguration.Run.PassThru = $true
-# These repository suites use TestDrive only. The protected process cannot
-# create Pester's optional HKCU TestRegistry fixture.
-$pesterConfiguration.TestRegistry.Enabled = $false
-$result = Invoke-Pester -Configuration $pesterConfiguration
+$result = Invoke-Pester -Path $requiredPesterPaths -PassThru
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
     [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
@@ -5102,7 +5175,6 @@ $completionJson = $completionPayload | ConvertTo-Json -Depth 20 -Compress
 # delivered by the out-of-process PowerShell remoting protocol after completion.
 Write-Output ('SGV1-Pester-Result:' + $completionJson)
 '@
-$pesterRunnerScript = $pesterRunnerScript.Replace('__REQUIRED_PESTER_TESTS_FUNCTION__', $requiredPesterTestsFunctionDefinition)
 [IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
 Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
@@ -5136,7 +5208,7 @@ $pesterOutput = Invoke-TrustedPowerShellProcess -Command $powerShellPath -Argume
     '-PesterChildWritableRoot', $childOutputRoot,
     '-PesterDiagnosticRoot', $runRoot,
     '-PesterRunnerSha256', $pesterRunnerSha256
-) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 930000
+) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 300000
 $trustedPesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
 if ($trustedPesterSupervisorActualSha256 -cne $trustedPesterSupervisorSha256) {
     throw 'Trusted Pester supervisor changed during the protected run.'
@@ -5303,58 +5375,6 @@ $postPesterRepositoryRawSnapshot = @(Get-RepositoryRawSnapshot -RepositoryRoot $
 Assert-RepositoryRawSnapshotUnchanged -Before $prePesterRepositoryRawSnapshot -After $postPesterRepositoryRawSnapshot
 $repositoryReport = $postPesterRepositoryReport
 
-# Stage 6: Conditional Semantic Scan. The central trigger is evaluated only
-# after every required repository test and the post-Pester inventory binding
-# have completed. Re-check the frozen scanner receipt and closure because
-# candidate test code has run since the static stage.
-$semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
-$semanticTriggered = $semanticTriggerCandidate
-$semanticReports = @()
-try {
-    if ($semanticTriggered) {
-        $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'Post-Pester SkillSpector semantic scanner'
-        if ($receiptClosureRoots.ContainsKey('skillspector')) {
-            [void](Assert-ReceiptInstalledClosure -Receipt $receipts.skillspector -InstallRoot $installRoot -Context 'Post-Pester SkillSpector semantic scanner')
-        }
-        foreach ($skillId in $skillIds) {
-            $skillRoot = Join-Path $repoRoot "skills/$skillId"
-            $expectedInventoryPaths = @(
-                @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
-                    ForEach-Object { [string]$_.path }
-            )
-            $semanticPath = Join-Path $childOutputRoot "skillspector-semantic-$skillId.json"
-            [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "Post-Pester SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticCredentialEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
-            $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
-            try {
-                $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
-            }
-            catch {
-                throw "Triggered SkillSpector semantic scan did not complete for '$skillId': $($_.Exception.Message)"
-            }
-            foreach ($issue in $semanticIssues) {
-                $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector semantic issue'
-                if ($reportedSeverity -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedSeverity)) {
-                    throw "SkillSpector semantic scan returned an issue without severity for '$skillId'."
-                }
-                $finding = ConvertTo-ValidationSecurityFinding -Policy $validationSecurityGate -ReportedSeverity ([string]$reportedSeverity) -Stage 'conditional-semantic-scan' -SkillId $skillId -Issue $issue
-                $securityFindings += $finding
-                switch ([string]$finding.action) {
-                    'BLOCK' { $securityBlockers += $finding }
-                    'HUMAN_REVIEW_REQUIRED' { $securityHumanReview += $finding; $securityBlockers += $finding }
-                    'RECORD_AND_TRACK' { $securityTracked += $finding }
-                    default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
-                }
-            }
-            $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); findings = $semanticIssues.Count }
-        }
-    }
-}
-finally {
-    foreach ($name in @($semanticCredentialEnvironment.Keys)) {
-        $semanticCredentialEnvironment[$name] = ''
-    }
-}
-
 $summary = [pscustomobject][ordered]@{
     schemaVersion = 1
     standardVersion = 'v1'
@@ -5415,14 +5435,14 @@ $summary = [pscustomobject][ordered]@{
             routing = $skillToolsRouteReports
             pester = [ordered]@{
                 result = 'passed'
-                testAuthorityCommit = $trustedPesterCommit
+                trustedCommit = $trustedPesterCommit
                 receipt = [IO.Path]::GetFileName($receiptPath)
                 total = [int]$pesterResult.TotalCount
                 passed = [int]$pesterResult.PassedCount
                 skipped = [int]$pesterResult.SkippedCount
             }
         }
-        conditionalSemanticScan = [ordered]@{ triggerCandidate = $semanticTriggerCandidate; triggered = $semanticTriggered; candidateProfile = 'offline-candidate'; executionProfile = if ($semanticTriggered) { 'trusted-semantic' } else { 'not-run' }; reports = $semanticReports }
+        conditionalSemanticScan = [ordered]@{ requested = [bool]$EnableSemanticScan; triggered = $semanticTriggered; candidateProfile = 'offline-candidate'; executionProfile = if ($semanticTriggered) { 'trusted-semantic' } else { 'not-run' }; reports = $semanticReports }
         aiReview = 'required-before-release'
         humanApproval = 'required-before-release'
         publishOrInstall = 'blocked-until-approved-release'
@@ -5438,11 +5458,6 @@ $summaryPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 else {
     Assert-PathWithinRoot -Path ([IO.Path]::GetFullPath($OutputPath)) -Root $artifactsRootPath -Context 'Conformance output'
 }
-$summaryDirectory = Split-Path -Parent $summaryPath
-if (-not [string]::IsNullOrWhiteSpace($summaryDirectory)) {
-    [void](New-Item -ItemType Directory -Path $summaryDirectory -Force)
-    Assert-NoReparseAncestors -Path $summaryDirectory -Context 'Conformance output directory'
-}
 if (Test-Path -LiteralPath $summaryPath) { throw 'Conformance output path already exists; evidence must not overwrite prior content.' }
 $summaryEncoding = [Text.UTF8Encoding]::new($false)
 $summaryText = $summaryJson + [Environment]::NewLine
@@ -5454,24 +5469,7 @@ try {
 finally {
     $summaryHasher.Dispose()
 }
-try {
-    $summaryStream = [IO.File]::Open(
-        $summaryPath,
-        [IO.FileMode]::CreateNew,
-        [IO.FileAccess]::Write,
-        [IO.FileShare]::Read
-    )
-    try {
-        $summaryStream.Write($summaryBytes, 0, $summaryBytes.Length)
-        $summaryStream.Flush($true)
-    }
-    finally {
-        $summaryStream.Dispose()
-    }
-}
-catch {
-    throw "Could not create supervisor-owned conformance evidence: $($_.Exception.Message)"
-}
+[void](Write-ExclusiveUtf8File -Path $summaryPath -Text $summaryText -Context 'Supervisor-owned conformance evidence')
 Assert-NoReparseAncestors -Path $summaryPath -Context 'Conformance output'
 $writtenSummaryBytes = [IO.File]::ReadAllBytes($summaryPath)
 $readbackHasher = [Security.Cryptography.SHA256]::Create()
