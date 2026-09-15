@@ -5575,16 +5575,6 @@ if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPest
 # only this test-harness spelling inside the isolated worker; production code
 # and the validator never see the shim.
 if (-not [OperatingSystem]::IsWindows()) {
-    # Windows PowerShell 5.1 treats a missing OrderedDictionary key accessed
-    # through the ETS member adapter as null, while PowerShell 7 raises under
-    # StrictMode.  The immutable base localization contract intentionally
-    # checks the optional idempotent receipt field this way.  Keep the base
-    # test blob immutable and preserve actual values while matching the
-    # Windows boundary only inside this isolated Unix test worker.
-    Update-TypeData -TypeName 'System.Collections.Specialized.OrderedDictionary' `
-        -MemberType ScriptProperty -MemberName 'idempotent' `
-        -Value { if ($this.Contains('idempotent')) { $this['idempotent'] } else { $null } } -Force
-
     function global:New-Item {
         [CmdletBinding(DefaultParameterSetName = 'Path')]
         param(
@@ -5694,6 +5684,14 @@ $pesterConfiguration.Run.PassThru = $true
 # The immutable base regression suite requires the registry-backed test
 # discovery cache to remain disabled inside the protected runner.
 $pesterConfiguration.TestRegistry.Enabled = $false
+# Windows PowerShell 5.1 treats a missing OrderedDictionary key accessed
+# through the ETS member adapter as null, while PowerShell 7 raises under
+# StrictMode 2+.  The immutable base localization contract intentionally
+# checks the optional idempotent receipt field this way.  Preserve the
+# worker's uninitialized-variable checks while matching the Windows boundary
+# only inside this isolated Unix test worker; do not add ETS members that
+# could alter receipt serialization.
+if (-not [OperatingSystem]::IsWindows()) { Set-StrictMode -Version 1.0 }
 $result = Invoke-Pester -Configuration $pesterConfiguration
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
