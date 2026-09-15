@@ -5575,6 +5575,16 @@ if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPest
 # only this test-harness spelling inside the isolated worker; production code
 # and the validator never see the shim.
 if (-not [OperatingSystem]::IsWindows()) {
+    # Windows PowerShell 5.1 treats a missing OrderedDictionary key accessed
+    # through the ETS member adapter as null, while PowerShell 7 raises under
+    # StrictMode.  The immutable base localization contract intentionally
+    # checks the optional idempotent receipt field this way.  Keep the base
+    # test blob immutable and preserve actual values while matching the
+    # Windows boundary only inside this isolated Unix test worker.
+    Update-TypeData -TypeName 'System.Collections.Specialized.OrderedDictionary' `
+        -MemberType ScriptProperty -MemberName 'idempotent' `
+        -Value { if ($this.Contains('idempotent')) { $this['idempotent'] } else { $null } } -Force
+
     function global:New-Item {
         [CmdletBinding(DefaultParameterSetName = 'Path')]
         param(
