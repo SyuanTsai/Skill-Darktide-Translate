@@ -5576,20 +5576,32 @@ if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPest
 # and the validator never see the shim.
 if (-not [OperatingSystem]::IsWindows()) {
     function global:New-Item {
-        $forward = [Collections.Generic.List[object]]::new()
-        for ($index = 0; $index -lt $args.Count; $index++) {
-            $argument = [string]$args[$index]
-            if ($argument -match '^-((Item)?Type)$' -and
-                $index + 1 -lt $args.Count -and
-                [string]$args[$index + 1] -ieq 'Junction') {
-                [void]$forward.Add($args[$index])
-                [void]$forward.Add('SymbolicLink')
-                $index++
-                continue
+        [CmdletBinding(DefaultParameterSetName = 'Path')]
+        param(
+            [Parameter(Position = 0, ParameterSetName = 'Path')]
+            [string[]] $Path,
+            [Parameter(Position = 0, ParameterSetName = 'Name')]
+            [string] $Name,
+            [Alias('Type')]
+            [string] $ItemType,
+            [string] $Target,
+            [object] $Value,
+            [switch] $Force,
+            [switch] $PassThru,
+            [switch] $WhatIf,
+            [switch] $Confirm
+        )
+
+        $forward = @{}
+        foreach ($parameterName in @('Path', 'Name', 'ItemType', 'Target', 'Value', 'Force', 'PassThru', 'WhatIf', 'Confirm')) {
+            if ($PSBoundParameters.ContainsKey($parameterName)) {
+                $forward[$parameterName] = $PSBoundParameters[$parameterName]
             }
-            [void]$forward.Add($args[$index])
         }
-        & Microsoft.PowerShell.Management\New-Item @($forward.ToArray())
+        if ($forward.ContainsKey('ItemType') -and [string]$forward['ItemType'] -ieq 'Junction') {
+            $forward['ItemType'] = 'SymbolicLink'
+        }
+        & Microsoft.PowerShell.Management\New-Item @forward
     }
 }
 
