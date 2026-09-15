@@ -222,6 +222,12 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '(?s)\$candidateMirrorTestsRoot.*?Remove-Item'
         $supervisor | Should -Match '\$readOnlyPaths = @\('
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
+        $supervisor | Should -Match '\[string\[\]\] \$TestNames'
+        $supervisor | Should -Match "AddParameter\('TestNames'"
+        $supervisor | Should -Match 'foreach \(\$requiredPesterTest in \$requiredPesterTests\)'
+        $supervisor | Should -Match '\$aggregateTotalCount'
+        $supervisor | Should -Match 'per-candidate 300-second CPU'
+        $supervisor | Should -Match 'TimeoutMilliseconds 1200000'
         $supervisor | Should -Match 'CreateOutOfProcessRunspace'
         $supervisor | Should -Match 'AddScript\(\$workerScriptText\)'
         $supervisor | Should -Match 'InvocationStateInfo\.State'
