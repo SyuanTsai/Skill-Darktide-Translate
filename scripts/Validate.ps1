@@ -4478,8 +4478,12 @@ exec chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bi
             $mountPath, $sandboxRoot, [IO.Path]::GetFullPath($DiagnosticRoot), [IO.Path]::GetFullPath($WorkingDirectory),
             [IO.Path]::GetFullPath($PowerShellPath), [string]$readOnlyPaths.Count
         ) + @($readOnlyPaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
+        # The delegated cgroup is the hard 2 GiB resident-memory boundary for
+        # the protected Pester server. Do not add RLIMIT_AS here: pwsh can
+        # reserve more than 2 GiB of virtual address space before it starts,
+        # which would fail the trusted server before the cgroup limit applies.
         $nativeArguments = @(
-            '--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',
+            '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',
             $unsharePath
         ) + @($unshareArguments)
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
