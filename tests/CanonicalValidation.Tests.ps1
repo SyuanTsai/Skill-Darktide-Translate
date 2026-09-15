@@ -57,6 +57,14 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'is backed by a reparse point'
     }
 
+    It 'binds safe Unix virtual-environment symlinks without allowing traversal' {
+        $script:Validator | Should -Match 'function Get-InstalledSafeUnixSymlinkEntry'
+        $script:Validator | Should -Match 'function Get-InstalledClosureSymlinkIdentitySha256'
+        $script:Validator | Should -Match 'symbolic-link target escapes the install root'
+        $script:Validator | Should -Match 'Get-InstalledSafeUnixSymlinkEntry -Item \$item'
+        $script:Validator | Should -Match 'symbolicLinkTarget='
+    }
+
     It 'skips unreadable optional Linux module search paths without weakening required paths' {
         $script:Validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
         $script:Validator | Should -Match 'catch \[UnauthorizedAccessException\]'
