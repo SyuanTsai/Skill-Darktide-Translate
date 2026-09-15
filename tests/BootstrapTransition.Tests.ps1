@@ -220,6 +220,9 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$trustedPesterCommit'
         $supervisor | Should -Match '(?s)Expand-TrustedGitArchive.*?-Revision \$trustedPesterCommit.*?-PathSpec @\(''tests''\).*?-Context ''Trusted base Pester tests'''
         $supervisor | Should -Match '(?s)\$candidateMirrorTestsRoot.*?Remove-Item'
+        $supervisor | Should -Match 'function global:New-Item'
+        $supervisor | Should -Match "'Junction'"
+        $supervisor | Should -Match "'SymbolicLink'"
         $supervisor | Should -Match '\$readOnlyPaths = @\('
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
         $supervisor | Should -Match '\[string\[\]\] \$TestNames'

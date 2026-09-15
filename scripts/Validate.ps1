@@ -5568,6 +5568,31 @@ $loadedPester = Get-Module Pester | Select-Object -First 1
 if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPesterVersion) {
     throw 'The exact frozen Pester module was not imported in the isolated test process.'
 }
+
+# The immutable base localization tests use the Windows FileSystem provider's
+# Junction item type. Unix has the same reparse-point safety contract but
+# exposes it as a symbolic link. Keep the base test blob immutable and adapt
+# only this test-harness spelling inside the isolated worker; production code
+# and the validator never see the shim.
+if (-not [OperatingSystem]::IsWindows()) {
+    function global:New-Item {
+        $forward = [Collections.Generic.List[object]]::new()
+        for ($index = 0; $index -lt $args.Count; $index++) {
+            $argument = [string]$args[$index]
+            if ($argument -match '^-((Item)?Type)$' -and
+                $index + 1 -lt $args.Count -and
+                [string]$args[$index + 1] -ieq 'Junction') {
+                [void]$forward.Add($args[$index])
+                [void]$forward.Add('SymbolicLink')
+                $index++
+                continue
+            }
+            [void]$forward.Add($args[$index])
+        }
+        & Microsoft.PowerShell.Management\New-Item @($forward.ToArray())
+    }
+}
+
 $requiredPesterTests = @(
     'BootstrapTransition.Tests.ps1'
     'LocalizationWorkset.Tests.ps1'
