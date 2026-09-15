@@ -19,7 +19,6 @@ on:
 
 permissions:
   contents: read
-  checks: write
 
 jobs:
   repository-contract-windows-powershell:
@@ -37,6 +36,7 @@ jobs:
         shell: powershell
         env:
           TRUSTED_SUPERVISOR_COMMIT: ${{ github.sha }}
+          TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           $ErrorActionPreference = 'Stop'
           $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
@@ -50,6 +50,19 @@ jobs:
           [void](New-Item -ItemType Directory -Path $trustedRoot -Force)
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $defaultBranch = [string]$env:TRUSTED_DEFAULT_BRANCH
+            if ($defaultBranch -notmatch '^[A-Za-z0-9._/-]+$' -or
+                $defaultBranch -cmatch '(^|/)\.{1,2}(/|$)') {
+              throw 'The trusted default branch name is invalid.'
+            }
+            $defaultRef = "refs/remotes/origin/$defaultBranch"
+            $resolvedDefaultCommit = ((& $gitPath rev-parse --verify "$defaultRef^{commit}" 2>$null) | Select-Object -First 1).Trim()
+            if ($LASTEXITCODE -ne 0 -or $resolvedDefaultCommit -notmatch '^[0-9a-f]{40}$') {
+              throw 'The default branch trusted supervisor commit could not be resolved.'
+            }
+            $trustedCommit = $resolvedDefaultCommit
+          }
           $relativePath = 'tests/validate-windows-powershell.ps1'
           $revision = "${trustedCommit}:$relativePath"
           $actualBlob = ((& $gitPath rev-parse $revision 2>$null) | Select-Object -First 1).Trim()
@@ -185,6 +198,7 @@ jobs:
         shell: pwsh
         env:
           TRUSTED_SUPERVISOR_COMMIT: ${{ github.sha }}
+          TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           $ErrorActionPreference = 'Stop'
           $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
@@ -199,6 +213,19 @@ jobs:
           [void](New-Item -ItemType Directory -Path $trustedScriptsRoot -Force)
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $defaultBranch = [string]$env:TRUSTED_DEFAULT_BRANCH
+            if ($defaultBranch -notmatch '^[A-Za-z0-9._/-]+$' -or
+                $defaultBranch -cmatch '(^|/)\.{1,2}(/|$)') {
+              throw 'The trusted default branch name is invalid.'
+            }
+            $defaultRef = "refs/remotes/origin/$defaultBranch"
+            $resolvedDefaultCommit = ((& $gitPath rev-parse --verify "$defaultRef^{commit}" 2>$null) | Select-Object -First 1).Trim()
+            if ($LASTEXITCODE -ne 0 -or $resolvedDefaultCommit -notmatch '^[0-9a-f]{40}$') {
+              throw 'The default branch trusted supervisor commit could not be resolved.'
+            }
+            $trustedCommit = $resolvedDefaultCommit
+          }
           $files = @(
             [pscustomobject]@{ RelativePath = 'scripts/Validate.ps1' },
             [pscustomobject]@{ RelativePath = 'scripts/Test-Repository.ps1' }
@@ -692,7 +719,8 @@ jobs:
 
   publish-head-required-checks:
     name: publish head-bound required checks
-    if: ${{ always() }}
+    # Manual runs may validate a candidate, but can never mint PR required checks.
+    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
     needs:
       - repository-contract-windows-powershell
       - canonical-validation
@@ -706,7 +734,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event_name == 'push' && github.sha || '' }}
           WINDOWS_RESULT: ${{ needs['repository-contract-windows-powershell'].result }}
           CANONICAL_RESULT: ${{ needs['canonical-validation'].result }}
           PUBLICATION_RESULT: ${{ needs['github-copilot-agent-skills'].result }}

@@ -229,11 +229,15 @@ Describe 'Canonical Standard v1 validation adapter' {
         $workflow | Should -Match 'Materialize protected Windows compatibility contract'
         $workflow | Should -Match 'TRUSTED_WINDOWS_CONTRACT'
         $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.sha \}\}'
+        $workflow | Should -Match 'TRUSTED_DEFAULT_BRANCH: \$\{\{ github\.event\.repository\.default_branch \}\}'
+        $workflow | Should -Match "GITHUB_EVENT_NAME -eq 'workflow_dispatch'"
+        $workflow | Should -Match 'refs/remotes/origin'
         $workflow | Should -Match 'Enable unprivileged Linux user namespaces'
         $workflow | Should -Match 'kernel\.unprivileged_userns_clone=1'
         $workflow | Should -Match 'kernel\.apparmor_restrict_unprivileged_userns=0'
         $workflow | Should -Match 'unshare --user --map-root-user --pid --fork --kill-child=SIGKILL -- true'
         $workflow | Should -Match 'publish-head-required-checks'
+        $workflow | Should -Match "github\.event_name != 'workflow_dispatch'"
         $workflow | Should -Match 'HEAD_SHA'
         $workflow | Should -Match 'Darktide Translate Standard v1'
         $workflow | Should -Not -Match "github\.event_name == 'pull_request'"
@@ -266,5 +270,6 @@ Describe 'Canonical Standard v1 validation adapter' {
         $workflow | Should -Match "github\.event_name == 'workflow_dispatch'.*github\.event\.inputs\.base_sha"
         $workflow | Should -Match "GITHUB_EVENT_NAME -in @\('pull_request_target', 'workflow_dispatch'\)"
         $workflow | Should -Match 'baseCandidate.*not.*distinct ancestor'
+        $workflow | Should -Match "github\.event_name == 'push'.*github\.sha"
     }
 }
