@@ -326,6 +326,23 @@ jobs:
             "$cgroup_parent" "$cgroup_supervisor" >> "$GITHUB_ENV"
           trap - ERR
 
+      - name: Enable unprivileged Linux user namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The protected validator requires an unprivileged user+mount+PID
+          # namespace so its candidate process cannot escape the private root.
+          # Ubuntu 24.04+ may gate this behind both sysctls; this runner is
+          # ephemeral, and the capability is verified immediately afterwards.
+          sudo -n sysctl -w kernel.unprivileged_userns_clone=1
+          if sudo -n sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
+            sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if ! unshare --user --map-root-user --pid --fork --kill-child=SIGKILL -- true; then
+            echo 'The hosted Linux runner could not establish the required unprivileged user/PID namespace.' >&2
+            exit 1
+          fi
+
       - name: Run canonical Standard v1 validation
         id: canonical-validation
         shell: pwsh
