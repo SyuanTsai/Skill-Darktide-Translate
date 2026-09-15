@@ -51,6 +51,16 @@ Describe 'Deterministic Darktide MOD update automation' {
         $pathSafety | Should -Not -Match 'knownSafePhysicalPaths'
     }
 
+    It 'UnitT107_UsesKernelIdentityForCaseOnlyPhysicalNormalization' {
+        $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+
+        $pathSafety | Should -Match 'TryGetPhysicalFileIdentity'
+        $pathSafety | Should -Match 'Test-PortablePhysicalIdentity'
+        $runner | Should -Match 'Test-PortablePhysicalIdentity'
+        $runner | Should -Match '\$samePhysicalPath'
+    }
+
     # Scenario: A caller invokes a single stage or resumes the same run.
     # Purpose: Preserve the fixed command surface, structured JSON, timing, state, and idempotency contracts.
     It 'UnitT110_DeclaresTheFixedResumableStageContract' {

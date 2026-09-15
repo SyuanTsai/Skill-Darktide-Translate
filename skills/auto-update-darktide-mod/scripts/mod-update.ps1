@@ -554,7 +554,57 @@ function Assert-NoReparsePath {
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    # Keep the function independently executable for the immutable legacy
+    # regression harness, which extracts it without the imported module's
+    # command scope.  Strict comparison is the fail-closed fallback; the
+    # production entrypoint imports PathSafety and uses its filesystem-aware
+    # comparison.
+    $comparison = [StringComparison]::Ordinal
+    $comparisonCommand = Get-Command -Name 'Get-PortablePathComparison' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $comparisonCommand) {
+        $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    }
+    $reparseCommand = Get-Command -Name 'Test-PortableReparseItem' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $testReparse = {
+        param([string] $CandidatePath, [AllowNull()][object] $CandidateItem)
+        if ($null -ne $reparseCommand) {
+            return [bool](Test-PortableReparseItem -Path $CandidatePath -Item $CandidateItem -Label $Label)
+        }
+        # The immutable legacy tests extract this function without its module
+        # scope.  Preserve the same fail-closed provider/link inspection here
+        # rather than treating an unavailable helper as a clean path.
+        if ($null -ne $CandidateItem) {
+            $attributesProperty = $CandidateItem.PSObject.Properties['Attributes']
+            if ($null -ne $attributesProperty -and
+                (($attributesProperty.Value -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $true }
+            $modeProperty = $CandidateItem.PSObject.Properties['Mode']
+            if ($null -ne $modeProperty -and [string]$modeProperty.Value -match '^l') { return $true }
+            foreach ($propertyName in @('LinkType', 'LinkTarget', 'Target')) {
+                $property = $CandidateItem.PSObject.Properties[$propertyName]
+                if ($null -eq $property) { continue }
+                if (-not [string]::IsNullOrWhiteSpace([string]$property.Value)) { return $true }
+            }
+            return $false
+        }
+        $probe = [IO.Path]::GetFullPath($CandidatePath)
+        for ($probeDepth = 0; $probeDepth -lt 2048; $probeDepth++) {
+            foreach ($info in @([IO.FileInfo]::new($probe), [IO.DirectoryInfo]::new($probe))) {
+                try {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$info.LinkTarget)) { return $true }
+                    if ($info.Exists -and (($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $true }
+                }
+                catch {
+                    throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+                }
+            }
+            $parent = [IO.DirectoryInfo]::new($probe).Parent
+            if ($null -eq $parent -or $parent.FullName.Equals($probe, [StringComparison]::OrdinalIgnoreCase)) { break }
+            $probe = $parent.FullName
+        }
+        $false
+    }
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Label escapes its physical verification root."
@@ -568,7 +618,7 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $current -Label $Label) {
+            if (& $testReparse $current $null) {
                 throw "$Label path contains a symlink or reparse point."
             }
             if (-not $AllowMissing) { throw "$Label path component is missing." }
@@ -576,7 +626,7 @@ function Assert-NoReparsePath {
         catch {
             throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
         }
-        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
+        if (& $testReparse $current $item) {
             throw "$Label path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, $comparison)) {
@@ -1339,7 +1389,11 @@ function Normalize-GitCaseVariantWorktreePaths {
         $sourceFullPath = [IO.Path]::GetFullPath($source)
         $destinationFullPath = [IO.Path]::GetFullPath($destination)
         $physicalPathComparison = Get-PortablePathComparison -Paths @($sourceFullPath, $destinationFullPath)
-        if ([string]::Equals($sourceFullPath, $destinationFullPath, $physicalPathComparison)) {
+        $samePhysicalPath = [string]::Equals($sourceFullPath, $destinationFullPath, $physicalPathComparison)
+        if (-not $samePhysicalPath -and (Get-Command -Name 'Test-PortablePhysicalIdentity' -ErrorAction SilentlyContinue)) {
+            $samePhysicalPath = Test-PortablePhysicalIdentity -PathA $sourceFullPath -PathB $destinationFullPath
+        }
+        if ($samePhysicalPath) {
             continue
         }
         $sourceExists = Test-Path -LiteralPath $source -PathType Leaf

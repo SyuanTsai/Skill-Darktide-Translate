@@ -14,7 +14,10 @@ using System.Runtime.InteropServices;
 
 namespace SyuanTsai {
     public static class PathSafetyNative {
-        private const uint FileReadAttributes = 0x00000080;
+        // A zero desired-access handle is sufficient for the case-sensitivity
+        // query and also works for user-profile directories whose ACLs reject
+        // FILE_READ_ATTRIBUTES even though the directory itself is traversable.
+        private const uint FileReadAttributes = 0x00000000;
         private const uint FileShareRead = 0x00000001;
         private const uint FileShareWrite = 0x00000002;
         private const uint FileShareDelete = 0x00000004;
@@ -34,6 +37,26 @@ namespace SyuanTsai {
             public IntPtr Information;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeFileTime {
+            public uint LowDateTime;
+            public uint HighDateTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformationBuffer {
+            public uint FileAttributes;
+            public NativeFileTime CreationTime;
+            public NativeFileTime LastAccessTime;
+            public NativeFileTime LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")]
         private static extern SafeFileHandle CreateFile(
             string path,
@@ -51,6 +74,20 @@ namespace SyuanTsai {
             out FileCaseSensitiveInformationBuffer fileInformation,
             uint length,
             int fileInformationClass);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "GetFileInformationByHandleEx")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle fileHandle,
+            int fileInformationClass,
+            out FileCaseSensitiveInformationBuffer fileInformation,
+            uint bufferSize);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "GetFileInformationByHandle")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle fileHandle,
+            out ByHandleFileInformationBuffer fileInformation);
 
         public static bool TryGetDirectoryCaseSensitive(string path, out bool caseSensitive) {
             caseSensitive = false;
@@ -74,11 +111,44 @@ namespace SyuanTsai {
                     out information,
                     (uint)Marshal.SizeOf(typeof(FileCaseSensitiveInformationBuffer)),
                     FileCaseSensitiveInformation);
-                if (status != 0) {
+                if (status != 0 && !GetFileInformationByHandleEx(
+                    handle,
+                    FileCaseSensitiveInformation,
+                    out information,
+                    (uint)Marshal.SizeOf(typeof(FileCaseSensitiveInformationBuffer)))) {
                     return false;
                 }
 
                 caseSensitive = (information.Flags & CaseSensitiveDirectoryFlag) != 0;
+                return true;
+            }
+        }
+
+        public static bool TryGetPhysicalFileIdentity(
+            string path,
+            out ulong volumeSerialNumber,
+            out ulong fileIndex) {
+            volumeSerialNumber = 0;
+            fileIndex = 0;
+            using (SafeFileHandle handle = CreateFile(
+                path,
+                0,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics,
+                IntPtr.Zero)) {
+                if (handle == null || handle.IsInvalid) {
+                    return false;
+                }
+
+                ByHandleFileInformationBuffer information;
+                if (!GetFileInformationByHandle(handle, out information)) {
+                    return false;
+                }
+
+                volumeSerialNumber = information.VolumeSerialNumber;
+                fileIndex = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
                 return true;
             }
         }
@@ -222,4 +292,26 @@ function Test-PortableReparseItem {
     $false
 }
 
-Export-ModuleMember -Function Get-PortablePathComparison, Test-PortableReparseItem
+function Test-PortablePhysicalIdentity {
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][string] $PathA,
+        [Parameter(Mandatory)][string] $PathB
+    )
+
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+        $null -eq ('SyuanTsai.PathSafetyNative' -as [type])) {
+        return $false
+    }
+    [ulong]$volumeA = 0
+    [ulong]$fileA = 0
+    [ulong]$volumeB = 0
+    [ulong]$fileB = 0
+    if (-not [SyuanTsai.PathSafetyNative]::TryGetPhysicalFileIdentity($PathA, [ref]$volumeA, [ref]$fileA) -or
+        -not [SyuanTsai.PathSafetyNative]::TryGetPhysicalFileIdentity($PathB, [ref]$volumeB, [ref]$fileB)) {
+        return $false
+    }
+    $volumeA -eq $volumeB -and $fileA -eq $fileB
+}
+
+Export-ModuleMember -Function Get-PortablePathComparison, Test-PortableReparseItem, Test-PortablePhysicalIdentity

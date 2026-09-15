@@ -197,6 +197,15 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Not -Match '/bin/cp -a'
     }
 
+    It 'UnitT85_UsesKernelCgroupAccountingWhenAvailable' {
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+
+        $supervisor | Should -Match '\$hasKernelCpuAccounting = -not \[string\]::IsNullOrWhiteSpace\(\$CgroupPath\)'
+        $supervisor | Should -Match 'if \(-not \$hasKernelCpuAccounting -and \$cpuTicks -gt'
+        $supervisor | Should -Match 'if \(\$hasKernelCpuAccounting\)'
+        $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage -CgroupPath \$CgroupPath'
+    }
+
     It 'UnitT90SeparatesChildOutputAndTrustedPesterContent' {
         # Scenario: Low-integrity children must write only to a labeled output root, while tests come from trusted Git bytes.
         # Purpose: Keep scanner receipts and Pester content outside candidate-writable paths and out of the worker's authority.

@@ -65,7 +65,18 @@ function Test-ModUpdateWorktreeRegistered {
             $candidate = & $normalizePath $line.Substring('worktree '.Length)
         }
         catch { continue }
-        if ($candidate.Equals($expected, (Get-PortablePathComparison -Paths @($candidate, $expected)))) { return $true }
+        # Older repository regression tests materialize this function AST in a
+        # standalone module and therefore do not inherit the imported helper's
+        # command scope.  Strict comparison is the safe fallback in that
+        # compatibility harness; the production entrypoint imports PathSafety
+        # and uses its filesystem-aware comparison.
+        $comparison = [StringComparison]::Ordinal
+        $comparisonCommand = Get-Command -Name 'Get-PortablePathComparison' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $comparisonCommand) {
+            $comparison = Get-PortablePathComparison -Paths @($candidate, $expected)
+        }
+        if ($candidate.Equals($expected, $comparison)) { return $true }
     }
     $false
 }

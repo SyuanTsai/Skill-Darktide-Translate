@@ -382,6 +382,7 @@ function Assert-LinuxAggregateResourceUsage {
     foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) { [void]$candidateIds.Add([int]$processId) }
     $memoryBytes = [int64]0
     $cpuTicks = [int64]0
+    $hasKernelCpuAccounting = -not [string]::IsNullOrWhiteSpace($CgroupPath)
     foreach ($processId in $candidateIds) {
         try {
             $usage = Get-LinuxProcessResourceUsage -ProcessId ([int]$processId)
@@ -395,8 +396,15 @@ function Assert-LinuxAggregateResourceUsage {
     }
     if ($candidateIds.Count -gt 256) { throw "$Context exceeded the aggregate Linux process-count limit of 256." }
     if ($memoryBytes -gt 2147483648) { throw "$Context exceeded the aggregate Linux resident-memory limit of 2147483648 bytes." }
-    if ($cpuTicks -gt ([int64]300 * $ClockTicksPerSecond)) { throw "$Context exceeded the aggregate Linux CPU limit of 300 seconds." }
-    if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
+    # When a delegated cgroup is available, its kernel-maintained usage_usec is
+    # the authoritative aggregate CPU total.  Do not also enforce the /proc
+    # utime/stime/cutime/cstime sum: parent child-time fields and short-lived
+    # reaping can represent overlapping observations even when the cgroup total
+    # is exact.  Native Linux calls without a cgroup retain the process fallback.
+    if (-not $hasKernelCpuAccounting -and $cpuTicks -gt ([int64]300 * $ClockTicksPerSecond)) {
+        throw "$Context exceeded the aggregate Linux CPU limit of 300 seconds."
+    }
+    if ($hasKernelCpuAccounting) {
         $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $CgroupPath -Context $Context
         if ($cgroupCpuMicroseconds -gt [int64]300000000) {
             throw "$Context exceeded the kernel-accounted Linux cgroup CPU limit of 300 seconds."
