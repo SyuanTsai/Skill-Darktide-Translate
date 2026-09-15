@@ -4637,8 +4637,14 @@ function Invoke-ProtectedPesterRunspace {
         return $workerResult.Substring($workerResultPrefix.Length)
     }
     finally {
-        if ($null -ne $serverProcessInstance.Process -and -not $serverProcessInstance.HasExited) {
-            try { $serverProcessInstance.Process.Kill($true) } catch { }
+        if ($null -ne $serverProcessInstance.Process) {
+            try {
+                if (-not $serverProcessInstance.HasExited) {
+                    $serverProcessInstance.Process.Kill($true)
+                }
+                [void]$serverProcessInstance.Process.WaitForExit(5000)
+            }
+            catch { }
         }
         $linuxPesterCgroupCleanupException = $null
         try { Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath }
