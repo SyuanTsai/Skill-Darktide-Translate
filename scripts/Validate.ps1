@@ -4411,6 +4411,10 @@ working_directory="$4"
 command_path="$5"
 readonly_count="$6"
 shift 6
+proxy_log="$run_root/protected-pester-proxy.log"
+: > "$proxy_log"
+exec 2>>"$proxy_log"
+trap 'status=$?; printf "proxy_exit=%s\n" "$status" >> "$proxy_log"' EXIT
 "$mount_path" --make-rprivate /
 "$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
 mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
@@ -4586,7 +4590,20 @@ function Invoke-ProtectedPesterRunspace {
         }
         else { $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $proxyArguments }
 
-        $runspace.Open()
+        try { $runspace.Open() }
+        catch {
+            $proxyLogPath = Join-Path $DiagnosticRoot 'protected-pester-proxy.log'
+            $proxyLog = if (Test-Path -LiteralPath $proxyLogPath -PathType Leaf) {
+                [IO.File]::ReadAllText($proxyLogPath)
+            }
+            else {
+                'The protected Pester proxy did not create its bounded startup log.'
+            }
+            if ($proxyLog.Length -gt 32768) {
+                $proxyLog = $proxyLog.Substring($proxyLog.Length - 32768)
+            }
+            throw "Protected Pester server could not open its runspace: $($_.Exception.Message)`nProxy startup diagnostics:`n$proxyLog"
+        }
         if ($script:IsLinuxHost) {
             if ($null -eq $serverProcessInstance.Process) {
                 throw 'Protected Pester remote pipeline did not expose its Linux proxy process.'
