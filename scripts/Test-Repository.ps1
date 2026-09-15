@@ -34,6 +34,107 @@ function Assert-ExactPropertySet {
     }
 }
 
+function Invoke-ProfileCatalogValidation {
+    param(
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)] $SourceInventory
+    )
+
+    $profilePath = Join-Path $RepositoryRoot 'catalog/profiles.json'
+    $catalog = Read-StrictJson -Path $profilePath
+    Assert-ExactPropertySet -Value $catalog -Expected @('schemaVersion', 'catalogId', 'sources', 'profiles', 'skills') -Context 'catalog/profiles.json'
+    if (($catalog.schemaVersion -isnot [int] -and $catalog.schemaVersion -isnot [long]) -or [int64]$catalog.schemaVersion -ne 1) {
+        throw 'catalog/profiles.json schemaVersion must be integer 1.'
+    }
+    if ($catalog.catalogId -isnot [string] -or [string]$catalog.catalogId -cne 'darktide-translate') {
+        throw 'catalog/profiles.json catalogId must be exact string darktide-translate.'
+    }
+
+    if ($catalog.sources -isnot [array] -or @($catalog.sources).Count -ne 1) {
+        throw 'Profile catalog must contain exactly one source.'
+    }
+    $source = @($catalog.sources)[0]
+    Assert-ExactPropertySet -Value $source -Expected @('id', 'repository') -Context 'catalog/profiles.json source'
+    if ($source.id -isnot [string] -or [string]$source.id -cne 'darktide-translate' -or
+        $source.repository -isnot [string] -or [string]$source.repository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git') {
+        throw 'Profile catalog source identity is invalid.'
+    }
+
+    if ($catalog.profiles -isnot [array] -or @($catalog.profiles).Count -ne 1) {
+        throw 'Profile catalog must contain exactly one profile.'
+    }
+    $profile = @($catalog.profiles)[0]
+    Assert-ExactPropertySet -Value $profile -Expected @('id', 'description', 'default', 'includes', 'excludes') -Context 'catalog/profiles.json profile'
+    if ($profile.id -isnot [string] -or [string]$profile.id -cne 'darktide-mod-maintenance' -or
+        $profile.description -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$profile.description) -or
+        $profile.default -ne $false -or $profile.includes -isnot [array] -or @($profile.includes).Count -ne 1 -or
+        [string]@($profile.includes)[0] -cne 'auto-update-darktide-mod' -or
+        $profile.excludes -isnot [array] -or @($profile.excludes).Count -ne 0) {
+        throw 'Profile catalog profile identity or membership is invalid.'
+    }
+
+    if ($catalog.skills -isnot [array] -or @($catalog.skills).Count -ne 1) {
+        throw 'Profile catalog must contain exactly one Skill.'
+    }
+    $skill = @($catalog.skills)[0]
+    Assert-ExactPropertySet -Value $skill -Expected @('id', 'group', 'source', 'profiles', 'compatibility', 'dependencies', 'lifecycle') -Context 'catalog/profiles.json Skill'
+    if ($skill.id -isnot [string] -or [string]$skill.id -cne 'auto-update-darktide-mod' -or
+        $skill.group -isnot [string] -or [string]$skill.group -cne [string]$profile.id -or
+        $skill.profiles -isnot [array] -or @($skill.profiles).Count -ne 1 -or
+        [string]@($skill.profiles)[0] -cne [string]$profile.id -or
+        @($SourceInventory.skills) -cnotcontains [string]$skill.id) {
+        throw 'Profile catalog Skill identity or profile binding is invalid.'
+    }
+
+    Assert-ExactPropertySet -Value $skill.source -Expected @('sourceId', 'path') -Context 'catalog/profiles.json Skill source'
+    if ($skill.source.sourceId -isnot [string] -or [string]$skill.source.sourceId -cne [string]$source.id -or
+        $skill.source.path -isnot [string] -or [string]$skill.source.path -cne "skills/$($skill.id)") {
+        throw 'Profile catalog Skill source binding is invalid.'
+    }
+    if ($skill.dependencies -isnot [array] -or @($skill.dependencies).Count -ne 0) {
+        throw 'Profile catalog Skill dependencies must be empty.'
+    }
+
+    Assert-ExactPropertySet -Value $skill.lifecycle -Expected @('status', 'aliases') -Context 'catalog/profiles.json Skill lifecycle'
+    if ($skill.lifecycle.status -isnot [string] -or [string]$skill.lifecycle.status -cne 'active' -or
+        $skill.lifecycle.aliases -isnot [array] -or @($skill.lifecycle.aliases).Count -ne 0) {
+        throw 'Profile catalog Skill lifecycle is invalid.'
+    }
+
+    Assert-ExactPropertySet -Value $skill.compatibility -Expected @('platforms', 'shells', 'requiredCapabilities', 'anyOfCapabilities') -Context 'catalog/profiles.json Skill compatibility'
+    if ($skill.compatibility.platforms -isnot [array] -or @($skill.compatibility.platforms).Count -ne 1 -or
+        [string]@($skill.compatibility.platforms)[0] -cne 'windows' -or
+        $skill.compatibility.shells -isnot [array] -or @($skill.compatibility.shells).Count -ne 1 -or
+        [string]@($skill.compatibility.shells)[0] -cne 'pwsh>=7') {
+        throw 'Profile catalog Skill platform compatibility is invalid.'
+    }
+
+    if ($skill.compatibility.requiredCapabilities -isnot [array] -or @($skill.compatibility.requiredCapabilities).Count -ne 1) {
+        throw 'Profile catalog Skill must declare exactly one required capability.'
+    }
+    $requiredCapability = @($skill.compatibility.requiredCapabilities)[0]
+    Assert-ExactPropertySet -Value $requiredCapability -Expected @('kind', 'id', 'state') -Context 'catalog/profiles.json required capability'
+    if ($requiredCapability.kind -isnot [string] -or [string]$requiredCapability.kind -cne 'command' -or
+        $requiredCapability.id -isnot [string] -or [string]$requiredCapability.id -cne 'git' -or
+        $requiredCapability.state -isnot [string] -or [string]$requiredCapability.state -cne 'available') {
+        throw 'Profile catalog required capability is invalid.'
+    }
+
+    if ($skill.compatibility.anyOfCapabilities -isnot [array] -or @($skill.compatibility.anyOfCapabilities).Count -ne 2) {
+        throw 'Profile catalog Skill must declare exactly two alternative capabilities.'
+    }
+    $alternativeCapabilityKeys = @()
+    foreach ($capability in @($skill.compatibility.anyOfCapabilities)) {
+        Assert-ExactPropertySet -Value $capability -Expected @('kind', 'id', 'state') -Context 'catalog/profiles.json alternative capability'
+        $alternativeCapabilityKeys += "{0}|{1}|{2}" -f [string]$capability.kind, [string]$capability.id, [string]$capability.state
+    }
+    foreach ($expectedCapability in @('connector|github|configured', 'command|gh|authenticated')) {
+        if ($alternativeCapabilityKeys -notcontains $expectedCapability) {
+            throw 'Profile catalog alternative capability contract is invalid.'
+        }
+    }
+}
+
 function Assert-NoDuplicateJsonProperties {
     param(
         [Parameter(Mandatory = $true)][System.Text.Json.JsonElement] $Element,
@@ -874,6 +975,7 @@ if ($inventory.skillsRoot -isnot [string] -or [string]$inventory.skillsRoot -cne
 if ($inventory.skills -isnot [array] -or @($inventory.skills).Count -eq 0) {
     throw 'catalog/source.json skills must be a non-empty array.'
 }
+Invoke-ProfileCatalogValidation -RepositoryRoot $repoRoot -SourceInventory $inventory
 if (Test-Path -LiteralPath (Join-Path $repoRoot 'catalog/skills-catalog.json')) {
     throw 'Legacy source-owned cross-source catalog must not coexist with catalog/source.json.'
 }

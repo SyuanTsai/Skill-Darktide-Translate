@@ -211,6 +211,38 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
     }
 
+    It 'rejects profile membership drift in the product-local catalog' {
+        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
+        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+        $catalog.profiles[0].includes = @('unlisted-skill')
+        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*profile identity or membership*'
+    }
+
+    It 'rejects a product-local profile source path that leaves the canonical source package' {
+        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
+        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+        $catalog.skills[0].source.path = 'skills/other-skill'
+        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*source binding*'
+    }
+
+    It 'rejects an inactive product-local Skill lifecycle' {
+        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
+        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+        $catalog.skills[0].lifecycle.status = 'retired'
+        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*lifecycle*'
+    }
+
+    It 'rejects a changed required capability in the product-local catalog' {
+        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
+        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+        $catalog.skills[0].compatibility.requiredCapabilities[0].state = 'missing'
+        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*required capability*'
+    }
+
     It 'rejects malformed optional OpenAI interface fields' {
         $metadataPath = Join-Path $script:SkillRoot 'agents/openai.yaml'
         $metadata = Get-Content -LiteralPath $metadataPath -Raw
