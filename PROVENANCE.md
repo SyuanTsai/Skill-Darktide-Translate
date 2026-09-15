@@ -18,7 +18,7 @@ The repository-authored workflow, tools, tests, metadata, and documentation are 
 
 The SYP-158 migration separates the repository-owned source package into the canonical `skills/auto-update-darktide-mod/` layout and records it in `catalog/source.json` with source ID `darktide-translate`. The former `catalog/skills-catalog.json` is retained as the product-local `catalog/profiles.json` extension; it does not replace the source inventory or define central validation, security, lifecycle, or approval policy.
 
-The six other `.agents/skills/*` directories are not Darktide-owned source packages. They are managed consumer projections whose exact target files, source repositories, revisions, and hashes are declared by `.codex/ai-instructions.manifest.json`. The migration preserves them and validates their manifest binding; it does not infer ownership or delete them.
+This migration is scoped to the Darktide Skill in this repository. No other `.agents/skills/*` projection or `.codex/ai-instructions.manifest.json` is present in the audited tree, so this record makes no preservation or validation claim about external consumer artifacts.
 
 `config/standard-v1.json` pins the reviewed `SyuanTsai-AI-Instructions` Standard v1 authority archive and normative files. `scripts/Validate.ps1` is the single local, pre-push, and CI validation entry point, while the existing Darktide domain regressions remain repository-test extensions within the canonical stage order.
 
