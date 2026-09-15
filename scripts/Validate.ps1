@@ -5481,7 +5481,13 @@ $requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
     }
     [IO.Path]::GetFullPath($testPath)
 })
-$result = Invoke-Pester -Path $requiredPesterPaths -PassThru
+$pesterConfiguration = New-PesterConfiguration
+$pesterConfiguration.Run.Path = $requiredPesterPaths
+$pesterConfiguration.Run.PassThru = $true
+# The immutable base regression suite requires the registry-backed test
+# discovery cache to remain disabled inside the protected runner.
+$pesterConfiguration.TestRegistry.Enabled = $false
+$result = Invoke-Pester -Configuration $pesterConfiguration
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
     [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
