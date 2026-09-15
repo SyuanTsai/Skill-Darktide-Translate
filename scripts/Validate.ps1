@@ -5700,12 +5700,25 @@ if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.Fai
         $message = ''
         $errorProperty = $_.PSObject.Properties['ErrorRecord']
         if ($null -ne $errorProperty -and $null -ne $errorProperty.Value) {
-            $exceptionProperty = $errorProperty.Value.PSObject.Properties['Exception']
-            if ($null -ne $exceptionProperty -and $null -ne $exceptionProperty.Value) {
-                $messageProperty = $exceptionProperty.Value.PSObject.Properties['Message']
-                if ($null -ne $messageProperty -and $null -ne $messageProperty.Value) {
-                    $message = [string]$messageProperty.Value
+            foreach ($errorRecord in @($errorProperty.Value)) {
+                foreach ($messagePropertyName in @('DisplayErrorMessage', 'Message')) {
+                    $messageProperty = $errorRecord.PSObject.Properties[$messagePropertyName]
+                    if ($null -ne $messageProperty -and $null -ne $messageProperty.Value -and
+                        -not [string]::IsNullOrWhiteSpace([string]$messageProperty.Value)) {
+                        $message = [string]$messageProperty.Value
+                        break
+                    }
                 }
+                if ([string]::IsNullOrWhiteSpace($message)) {
+                    $exceptionProperty = $errorRecord.PSObject.Properties['Exception']
+                    if ($null -ne $exceptionProperty -and $null -ne $exceptionProperty.Value) {
+                        $messageProperty = $exceptionProperty.Value.PSObject.Properties['Message']
+                        if ($null -ne $messageProperty -and $null -ne $messageProperty.Value) {
+                            $message = [string]$messageProperty.Value
+                        }
+                    }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($message)) { break }
             }
         }
         if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$_ }
