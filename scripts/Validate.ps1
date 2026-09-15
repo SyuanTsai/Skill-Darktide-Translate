@@ -45,6 +45,26 @@ $script:IsSupportedProcessBoundaryHost = $script:IsWindowsHost -or $script:IsLin
 $env:GIT_NO_REPLACE_OBJECTS = '1'
 $script:TrustedStatPath = $null
 
+function Read-StrictUtf8File {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $offset = if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF) {
+        3
+    }
+    else {
+        0
+    }
+    return [Text.UTF8Encoding]::new($false, $true).GetString(
+        $bytes,
+        $offset,
+        $bytes.Length - $offset
+    )
+}
+
 function Assert-NoDuplicateJsonProperties {
     param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement] $Element, [string] $Context = '$')
     if ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
@@ -69,7 +89,7 @@ function Read-JsonFile {
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Context is missing: $Path" }
     try {
-        $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
+        $text = Read-StrictUtf8File -Path $Path
         $document = [System.Text.Json.JsonDocument]::Parse($text)
         try { Assert-NoDuplicateJsonProperties -Element $document.RootElement -Context $Context }
         finally { $document.Dispose() }
@@ -3001,6 +3021,7 @@ function Protect-ProcessCredentialEnvironment {
     param(
         [Parameter()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
     )
+    Assert-SemanticCredentialHostSupport -SemanticCredentialNames $SemanticCredentialNames
     $credentialNamePattern = '(?i)(^|_)(API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIALS?|AUTH)(_|$)'
     $exactCredentialNames = @(
         'GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
@@ -3037,6 +3058,18 @@ function Protect-ProcessCredentialEnvironment {
         [Environment]::SetEnvironmentVariable([string]$name, $null, [EnvironmentVariableTarget]::Process)
     }
     return $semanticEnvironment
+}
+
+function Assert-SemanticCredentialHostSupport {
+    param(
+        [Parameter()][AllowNull()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
+    )
+    if (-not $script:IsWindowsHost) { return }
+    foreach ($name in $SemanticCredentialNames) {
+        if (-not [string]::IsNullOrWhiteSpace($name)) {
+            throw 'Credential-backed semantic validation is not supported on Windows because the protected Pester boundary does not establish credential confidentiality.'
+        }
+    }
 }
 
 function Get-RepositoryRawSnapshot {
@@ -3108,6 +3141,18 @@ function Assert-BootstrapTransitionChangedPaths {
         'scripts/Test-Repository.ps1'
         'scripts/Validate.ps1'
         'tests/BootstrapTransition.Tests.ps1'
+        'tests/CanonicalValidation.Tests.ps1'
+        'tests/LocalizationWorkset.Tests.ps1'
+        'tests/ModUpdateAutomation.Tests.ps1'
+        'tests/RepositoryContract.Tests.ps1'
+        'tests/RepositoryValidation.Tests.ps1'
+        'tests/Schema15Coordination.Tests.ps1'
+        'tests/Schema15SourceAcquisition.Tests.ps1'
+        'tests/SkillContract.Tests.ps1'
+        'tests/SourcePin.Tests.ps1'
+        'tests/StandardV1Conformance.Tests.ps1'
+        'tests/Test-Repository.Tests.ps1'
+        'tests/TestSupport.ps1'
         'tests/validate-windows-powershell.ps1'
     )
     $allowedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -3151,9 +3196,20 @@ function Assert-BootstrapTransitionChangedPaths {
         'scripts/Validate.ps1'
         'tests/validate-windows-powershell.ps1'
     )
-    foreach ($requiredPath in $requiredPathList) {
-        if (-not $changedPathSet.Contains($requiredPath)) {
-            throw "Bootstrap transition changed-path binding is missing required path '$requiredPath'."
+    # A maintenance update need not rewrite every established trust anchor.
+    # Both immutable revisions must still contain every anchor as a regular blob.
+    foreach ($revision in @($BaseCommit, $CandidateCommit)) {
+        foreach ($requiredPath in $requiredPathList) {
+            $anchorOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $revision -- $requiredPath) -join '')
+            if ($LASTEXITCODE -ne 0) {
+                throw "Could not inspect bootstrap trust anchor '$requiredPath' at '$revision'."
+            }
+            $anchorRecords = @($anchorOutput.Split([char]0) | Where-Object { $_ -ne '' })
+            if ($anchorRecords.Count -ne 1 -or
+                $anchorRecords[0] -cnotmatch '^(?<mode>100644|100755) blob [0-9a-f]{40}\t(?<path>[^\x00\r\n]+)$' -or
+                $Matches.path -cne $requiredPath) {
+                throw "Bootstrap transition requires tracked regular trust anchor '$requiredPath' at '$revision'."
+            }
         }
     }
     return [pscustomobject][ordered]@{
@@ -3446,7 +3502,7 @@ function Resolve-GitCommonDirectoryFromMetadata {
     }
     else {
         if ($metadataItem.Length -gt 4096) { throw "$Context Git metadata pointer is too large: $metadataPath" }
-        $metadataText = [IO.File]::ReadAllText($metadataItem.FullName, [Text.UTF8Encoding]::new($false, $true)).Trim()
+        $metadataText = (Read-StrictUtf8File -Path $metadataItem.FullName).Trim()
         if ($metadataText -notmatch '^gitdir:\s*(?<path>[^\r\n]+)$') {
             throw "$Context Git metadata pointer is invalid: $metadataPath"
         }
@@ -3474,7 +3530,7 @@ function Resolve-GitCommonDirectoryFromMetadata {
             throw "$Context Git commondir file is a reparse point: $commonDirectoryFile"
         }
         if ($commonItem.Length -gt 4096) { throw "$Context Git commondir file is too large: $commonDirectoryFile" }
-        $commonValue = [IO.File]::ReadAllText($commonItem.FullName, [Text.UTF8Encoding]::new($false, $true)).Trim()
+        $commonValue = (Read-StrictUtf8File -Path $commonItem.FullName).Trim()
         if ([string]::IsNullOrWhiteSpace($commonValue) -or $commonValue -match '[\r\n]') {
             throw "$Context Git commondir file is invalid: $commonDirectoryFile"
         }

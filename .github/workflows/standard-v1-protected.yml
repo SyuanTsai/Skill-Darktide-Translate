@@ -368,6 +368,10 @@ jobs:
           if ($currentCgroup -notmatch ("0::" + [regex]::Escape($relativeValidatorCgroup) + '$')) {
             throw 'The trusted canonical validator did not enter its delegated cgroup.'
           }
+          $repositoryRoot = [IO.Path]::GetFullPath((Get-Location).Path)
+          $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+          $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          $gitArguments = @('-c', "safe.directory=$repositoryRoot", '-c', "core.worktree=$repositoryRoot")
           $baseCandidate = if ($env:GITHUB_EVENT_NAME -in @('pull_request_target', 'workflow_dispatch')) {
             $env:PULL_REQUEST_BASE_SHA
           }
@@ -379,10 +383,10 @@ jobs:
           else {
             ''
           }
-          $candidateHead = ((git rev-parse HEAD 2>$null) | Select-Object -First 1).Trim()
+          $candidateHead = ((& $gitPath @gitArguments -C $repositoryRoot rev-parse HEAD 2>$null) | Select-Object -First 1).Trim()
           $baseCommit = ''
           if ($baseCandidate -match '^[0-9a-f]{40}$' -and $candidateHead -match '^[0-9a-f]{40}$') {
-            & git merge-base --is-ancestor $baseCandidate $candidateHead 2>$null
+            & $gitPath @gitArguments -C $repositoryRoot merge-base --is-ancestor $baseCandidate $candidateHead 2>$null
             $ancestryExitCode = $LASTEXITCODE
             if ($ancestryExitCode -eq 0 -and $baseCandidate -cne $candidateHead) {
               $baseCommit = $baseCandidate
@@ -397,7 +401,7 @@ jobs:
           $outputPath = Join-Path $env:RUNNER_TEMP 'darktide-translate-conformance-report.json'
           $trustedValidator = Join-Path $env:TRUSTED_SUPERVISOR_ROOT 'scripts/Validate.ps1'
           $validatorArguments = @{
-            RepositoryRoot = (Get-Location).Path
+            RepositoryRoot = [IO.Path]::GetFullPath((Get-Location).Path)
             ArtifactsRoot = $env:RUNNER_TEMP
             BaseCommit = $baseCommit
             ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION
