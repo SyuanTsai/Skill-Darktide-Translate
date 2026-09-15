@@ -216,6 +216,8 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$powerShell\.Stop\(\)'
         $supervisor | Should -Match '\$runspace\.Close\(\)'
         $supervisor | Should -Match 'serverProcessInstance\.Process\.WaitForExit\(5000\)'
+        $supervisor | Should -Match 'Get-Command rmdir -CommandType Application'
+        $supervisor | Should -Match '\$rmdirPath -- \$CgroupPath'
         $supervisor | Should -Match 'Assert-LinuxAggregateResourceUsage'
         $supervisor | Should -Match 'Get-LinuxAggregateClockTicksPerSecond'
         $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage'

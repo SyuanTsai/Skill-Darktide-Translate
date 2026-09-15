@@ -512,6 +512,10 @@ function Remove-LinuxPesterCgroup {
         try { [IO.File]::WriteAllText($killPath, '1') } catch { }
     }
     $eventsPath = Join-Path $CgroupPath 'cgroup.events'
+    $rmdirCommand = Get-Command rmdir -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $rmdirPath = Resolve-LinuxExecutablePath `
+        -Path ([string]$rmdirCommand.Path) `
+        -Context 'Protected Pester cgroup rmdir utility'
     $deadline = [DateTime]::UtcNow.AddSeconds(3)
     for ($attempt = 0; $attempt -lt 120; $attempt++) {
         if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
@@ -523,7 +527,7 @@ function Remove-LinuxPesterCgroup {
             throw 'Protected Pester cgroup cleanup received an invalid cgroup.events population record.'
         }
         if ([string]$Matches['value'] -eq '0') {
-            try { Remove-Item -LiteralPath $CgroupPath -Force -ErrorAction Stop } catch { }
+            try { & $rmdirPath -- $CgroupPath 2>$null } catch { }
             if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
         }
         if ([DateTime]::UtcNow -ge $deadline) { break }
