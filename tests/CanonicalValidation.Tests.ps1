@@ -89,6 +89,14 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match '\$storageBytes = \[Text\.Encoding\]::UTF8\.GetByteCount\(\$target\)'
     }
 
+    It 'counts directories toward the bounded Linux writable-entry limit' {
+        $usageStart = $script:Validator.IndexOf('function Get-LinuxWritableRootUsage', [StringComparison]::Ordinal)
+        $usageEnd = $script:Validator.IndexOf('function Assert-LinuxWritableRootUsage', $usageStart, [StringComparison]::Ordinal)
+        $usageFunction = $script:Validator.Substring($usageStart, $usageEnd - $usageStart)
+
+        $usageFunction | Should -Match '(?s)if \(\$entry\.PSIsContainer\) \{.*?\$entryCount\+\+.*?writable-entry-count limit of 100000.*?\$pending\.Push\(\[IO\.DirectoryInfo\]\$entry\)'
+    }
+
     It 'sizes the private Linux etc projection for hosted runner images' {
         $script:Validator | Should -Match 'size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
     }

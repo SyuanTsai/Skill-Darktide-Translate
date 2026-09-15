@@ -627,6 +627,8 @@ function Get-LinuxWritableRootUsage {
                 continue
             }
             if ($entry.PSIsContainer) {
+                $entryCount++
+                if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
                 $pending.Push([IO.DirectoryInfo]$entry)
                 continue
             }
