@@ -259,4 +259,12 @@ Describe 'Canonical Standard v1 validation adapter' {
         $repositoryValidator | Should -Match '\[switch\] \$NoFilters'
         $repositoryValidator | Should -Match 'NoFilters:\$NoFilters'
     }
+
+    It 'supports PR-equivalent manual validation with an explicit base SHA' {
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+        $workflow | Should -Match '(?s)workflow_dispatch:\r?\n\s+inputs:\r?\n\s+base_sha:'
+        $workflow | Should -Match "github\.event_name == 'workflow_dispatch'.*github\.event\.inputs\.base_sha"
+        $workflow | Should -Match "GITHUB_EVENT_NAME -in @\('pull_request_target', 'workflow_dispatch'\)"
+        $workflow | Should -Match 'baseCandidate.*not.*distinct ancestor'
+    }
 }

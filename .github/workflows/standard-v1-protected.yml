@@ -11,6 +11,11 @@ on:
       - main
   pull_request_target:
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: 'Optional full base commit SHA for PR-equivalent manual validation'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -347,7 +352,7 @@ jobs:
         id: canonical-validation
         shell: pwsh
         env:
-          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.base_sha || github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -363,7 +368,7 @@ jobs:
           if ($currentCgroup -notmatch ("0::" + [regex]::Escape($relativeValidatorCgroup) + '$')) {
             throw 'The trusted canonical validator did not enter its delegated cgroup.'
           }
-          $baseCandidate = if ($env:GITHUB_EVENT_NAME -eq 'pull_request_target') {
+          $baseCandidate = if ($env:GITHUB_EVENT_NAME -in @('pull_request_target', 'workflow_dispatch')) {
             $env:PULL_REQUEST_BASE_SHA
           }
           elseif ($env:GITHUB_EVENT_NAME -eq 'push' -and
