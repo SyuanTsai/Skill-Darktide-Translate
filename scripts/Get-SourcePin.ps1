@@ -24,6 +24,7 @@ function Invoke-GitBytes {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'git'
     $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     foreach ($argument in @('-c', "safe.directory=$repoRoot", '-C', $repoRoot) + $Arguments) { $start.ArgumentList.Add($argument) }
@@ -32,6 +33,7 @@ function Invoke-GitBytes {
     if (-not $process.Start()) { throw 'Unable to start Git for source-pin blob hashing.' }
     $memory = [IO.MemoryStream]::new()
     try {
+        $process.StandardInput.Close()
         $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
         $errorTask = $process.StandardError.ReadToEndAsync()
         while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {

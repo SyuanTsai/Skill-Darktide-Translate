@@ -282,6 +282,7 @@ function Get-GitBlobSha256 {
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $GitPath
     $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     foreach ($argument in @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot", '-C', $RepositoryRoot, 'cat-file', 'blob', $ObjectId)) {
@@ -292,8 +293,10 @@ function Get-GitBlobSha256 {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         if (-not $process.Start()) { throw "Could not start Git blob reader for '$ObjectId'." }
+        $process.StandardInput.Close()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
         $hash = $hasher.ComputeHash($process.StandardOutput.BaseStream)
-        $stderr = $process.StandardError.ReadToEnd()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         $process.WaitForExit()
         if ($process.ExitCode -ne 0) { throw "Git blob reader failed for '$ObjectId': $stderr" }
         return ([BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
