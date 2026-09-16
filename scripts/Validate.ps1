@@ -5397,7 +5397,18 @@ $securityPreflightSummary = [ordered]@{
     runId = $runId
     diagnostics = $sanitizedSecurityFindings
 }
-[IO.File]::WriteAllText($securityPreflightSummaryPath, ($securityPreflightSummary | ConvertTo-Json -Depth 20) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+$summaryBytes = [Text.UTF8Encoding]::new($false).GetBytes(($securityPreflightSummary | ConvertTo-Json -Depth 20) + [Environment]::NewLine)
+[IO.File]::WriteAllBytes($securityPreflightSummaryPath, $summaryBytes)
+# Bind the summary before any candidate-executing tests. The runner command
+# file stays outside candidate-writable mounts; hashing only during export
+# would instead authenticate an attacker-controlled replacement.
+$summaryHasher = [Security.Cryptography.SHA256]::Create()
+try { $summarySha256 = [BitConverter]::ToString($summaryHasher.ComputeHash($summaryBytes)).Replace('-', '').ToLowerInvariant() }
+finally { $summaryHasher.Dispose() }
+$summaryOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
+if (-not [string]::IsNullOrWhiteSpace($summaryOutputPath)) {
+    [IO.File]::AppendAllText($summaryOutputPath, "standard_v1_diagnostics_sha256=$summarySha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+}
 if ($securityBlockers.Count -gt 0) {
     throw 'SkillSpector classified one or more candidate files as BLOCK or HUMAN_REVIEW_REQUIRED; candidate-executing repository tests are not started.'
 }
