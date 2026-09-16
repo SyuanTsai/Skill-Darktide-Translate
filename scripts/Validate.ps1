@@ -2515,6 +2515,169 @@ function Assert-PathWithinRoot {
     return $fullPath
 }
 
+function Assert-InstalledClosureSafeRelativePath {
+    param(
+        [Parameter(Mandatory = $true)][string] $Value,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if ([string]::IsNullOrEmpty($Value) -or $Value.StartsWith('/') -or $Value.Contains('\') -or
+        $Value.Contains(':') -or $Value -match '[\x00-\x1F\x7F]') {
+        throw "$Context contains an unsafe relative path: '$Value'."
+    }
+    foreach ($segment in $Value.Split('/')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -ceq '.' -or $segment -ceq '..') {
+            throw "$Context contains an unsafe relative path: '$Value'."
+        }
+    }
+    try {
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        [void]$utf8.GetBytes($Value)
+    }
+    catch {
+        throw "$Context contains a non-UTF-8 relative path: '$Value'."
+    }
+}
+
+function Get-InstalledClosureSymlinkTarget {
+    param(
+        [Parameter(Mandatory = $true)] $Item,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    foreach ($propertyName in @('LinkTarget', 'Target')) {
+        $property = $Item.PSObject.Properties[$propertyName]
+        if ($null -ne $property -and $property.Value -is [string] -and
+            -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return [string]$property.Value
+        }
+    }
+    throw "$Context cannot read the symbolic-link target: $($Item.FullName)"
+}
+
+function Get-InstalledClosureSymlinkIdentitySha256 {
+    param(
+        [Parameter(Mandatory = $true)][string] $Target,
+        [Parameter(Mandatory = $true)][string] $ResolvedRelativeTarget
+    )
+    $canonical = "symbolicLinkTarget=$Target`nresolvedTarget=$ResolvedRelativeTarget`n"
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString(
+            $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))
+        ) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function Get-InstalledSafeUnixSymlinkEntry {
+    param(
+        [Parameter(Mandatory = $true)] $Item,
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Unix) {
+        throw "$Context installed closure contains a reparse-backed entry that is not a safe Unix symbolic link: $($Item.FullName)"
+    }
+    $target = Get-InstalledClosureSymlinkTarget -Item $Item -Context $Context
+    if ($target -match '[\x00-\x1F\x7F]' -or $target.Contains('\') -or $target.Contains(':')) {
+        throw "$Context installed closure contains an unsafe symbolic-link target: '$target'."
+    }
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $parentFull = [IO.Path]::GetFullPath((Split-Path -Parent $Item.FullName))
+    try {
+        $targetFull = if ([IO.Path]::IsPathRooted($target)) {
+            [IO.Path]::GetFullPath($target)
+        }
+        else {
+            [IO.Path]::GetFullPath((Join-Path $parentFull $target))
+        }
+    }
+    catch {
+        throw "$Context installed closure contains an invalid symbolic-link target '$target': $($_.Exception.Message)"
+    }
+    $rootPrefix = $rootFull + [IO.Path]::DirectorySeparatorChar
+    if ([string]::Equals($targetFull, $rootFull, [StringComparison]::Ordinal) -or
+        -not $targetFull.StartsWith($rootPrefix, [StringComparison]::Ordinal)) {
+        throw "$Context installed closure symbolic-link target escapes the install root: '$target'."
+    }
+    $targetItem = Get-Item -Force -LiteralPath $targetFull -ErrorAction Stop
+    if ((-not $targetItem.PSIsContainer -and $targetItem -isnot [IO.FileInfo]) -or
+        ($targetItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Context installed closure symbolic-link target must be a non-reparse regular file or directory: '$target'."
+    }
+    $relativeTarget = $targetFull.Substring($rootFull.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $relativeTarget = $relativeTarget.Replace([IO.Path]::DirectorySeparatorChar, '/').Replace([IO.Path]::AltDirectorySeparatorChar, '/')
+    Assert-InstalledClosureSafeRelativePath -Value $relativeTarget -Context "$Context symbolic-link target"
+    $relativePath = $Item.FullName.Substring($rootFull.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $relativePath = $relativePath.Replace([IO.Path]::DirectorySeparatorChar, '/').Replace([IO.Path]::AltDirectorySeparatorChar, '/')
+    $storageBytes = [Text.Encoding]::UTF8.GetByteCount($target)
+    return [pscustomobject][ordered]@{
+        path = $relativePath
+        sha256 = Get-InstalledClosureSymlinkIdentitySha256 -Target $target -ResolvedRelativeTarget $relativeTarget
+        storageBytes = $storageBytes
+    }
+}
+
+function Get-InstalledClosureAsciiCaseFold {
+    param([Parameter(Mandatory = $true)][string] $Value)
+    $builder = [Text.StringBuilder]::new()
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int][char]$character
+        if ($code -ge 65 -and $code -le 90) { $code += 32 }
+        [void]$builder.Append([char]$code)
+    }
+    return $builder.ToString()
+}
+
+function Add-InstalledClosureEntry {
+    param(
+        [Parameter(Mandatory = $true)] $Entries,
+        [Parameter(Mandatory = $true)] $OrdinalPaths,
+        [Parameter(Mandatory = $true)] $NfcPaths,
+        [Parameter(Mandatory = $true)] $AsciiCasePaths,
+        [Parameter(Mandatory = $true)] $Entry,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $relative = [string]$Entry.path
+    Assert-InstalledClosureSafeRelativePath -Value $relative -Context $Context
+    if (-not $OrdinalPaths.Add($relative)) {
+        throw "$Context contains a duplicate path: '$relative'."
+    }
+    $nfc = $relative.Normalize([Text.NormalizationForm]::FormC)
+    if ($NfcPaths.ContainsKey($nfc) -and -not [string]::Equals([string]$NfcPaths[$nfc], $relative, [StringComparison]::Ordinal)) {
+        throw "$Context contains Unicode-normalization-colliding paths: '$($NfcPaths[$nfc])' and '$relative'."
+    }
+    $NfcPaths[$nfc] = $relative
+    $asciiCase = Get-InstalledClosureAsciiCaseFold -Value $nfc
+    if ($AsciiCasePaths.ContainsKey($asciiCase) -and -not [string]::Equals([string]$AsciiCasePaths[$asciiCase], $relative, [StringComparison]::Ordinal)) {
+        throw "$Context contains ASCII-case-colliding paths: '$($AsciiCasePaths[$asciiCase])' and '$relative'."
+    }
+    $AsciiCasePaths[$asciiCase] = $relative
+    [void]$Entries.Add($Entry)
+}
+
+function Sort-InstalledClosureEntriesByOrdinalPath {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Entries
+    )
+
+    $entriesByPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $Entries) {
+        $path = [string]$entry.path
+        if (-not $entriesByPath.TryAdd($path, $entry)) {
+            throw "Installed closure contains a duplicate path: '$path'."
+        }
+    }
+    $orderedPaths = [string[]]@($entriesByPath.Keys | ForEach-Object { [string]$_ })
+    [Array]::Sort($orderedPaths, [StringComparer]::Ordinal)
+    $ordered = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($path in $orderedPaths) {
+        [void]$ordered.Add($entriesByPath[$path])
+    }
+    return ,$ordered
+}
+
 function Get-InstalledDirectoryClosureSha256 {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -2523,32 +2686,35 @@ function Get-InstalledDirectoryClosureSha256 {
     $root = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "$Context install root is missing: $root" }
     Assert-NoReparseAncestors -Path $root -Context "$Context install root"
-    $entries = @(Get-ChildItem -LiteralPath $root -Recurse -Force | Sort-Object FullName)
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    $ordinalPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $nfcPaths = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $asciiCasePaths = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($item in @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop)) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $symlinkEntry = Get-InstalledSafeUnixSymlinkEntry -Item $item -Root $root -Context $Context
+            Add-InstalledClosureEntry -Entries $entries -OrdinalPaths $ordinalPaths -NfcPaths $nfcPaths -AsciiCasePaths $asciiCasePaths -Entry $symlinkEntry -Context $Context
+            continue
+        }
+        if ($item.PSIsContainer) { continue }
+        if ($item -isnot [IO.FileInfo]) {
+            throw "$Context installed closure contains a non-regular filesystem entry: $($item.FullName)"
+        }
+        $relative = $item.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $relative = $relative.Replace([IO.Path]::DirectorySeparatorChar, '/').Replace([IO.Path]::AltDirectorySeparatorChar, '/')
+        Assert-NoReparseAncestors -Path $item.FullName -Context "$Context installed closure file"
+        $entry = [pscustomobject][ordered]@{
+            path = $relative
+            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash.ToLowerInvariant()
+        }
+        Add-InstalledClosureEntry -Entries $entries -OrdinalPaths $ordinalPaths -NfcPaths $nfcPaths -AsciiCasePaths $asciiCasePaths -Entry $entry -Context $Context
+    }
     if ($entries.Count -eq 0) { throw "$Context install root is empty: $root" }
-    foreach ($entry in $entries) {
-        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "$Context installed closure contains a reparse-backed entry: $($entry.FullName)"
-        }
-    }
-    $files = @($entries | Where-Object { -not $_.PSIsContainer })
-    if ($files.Count -eq 0) { throw "$Context install root contains no regular files: $root" }
-    $canonical = [Text.StringBuilder]::new()
-    foreach ($file in $files) {
-        if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "$Context installed closure contains a reparse-backed file: $($file.FullName)"
-        }
-        Assert-NoReparseAncestors -Path $file.FullName -Context "$Context installed closure file"
-        $relative = $file.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-        $relative = $relative.Replace([IO.Path]::DirectorySeparatorChar, '/')
-        if ([string]::IsNullOrWhiteSpace($relative) -or $relative -match '(^|/)\.\.?(/|$)') {
-            throw "$Context installed closure contains an unsafe relative path."
-        }
-        $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
-        [void]$canonical.Append($relative).Append("`t").Append($sha256).Append("`n")
-    }
+    $ordered = Sort-InstalledClosureEntriesByOrdinalPath -Entries $entries
+    $canonical = ($ordered | ForEach-Object { "$($_.path)`t$($_.sha256)`n" }) -join ''
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
-        return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical.ToString()))) -replace '-', '').ToLowerInvariant()
+        return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))) -replace '-', '').ToLowerInvariant()
     }
     finally { $hasher.Dispose() }
 }
@@ -3204,7 +3370,7 @@ function Assert-RegularFileForHash {
         finally {
             [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
         }
-        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
+        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cnotin @('regular file', 'regular empty file')) {
             throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
         }
     }

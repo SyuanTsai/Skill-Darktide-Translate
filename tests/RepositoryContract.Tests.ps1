@@ -355,3 +355,249 @@ foreach ($modulePath in @(([string]$env:PSModulePath -split ':') | Where-Object 
             Should -Throw '*unsafe bind source*'
     }
 }
+
+Describe 'Trusted filesystem contract' {
+    BeforeAll {
+        $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
+        $statCommand = Get-Command stat -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $statCommand) { $script:NativeStatPath = [string]$statCommand.Path }
+        else {
+            $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+            $script:NativeStatPath = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $gitCommand.Path) '../usr/bin/stat.exe'))
+        }
+        if (-not (Test-Path -LiteralPath $script:NativeStatPath -PathType Leaf)) {
+            throw 'GNU stat is required for the native file-classification regression.'
+        }
+        $statVersion = @(& $script:NativeStatPath --version)
+        if ($LASTEXITCODE -ne 0 -or $statVersion[0] -notmatch 'GNU coreutils') {
+            throw 'The file-classification regression requires GNU stat.'
+        }
+
+        function New-TestFilesystemModule {
+            param([Parameter(Mandatory)][string] $RelativePath)
+            $tokens = $null
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $script:RepositoryRoot $RelativePath), [ref]$tokens, [ref]$errors)
+            if (@($errors).Count -ne 0) { throw 'The production filesystem source must parse.' }
+            $names = @(
+                'Assert-RegularFileForHash', 'Assert-NoReparseAncestors', 'Test-PathEqual',
+                'Assert-InstalledClosureSafeRelativePath', 'Get-InstalledClosureSymlinkTarget',
+                'Get-InstalledClosureSymlinkIdentitySha256', 'Get-InstalledSafeUnixSymlinkEntry',
+                'Get-InstalledClosureAsciiCaseFold', 'Add-InstalledClosureEntry',
+                'Sort-InstalledClosureEntriesByOrdinalPath', 'Get-InstalledDirectoryClosureSha256'
+            )
+            $functions = @($ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -cin $names
+            }, $true))
+            $source = ($functions | ForEach-Object {
+                $text = $_.Extent.Text
+                if ($RelativePath -ceq 'scripts/Test-Repository.ps1' -and $_.Name -ceq 'Assert-RegularFileForHash') {
+                    $guard = $_.Body.Find({
+                        param($node)
+                        $node -is [Management.Automation.Language.IfStatementAst] -and
+                            $node.Clauses[0].Item1.Extent.Text -ceq '[Environment]::OSVersion.Platform -eq [PlatformID]::Unix'
+                    }, $true)
+                    if ($null -eq $guard) { throw 'Expected the repository validator native-platform guard.' }
+                    # Only select its native branch for the portable GNU-stat harness.
+                    # All filesystem checks, native invocation, parsing and locale handling stay unchanged.
+                    $condition = $guard.Clauses[0].Item1.Extent
+                    $start = $condition.StartOffset - $_.Extent.StartOffset
+                    $text = $text.Substring(0, $start) + '$true' + $text.Substring($start + $condition.Text.Length)
+                }
+                $text
+            }) -join "`n"
+            $module = New-Module -ScriptBlock ([scriptblock]::Create($source))
+            & $module {
+                param($statPath)
+                # Exercise the production GNU-stat path on either host, using the real native utility.
+                $script:IsLinuxHost = $true
+                $script:TrustedStatPath = $statPath
+            } $script:NativeStatPath
+            return $module
+        }
+
+        $script:FilesystemModules = @{}
+        foreach ($relativePath in @('scripts/Validate.ps1', 'scripts/Test-Repository.ps1')) {
+            $script:FilesystemModules[$relativePath] = New-TestFilesystemModule -RelativePath $relativePath
+        }
+    }
+
+    # Scenario: GNU stat classifies a newly created, zero-byte Git configuration file.
+    # Purpose: Accept the exact regular-empty-file shape that the protected Linux preflight creates.
+    It 'InterT10_AcceptsNativeGnuEmptyRegularFile_<Source>' -ForEach @(
+        @{ Source = 'scripts/Validate.ps1' }
+        @{ Source = 'scripts/Test-Repository.ps1' }
+    ) {
+        $path = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $item = New-Item -ItemType File -Path $path
+        { & $script:FilesystemModules[$Source] {
+            param($file)
+            Assert-RegularFileForHash -Item $file -Context 'Empty Git config fixture'
+        } $item } | Should -Not -Throw
+    }
+
+    # Scenario: The same native classification checks a nonempty ordinary file.
+    # Purpose: Preserve the existing accepted regular-file behavior.
+    It 'InterT20_AcceptsNativeGnuNonemptyRegularFile_<Source>' -ForEach @(
+        @{ Source = 'scripts/Validate.ps1' }
+        @{ Source = 'scripts/Test-Repository.ps1' }
+    ) {
+        $path = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($path, 'fixture', [Text.UTF8Encoding]::new($false))
+        $item = Get-Item -LiteralPath $path
+        { & $script:FilesystemModules[$Source] {
+            param($file)
+            Assert-RegularFileForHash -Item $file -Context 'Nonempty file fixture'
+        } $item } | Should -Not -Throw
+    }
+
+    # Scenario: A directory is supplied where a regular file is required.
+    # Purpose: Keep non-file entries rejected before hashing or invoking downstream tools.
+    It 'InterT30_RejectsDirectory_<Source>' -ForEach @(
+        @{ Source = 'scripts/Validate.ps1' }
+        @{ Source = 'scripts/Test-Repository.ps1' }
+    ) {
+        $item = New-Item -ItemType Directory -Path (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))
+        { & $script:FilesystemModules[$Source] {
+            param($file)
+            Assert-RegularFileForHash -Item $file -Context 'Directory fixture'
+        } $item } | Should -Throw '*not a regular non-reparse file*'
+    }
+
+    # Scenario: stat encounters a file deleted after its FileInfo was obtained, with a caller locale set.
+    # Purpose: Fail closed on native probe errors and restore the exact caller environment on failure.
+    It 'InterT40_RejectsFailedStatAndRestoresLocale_<Source>' -ForEach @(
+        @{ Source = 'scripts/Validate.ps1' }
+        @{ Source = 'scripts/Test-Repository.ps1' }
+    ) {
+        $path = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($path, 'fixture')
+        $item = Get-Item -LiteralPath $path
+        Remove-Item -LiteralPath $path
+        $previous = [Environment]::GetEnvironmentVariable('LC_ALL', 'Process')
+        try {
+            [Environment]::SetEnvironmentVariable('LC_ALL', 'fixture-caller-locale', 'Process')
+            { & $script:FilesystemModules[$Source] {
+                param($file)
+                Assert-RegularFileForHash -Item $file -Context 'Missing file fixture'
+            } $item } | Should -Throw '*trusted filesystem type check*'
+            [Environment]::GetEnvironmentVariable('LC_ALL', 'Process') | Should -BeExactly 'fixture-caller-locale'
+        }
+        finally { [Environment]::SetEnvironmentVariable('LC_ALL', $previous, 'Process') }
+    }
+
+    # Scenario: A closure contains names whose culture sort differs from the authority's Ordinal order.
+    # Purpose: Bind canonical UTF-8 path/hash bytes to the same digest as the approved resolver contract.
+    It 'InterT50_MatchesOrdinalCanonicalClosureDigest' {
+        $root = Join-Path $TestDrive 'closure'
+        [void](New-Item -ItemType Directory -Path $root)
+        $names = [string[]]@('a.txt', 'Z.txt', 'é.txt', '中.txt')
+        foreach ($name in $names) {
+            [IO.File]::WriteAllText((Join-Path $root $name), "content:$name", [Text.UTF8Encoding]::new($false))
+        }
+        [Array]::Sort($names, [StringComparer]::Ordinal)
+        $canonical = ($names | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath (Join-Path $root $_) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$_`t$hash`n"
+        }) -join ''
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $expected = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))) -replace '-', '').ToLowerInvariant() }
+        finally { $sha.Dispose() }
+        $actual = & $script:FilesystemModules['scripts/Validate.ps1'] {
+            param($path)
+            Get-InstalledDirectoryClosureSha256 -Path $path -Context 'Authority closure fixture'
+        } $root
+        $actual | Should -BeExactly $expected
+    }
+
+    # Scenario: A closure entry repeats a path or collides after authority normalization.
+    # Purpose: Preserve duplicate, Unicode NFC, ASCII case and unsafe-path rejection before sorting.
+    It 'UnitT60_RejectsInvalidClosureIdentity_<Case>' -ForEach @(
+        @{ Case = 'duplicate'; Paths = @('same', 'same'); Error = '*duplicate path*' }
+        @{ Case = 'unicode'; Paths = @('é', "e$([char]0x301)"); Error = '*Unicode-normalization-colliding*' }
+        @{ Case = 'ascii-case'; Paths = @('A.txt', 'a.txt'); Error = '*ASCII-case-colliding*' }
+        @{ Case = 'parent'; Paths = @('../outside'); Error = '*unsafe relative path*' }
+        @{ Case = 'separator'; Paths = @('folder\file'); Error = '*unsafe relative path*' }
+    ) {
+        { & $script:FilesystemModules['scripts/Validate.ps1'] {
+            param($paths)
+            $entries = [Collections.Generic.List[object]]::new()
+            $ordinal = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $nfc = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            $ascii = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            foreach ($path in $paths) {
+                Add-InstalledClosureEntry -Entries $entries -OrdinalPaths $ordinal -NfcPaths $nfc -AsciiCasePaths $ascii `
+                    -Entry ([pscustomobject]@{ path = $path; sha256 = ('a' * 64) }) -Context 'Closure fixture'
+            }
+        } $Paths } | Should -Throw $Error
+    }
+
+    # Scenario: Installed file bytes change after a closure receipt is created.
+    # Purpose: Ensure content tampering changes the digest even when paths remain identical.
+    It 'InterT70_DetectsContentTampering' {
+        $root = Join-Path $TestDrive 'tamper-closure'
+        [void](New-Item -ItemType Directory -Path $root)
+        $path = Join-Path $root 'payload.txt'
+        [IO.File]::WriteAllText($path, 'before')
+        $before = & $script:FilesystemModules['scripts/Validate.ps1'] {
+            param($root)
+            Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Tamper fixture'
+        } $root
+        [IO.File]::WriteAllText($path, 'after')
+        $after = & $script:FilesystemModules['scripts/Validate.ps1'] {
+            param($root)
+            Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Tamper fixture'
+        } $root
+        $after | Should -Not -Be $before
+    }
+
+    # Scenario: An installed closure contains an in-root link on the current OS.
+    # Purpose: Reject Windows reparse points and accept only identity-bound, in-root Unix symbolic links.
+    It 'InterT80_EnforcesHostSpecificReparsePolicy' {
+        $root = Join-Path $TestDrive 'linked-closure'
+        $target = Join-Path $root 'target'
+        [void](New-Item -ItemType Directory -Path $target -Force)
+        [IO.File]::WriteAllText((Join-Path $target 'payload'), 'fixture')
+        $link = Join-Path $root 'link'
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
+            [void](New-Item -ItemType SymbolicLink -Path $link -Target 'target')
+            $entry = & $script:FilesystemModules['scripts/Validate.ps1'] {
+                param($link, $root)
+                Get-InstalledSafeUnixSymlinkEntry -Item (Get-Item -LiteralPath $link -Force) -Root $root -Context 'Unix link fixture'
+            } $link $root
+            $entry.path | Should -BeExactly 'link'
+            $entry.sha256 | Should -Match '^[0-9a-f]{64}$'
+        }
+        else {
+            [void](New-Item -ItemType Junction -Path $link -Target $target)
+            { & $script:FilesystemModules['scripts/Validate.ps1'] {
+                param($root)
+                Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Windows reparse fixture'
+            } $root } | Should -Throw '*not a safe Unix symbolic link*'
+        }
+    }
+
+    # Scenario: A large closure must be sorted while preserving its independently computed canonical bytes.
+    # Purpose: Prevent reintroducing quadratic insertion ordering or silently changing the Ordinal digest input.
+    It 'UnitT90_PreservesLargeClosureCanonicalBytesWithinABoundedSort' {
+        $entries = @(15278..0 | ForEach-Object {
+            [pscustomobject]@{ path = ('entry/{0:D5}' -f $_); sha256 = ('a' * 64) }
+        })
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $actual = & $script:FilesystemModules['scripts/Validate.ps1'] {
+            param($entries)
+            (Sort-InstalledClosureEntriesByOrdinalPath -Entries $entries).ToArray()
+        } $entries
+        $timer.Stop()
+        $actual.Count | Should -Be 15279
+        $expectedPaths = [string[]]@($entries | ForEach-Object path)
+        [Array]::Sort($expectedPaths, [StringComparer]::Ordinal)
+        $actualCanonical = ($actual | ForEach-Object { "$($_.path)`t$($_.sha256)`n" }) -join ''
+        $expectedCanonical = ($expectedPaths | ForEach-Object { "$_`t$('a' * 64)`n" }) -join ''
+        $actualCanonical | Should -BeExactly $expectedCanonical
+        $timer.Elapsed.TotalSeconds | Should -BeLessThan 10
+        Write-Host "Ordinal ordering: 15279 entries in $($timer.Elapsed.TotalMilliseconds) ms; canonical bytes equal."
+    }
+}
