@@ -57,20 +57,20 @@ Describe 'Repository pre-push validation' {
             Should -Throw '*HEAD changed during pre-push validation*'
     }
 
-    It 'UnitT40_UsesOnePrePushEntrypointForTheLocalAndCiContract' {
-        Test-Path -LiteralPath $script:prePushPath | Should -Be $true
-        $prePush = Get-Content -LiteralPath $script:prePushPath -Raw
+    # Scenario: Source layout and validation lifecycle can differ during the bootstrap transition.
+    # Purpose: Require the current protected entry without resurrecting the retired pre-push workflow.
+    It 'UnitT40_UsesTheValidationEntrypointForTheCurrentLifecycle' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
 
         if ($script:layout.Name -ceq 'legacy') {
-            $prePush | Should -Match 'Test-CleanRepositoryHead\.ps1'
-            $prePush | Should -Match 'tests/Invoke-Tests\.ps1'
-            $prePush | Should -Match 'Test-ReferenceIntegrity\.ps1'
-            $prePush | Should -Match 'scripts/Get-SourcePin\.ps1'
-            ([regex]::Matches($prePush, 'Test-CleanRepositoryHead\.ps1')).Count | Should -Be 2
-            $workflow | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
+            Test-Path -LiteralPath $script:prePushPath | Should -BeFalse
+            $workflow | Should -Match 'BootstrapTransition'
+            $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github.sha \}\}'
+            $workflow | Should -Match 'scripts/Validate\.ps1'
         }
         else {
+            Test-Path -LiteralPath $script:prePushPath | Should -BeTrue
+            $prePush = Get-Content -LiteralPath $script:prePushPath -Raw
             $prePush | Should -Match 'scripts/Validate\.ps1'
             $prePush | Should -Match 'ArtifactsRoot'
             $prePush | Should -Match 'BaseCommit'
@@ -81,18 +81,15 @@ Describe 'Repository pre-push validation' {
         $workflow | Should -Not -Match 'run: \./tests/Invoke-Tests\.ps1'
     }
 
-    It 'UnitT50_RunsEachPullRequestHeadOnceAndRevalidatesMainAfterMerge' {
+    # Scenario: The bootstrap is PR-only; the promoted Standard v1 adapter adds main-push validation.
+    # Purpose: Verify the actual event contract without requiring retired legacy workflow files.
+    It 'UnitT50_UsesTheProtectedEventsForTheCurrentLifecycle' {
+        $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
+        $workflow | Should -Match '(?m)^  pull_request_target:'
         if ($script:layout.Name -ceq 'legacy') {
-            foreach ($workflowName in @('validate.yml', 'skill-validator.yml')) {
-                $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot ".github/workflows/$workflowName") -Raw
-
-                $workflow | Should -Match '(?m)^  push:\r?$'
-                $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
-                $workflow | Should -Match '(?m)^  pull_request:'
-            }
+            $workflow | Should -Not -Match '(?m)^  (push|pull_request|workflow_dispatch):'
         }
         else {
-            $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
             $workflow | Should -Match '(?m)^  push:\r?$'
             $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
             $workflow | Should -Match '(?m)^  pull_request_target:'
