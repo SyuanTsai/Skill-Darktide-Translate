@@ -669,3 +669,86 @@ Describe 'Protected workflow trust binding' {
         }
     }
 }
+Describe 'Optional Linux read-only path binding' {
+    BeforeAll {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1'), [ref]$tokens, [ref]$errors)
+        if (@($errors).Count -ne 0) { throw 'Production validator must parse.' }
+        $native = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $parameter = @($native.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'ReadOnlyPaths' })
+        $loop = @($native.Body.FindAll({ param($node)
+            $node -is [Management.Automation.Language.ForEachStatementAst] -and $node.Variable.VariablePath.UserPath -ceq 'readOnlyPath'
+        }, $true))
+        $reparseGuard = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-NoReparseAncestors'
+        }, $true)
+        $pathEqual = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-PathEqual'
+        }, $true)
+        if ($parameter.Count -ne 1 -or $loop.Count -ne 1 -or $null -eq $reparseGuard -or $null -eq $pathEqual) {
+            throw 'Expected the production parameter, Linux bind loop and reparse guard.'
+        }
+        # Execute the unchanged production parameter binding and bind-source loop.
+        # This does not emulate or claim to run Linux mount/cgroup isolation.
+        $source = 'param(' + $parameter[0].Extent.Text + ')' + [Environment]::NewLine +
+            $pathEqual.Extent.Text + [Environment]::NewLine +
+            $reparseGuard.Extent.Text + [Environment]::NewLine +
+            '$Context = "Read-only fixture"; $linuxReadonlyBindPaths = [Collections.Generic.List[string]]::new()' +
+            [Environment]::NewLine + $loop[0].Extent.Text + [Environment]::NewLine +
+            'return ,$linuxReadonlyBindPaths'
+        $script:ReadOnlyProbe = [scriptblock]::Create($source)
+    }
+
+    # Scenario: Bootstrap probes omit the optional read-only path array.
+    # Purpose: Absence means zero additional bind sources, not one null path.
+    It 'UnitT10_AcceptsOmittedReadOnlyPaths' {
+        $actual = & $script:ReadOnlyProbe
+        $actual.Count | Should -Be 0
+    }
+
+    # Scenario: A caller explicitly provides an empty collection.
+    # Purpose: Preserve the documented empty collection behavior.
+    It 'UnitT20_AcceptsEmptyReadOnlyPaths' {
+        $actual = & $script:ReadOnlyProbe -ReadOnlyPaths @()
+        $actual.Count | Should -Be 0
+    }
+
+    # Scenario: Existing regular files are provided twice.
+    # Purpose: Keep validated full paths and deduplicate repeated bind entries.
+    It 'InterT30_PreservesExistingReadOnlyPaths' {
+        $path = Join-Path $TestDrive 'existing.txt'
+        [IO.File]::WriteAllText($path, 'fixture')
+        $actual = & $script:ReadOnlyProbe -ReadOnlyPaths @($path, $path)
+        $actual.Count | Should -Be 1
+        $actual[0] | Should -BeExactly ([IO.Path]::GetFullPath($path))
+    }
+
+    # Scenario: A supplied path does not exist.
+    # Purpose: Missing explicit inputs must still fail closed.
+    It 'InterT40_RejectsMissingExplicitPath' {
+        $path = Join-Path $TestDrive 'missing'
+        { & $script:ReadOnlyProbe -ReadOnlyPaths @($path) } | Should -Throw '*read-only child path is missing*'
+    }
+
+    # Scenario: A caller explicitly supplies a blank or null path entry.
+    # Purpose: The omitted-array default must not silently discard invalid supplied entries.
+    It 'UnitT50_RejectsInvalidExplicitEntry_<kind>' -ForEach @(
+        @{ kind = 'empty'; value = '' }, @{ kind = 'null'; value = $null }
+    ) {
+        { & $script:ReadOnlyProbe -ReadOnlyPaths @($value) } | Should -Throw
+    }
+
+    # Scenario: A supplied directory is backed by a reparse point.
+    # Purpose: Optional-path handling cannot weaken the existing reparse boundary.
+    It 'InterT60_RejectsReparseReadOnlyPath' {
+        $target = Join-Path $TestDrive 'target'
+        $link = Join-Path $TestDrive 'link'
+        [void](New-Item -ItemType Directory -Path $target)
+        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        [void](New-Item -ItemType $linkType -Path $link -Target $target)
+        { & $script:ReadOnlyProbe -ReadOnlyPaths @($link) } | Should -Throw '*reparse*'
+    }
+}

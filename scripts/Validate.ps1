@@ -3433,7 +3433,7 @@ function Invoke-NativeChecked {
         [Parameter()][switch] $TerminateProcessTree,
         [Parameter()][switch] $ProtectRunnerCommandFiles,
         [Parameter()][switch] $DirectWindowsProcess,
-        [Parameter()][AllowEmptyCollection()][string[]] $ReadOnlyPaths,
+        [Parameter()][AllowEmptyCollection()][string[]] $ReadOnlyPaths = @(),
         [Parameter()][switch] $ApplyLinuxResourceLimits,
         [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline',
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
