@@ -96,8 +96,8 @@ function Get-TestRepositoryLayout {
             ProfilePath = 'catalog/skills-catalog.json'
             SourcePath = $null
             AdapterPath = $null
-            WorkflowPath = '.github/workflows/validate.yml'
-            QualityWorkflowPath = '.github/workflows/skill-validator.yml'
+            WorkflowPath = '.github/workflows/standard-v1-protected.yml'
+            QualityWorkflowPath = $null
         }
     }
     if ($hasStandardSource -and $hasStandardAdapter -and $hasStandardSkill -and -not $hasLegacyMarker) {
@@ -118,6 +118,56 @@ function Get-TestRepositoryLayout {
     }
 
     throw 'Repository layout is incomplete or unauthorized; only the complete legacy or Standard v1 structure is accepted.'
+}
+
+function Invoke-TestModulePathProbe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $RepositoryRoot,
+        [string] $Source,
+        [string] $DeniedPath,
+        [switch] $UnexpectedError,
+        [switch] $BindError
+    )
+
+    if ([string]::IsNullOrEmpty($Source)) {
+        $Source = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'scripts/Validate.ps1') -Raw
+    }
+    $parseTokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Source, [ref]$parseTokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -ne 0) { throw 'The module-path test source does not parse.' }
+    $loops = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.ForEachStatementAst] -and
+            $node.Variable.VariablePath.UserPath -ceq 'modulePath'
+    }, $true))
+    if ($loops.Count -ne 1) { throw 'Expected one production module-path loop.' }
+
+    # Execute the production loop, replacing only filesystem probing and bind collection.
+    function Test-Path {
+        [CmdletBinding()]
+        param([string] $LiteralPath, [string] $PathType)
+        if ($UnexpectedError) { throw [IO.IOException]::new('unexpected module-path IO failure') }
+        if ($LiteralPath -ceq $DeniedPath) {
+            throw [UnauthorizedAccessException]::new('denied optional module path')
+        }
+        return $LiteralPath -ceq '/readable/modules'
+    }
+    $bound = [Collections.Generic.List[string]]::new()
+    $addLinuxReadonlyBindPath = {
+        param([string] $Path)
+        if ($BindError) { throw [IO.InvalidDataException]::new('unsafe bind source') }
+        [void]$bound.Add($Path)
+    }
+    $oldModulePath = $env:PSModulePath
+    try {
+        $env:PSModulePath = '/denied/modules:/missing/modules:/readable/modules'
+        $ErrorActionPreference = 'Stop'
+        & ([scriptblock]::Create($loops[0].Extent.Text))
+        return ,$bound.ToArray()
+    }
+    finally { $env:PSModulePath = $oldModulePath }
 }
 
 function Get-TestSkillRepositoryPath {
