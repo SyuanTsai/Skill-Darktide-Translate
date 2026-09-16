@@ -5116,6 +5116,12 @@ Assert-NoReparseAncestors -Path $runRoot -Context 'Run-owned artifacts path'
 Assert-NoReparseAncestors -Path $childOutputRoot -Context 'Low-integrity child output root'
 Set-WindowsLowIntegrityDirectory -Path $childOutputRoot
 $semanticCredentialEnvironment = Protect-ProcessCredentialEnvironment -SemanticCredentialNames $SemanticCredentialNames
+# SkillSpector's supply-chain pass has its own short default timeout. Keep the
+# tool setting explicit and run-owned while the native process boundary below
+# remains the authoritative 300-second execution limit.
+$skillSpectorRuntimeEnvironment = [ordered]@{
+    'SKILLSPECTOR_MAX_WORKFLOW_SECONDS' = '1200'
+}
 [void](New-Item -ItemType Directory -Path $authorityExtractRoot -Force)
 [void](New-Item -ItemType Directory -Path $installRoot -Force)
 $trustedGitConfigPath = Join-Path $runRoot 'empty-git-config'
@@ -5289,7 +5295,7 @@ foreach ($skillId in $skillIds) {
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
     $reportPath = Join-Path $childOutputRoot "skillspector-static-$skillId.json"
-    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
+    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $skillSpectorRuntimeEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
     $report = Read-JsonFile -Path $reportPath -Context "SkillSpector static report for $skillId"
     $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
     foreach ($issue in $issues) {
@@ -5450,7 +5456,14 @@ if ($semanticTriggered) {
                 ForEach-Object { [string]$_.path }
         )
         $semanticPath = Join-Path $childOutputRoot "skillspector-semantic-$skillId.json"
-        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticCredentialEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
+        $semanticEnvironment = [ordered]@{}
+        foreach ($name in @($semanticCredentialEnvironment.Keys)) {
+            $semanticEnvironment[$name] = [string]$semanticCredentialEnvironment[$name]
+        }
+        foreach ($name in @($skillSpectorRuntimeEnvironment.Keys)) {
+            $semanticEnvironment[$name] = [string]$skillSpectorRuntimeEnvironment[$name]
+        }
+        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
         $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
         try {
             $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)

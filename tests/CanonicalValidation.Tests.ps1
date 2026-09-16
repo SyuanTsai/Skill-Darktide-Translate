@@ -277,6 +277,9 @@ Describe 'Canonical Standard v1 validation adapter' {
         $workflow | Should -Not -Match 'EnableSemanticScan'
         $script:Validator | Should -Match 'credential-free and deterministic'
         $script:Validator | Should -Match 'SkippedCount -ne 0'
+        $script:Validator | Should -Match "SKILLSPECTOR_MAX_WORKFLOW_SECONDS.*=.*'1200'"
+        $script:Validator | Should -Match 'authoritative 300-second execution limit'
+        $script:Validator | Should -Match '-AdditionalEnvironmentVariables \$skillSpectorRuntimeEnvironment'
         $repositoryValidator = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Test-Repository.ps1') -Raw
         $repositoryValidator | Should -Match 'rawSha256'
         $repositoryValidator | Should -Match '\[string\] \$TrustedGitPath'
