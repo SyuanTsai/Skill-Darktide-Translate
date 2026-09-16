@@ -89,12 +89,14 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match '\$storageBytes = \[Text\.Encoding\]::UTF8\.GetByteCount\(\$target\)'
     }
 
-    It 'counts directories toward the bounded Linux writable-entry limit' {
+    # Scenario: A real directory is encountered during bounded writable-root inspection.
+    # Purpose: Preserve count-and-limit ordering before traversal; native behavior is tested below.
+    It 'UnitT90_CountsDirectoriesBeforeTraversingBoundedWritableRoots' {
         $usageStart = $script:Validator.IndexOf('function Get-LinuxWritableRootUsage', [StringComparison]::Ordinal)
         $usageEnd = $script:Validator.IndexOf('function Assert-LinuxWritableRootUsage', $usageStart, [StringComparison]::Ordinal)
         $usageFunction = $script:Validator.Substring($usageStart, $usageEnd - $usageStart)
 
-        $usageFunction | Should -Match '(?s)if \(\$entry\.PSIsContainer\) \{.*?\$entryCount\+\+.*?writable-entry-count limit of 100000.*?\$pending\.Push\(\[IO\.DirectoryInfo\]\$entry\)'
+        $usageFunction | Should -Match '(?s)if \(\$entry -is \[IO\.DirectoryInfo\]\) \{.*?\$entryCount\+\+.*?writable-entry-count limit of 100000.*?\$pending\.Push\(\[IO\.DirectoryInfo\]\$entry\)'
     }
 
     It 'enforces writable-root growth during every protected Pester shard' {
@@ -548,5 +550,100 @@ if ($LASTEXITCODE -ne 0) { throw 'Selected trusted test commit is not readable.'
         finally {
             foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
         }
+    }
+}
+
+Describe 'Bounded writable-root enumeration behavior' {
+    BeforeAll {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1'), [ref]$tokens, [ref]$errors)
+        if (@($errors).Count -ne 0) { throw 'Validator must parse before behavioral testing.' }
+        # Test seam exists before the fix so Red measures eager consumption, not a missing symbol.
+        function Get-LinuxWritableDirectoryEnumerator {
+            param([IO.DirectoryInfo] $Directory)
+            return ,$Directory.EnumerateFileSystemInfos().GetEnumerator()
+        }
+        foreach ($name in @('Get-LinuxWritableDirectoryEnumerator', 'Get-LinuxWritableRootUsage')) {
+            $definition = $ast.Find({ param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+            }, $true)
+            if ($null -ne $definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
+            elseif ($name -ceq 'Get-LinuxWritableRootUsage') { throw 'Missing production usage function.' }
+        }
+    }
+
+    BeforeEach {
+        $script:PreviousLinuxHost = $script:IsLinuxHost
+        # Cross-platform function test only: this is not namespace/cgroup acceptance.
+        $script:IsLinuxHost = $true
+        $script:UsageRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Path $script:UsageRoot)
+        $file = Join-Path $script:UsageRoot 'entry'
+        [IO.File]::WriteAllText($file, '')
+        $script:CursorState = [pscustomobject]@{
+            Pulls = 0; Maximum = 100002; Disposed = 0; Entry = (Get-Item -LiteralPath $file)
+        }
+        $script:UsageCursor = [pscustomobject]@{ State = $script:CursorState }
+        $script:UsageCursor | Add-Member ScriptMethod MoveNext {
+            $this.State.Pulls++
+            return $this.State.Pulls -le $this.State.Maximum
+        }
+        $script:UsageCursor | Add-Member ScriptProperty Current { $this.State.Entry }
+        $script:UsageCursor | Add-Member ScriptMethod Dispose { $this.State.Disposed++ }
+    }
+    AfterEach { $script:IsLinuxHost = $script:PreviousLinuxHost }
+
+    # Scenario: A finite source has more entries than the production limit.
+    # Purpose: Abort at entry100001 without requesting the remaining source and release the enumerator.
+    It 'UnitT10_StopsEnumerationAtTheFirstExcessEntry' {
+        Mock Get-LinuxWritableDirectoryEnumerator { return ,$script:UsageCursor }
+        Mock Get-ChildItem {
+            for ($i = 0; $i -lt $script:CursorState.Maximum; $i++) {
+                $script:CursorState.Pulls++
+                $script:CursorState.Entry
+            }
+        }
+        { Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Bounded fixture' } | Should -Throw '*limit*'
+        $script:CursorState.Pulls | Should -Be 100001
+        $script:CursorState.Disposed | Should -Be 1
+    }
+
+    # Scenario: A finite source contains exactly the allowed100000 regular files.
+    # Purpose: Preserve the inclusive limit and return contract without weakening the overflow case.
+    It 'UnitT20_AcceptsTheExactEntryLimit' {
+        $script:CursorState.Maximum = 100000
+        Mock Get-LinuxWritableDirectoryEnumerator { return ,$script:UsageCursor }
+        Mock Get-ChildItem {
+            for ($i = 0; $i -lt $script:CursorState.Maximum; $i++) {
+                $script:CursorState.Pulls++
+                $script:CursorState.Entry
+            }
+        }
+        $usage = Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Exact fixture'
+        $usage.fileCount | Should -Be 100000
+        $usage.bytes | Should -Be 0
+    }
+
+    # Scenario: A real directory contains an ordinary file, hidden-name file and nested directory/file.
+    # Purpose: Exercise native enumeration and verify that directories count while file bytes remain exact.
+    It 'InterT30_CountsRealFilesDirectoriesAndHiddenEntries' {
+        [IO.File]::WriteAllText((Join-Path $script:UsageRoot '.hidden'), 'ab')
+        $subdir = Join-Path $script:UsageRoot 'nested'
+        [void](New-Item -ItemType Directory -Path $subdir)
+        [IO.File]::WriteAllText((Join-Path $subdir 'payload'), 'xyz')
+        $usage = Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Real fixture'
+        $usage.fileCount | Should -Be 4
+        $usage.bytes | Should -Be 5
+    }
+
+    # Scenario: The enumeration source raises an IO error while advancing.
+    # Purpose: Preserve fail-closed propagation and dispose the native enumeration resource.
+    It 'UnitT40_DisposesEnumeratorWhenMoveNextFails' {
+        $script:UsageCursor | Add-Member ScriptMethod MoveNext { throw [IO.IOException]::new('fixture enumeration failure') } -Force
+        Mock Get-LinuxWritableDirectoryEnumerator { return ,$script:UsageCursor }
+        Mock Get-ChildItem { throw [IO.IOException]::new('fixture enumeration failure') }
+        { Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Error fixture' } | Should -Throw '*fixture enumeration failure*'
+        $script:CursorState.Disposed | Should -Be 1
     }
 }

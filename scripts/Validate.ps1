@@ -598,6 +598,12 @@ function Remove-LinuxPesterCgroup {
     }
 }
 
+function Get-LinuxWritableDirectoryEnumerator {
+    param([Parameter(Mandatory = $true)][IO.DirectoryInfo] $Directory)
+    # Return the iterator itself; never drain an untrusted directory into a PowerShell array.
+    return ,$Directory.EnumerateFileSystemInfos().GetEnumerator()
+}
+
 function Get-LinuxWritableRootUsage {
     param(
         [Parameter(Mandatory = $true)][string] $Root,
@@ -615,31 +621,36 @@ function Get-LinuxWritableRootUsage {
     $entryCount = 0
     while ($pending.Count -gt 0) {
         $directory = $pending.Pop()
-        foreach ($entry in @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)) {
-            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                $symlinkEntry = Get-InstalledSafeUnixSymlinkEntry -Item $entry -Root $rootPath -Context $Context
+        $enumerator = Get-LinuxWritableDirectoryEnumerator -Directory $directory
+        try {
+            while ($enumerator.MoveNext()) {
+                $entry = $enumerator.Current
+                if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    $symlinkEntry = Get-InstalledSafeUnixSymlinkEntry -Item $entry -Root $rootPath -Context $Context
+                    $entryCount++
+                    if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
+                    $symlinkBytes = [int64]$symlinkEntry.storageBytes
+                    if ($symlinkBytes -gt 0 -and $symlinkBytes -gt ([int64]::MaxValue - $bytes)) {
+                        throw "$Context writable-root size overflowed the bounded accounting range."
+                    }
+                    $bytes += $symlinkBytes
+                    continue
+                }
+                if ($entry -is [IO.DirectoryInfo]) {
+                    $entryCount++
+                    if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
+                    $pending.Push([IO.DirectoryInfo]$entry)
+                    continue
+                }
                 $entryCount++
                 if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
-                $symlinkBytes = [int64]$symlinkEntry.storageBytes
-                if ($symlinkBytes -gt 0 -and $symlinkBytes -gt ([int64]::MaxValue - $bytes)) {
+                if ($entry.Length -gt 0 -and [int64]$entry.Length -gt ([int64]::MaxValue - $bytes)) {
                     throw "$Context writable-root size overflowed the bounded accounting range."
                 }
-                $bytes += $symlinkBytes
-                continue
+                $bytes += [int64]$entry.Length
             }
-            if ($entry.PSIsContainer) {
-                $entryCount++
-                if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
-                $pending.Push([IO.DirectoryInfo]$entry)
-                continue
-            }
-            $entryCount++
-            if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
-            if ($entry.Length -gt 0 -and [int64]$entry.Length -gt ([int64]::MaxValue - $bytes)) {
-                throw "$Context writable-root size overflowed the bounded accounting range."
-            }
-            $bytes += [int64]$entry.Length
         }
+        finally { $enumerator.Dispose() }
     }
     return [pscustomobject][ordered]@{ bytes = $bytes; fileCount = $entryCount }
 }
