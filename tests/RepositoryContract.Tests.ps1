@@ -330,4 +330,16 @@ Describe 'Darktide Translate repository contract' {
             $workflow | Should -Match 'scripts/Validate\.ps1'
         }
     }
+
+    # Scenario: The base-owned protected supervisor validates the next migration against the current central authority snapshot.
+    # Purpose: Prevent a merged workflow bootstrap from retaining a stale authority pin that rejects the candidate before validation.
+    It 'UnitT45_BindsTheProtectedSupervisorToTheCurrentAuthoritySnapshot' {
+        if ($layout.Name -ceq 'legacy') {
+            $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
+
+            $validator | Should -Match ([regex]::Escape("`$approvedAuthorityCommit = 'a403abdf038a3346d775431a6908a71cc3d35a5b'"))
+            $validator | Should -Match ([regex]::Escape("`$approvedAuthorityArchiveSha256 = '17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3'"))
+            $validator | Should -Not -Match ([regex]::Escape('d38eba3faf967504751aba759f38102e7538a519'))
+        }
+    }
 }
