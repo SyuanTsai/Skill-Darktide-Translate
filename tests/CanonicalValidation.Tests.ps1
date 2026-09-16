@@ -307,11 +307,12 @@ Describe 'Canonical Standard v1 validation adapter' {
         $repositoryValidator | Should -Match 'NoFilters:\$NoFilters'
     }
 
-    It 'supports PR-equivalent manual validation with an explicit base SHA' {
+    # Scenario: A collaborator can choose a branch when manually dispatching a workflow.
+    # Purpose: A branch-owned definition must never gain this publisher's checks permission.
+    It 'does not expose ref-selectable dispatch on the privileged workflow' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
-        $workflow | Should -Match '(?s)workflow_dispatch:\r?\n\s+inputs:\r?\n\s+base_sha:'
-        $workflow | Should -Match "github\.event_name == 'workflow_dispatch'.*github\.event\.inputs\.base_sha"
-        $workflow | Should -Match "GITHUB_EVENT_NAME -in @\('pull_request_target', 'workflow_dispatch'\)"
+        $workflow | Should -Not -Match '(?m)^\s+workflow_dispatch:'
+        $workflow | Should -Match '(?m)^  pull_request_target:'
         $workflow | Should -Match 'baseCandidate.*not.*distinct ancestor'
         $workflow | Should -Match "github\.event_name == 'push'.*github\.sha"
     }

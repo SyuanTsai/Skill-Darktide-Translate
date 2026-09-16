@@ -10,12 +10,9 @@ on:
     branches:
       - main
   pull_request_target:
-  workflow_dispatch:
-    inputs:
-      base_sha:
-        description: 'Optional assertion of the resolved default-branch supervisor SHA'
-        required: false
-        type: string
+
+# No workflow_dispatch: its selected ref owns the workflow definition and could
+# replace guards before requesting the required-check publisher's permission.
 
 permissions:
   contents: read
@@ -758,7 +755,7 @@ jobs:
 
   publish-head-required-checks:
     name: publish head-bound required checks
-    # Manual runs may validate a candidate, but can never mint PR required checks.
+    # Defense in depth; ref-selectable manual dispatch is not exposed above.
     if: ${{ always() && github.event_name != 'workflow_dispatch' }}
     needs:
       - repository-contract-windows-powershell
