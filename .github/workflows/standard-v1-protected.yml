@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       base_sha:
-        description: 'Optional full base commit SHA for PR-equivalent manual validation'
+        description: 'Optional assertion of the resolved default-branch supervisor SHA'
         required: false
         type: string
 
@@ -264,6 +264,7 @@ jobs:
             throw 'Protected supervisor root must be a regular non-reparse directory.'
           }
           "TRUSTED_SUPERVISOR_ROOT=$trustedRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TRUSTED_SUPERVISOR_SHA=$trustedCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up approved Go runtime
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -399,6 +400,15 @@ jobs:
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
           $gitArguments = @('-c', "safe.directory=$repositoryRoot", '-c', "core.worktree=$repositoryRoot")
+          $trustedTestCommit = [string]$env:TRUSTED_SUPERVISOR_SHA
+          if ($trustedTestCommit -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'The resolved trusted supervisor SHA is missing or invalid.'
+          }
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and
+              -not [string]::IsNullOrWhiteSpace($env:PULL_REQUEST_BASE_SHA) -and
+              $env:PULL_REQUEST_BASE_SHA -cne $trustedTestCommit) {
+            throw 'The manual base must match the resolved trusted supervisor SHA.'
+          }
           $baseCandidate = if ($env:GITHUB_EVENT_NAME -in @('pull_request_target', 'workflow_dispatch')) {
             $env:PULL_REQUEST_BASE_SHA
           }
@@ -431,6 +441,7 @@ jobs:
             RepositoryRoot = [IO.Path]::GetFullPath((Get-Location).Path)
             ArtifactsRoot = $env:RUNNER_TEMP
             BaseCommit = $baseCommit
+            TrustedTestCommit = $trustedTestCommit
             ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION
             OutputPath = $outputPath
           }

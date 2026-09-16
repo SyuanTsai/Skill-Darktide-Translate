@@ -314,3 +314,145 @@ Describe 'Canonical Standard v1 validation adapter' {
         $workflow | Should -Match "github\.event_name == 'push'.*github\.sha"
     }
 }
+
+Describe 'Protected workflow trust binding' {
+    BeforeAll {
+        $script:TrustRepositoryRoot = Split-Path -Parent $PSScriptRoot
+        $script:TrustWorkflow = Get-Content -LiteralPath (Join-Path $script:TrustRepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+        $script:TrustValidator = Get-Content -LiteralPath (Join-Path $script:TrustRepositoryRoot 'scripts/Validate.ps1') -Raw
+
+        function Get-TestWorkflowStep {
+            param([string] $Name)
+            $pattern = '(?ms)^      - name: ' + [regex]::Escape($Name) + '\r?\n(?:(?!^      - name: ).)*?        run: \|\r?\n(?<body>(?:          [^\r\n]*\r?\n|\r?\n)+)'
+            $match = [regex]::Match($script:TrustWorkflow, $pattern)
+            if (-not $match.Success) { throw "Workflow step not found: $Name" }
+            return [regex]::Replace($match.Groups['body'].Value, '(?m)^          ', '')
+        }
+
+        function Invoke-TestManualTrust {
+            param([string] $BaseMode = 'blank', [string] $EventName = 'workflow_dispatch', [switch] $RemoveProof)
+            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            $repo = Join-Path $root 'repo'
+            $temp = Join-Path $root 'runner'
+            [void](New-Item -ItemType Directory -Path $repo, $temp, (Join-Path $repo 'scripts'), (Join-Path $repo 'tests') -Force)
+            $git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path
+            function Invoke-FixtureGit {
+                param([string[]] $GitArgs)
+                $output = @(& $git -C $repo -c user.name=Example -c user.email=example@example.test -c commit.gpgsign=false @GitArgs 2>&1)
+                if ($LASTEXITCODE -ne 0) { throw "Git fixture failed: $output" }
+                return ($output -join "`n").Trim()
+            }
+            $start = $script:TrustValidator.IndexOf('$trustedPesterCommit =', [StringComparison]::Ordinal)
+            $end = $script:TrustValidator.IndexOf('$pesterMirrorRoot =', $start, [StringComparison]::Ordinal)
+            if ($start -lt 0 -or $end -le $start) { throw 'Production Pester trust-selection block not found.' }
+            $selection = $script:TrustValidator.Substring($start, $end - $start)
+            $spy = @'
+param($RepositoryRoot, $ArtifactsRoot, $BaseCommit, $TrustedTestCommit, $ExpectedGoRuntimeVersion, $OutputPath)
+$isGitHubActions = $true
+$candidateCommit = (& git -C $RepositoryRoot rev-parse HEAD) -join ''
+'@ + "`n" + $selection + @'
+
+$marker = (& git -C $RepositoryRoot show "${trustedPesterCommit}:tests/marker.txt") -join ''
+if ($LASTEXITCODE -ne 0) { throw 'Selected trusted test commit is not readable.' }
+[pscustomobject]@{ base = $BaseCommit; trusted = $trustedPesterCommit; marker = $marker } |
+    ConvertTo-Json | Set-Content -LiteralPath $OutputPath -Encoding utf8
+'@
+            [IO.File]::WriteAllText((Join-Path $repo 'scripts/Validate.ps1'), $spy)
+            [IO.File]::WriteAllText((Join-Path $repo 'scripts/Test-Repository.ps1'), '# trusted fixture')
+            [IO.File]::WriteAllText((Join-Path $repo 'tests/marker.txt'), 'common')
+            [void](Invoke-FixtureGit @('init', '-q', '-b', 'main'))
+            [void](Invoke-FixtureGit @('add', '.'))
+            [void](Invoke-FixtureGit @('commit', '-qm', 'common'))
+            $common = Invoke-FixtureGit @('rev-parse', 'HEAD')
+            [void](Invoke-FixtureGit @('checkout', '-qb', 'candidate'))
+            [IO.File]::WriteAllText((Join-Path $repo 'tests/marker.txt'), 'candidate-untrusted')
+            [void](Invoke-FixtureGit @('commit', '-qam', 'candidate'))
+            $candidate = Invoke-FixtureGit @('rev-parse', 'HEAD')
+            [void](Invoke-FixtureGit @('checkout', '-q', 'main'))
+            [IO.File]::WriteAllText((Join-Path $repo 'tests/marker.txt'), 'default-trusted')
+            [void](Invoke-FixtureGit @('commit', '-qam', 'trusted'))
+            $trusted = Invoke-FixtureGit @('rev-parse', 'HEAD')
+            [void](Invoke-FixtureGit @('update-ref', 'refs/remotes/origin/main', $trusted))
+            [void](Invoke-FixtureGit @('checkout', '-q', 'candidate'))
+            $names = @('RUNNER_TEMP', 'GITHUB_ENV', 'GITHUB_EVENT_NAME', 'GITHUB_SHA', 'TRUSTED_SUPERVISOR_COMMIT', 'TRUSTED_DEFAULT_BRANCH', 'TRUSTED_SUPERVISOR_ROOT', 'TRUSTED_SUPERVISOR_SHA', 'PULL_REQUEST_BASE_SHA', 'PUSH_BEFORE_SHA', 'STANDARD_GO_RUNTIME_VERSION')
+            $saved = @{}
+            foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+            $savedNativeDirectory = [Environment]::CurrentDirectory
+            Push-Location $repo
+            try {
+                # GitHub launches pwsh with its native cwd equal to the checkout.
+                # Match that for the real ProcessStartInfo cat-file invocation.
+                [Environment]::CurrentDirectory = $repo
+                $env:RUNNER_TEMP = $temp
+                $env:GITHUB_ENV = Join-Path $temp 'github-env'
+                $env:GITHUB_EVENT_NAME = $EventName
+                $env:GITHUB_SHA = if ($EventName -eq 'workflow_dispatch') { $candidate } else { $common }
+                $env:TRUSTED_SUPERVISOR_COMMIT = if ($EventName -eq 'workflow_dispatch') { $candidate } else { $common }
+                $env:TRUSTED_DEFAULT_BRANCH = 'main'
+                $env:TRUSTED_SUPERVISOR_SHA = ''
+                $env:PUSH_BEFORE_SHA = ''
+                $env:STANDARD_GO_RUNTIME_VERSION = '1.2.3'
+                $env:PULL_REQUEST_BASE_SHA = switch ($BaseMode) {
+                    'matching' { $trusted }; 'candidate' { $candidate }; 'malformed' { 'not-a-sha' }; 'common' { $common }; default { '' }
+                }
+                & ([scriptblock]::Create((Get-TestWorkflowStep 'Materialize protected validation supervisor')))
+                foreach ($line in (Get-Content -LiteralPath $env:GITHUB_ENV)) {
+                    $parts = $line.Split('=', 2)
+                    [Environment]::SetEnvironmentVariable($parts[0], $parts[1])
+                }
+                if ($RemoveProof) { $env:TRUSTED_SUPERVISOR_SHA = '' }
+                $canonical = Get-TestWorkflowStep 'Run canonical Standard v1 validation'
+                $selectionStart = $canonical.IndexOf('$repositoryRoot =', [StringComparison]::Ordinal)
+                if ($selectionStart -lt 0) { throw 'Canonical parameter-selection boundary not found.' }
+                # This portable regression executes the real Git/parameter path;
+                # Linux cgroup admission is validated by the protected Linux job.
+                & ([scriptblock]::Create($canonical.Substring($selectionStart)))
+                $result = Get-Content -LiteralPath (Join-Path $temp 'darktide-translate-conformance-report.json') -Raw | ConvertFrom-Json
+                return [pscustomobject]@{ Result = $result; Trusted = $trusted; Common = $common }
+            }
+            finally {
+                [Environment]::CurrentDirectory = $savedNativeDirectory
+                Pop-Location
+                foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+            }
+        }
+    }
+
+    # Scenario: A manual candidate diverges from the current default branch and omits the optional base.
+    # Purpose: Candidate-owned tests cannot replace the supervisor's trusted regression archive.
+    It 'InterT10_BindsBlankManualBaseToResolvedDefaultTests' {
+        $probe = Invoke-TestManualTrust
+        $probe.Result.trusted | Should -BeExactly $probe.Trusted
+        $probe.Result.marker | Should -BeExactly 'default-trusted'
+        $probe.Result.base | Should -BeNullOrEmpty
+    }
+
+    # Scenario: A caller supplies the same resolved default SHA despite divergent candidate history.
+    # Purpose: Keep trusted-test identity separate from optional ancestor-only diff comparison.
+    It 'InterT20_AcceptsMatchingManualBaseWithoutCandidateFallback' {
+        $probe = Invoke-TestManualTrust -BaseMode matching
+        $probe.Result.trusted | Should -BeExactly $probe.Trusted
+        $probe.Result.base | Should -BeNullOrEmpty
+    }
+
+    # Scenario: A manual caller names a candidate or malformed SHA instead of the trusted default.
+    # Purpose: Reject arbitrary test provenance instead of silently falling back to candidate tests.
+    It 'InterT30_RejectsConflictingManualBase_<mode>' -ForEach @(@{ mode = 'candidate' }, @{ mode = 'malformed' }) {
+        { Invoke-TestManualTrust -BaseMode $mode } | Should -Throw '*manual base*trusted supervisor*'
+    }
+
+    # Scenario: Materializer proof is missing before canonical invocation.
+    # Purpose: An absent trust identity must fail closed before expensive validation.
+    It 'InterT40_RejectsMissingSupervisorIdentity' {
+        { Invoke-TestManualTrust -RemoveProof } | Should -Throw '*supervisor*SHA*'
+    }
+
+    # Scenario: A PR event supplies its immutable common ancestor as the supervisor and comparison base.
+    # Purpose: Preserve the established PR archive and changed-path binding.
+    It 'InterT50_PreservesPullRequestTrustedBase' {
+        $probe = Invoke-TestManualTrust -BaseMode common -EventName pull_request_target
+        $probe.Result.trusted | Should -BeExactly $probe.Common
+        $probe.Result.base | Should -BeExactly $probe.Common
+        $probe.Result.marker | Should -BeExactly 'common'
+    }
+}

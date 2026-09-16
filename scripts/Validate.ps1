@@ -11,6 +11,7 @@ param(
     ),
     [string] $AuthorityArchivePath,
     [string] $BaseCommit,
+    [string] $TrustedTestCommit,
     [string] $ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION,
     [string] $OutputPath,
     [switch] $BootstrapTransition,
@@ -5549,7 +5550,13 @@ $requiredPesterTests = @(
     'StandardV1Conformance.Tests.ps1'
     'Test-Repository.Tests.ps1'
 )
-$trustedPesterCommit = [string]$BaseCommit
+$trustedPesterCommit = [string]$TrustedTestCommit
+if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and [string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
+    throw 'Manual validation requires the resolved trusted supervisor SHA for its tests.'
+}
+if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
+    $trustedPesterCommit = [string]$BaseCommit
+}
 if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
     $trustedPesterCommit = [string]$env:GITHUB_SHA
 }
