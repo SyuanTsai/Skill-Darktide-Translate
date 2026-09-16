@@ -2773,12 +2773,12 @@ function Add-InstalledClosureEntry {
         throw "$Context contains a duplicate path: '$relative'."
     }
     $nfc = $relative.Normalize([Text.NormalizationForm]::FormC)
-    if ($NfcPaths.ContainsKey($nfc) -and [string]$NfcPaths[$nfc] -cne $relative) {
+    if ($NfcPaths.ContainsKey($nfc) -and -not [string]::Equals([string]$NfcPaths[$nfc], $relative, [StringComparison]::Ordinal)) {
         throw "$Context contains Unicode-normalization-colliding paths: '$($NfcPaths[$nfc])' and '$relative'."
     }
     $NfcPaths[$nfc] = $relative
     $asciiCase = Get-InstalledClosureAsciiCaseFold -Value $nfc
-    if ($AsciiCasePaths.ContainsKey($asciiCase) -and [string]$AsciiCasePaths[$asciiCase] -cne $relative) {
+    if ($AsciiCasePaths.ContainsKey($asciiCase) -and -not [string]::Equals([string]$AsciiCasePaths[$asciiCase], $relative, [StringComparison]::Ordinal)) {
         throw "$Context contains ASCII-case-colliding paths: '$($AsciiCasePaths[$asciiCase])' and '$relative'."
     }
     $AsciiCasePaths[$asciiCase] = $relative

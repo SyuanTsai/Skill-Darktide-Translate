@@ -455,4 +455,32 @@ if ($LASTEXITCODE -ne 0) { throw 'Selected trusted test commit is not readable.'
         $probe.Result.base | Should -BeExactly $probe.Common
         $probe.Result.marker | Should -BeExactly 'common'
     }
+
+    # Scenario: Two installed paths share an ordinal, NFC or ASCII-folded identity.
+    # Purpose: Fail closed using actual production helpers, including canonically equivalent Unicode.
+    It 'UnitT55_RejectsCollidingInstalledPaths_<kind>' -ForEach @(
+        @{ kind = 'NFC'; first = "$([char]0xE9).txt"; second = "e$([char]0x301).txt"; message = '*Unicode-normalization-colliding*' },
+        @{ kind = 'case'; first = 'A.txt'; second = 'a.txt'; message = '*ASCII-case-colliding*' },
+        @{ kind = 'duplicate'; first = 'a.txt'; second = 'a.txt'; message = '*duplicate path*' }
+    ) {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($script:TrustValidator, [ref]$tokens, [ref]$errors)
+        $functions = $ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -in @('Assert-InstalledClosureSafeRelativePath', 'Get-InstalledClosureAsciiCaseFold', 'Add-InstalledClosureEntry')
+        }, $true)
+        @($errors).Count | Should -Be 0
+        @($functions).Count | Should -Be 3
+        $module = New-Module -ScriptBlock ([scriptblock]::Create(($functions.Extent.Text -join "`n")))
+        { & $module {
+            param($one, $two)
+            $entries = [Collections.Generic.List[object]]::new()
+            $ordinal = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $nfc = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            $ascii = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            foreach ($path in @($one, $two)) {
+                Add-InstalledClosureEntry -Entries $entries -OrdinalPaths $ordinal -NfcPaths $nfc -AsciiCasePaths $ascii -Entry @{ path = $path; sha256 = ('a' * 64) } -Context 'fixture'
+            }
+        } $first $second } | Should -Throw $message
+    }
 }
