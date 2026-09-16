@@ -2784,6 +2784,27 @@ function Add-InstalledClosureEntry {
     [void]$Entries.Add($Entry)
 }
 
+function Sort-InstalledClosureEntriesByOrdinalPath {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Entries
+    )
+
+    $entriesByPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $Entries) {
+        $path = [string]$entry.path
+        if (-not $entriesByPath.TryAdd($path, $entry)) {
+            throw "Installed closure contains a duplicate path: '$path'."
+        }
+    }
+    $orderedPaths = [string[]]@($entriesByPath.Keys | ForEach-Object { [string]$_ })
+    [Array]::Sort($orderedPaths, [StringComparer]::Ordinal)
+    $ordered = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($path in $orderedPaths) {
+        [void]$ordered.Add($entriesByPath[$path])
+    }
+    return ,$ordered
+}
+
 function Get-InstalledDirectoryClosureSha256 {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -2816,15 +2837,7 @@ function Get-InstalledDirectoryClosureSha256 {
         Add-InstalledClosureEntry -Entries $entries -OrdinalPaths $ordinalPaths -NfcPaths $nfcPaths -AsciiCasePaths $asciiCasePaths -Entry $entry -Context $Context
     }
     if ($entries.Count -eq 0) { throw "$Context install root is empty: $root" }
-    $ordered = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($entry in $entries) {
-        $insertAt = 0
-        while ($insertAt -lt $ordered.Count -and
-            [string]::Compare([string]$ordered[$insertAt].path, [string]$entry.path, [StringComparison]::Ordinal) -lt 0) {
-            $insertAt++
-        }
-        [void]$ordered.Insert($insertAt, $entry)
-    }
+    $ordered = Sort-InstalledClosureEntriesByOrdinalPath -Entries $entries
     $canonical = ($ordered | ForEach-Object { "$($_.path)`t$($_.sha256)`n" }) -join ''
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
