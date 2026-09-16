@@ -342,4 +342,16 @@ Describe 'Darktide Translate repository contract' {
             $validator | Should -Not -Match ([regex]::Escape('d38eba3faf967504751aba759f38102e7538a519'))
         }
     }
+
+    # Scenario: A hosted Linux runner may expose an inherited module path that the isolated identity cannot read.
+    # Purpose: Keep optional module-path probing fail-closed for unexpected errors without blocking on an unavailable optional entry.
+    It 'UnitT46_ToleratesUnreadableOptionalLinuxModulePaths' {
+        if ($layout.Name -ceq 'legacy') {
+            $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
+
+            $validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
+            $validator | Should -Match 'catch \[UnauthorizedAccessException\]'
+            $validator | Should -Match 'Inherited PSModulePath entries are optional'
+        }
+    }
 }
