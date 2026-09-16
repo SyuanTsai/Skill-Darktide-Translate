@@ -556,6 +556,9 @@ jobs:
             ForEach-Object { Join-Path $_.FullName 'security-preflight-summary.json' } |
             Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
           if ($summaryPaths.Count -eq 0) {
+            if (-not [string]::IsNullOrEmpty([string]$env:EXPECTED_DIAGNOSTICS_SHA256)) {
+              throw 'Validation diagnostics are missing after the trusted preflight bound their digest.'
+            }
             [IO.File]::AppendAllText($outputPath, "diagnostics_base64=$([Environment]::NewLine)diagnostics_sha256=$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
             exit 0
           }
