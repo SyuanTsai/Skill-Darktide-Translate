@@ -97,6 +97,23 @@ Describe 'Canonical Standard v1 validation adapter' {
         $usageFunction | Should -Match '(?s)if \(\$entry\.PSIsContainer\) \{.*?\$entryCount\+\+.*?writable-entry-count limit of 100000.*?\$pending\.Push\(\[IO\.DirectoryInfo\]\$entry\)'
     }
 
+    It 'enforces writable-root growth during every protected Pester shard' {
+        $runspaceStart = $script:Validator.IndexOf('function Invoke-ProtectedPesterRunspace', [StringComparison]::Ordinal)
+        $runspaceEnd = $script:Validator.IndexOf('if ($ProtectedPesterServerProxy)', $runspaceStart, [StringComparison]::Ordinal)
+        $runspaceFunction = $script:Validator.Substring($runspaceStart, $runspaceEnd - $runspaceStart)
+
+        $runspaceFunction | Should -Match '\[int64\] \$WritableRootBaselineBytes'
+        $runspaceFunction | Should -Match '(?s)Assert-LinuxAggregateResourceUsage.*?Assert-LinuxWritableRootUsage'
+        $runspaceFunction | Should -Match '-BaselineBytes \$WritableRootBaselineBytes'
+        $runspaceFunction | Should -Match '(?s)\$output = @\(\$powerShell\.EndInvoke\(\$asyncResult\)\).*?Assert-LinuxWritableRootUsage'
+
+        $supervisorStart = $script:Validator.IndexOf('function Invoke-ProtectedPesterSupervisor', [StringComparison]::Ordinal)
+        $supervisorEnd = $script:Validator.IndexOf('if ($ProtectedPesterSupervisor)', $supervisorStart, [StringComparison]::Ordinal)
+        $supervisorFunction = $script:Validator.Substring($supervisorStart, $supervisorEnd - $supervisorStart)
+        $supervisorFunction | Should -Match '(?s)\$linuxWritableRootBaselineBytes = \[int64\]0.*?foreach \(\$requiredPesterTest'
+        $supervisorFunction | Should -Match '-WritableRootBaselineBytes \$linuxWritableRootBaselineBytes'
+    }
+
     It 'sizes the private Linux etc projection for hosted runner images' {
         $script:Validator | Should -Match 'size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
     }

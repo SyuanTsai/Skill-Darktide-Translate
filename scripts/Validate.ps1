@@ -4644,6 +4644,7 @@ function Invoke-ProtectedPesterRunspace {
         [Parameter(Mandatory = $true)][string] $WorkingDirectory,
         [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][int64] $WritableRootBaselineBytes,
         [Parameter(Mandatory = $true)][string] $RunnerSha256,
         [Parameter(Mandatory = $true)][string[]] $TestNames,
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
@@ -4757,6 +4758,10 @@ function Invoke-ProtectedPesterRunspace {
                     -ClockTicksPerSecond $linuxClockTicksPerSecond `
                     -CgroupPath $linuxPesterCgroupPath `
                     -Context 'Protected Pester remote pipeline'
+                [void](Assert-LinuxWritableRootUsage `
+                        -Root $DiagnosticRoot `
+                        -BaselineBytes $WritableRootBaselineBytes `
+                        -Context 'Protected Pester remote pipeline')
             }
             Start-Sleep -Milliseconds 50
         }
@@ -4764,6 +4769,12 @@ function Invoke-ProtectedPesterRunspace {
             throw 'Protected Pester remote pipeline exceeded its bounded execution timeout.'
         }
         $output = @($powerShell.EndInvoke($asyncResult))
+        if ($script:IsLinuxHost) {
+            [void](Assert-LinuxWritableRootUsage `
+                    -Root $DiagnosticRoot `
+                    -BaselineBytes $WritableRootBaselineBytes `
+                    -Context 'Protected Pester remote pipeline')
+        }
         if ($powerShell.InvocationStateInfo.State -ne [Management.Automation.PSInvocationState]::Completed) {
             throw "Protected Pester remote pipeline did not complete normally: $($powerShell.InvocationStateInfo.State)."
         }
@@ -4872,6 +4883,16 @@ function Invoke-ProtectedPesterSupervisor {
         throw 'Trusted Pester worker changed before the protected run.'
     }
 
+    # Keep one baseline for the complete protected Pester suite, not one per
+    # shard. Candidate writes must not accumulate across the fourteen bounded
+    # child processes and evade the aggregate writable-root limit.
+    $linuxWritableRootBaselineBytes = [int64]0
+    if ($script:IsLinuxHost) {
+        $linuxWritableRootBaselineBytes = [int64](Get-LinuxWritableRootUsage `
+                -Root $DiagnosticRoot `
+                -Context 'Protected Pester supervisor').bytes
+    }
+
     # Each immutable regression file gets its own protected process/cgroup.  The
     # suite is intentionally sharded because the per-candidate 300-second CPU
     # boundary must remain hard while the complete domain regression inventory
@@ -4894,6 +4915,7 @@ function Invoke-ProtectedPesterSupervisor {
             -WorkingDirectory ([IO.Path]::GetFullPath((Get-Location).Path)) `
             -ChildWritableRoot $ChildWritableRoot `
             -DiagnosticRoot $DiagnosticRoot `
+            -WritableRootBaselineBytes $linuxWritableRootBaselineBytes `
             -RunnerSha256 $RunnerSha256 `
             -TestNames @($requiredPesterTest) `
             -TimeoutMilliseconds 300000
