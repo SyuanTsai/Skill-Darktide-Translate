@@ -554,6 +554,12 @@ function Remove-LinuxPesterCgroup {
     }
 }
 
+function Get-LinuxWritableDirectoryEnumerator {
+    param([Parameter(Mandatory = $true)][IO.DirectoryInfo] $Directory)
+    # Return the iterator itself; never drain an untrusted directory into a PowerShell array.
+    return ,$Directory.EnumerateFileSystemInfos().GetEnumerator()
+}
+
 function Get-LinuxWritableRootUsage {
     param(
         [Parameter(Mandatory = $true)][string] $Root,
@@ -568,26 +574,31 @@ function Get-LinuxWritableRootUsage {
     $pending = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
     $pending.Push([IO.DirectoryInfo]$rootItem)
     $bytes = [int64]0
-    $fileCount = 0
+    $entryCount = 0
     while ($pending.Count -gt 0) {
         $directory = $pending.Pop()
-        foreach ($entry in @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)) {
-            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "$Context writable root contains a reparse entry: $($entry.FullName)"
+        $enumerator = Get-LinuxWritableDirectoryEnumerator -Directory $directory
+        try {
+            while ($enumerator.MoveNext()) {
+                $entry = $enumerator.Current
+                $entryCount++
+                if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
+                if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "$Context writable root contains a reparse entry: $($entry.FullName)"
+                }
+                if ($entry -is [IO.DirectoryInfo]) {
+                    $pending.Push([IO.DirectoryInfo]$entry)
+                    continue
+                }
+                if ($entry.Length -gt 0 -and [int64]$entry.Length -gt ([int64]::MaxValue - $bytes)) {
+                    throw "$Context writable-root size overflowed the bounded accounting range."
+                }
+                $bytes += [int64]$entry.Length
             }
-            if ($entry.PSIsContainer) {
-                $pending.Push([IO.DirectoryInfo]$entry)
-                continue
-            }
-            $fileCount++
-            if ($fileCount -gt 100000) { throw "$Context exceeded the aggregate writable-file-count limit of 100000." }
-            if ($entry.Length -gt 0 -and [int64]$entry.Length -gt ([int64]::MaxValue - $bytes)) {
-                throw "$Context writable-root size overflowed the bounded accounting range."
-            }
-            $bytes += [int64]$entry.Length
         }
+        finally { $enumerator.Dispose() }
     }
-    return [pscustomobject][ordered]@{ bytes = $bytes; fileCount = $fileCount }
+    return [pscustomobject][ordered]@{ bytes = $bytes; fileCount = $entryCount }
 }
 
 function Assert-LinuxWritableRootUsage {
