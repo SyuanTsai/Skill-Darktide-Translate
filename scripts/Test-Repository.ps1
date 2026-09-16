@@ -130,7 +130,7 @@ function Invoke-ProfileCatalogValidation {
         $alternativeCapabilityKeys += "{0}|{1}|{2}" -f [string]$capability.kind, [string]$capability.id, [string]$capability.state
     }
     foreach ($expectedCapability in @('connector|github|configured', 'command|gh|authenticated')) {
-        if ($alternativeCapabilityKeys -notcontains $expectedCapability) {
+        if ($alternativeCapabilityKeys -cnotcontains $expectedCapability) {
             throw 'Profile catalog alternative capability contract is invalid.'
         }
     }

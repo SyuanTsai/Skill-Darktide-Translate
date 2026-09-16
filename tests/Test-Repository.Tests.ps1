@@ -251,6 +251,27 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*required capability*'
     }
 
+    # Scenario: Each alternative capability field changes only its case, or stays canonical.
+    # Purpose: Exercise the real repository validator so case-only contract drift cannot pass.
+    It 'InterT30_ProfileAlternativeCapabilityCase_<scenario>' -ForEach @(
+        @{ scenario = 'canonical'; alternativeIndex = 0; field = ''; value = '' },
+        @{ scenario = 'connector-kind'; alternativeIndex = 0; field = 'kind'; value = 'Connector' },
+        @{ scenario = 'connector-id'; alternativeIndex = 0; field = 'id'; value = 'GitHub' },
+        @{ scenario = 'connector-state'; alternativeIndex = 0; field = 'state'; value = 'Configured' },
+        @{ scenario = 'command-kind'; alternativeIndex = 1; field = 'kind'; value = 'Command' },
+        @{ scenario = 'command-id'; alternativeIndex = 1; field = 'id'; value = 'GH' },
+        @{ scenario = 'command-state'; alternativeIndex = 1; field = 'state'; value = 'Authenticated' }
+    ) {
+        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
+        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+        if ($field) { $catalog.skills[0].compatibility.anyOfCapabilities[$alternativeIndex].$field = $value }
+        [IO.File]::WriteAllText($profilePath, ($catalog | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($false))
+        if ($field) {
+            { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*alternative capability contract*'
+        }
+        else { { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw }
+    }
+
     It 'rejects malformed optional OpenAI interface fields' {
         $metadataPath = Join-Path $script:SkillRoot 'agents/openai.yaml'
         $metadata = Get-Content -LiteralPath $metadataPath -Raw
