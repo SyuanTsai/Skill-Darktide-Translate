@@ -617,10 +617,11 @@ Describe 'Protected workflow trust binding' {
 
     }
 
-    # Scenario: A child rewrites an existing summary after the trusted preflight emitted its evidence.
+    # Scenario: An existing summary is rewritten or removed after the trusted preflight emitted its evidence.
     # Purpose: Exercise the real exporter against a tampered regular file, not a regex approximation.
     It 'InterT60_AuthenticatesDiagnosticsBeforeExport_<mode>' -ForEach @(
-        @{ mode = 'valid' }, @{ mode = 'tampered' }, @{ mode = 'missing-proof' }
+        @{ mode = 'valid' }, @{ mode = 'tampered' }, @{ mode = 'missing-proof' },
+        @{ mode = 'deleted' }, @{ mode = 'pre-summary-failure' }
     ) {
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
         $run = Join-Path $root 'sgv1-fixture'
@@ -650,17 +651,30 @@ Describe 'Protected workflow trust binding' {
                 & (Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })) -NoProfile -EncodedCommand $encoded
                 $LASTEXITCODE | Should -Be 1
             }
-            if ($mode -eq 'missing-proof') { $env:EXPECTED_DIAGNOSTICS_SHA256 = '' }
+            if ($mode -in @('deleted', 'pre-summary-failure')) {
+                [IO.File]::Delete($securityPreflightSummaryPath)
+            }
+            if ($mode -in @('missing-proof', 'pre-summary-failure')) { $env:EXPECTED_DIAGNOSTICS_SHA256 = '' }
             $env:GITHUB_OUTPUT = Join-Path $root 'export-output'
-            $export = [scriptblock]::Create((Get-TestWorkflowStep 'Export bounded validation diagnostics for clean upload'))
-            if ($mode -eq 'valid') {
-                $env:EXPECTED_DIAGNOSTICS_SHA256 | Should -Match '^[0-9a-f]{64}$'
-                & $export
+            $exportPath = Join-Path $root 'export.ps1'
+            [IO.File]::WriteAllText($exportPath, '$ErrorActionPreference = ''Stop''' + [Environment]::NewLine +
+                (Get-TestWorkflowStep 'Export bounded validation diagnostics for clean upload'), [Text.UTF8Encoding]::new($false))
+            # Run the real workflow step in a separate pwsh so its exit 0 cannot
+            # terminate the test harness or bypass subsequent assertions.
+            $exportOutput = @(& (Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })) -NoProfile -NonInteractive -File $exportPath 2>&1)
+            $exportExitCode = $LASTEXITCODE
+            if ($mode -in @('valid', 'pre-summary-failure')) {
+                $exportExitCode | Should -Be 0
+                if ($mode -eq 'valid') { $env:EXPECTED_DIAGNOSTICS_SHA256 | Should -Match '^[0-9a-f]{64}$' }
                 $lines = Get-Content -LiteralPath $env:GITHUB_OUTPUT
                 ($lines | Where-Object { $_ -like 'diagnostics_sha256=*' }) | Should -BeExactly "diagnostics_sha256=$env:EXPECTED_DIAGNOSTICS_SHA256"
+                if ($mode -eq 'pre-summary-failure') {
+                    ($lines | Where-Object { $_ -like 'diagnostics_base64=*' }) | Should -BeExactly 'diagnostics_base64='
+                }
             }
             else {
-                { & $export } | Should -Throw '*diagnostics*'
+                $exportExitCode | Should -Not -Be 0
+                ($exportOutput -join [Environment]::NewLine) | Should -Match 'diagnostics'
                 Test-Path -LiteralPath $env:GITHUB_OUTPUT | Should -BeFalse
             }
         }
