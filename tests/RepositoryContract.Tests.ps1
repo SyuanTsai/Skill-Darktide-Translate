@@ -159,26 +159,24 @@ Describe 'Darktide Translate repository contract' {
             'docs/RELEASE.md',
             'docs/ROLLBACK.md',
             'scripts/Get-SourcePin.ps1',
-            'scripts/Invoke-PrePushValidation.ps1',
             'scripts/Test-CleanRepositoryHead.ps1',
+            '.github/workflows/standard-v1-protected.yml',
+            'scripts/Test-Repository.ps1',
+            'scripts/Validate.ps1',
             'tests/Invoke-Tests.ps1',
             'VERSION'
         )
         if ($layout.Name -ceq 'legacy') {
             $expectedPaths += @(
-                '.github/workflows/validate.yml',
-                '.github/workflows/skill-validator.yml',
                 'catalog/skills-catalog.json'
             )
         }
         else {
             $expectedPaths += @(
-                '.github/workflows/standard-v1-protected.yml',
                 'catalog/source.json',
                 'catalog/profiles.json',
                 'config/standard-v1.json',
-                'scripts/Test-Repository.ps1',
-                'scripts/Validate.ps1'
+                'scripts/Invoke-PrePushValidation.ps1'
             )
         }
 
@@ -294,41 +292,18 @@ Describe 'Darktide Translate repository contract' {
     # Scenario: GitHub validates a branch or pull request using the shared tool policy.
     # Purpose: Prevent the repository from silently pinning stale quality tools or weakening the required gates.
     It 'UnitT40_PreservesTheSharedLatestAtRunTimeQualityGate' {
-        if ($layout.Name -ceq 'legacy') {
-            $qualityPath = Join-Path $repoRoot $layout.QualityWorkflowPath
-            $validatePath = Join-Path $repoRoot $layout.WorkflowPath
-            Test-Path -LiteralPath $qualityPath | Should -Be $true
-            Test-Path -LiteralPath $validatePath | Should -Be $true
-
-            $quality = Get-Content -LiteralPath $qualityPath -Raw
-            $quality | Should -Match 'go-version: stable'
-            $quality | Should -Match 'check-latest: true'
-            $quality | Should -Match 'skill-validator/cmd/skill-validator@latest'
-            $quality | Should -Match "node-version: 'lts/\*'"
-            $quality | Should -Match 'skill-tools@latest'
-            $quality | Should -Match 'check --strict --allow-dirs=agents --emit-annotations'
-            $quality | Should -Match '--fail-on warning'
-            $quality | Should -Match '--min-score 91'
-
-            $validate = Get-Content -LiteralPath $validatePath -Raw
-            $validate | Should -Match 'MinimumVersion 5\.0\.0'
-            $validate | Should -Match 'scripts/Invoke-PrePushValidation\.ps1'
-
-            $exactHeadRef = 'ref: ${{ github.event_name == ''pull_request'' && github.event.pull_request.head.sha || github.sha }}'
-            $validate | Should -Match ([regex]::Escape($exactHeadRef))
-            ([regex]::Matches($quality, [regex]::Escape($exactHeadRef))).Count | Should -Be 2
+        # Source layout remains legacy during bootstrap, but its old CI was retired.
+        $workflow = Get-Content -LiteralPath (Join-Path $repoRoot $layout.WorkflowPath) -Raw
+        foreach ($retiredWorkflow in @('validate.yml', 'skill-validator.yml')) {
+            Test-Path -LiteralPath (Join-Path $repoRoot ".github/workflows/$retiredWorkflow") | Should -BeFalse
         }
-        else {
-            $workflow = Get-Content -LiteralPath (Join-Path $repoRoot $layout.WorkflowPath) -Raw
-            Test-Path -LiteralPath (Join-Path $repoRoot '.github/workflows/skill-validator.yml') | Should -Be $false
-            $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
-            $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
-            $workflow | Should -Match 'persist-credentials:\s*false'
-            $workflow | Should -Match "go-version: 'stable'"
-            $workflow | Should -Match 'check-latest: true'
-            $workflow | Should -Not -Match "go-version: '[0-9]+\.[0-9]+\.[0-9]+'"
-            $workflow | Should -Match 'scripts/Validate\.ps1'
-        }
+        $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
+        $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
+        $workflow | Should -Match 'persist-credentials:\s*false'
+        $workflow | Should -Match "go-version: 'stable'"
+        $workflow | Should -Match 'check-latest: true'
+        $workflow | Should -Not -Match "go-version: '[0-9]+\.[0-9]+\.[0-9]+'"
+        $workflow | Should -Match 'scripts/Validate\.ps1'
     }
 
     # Scenario: The base-owned protected supervisor validates the next migration against the current central authority snapshot.
@@ -346,12 +321,37 @@ Describe 'Darktide Translate repository contract' {
     # Scenario: A hosted Linux runner may expose an inherited module path that the isolated identity cannot read.
     # Purpose: Keep optional module-path probing fail-closed for unexpected errors without blocking on an unavailable optional entry.
     It 'UnitT46_ToleratesUnreadableOptionalLinuxModulePaths' {
-        if ($layout.Name -ceq 'legacy') {
-            $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
+        $boundPaths = Invoke-TestModulePathProbe -RepositoryRoot $repoRoot -DeniedPath '/denied/modules'
+        @($boundPaths).Count | Should -Be 1
+        $boundPaths[0] | Should -Be '/readable/modules'
+    }
 
-            $validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
-            $validator | Should -Match 'catch \[UnauthorizedAccessException\]'
-            $validator | Should -Match 'Inherited PSModulePath entries are optional'
-        }
+    # Scenario: An optional path probe fails for a reason other than permission denial.
+    # Purpose: Prevent the recovery from hiding unexpected IO failures behind a broad catch.
+    It 'UnitT47_PropagatesUnexpectedOptionalModulePathErrors' {
+        { Invoke-TestModulePathProbe -RepositoryRoot $repoRoot -UnexpectedError } |
+            Should -Throw '*unexpected module-path IO failure*'
+    }
+
+    # Scenario: The original unguarded loop encounters the same denied module path.
+    # Purpose: Prove the behavioral fixture detects the actual regression instead of accepting both versions.
+    It 'UnitT48_DetectsThePreFixModulePathFailure' {
+        # Preserve the old loop as a harmless fixture: isolated test snapshots need no Git history.
+        $oldSource = @'
+foreach ($modulePath in @(([string]$env:PSModulePath -split ':') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+    if (Test-Path -LiteralPath $modulePath -PathType Container) {
+        & $addLinuxReadonlyBindPath -Path $modulePath
+    }
+}
+'@
+        { Invoke-TestModulePathProbe -RepositoryRoot $repoRoot -Source $oldSource -DeniedPath '/denied/modules' } |
+            Should -Throw '*denied optional module path*'
+    }
+
+    # Scenario: An existing module path fails the subsequent sandbox bind-source validation.
+    # Purpose: Ensure optional-path recovery cannot swallow a safety failure after a successful probe.
+    It 'UnitT49_PropagatesSandboxBindValidationErrors' {
+        { Invoke-TestModulePathProbe -RepositoryRoot $repoRoot -BindError } |
+            Should -Throw '*unsafe bind source*'
     }
 }
