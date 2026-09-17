@@ -3204,7 +3204,7 @@ function Assert-RegularFileForHash {
         finally {
             [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
         }
-        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cne 'regular file') {
+        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cnotin @('regular file', 'regular empty file')) {
             throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
         }
     }
@@ -3267,7 +3267,7 @@ function Invoke-NativeChecked {
         [Parameter()][switch] $TerminateProcessTree,
         [Parameter()][switch] $ProtectRunnerCommandFiles,
         [Parameter()][switch] $DirectWindowsProcess,
-        [Parameter()][AllowEmptyCollection()][string[]] $ReadOnlyPaths,
+        [Parameter()][AllowEmptyCollection()][string[]] $ReadOnlyPaths = @(),
         [Parameter()][switch] $ApplyLinuxResourceLimits,
         [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline',
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
@@ -3479,7 +3479,9 @@ function Invoke-NativeChecked {
                 & $addLinuxReadonlyBindPath -Path $chrootPath
                 & $addLinuxReadonlyBindPath -Path $setprivPath
                 foreach ($readOnlyPath in @($ReadOnlyPaths)) {
-                    $readOnlyFullPath = [IO.Path]::GetFullPath([string]$readOnlyPath)
+                    $readOnlyPathText = [string]$readOnlyPath
+                    if ([string]::IsNullOrWhiteSpace($readOnlyPathText)) { continue }
+                    $readOnlyFullPath = [IO.Path]::GetFullPath($readOnlyPathText)
                     if (-not (Test-Path -LiteralPath $readOnlyFullPath)) {
                         throw "$Context trusted read-only child path is missing: $readOnlyFullPath"
                     }

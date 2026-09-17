@@ -354,4 +354,19 @@ foreach ($modulePath in @(([string]$env:PSModulePath -split ':') | Where-Object 
         { Invoke-TestModulePathProbe -RepositoryRoot $repoRoot -BindError } |
             Should -Throw '*unsafe bind source*'
     }
+
+    # Scenario: The Linux sandbox receives no optional read-only bind paths and
+    # GNU stat classifies an empty file as a regular empty file.
+    # Purpose: Keep the protected base supervisor from turning valid empty
+    # files or an omitted optional path list into GetFullPath(empty) failures.
+    It 'UnitT50_AcceptsEmptyOptionalReadOnlyPathsAndGnuEmptyFiles' {
+        $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
+        $repositoryValidator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Test-Repository.ps1') -Raw
+
+        $validator | Should -Match '\[Parameter\(\)\]\[AllowEmptyCollection\(\)\]\[string\[\]\] \$ReadOnlyPaths = @\(\)'
+        $validator | Should -Match 'readOnlyPathText = \[string\]\$readOnlyPath'
+        $validator | Should -Match 'IsNullOrWhiteSpace\(\$readOnlyPathText\)'
+        $validator | Should -Match "-cnotin @\('regular file', 'regular empty file'\)"
+        $repositoryValidator | Should -Match "-cnotin @\('regular file', 'regular empty file'\)"
+    }
 }
