@@ -773,17 +773,17 @@ Describe 'Bounded writable-root enumeration behavior' {
         $ast = [Management.Automation.Language.Parser]::ParseFile(
             (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1'), [ref]$tokens, [ref]$errors)
         if (@($errors).Count -ne 0) { throw 'Validator must parse before behavioral testing.' }
-        # Test seam exists before the fix so Red measures eager consumption, not a missing symbol.
-        function Get-LinuxWritableDirectoryEnumerator {
-            param([IO.DirectoryInfo] $Directory)
-            return ,$Directory.EnumerateFileSystemInfos().GetEnumerator()
-        }
-        foreach ($name in @('Get-LinuxWritableDirectoryEnumerator', 'Get-LinuxWritableRootUsage')) {
+        $script:HostIsLinux = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
+        foreach ($name in @(
+            'Enable-LinuxWritableRootInspector',
+            'Invoke-LinuxWritableRootInspection',
+            'Get-LinuxWritableRootUsage'
+        )) {
             $definition = $ast.Find({ param($node)
                 $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
             }, $true)
             if ($null -ne $definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
-            elseif ($name -ceq 'Get-LinuxWritableRootUsage') { throw 'Missing production usage function.' }
+            else { throw "Missing production writable-root function: $name" }
         }
     }
 
@@ -795,53 +795,42 @@ Describe 'Bounded writable-root enumeration behavior' {
         [void](New-Item -ItemType Directory -Path $script:UsageRoot)
         $file = Join-Path $script:UsageRoot 'entry'
         [IO.File]::WriteAllText($file, '')
-        $script:CursorState = [pscustomobject]@{
-            Pulls = 0; Maximum = 100002; Disposed = 0; Entry = (Get-Item -LiteralPath $file)
-        }
-        $script:UsageCursor = [pscustomobject]@{ State = $script:CursorState }
-        $script:UsageCursor | Add-Member ScriptMethod MoveNext {
-            $this.State.Pulls++
-            return $this.State.Pulls -le $this.State.Maximum
-        }
-        $script:UsageCursor | Add-Member ScriptProperty Current { $this.State.Entry }
-        $script:UsageCursor | Add-Member ScriptMethod Dispose { $this.State.Disposed++ }
     }
     AfterEach { $script:IsLinuxHost = $script:PreviousLinuxHost }
 
-    # Scenario: A finite source has more entries than the production limit.
-    # Purpose: Abort at entry100001 without requesting the remaining source and release the enumerator.
+    # Scenario: A hostile tree exceeds the bounded entry inventory.
+    # Purpose: Keep the exact100000 ceiling inside the descriptor-relative native traversal.
     It 'UnitT10_StopsEnumerationAtTheFirstExcessEntry' {
-        Mock Get-LinuxWritableDirectoryEnumerator { return ,$script:UsageCursor }
-        Mock Get-ChildItem {
-            for ($i = 0; $i -lt $script:CursorState.Maximum; $i++) {
-                $script:CursorState.Pulls++
-                $script:CursorState.Entry
-            }
-        }
-        { Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Bounded fixture' } | Should -Throw '*limit*'
-        $script:CursorState.Pulls | Should -Be 100001
-        $script:CursorState.Disposed | Should -Be 1
+        $source = $ast.Extent.Text
+        $source | Should -Match 'entryCount\+\+;\s+if \(entryCount > maximumEntries\)'
+        $source | Should -Match 'Writable root exceeded the aggregate writable-entry-count limit'
+        $usage = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-LinuxWritableRootUsage'
+        }, $true)
+        $usage.Extent.Text | Should -Match '-MaximumEntries\s+100000'
     }
 
-    # Scenario: A finite source contains exactly the allowed100000 regular files.
-    # Purpose: Preserve the inclusive limit and return contract without weakening the overflow case.
+    # Scenario: The native inspector accepts a result at the inclusive limit.
+    # Purpose: Preserve the PowerShell return contract without executing libc on a non-Linux unit host.
     It 'UnitT20_AcceptsTheExactEntryLimit' {
-        $script:CursorState.Maximum = 100000
-        Mock Get-LinuxWritableDirectoryEnumerator { return ,$script:UsageCursor }
-        Mock Get-ChildItem {
-            for ($i = 0; $i -lt $script:CursorState.Maximum; $i++) {
-                $script:CursorState.Pulls++
-                $script:CursorState.Entry
-            }
+        Mock Invoke-LinuxWritableRootInspection {
+            [pscustomobject]@{ Bytes = [int64]17; EntryCount = 100000 }
         }
         $usage = Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Exact fixture'
         $usage.fileCount | Should -Be 100000
-        $usage.bytes | Should -Be 0
+        $usage.bytes | Should -Be 17
+        Should -Invoke Invoke-LinuxWritableRootInspection -Times 1 -Exactly -ParameterFilter {
+            $MaximumEntries -eq 100000 -and -not $AllowReparseEntries
+        }
     }
 
     # Scenario: A real directory contains an ordinary file, hidden-name file and nested directory/file.
     # Purpose: Exercise native enumeration and verify that directories count while file bytes remain exact.
     It 'InterT30_CountsRealFilesDirectoriesAndHiddenEntries' {
+        if (-not $script:HostIsLinux) {
+            Set-ItResult -Skipped -Because 'native descriptor traversal is Linux-only'
+            return
+        }
         [IO.File]::WriteAllText((Join-Path $script:UsageRoot '.hidden'), 'ab')
         $subdir = Join-Path $script:UsageRoot 'nested'
         [void](New-Item -ItemType Directory -Path $subdir)
@@ -851,19 +840,21 @@ Describe 'Bounded writable-root enumeration behavior' {
         $usage.bytes | Should -Be 5
     }
 
-    # Scenario: The enumeration source raises an IO error while advancing.
-    # Purpose: Preserve fail-closed propagation and dispose the native enumeration resource.
+    # Scenario: Traversal fails while directory descriptors remain stacked.
+    # Purpose: Keep fail-closed cleanup on every native traversal exit.
     It 'UnitT40_DisposesEnumeratorWhenMoveNextFails' {
-        $script:UsageCursor | Add-Member ScriptMethod MoveNext { throw [IO.IOException]::new('fixture enumeration failure') } -Force
-        Mock Get-LinuxWritableDirectoryEnumerator { return ,$script:UsageCursor }
-        Mock Get-ChildItem { throw [IO.IOException]::new('fixture enumeration failure') }
-        { Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Error fixture' } | Should -Throw '*fixture enumeration failure*'
-        $script:CursorState.Disposed | Should -Be 1
+        $source = $ast.Extent.Text
+        $source | Should -Match '(?s)finally\s*\{\s*while \(pending\.Count > 0\).*?CloseFrame\(frame\)'
+        $source | Should -Match 'CloseDirectory\(directory\)'
     }
 
     # Scenario: Protected tests intentionally create a temporary symlink or junction and remove it before completion.
     # Purpose: Count but never follow explicitly allowed in-flight reparse entries while retaining strict default rejection.
     It 'UnitT45_AllowsOnlyExplicitEphemeralReparseAccounting' {
+        if (-not $script:HostIsLinux) {
+            Set-ItResult -Skipped -Because 'native descriptor traversal is Linux-only'
+            return
+        }
         $target = Join-Path $TestDrive 'ephemeral-target'
         $link = Join-Path $script:UsageRoot 'ephemeral-link'
         [void](New-Item -ItemType Directory -Path $target)
@@ -927,5 +918,48 @@ Describe 'Bounded writable-root enumeration behavior' {
         $source = $invokeNative.Extent.Text
         $source | Should -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
         $source | Should -Not -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=67108864,nodev,nosuid,noexec tmpfs "\$target"'
+    }
+
+    # Scenario: A writable directory is replaced with a symlink between enumeration and descent.
+    # Purpose: Bind traversal to directory descriptors and refuse link following instead of reopening by pathname.
+    It 'UnitT90_UsesDescriptorRelativeNoFollowWritableRootTraversal' {
+        $source = $ast.Extent.Text
+        $source | Should -Match 'class\s+LinuxWritableRootInspector'
+        $source | Should -Match 'EntryPoint\s*=\s*"openat"'
+        $source | Should -Match 'O_NOFOLLOW'
+        $source | Should -Match 'AT_SYMLINK_NOFOLLOW'
+        $inspection = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-LinuxWritableRootInspection'
+        }, $true)
+        $inspection.Extent.Text | Should -Match 'LinuxWritableRootInspector\]::Inspect'
+        $usage = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-LinuxWritableRootUsage'
+        }, $true)
+        $usage.Extent.Text | Should -Not -Match 'EnumerateFileSystemInfos|Get-ChildItem'
+    }
+
+    # Scenario: The validator is parsed and tested on Windows before Linux evidence runs.
+    # Purpose: Compile the descriptor walker eagerly without invoking libc on the non-Linux host.
+    It 'UnitT95_CompilesTheLinuxWritableRootInspector' {
+        $nativeType = Enable-LinuxWritableRootInspector
+        $nativeType.FullName | Should -BeExactly 'Codex.Validation.LinuxWritableRootInspector'
+    }
+
+    # Scenario: A protected test leaves a detached writer in the Pester cgroup.
+    # Purpose: Evacuate every sandbox writer before the final strict reparse scan accepts the child root.
+    It 'UnitT100_QuiescesProtectedPesterBeforeTheFinalStrictScan' {
+        $runspace = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
+        }, $true)
+        $source = $runspace.Extent.Text
+        $source | Should -Match '(?s)Remove-LinuxPesterCgroup\s+-CgroupPath\s+\$linuxPesterCgroupPath\s+\$linuxPesterCgroupPath\s*=\s*\$null.*?Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath'
+    }
+
+    # Scenario: Ubuntu's util-linux setpriv rejects the nonexistent --ambient-clear option.
+    # Purpose: Clear the ambient capability set with the documented capability-list syntax in both Linux sandboxes.
+    It 'UnitT105_UsesSupportedSetprivAmbientCapabilityClearing' {
+        $source = $ast.Extent.Text
+        $source | Should -Not -Match '--ambient-clear'
+        ([regex]::Matches($source, '--ambient-caps=-all')).Count | Should -Be 2
     }
 }

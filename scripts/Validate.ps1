@@ -554,10 +554,275 @@ function Remove-LinuxPesterCgroup {
     }
 }
 
-function Get-LinuxWritableDirectoryEnumerator {
-    param([Parameter(Mandatory = $true)][IO.DirectoryInfo] $Directory)
-    # Return the iterator itself; never drain an untrusted directory into a PowerShell array.
-    return ,$Directory.EnumerateFileSystemInfos().GetEnumerator()
+function Enable-LinuxWritableRootInspector {
+    if (-not $script:IsLinuxHost) { throw 'Linux writable-root inspection requires a Linux host.' }
+    $nativeType = 'Codex.Validation.LinuxWritableRootInspector' -as [type]
+    if ($null -eq $nativeType) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Codex.Validation {
+    public sealed class LinuxWritableRootUsage {
+        public long Bytes { get; private set; }
+        public int EntryCount { get; private set; }
+
+        public LinuxWritableRootUsage(long bytes, int entryCount) {
+            Bytes = bytes;
+            EntryCount = entryCount;
+        }
+    }
+
+    public static class LinuxWritableRootInspector {
+        private const int O_RDONLY = 0;
+        private const int O_DIRECTORY = 0x10000;
+        private const int O_NOFOLLOW = 0x20000;
+        private const int O_CLOEXEC = 0x80000;
+        private const int AT_SYMLINK_NOFOLLOW = 0x100;
+        private const int AT_NO_AUTOMOUNT = 0x800;
+        private const uint STATX_TYPE = 0x0001;
+        private const uint STATX_SIZE = 0x0200;
+        private const ushort S_IFMT = 0xF000;
+        private const ushort S_IFDIR = 0x4000;
+        private const ushort S_IFREG = 0x8000;
+        private const ushort S_IFLNK = 0xA000;
+        private const int ENOENT = 2;
+        private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
+
+        [StructLayout(LayoutKind.Explicit, Size = 256)]
+        private struct Statx {
+            [FieldOffset(0)]
+            public uint Mask;
+            [FieldOffset(28)]
+            public ushort Mode;
+            [FieldOffset(40)]
+            public ulong Size;
+        }
+
+        private sealed class DirectoryFrame {
+            public int FileDescriptor;
+            public IntPtr Directory;
+            public string DisplayPath;
+
+            public DirectoryFrame(int fileDescriptor, IntPtr directory, string displayPath) {
+                FileDescriptor = fileDescriptor;
+                Directory = directory;
+                DisplayPath = displayPath;
+            }
+        }
+
+        [DllImport("libc.so.6", EntryPoint = "open", SetLastError = true)]
+        private static extern int Open(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            int flags);
+
+        [DllImport("libc.so.6", EntryPoint = "openat", SetLastError = true)]
+        private static extern int OpenAt(
+            int directoryFileDescriptor,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            int flags);
+
+        [DllImport("libc.so.6", EntryPoint = "statx", SetLastError = true)]
+        private static extern int StatAt(
+            int directoryFileDescriptor,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            int flags,
+            uint mask,
+            out Statx status);
+
+        [DllImport("libc.so.6", EntryPoint = "fdopendir", SetLastError = true)]
+        private static extern IntPtr OpenDirectory(int fileDescriptor);
+
+        [DllImport("libc.so.6", EntryPoint = "readdir", SetLastError = true)]
+        private static extern IntPtr ReadDirectory(IntPtr directory);
+
+        [DllImport("libc.so.6", EntryPoint = "closedir", SetLastError = true)]
+        private static extern int CloseDirectory(IntPtr directory);
+
+        [DllImport("libc.so.6", EntryPoint = "close", SetLastError = true)]
+        private static extern int CloseFileDescriptor(int fileDescriptor);
+
+        [DllImport("libc.so.6", EntryPoint = "__errno_location")]
+        private static extern IntPtr GetErrnoLocation();
+
+        private static int GetErrno() {
+            return Marshal.ReadInt32(GetErrnoLocation());
+        }
+
+        private static void ResetErrno() {
+            Marshal.WriteInt32(GetErrnoLocation(), 0);
+        }
+
+        private static DirectoryFrame CreateFrame(int fileDescriptor, string displayPath) {
+            IntPtr directory = OpenDirectory(fileDescriptor);
+            if (directory == IntPtr.Zero) {
+                int error = GetErrno();
+                CloseFileDescriptor(fileDescriptor);
+                throw new IOException("Could not open a writable-root directory handle (errno " + error + "): " + displayPath);
+            }
+            return new DirectoryFrame(fileDescriptor, directory, displayPath);
+        }
+
+        private static void CloseFrame(DirectoryFrame frame) {
+            if (frame != null && frame.Directory != IntPtr.Zero) {
+                IntPtr directory = frame.Directory;
+                frame.Directory = IntPtr.Zero;
+                if (CloseDirectory(directory) != 0) {
+                    int error = GetErrno();
+                    throw new IOException("Could not close a writable-root directory handle (errno " + error + "): " + frame.DisplayPath);
+                }
+            }
+        }
+
+        private static string ReadEntryName(IntPtr entry) {
+            int recordLength = (ushort)Marshal.ReadInt16(entry, 16);
+            const int nameOffset = 19;
+            if (recordLength <= nameOffset) {
+                throw new IOException("Writable-root traversal received an invalid directory entry record.");
+            }
+            int maximumLength = recordLength - nameOffset;
+            int length = 0;
+            while (length < maximumLength && Marshal.ReadByte(entry, nameOffset + length) != 0) {
+                length++;
+            }
+            if (length == maximumLength) {
+                throw new IOException("Writable-root traversal received an unterminated directory entry name.");
+            }
+            byte[] nameBytes = new byte[length];
+            for (int index = 0; index < length; index++) {
+                nameBytes[index] = Marshal.ReadByte(entry, nameOffset + index);
+            }
+            return StrictUtf8.GetString(nameBytes);
+        }
+
+        private static bool TryStatEntry(int directoryFileDescriptor, string name, out Statx status, out int error) {
+            int result = StatAt(
+                directoryFileDescriptor,
+                name,
+                AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
+                STATX_TYPE | STATX_SIZE,
+                out status);
+            error = result == 0 ? 0 : GetErrno();
+            return result == 0;
+        }
+
+        public static LinuxWritableRootUsage Inspect(string root, bool allowReparseEntries, int maximumEntries) {
+            if (String.IsNullOrWhiteSpace(root)) { throw new ArgumentException("Writable root is required.", "root"); }
+            if (maximumEntries <= 0) { throw new ArgumentOutOfRangeException("maximumEntries"); }
+            string rootPath = Path.GetFullPath(root);
+            int rootFileDescriptor = Open(rootPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (rootFileDescriptor < 0) {
+                throw new IOException("Writable root is not a regular non-reparse directory (errno " + GetErrno() + "): " + rootPath);
+            }
+
+            Stack<DirectoryFrame> pending = new Stack<DirectoryFrame>();
+            try {
+                pending.Push(CreateFrame(rootFileDescriptor, rootPath));
+                long bytes = 0;
+                int entryCount = 0;
+                while (pending.Count > 0) {
+                    DirectoryFrame frame = pending.Peek();
+                    ResetErrno();
+                    IntPtr entry = ReadDirectory(frame.Directory);
+                    if (entry == IntPtr.Zero) {
+                        int error = GetErrno();
+                        if (error != 0) {
+                            throw new IOException("Could not enumerate writable-root entries (errno " + error + "): " + frame.DisplayPath);
+                        }
+                        pending.Pop();
+                        CloseFrame(frame);
+                        continue;
+                    }
+
+                    string name = ReadEntryName(entry);
+                    if (name == "." || name == "..") { continue; }
+                    if (name.Length == 0 || name.IndexOf('/') >= 0) {
+                        throw new IOException("Writable-root traversal received an invalid entry name.");
+                    }
+                    entryCount++;
+                    if (entryCount > maximumEntries) {
+                        throw new IOException("Writable root exceeded the aggregate writable-entry-count limit of " + maximumEntries + ".");
+                    }
+
+                    Statx status;
+                    int statusError;
+                    if (!TryStatEntry(frame.FileDescriptor, name, out status, out statusError)) {
+                        if (statusError == ENOENT) { continue; }
+                        throw new IOException("Could not inspect a writable-root entry without following links (errno " + statusError + "): " + Path.Combine(frame.DisplayPath, name));
+                    }
+                    if ((status.Mask & (STATX_TYPE | STATX_SIZE)) != (STATX_TYPE | STATX_SIZE)) {
+                        throw new IOException("Writable-root inspection did not receive the required type and size metadata: " + Path.Combine(frame.DisplayPath, name));
+                    }
+                    ushort fileType = (ushort)(status.Mode & S_IFMT);
+                    string displayPath = Path.Combine(frame.DisplayPath, name);
+                    if (fileType == S_IFLNK) {
+                        if (allowReparseEntries) { continue; }
+                        throw new IOException("Writable root contains a reparse entry: " + displayPath);
+                    }
+                    if (fileType == S_IFDIR) {
+                        int childFileDescriptor = OpenAt(
+                            frame.FileDescriptor,
+                            name,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                        if (childFileDescriptor < 0) {
+                            int openError = GetErrno();
+                            Statx replacementStatus;
+                            int replacementError;
+                            if (!TryStatEntry(frame.FileDescriptor, name, out replacementStatus, out replacementError) && replacementError == ENOENT) {
+                                continue;
+                            }
+                            if (replacementError == 0 &&
+                                (replacementStatus.Mask & STATX_TYPE) == STATX_TYPE &&
+                                (replacementStatus.Mode & S_IFMT) == S_IFLNK &&
+                                allowReparseEntries) {
+                                continue;
+                            }
+                            throw new IOException("Could not descend into a writable-root directory without following links (errno " + openError + "): " + displayPath);
+                        }
+                        pending.Push(CreateFrame(childFileDescriptor, displayPath));
+                        continue;
+                    }
+                    if (fileType != S_IFREG) {
+                        throw new IOException("Writable root contains an unsupported non-regular entry: " + displayPath);
+                    }
+                    if (status.Size > Int64.MaxValue || (long)status.Size > Int64.MaxValue - bytes) {
+                        throw new IOException("Writable-root size overflowed the bounded accounting range.");
+                    }
+                    bytes += (long)status.Size;
+                }
+                return new LinuxWritableRootUsage(bytes, entryCount);
+            }
+            finally {
+                while (pending.Count > 0) {
+                    DirectoryFrame frame = pending.Pop();
+                    try { CloseFrame(frame); } catch { }
+                }
+            }
+        }
+    }
+}
+'@ -ErrorAction Stop
+        $nativeType = 'Codex.Validation.LinuxWritableRootInspector' -as [type]
+    }
+    if ($null -eq $nativeType) { throw 'The Linux writable-root inspector could not be loaded.' }
+    return $nativeType
+}
+
+function Invoke-LinuxWritableRootInspection {
+    param(
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][bool] $AllowReparseEntries,
+        [Parameter(Mandatory = $true)][int] $MaximumEntries
+    )
+    [void](Enable-LinuxWritableRootInspector)
+    return [Codex.Validation.LinuxWritableRootInspector]::Inspect(
+        $Root,
+        $AllowReparseEntries,
+        $MaximumEntries
+    )
 }
 
 function Get-LinuxWritableRootUsage {
@@ -568,39 +833,19 @@ function Get-LinuxWritableRootUsage {
     )
     if (-not $script:IsLinuxHost) { throw 'Linux writable-root inspection requires a Linux host.' }
     $rootPath = [IO.Path]::GetFullPath($Root)
-    $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
-    if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$Context writable root is not a regular non-reparse directory: $rootPath"
+    try {
+        $usage = Invoke-LinuxWritableRootInspection `
+            -Root $rootPath `
+            -AllowReparseEntries ([bool]$AllowReparseEntries) `
+            -MaximumEntries 100000
     }
-    $pending = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
-    $pending.Push([IO.DirectoryInfo]$rootItem)
-    $bytes = [int64]0
-    $entryCount = 0
-    while ($pending.Count -gt 0) {
-        $directory = $pending.Pop()
-        $enumerator = Get-LinuxWritableDirectoryEnumerator -Directory $directory
-        try {
-            while ($enumerator.MoveNext()) {
-                $entry = $enumerator.Current
-                $entryCount++
-                if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
-                if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    if ($AllowReparseEntries) { continue }
-                    throw "$Context writable root contains a reparse entry: $($entry.FullName)"
-                }
-                if ($entry -is [IO.DirectoryInfo]) {
-                    $pending.Push([IO.DirectoryInfo]$entry)
-                    continue
-                }
-                if ($entry.Length -gt 0 -and [int64]$entry.Length -gt ([int64]::MaxValue - $bytes)) {
-                    throw "$Context writable-root size overflowed the bounded accounting range."
-                }
-                $bytes += [int64]$entry.Length
-            }
-        }
-        finally { $enumerator.Dispose() }
+    catch {
+        throw "$Context writable-root inspection failed: $($_.Exception.Message)"
     }
-    return [pscustomobject][ordered]@{ bytes = $bytes; fileCount = $entryCount }
+    return [pscustomobject][ordered]@{
+        bytes = [int64]$usage.Bytes
+        fileCount = [int]$usage.EntryCount
+    }
 }
 
 function Assert-LinuxWritableRootUsage {
@@ -3790,7 +4035,7 @@ do
     "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
 done
 "$find_path" "$sandbox_root/dev" -xdev -type s -exec "$mount_path" --bind /dev/null '{}' \; 2>/dev/null || true
-exec "$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" "$@"
+exec "$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"' -- "$working_directory" "$command_path" "$@"
 '@
                 $networkNamespaceArguments = if ($NetworkProfile -ceq 'Offline') { @('--net') } else { @() }
                 $linuxMountArguments = @(
@@ -4420,7 +4665,7 @@ do
     "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
 done
 "$mount_path" --bind /dev/null "$sandbox_root/dev/console"
-exec chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
+exec chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
 '@
         $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $childWritableRootPath
         $environment = @{}
@@ -4592,12 +4837,6 @@ function Invoke-ProtectedPesterRunspace {
         if (-not $asyncResult.IsCompleted) {
             throw 'Protected Pester remote pipeline exceeded its bounded execution timeout.'
         }
-        if ($script:IsLinuxHost) {
-            [void](Assert-LinuxWritableRootUsage `
-                -Root $childWritableRootPath `
-                -BaselineBytes $linuxWritableRootBaselineBytes `
-                -Context 'Protected Pester remote pipeline')
-        }
         $output = @($powerShell.EndInvoke($asyncResult))
         if ($powerShell.InvocationStateInfo.State -ne [Management.Automation.PSInvocationState]::Completed) {
             throw "Protected Pester remote pipeline did not complete normally: $($powerShell.InvocationStateInfo.State)."
@@ -4618,6 +4857,14 @@ function Invoke-ProtectedPesterRunspace {
         $workerResult = [string]$workerResultObject
         if (-not $workerResult.StartsWith($workerResultPrefix, [StringComparison]::Ordinal)) {
             throw 'Protected Pester remote pipeline returned an unexpected completion payload.'
+        }
+        if ($script:IsLinuxHost) {
+            Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath
+            $linuxPesterCgroupPath = $null
+            [void](Assert-LinuxWritableRootUsage `
+                -Root $childWritableRootPath `
+                -BaselineBytes $linuxWritableRootBaselineBytes `
+                -Context 'Protected Pester remote pipeline')
         }
         return $workerResult.Substring($workerResultPrefix.Length)
     }
