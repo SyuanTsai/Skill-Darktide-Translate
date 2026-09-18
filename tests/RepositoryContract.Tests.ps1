@@ -860,4 +860,17 @@ Describe 'Bounded writable-root enumeration behavior' {
         { Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Error fixture' } | Should -Throw '*fixture enumeration failure*'
         $script:CursorState.Disposed | Should -Be 1
     }
+
+    # Scenario: Trusted tool installations share the diagnostic parent with a narrower candidate-writable child root.
+    # Purpose: Bound only the declared child-writable surface and never treat trusted package symlinks as candidate output.
+    It 'UnitT50_AccountsOnlyTheDeclaredChildWritableRoot' {
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $invokeNative | Should -Not -BeNullOrEmpty
+        $source = $invokeNative.Extent.Text
+        ([regex]::Matches($source, 'Get-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath')).Count | Should -Be 1
+        ([regex]::Matches($source, 'Assert-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath')).Count | Should -Be 3
+        $source | Should -Not -Match '(?:Get|Assert)-LinuxWritableRootUsage\s+-Root\s+\$DiagnosticRoot'
+    }
 }

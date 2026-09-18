@@ -3885,7 +3885,7 @@ finally {
                 $null
             }
             if ($script:IsLinuxHost) {
-                $linuxWritableRootBaselineBytes = [int64](Get-LinuxWritableRootUsage -Root $DiagnosticRoot -Context $Context).bytes
+                $linuxWritableRootBaselineBytes = [int64](Get-LinuxWritableRootUsage -Root $childWritableRootPath -Context $Context).bytes
             }
             if ($null -ne $nativeEnvironmentVariables) {
                 $startInfo.EnvironmentVariables.Clear()
@@ -3987,7 +3987,7 @@ finally {
             $processDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             if ($script:IsLinuxHost -and $childProcessGroupId -gt 0 -and -not $childProcess.HasExited) {
-                [void](Assert-LinuxWritableRootUsage -Root $DiagnosticRoot -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+                [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
                 Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
             }
             while (-not $childProcess.HasExited) {
@@ -3997,13 +3997,13 @@ finally {
                 [void]$childProcess.WaitForExit(100)
                 Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
                 if ($script:IsLinuxHost -and -not $childProcess.HasExited) {
-                    [void](Assert-LinuxWritableRootUsage -Root $DiagnosticRoot -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+                    [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
                     Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
                 }
             }
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             if ($script:IsLinuxHost) {
-                [void](Assert-LinuxWritableRootUsage -Root $DiagnosticRoot -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+                [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
             }
             Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
             $processTreeStopped = $true
