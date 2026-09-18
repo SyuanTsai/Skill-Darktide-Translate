@@ -3463,14 +3463,21 @@ function Invoke-NativeChecked {
     if ($null -ne $AdditionalEnvironmentVariables -and -not $TerminateProcessTree) {
         throw "$Context cannot add environment variables without process containment."
     }
+    $diagnosticRootFullPath = [IO.Path]::GetFullPath($DiagnosticRoot)
+    if (-not (Test-Path -LiteralPath $diagnosticRootFullPath -PathType Container)) {
+        throw "$Context diagnostic root is missing: $diagnosticRootFullPath"
+    }
     $childWritableRootPath = if ([string]::IsNullOrWhiteSpace($ChildWritableRoot)) {
-        [IO.Path]::GetFullPath($DiagnosticRoot)
+        $diagnosticRootFullPath
     }
     else {
         [IO.Path]::GetFullPath($ChildWritableRoot)
     }
     if (-not (Test-Path -LiteralPath $childWritableRootPath -PathType Container)) {
         throw "$Context child-writable output root is missing: $childWritableRootPath"
+    }
+    if (-not (Test-PathWithinOrEqual -Path $childWritableRootPath -Root $diagnosticRootFullPath)) {
+        throw "$Context child-writable output root must remain within the diagnostic root."
     }
     Assert-NoReparseAncestors -Path $childWritableRootPath -Context "$Context child-writable output root"
     $stderrPath = Join-Path $childWritableRootPath ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
@@ -3598,7 +3605,6 @@ function Invoke-NativeChecked {
                 [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
                 Assert-NoReparseAncestors -Path $sandboxRoot -Context "$Context Linux sandbox root"
                 $linuxReadonlyBindPaths = [Collections.Generic.List[string]]::new()
-                $diagnosticRootFullPath = [IO.Path]::GetFullPath($DiagnosticRoot)
                 $addLinuxReadonlyBindPath = {
                     param([Parameter(Mandatory = $true)][string] $Path)
                     $fullPath = [IO.Path]::GetFullPath($Path)
@@ -3672,10 +3678,11 @@ find_path="$2"
 chroot_path="$3"
 sandbox_root="$4"
 run_root="$5"
-working_directory="$6"
-command_path="$7"
-bind_count="$8"
-shift 8
+child_writable_root="$6"
+working_directory="$7"
+command_path="$8"
+bind_count="$9"
+shift 9
 "$mount_path" --make-rprivate /
 "$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
 mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
@@ -3730,6 +3737,16 @@ done
 mkdir -p "$sandbox_root$run_root"
 "$mount_path" --bind "$run_root" "$sandbox_root$run_root"
 "$mount_path" --make-rslave "$sandbox_root$run_root"
+case "$child_writable_root" in
+    "$run_root") ;;
+    "$run_root"/*)
+        "$mount_path" -o remount,bind,ro "$sandbox_root$run_root"
+        "$mount_path" --bind "$child_writable_root" "$sandbox_root$child_writable_root"
+        "$mount_path" --make-rslave "$sandbox_root$child_writable_root"
+        "$mount_path" -o remount,bind,rw "$sandbox_root$child_writable_root"
+        ;;
+    *) exit 126 ;;
+esac
 while [ "$bind_count" -gt 0 ]
 do
     source_path="$1"
@@ -3774,7 +3791,7 @@ exec "$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec
 '@
                 $networkNamespaceArguments = if ($NetworkProfile -ceq 'Offline') { @('--net') } else { @() }
                 $linuxMountArguments = @(
-                    $mountPath, $findPath, $chrootPath, $sandboxRoot, $DiagnosticRoot, $workingDirectory, $Command,
+                    $mountPath, $findPath, $chrootPath, $sandboxRoot, $diagnosticRootFullPath, $childWritableRootPath, $workingDirectory, $Command,
                     [string]$linuxReadonlyBindPaths.Count
                 ) + @($linuxReadonlyBindPaths.ToArray()) + @($Arguments)
                 $namespaceArguments = @(
@@ -4232,9 +4249,14 @@ function Invoke-ProtectedPesterServerProxy {
     if (-not (Test-Path -LiteralPath $ChildWritableRoot -PathType Container)) {
         throw "Protected Pester server child-writable root is missing: $ChildWritableRoot"
     }
+    $diagnosticRootPath = [IO.Path]::GetFullPath($DiagnosticRoot)
+    $childWritableRootPath = [IO.Path]::GetFullPath($ChildWritableRoot)
+    if (-not (Test-PathWithinOrEqual -Path $childWritableRootPath -Root $diagnosticRootPath)) {
+        throw 'Protected Pester server child-writable root must remain within the diagnostic root.'
+    }
     Assert-NoReparseAncestors -Path $WorkingDirectory -Context 'Protected Pester server working directory'
-    Assert-NoReparseAncestors -Path $DiagnosticRoot -Context 'Protected Pester server diagnostic root'
-    Assert-NoReparseAncestors -Path $ChildWritableRoot -Context 'Protected Pester server child-writable root'
+    Assert-NoReparseAncestors -Path $diagnosticRootPath -Context 'Protected Pester server diagnostic root'
+    Assert-NoReparseAncestors -Path $childWritableRootPath -Context 'Protected Pester server child-writable root'
     $readOnlyPaths = @($ReadOnlyPathsJson | ConvertFrom-Json -Depth 20)
     foreach ($readOnlyPath in $readOnlyPaths) {
         if ([string]::IsNullOrWhiteSpace([string]$readOnlyPath) -or -not (Test-Path -LiteralPath ([string]$readOnlyPath))) {
@@ -4331,8 +4353,9 @@ sandbox_root="$2"
 run_root="$3"
 working_directory="$4"
 command_path="$5"
-readonly_count="$6"
-shift 6
+child_writable_root="$6"
+readonly_count="$7"
+shift 7
 "$mount_path" --make-rprivate /
 "$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
 mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
@@ -4349,6 +4372,16 @@ done
 mkdir -p "$sandbox_root$run_root"
 "$mount_path" --bind "$run_root" "$sandbox_root$run_root"
 "$mount_path" --make-rslave "$sandbox_root$run_root"
+case "$child_writable_root" in
+    "$run_root") ;;
+    "$run_root"/*)
+        "$mount_path" -o remount,bind,ro "$sandbox_root$run_root"
+        "$mount_path" --bind "$child_writable_root" "$sandbox_root$child_writable_root"
+        "$mount_path" --make-rslave "$sandbox_root$child_writable_root"
+        "$mount_path" -o remount,bind,rw "$sandbox_root$child_writable_root"
+        ;;
+    *) exit 126 ;;
+esac
 while [ "$readonly_count" -gt 0 ]
 do
     readonly_path="$1"
@@ -4392,8 +4425,8 @@ exec chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bi
         $unshareArguments = @(
             '--user', '--map-root-user', '--mount', '--pid', '--ipc', '--uts', '--fork', '--mount-proc', '--kill-child', '--net',
             '--', $shellPath, '-c', $maskHostSocketsScript, '--',
-            $mountPath, $sandboxRoot, [IO.Path]::GetFullPath($DiagnosticRoot), [IO.Path]::GetFullPath($WorkingDirectory),
-            [IO.Path]::GetFullPath($PowerShellPath), [string]$readOnlyPaths.Count
+            $mountPath, $sandboxRoot, $diagnosticRootPath, [IO.Path]::GetFullPath($WorkingDirectory),
+            [IO.Path]::GetFullPath($PowerShellPath), $childWritableRootPath, [string]$readOnlyPaths.Count
         ) + @($readOnlyPaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
         $nativeArguments = @(
             '--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',

@@ -873,4 +873,15 @@ Describe 'Bounded writable-root enumeration behavior' {
         ([regex]::Matches($source, 'Assert-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath')).Count | Should -Be 3
         $source | Should -Not -Match '(?:Get|Assert)-LinuxWritableRootUsage\s+-Root\s+\$DiagnosticRoot'
     }
+
+    # Scenario: Trusted tools and the candidate-writable child share one diagnostic root in both Linux sandboxes.
+    # Purpose: Make every sibling read-only before quota accounting narrows to the only writable child mount.
+    It 'UnitT60_MountsOnlyTheDeclaredChildWritableRootInsideReadOnlyDiagnosticRoot' {
+        $source = $ast.Extent.Text
+        $source | Should -Match 'Test-PathWithinOrEqual\s+-Path\s+\$childWritableRootPath\s+-Root\s+\$diagnosticRootFullPath'
+        ([regex]::Matches($source, [regex]::Escape('child_writable_root="$6"'))).Count | Should -Be 2
+        ([regex]::Matches($source, [regex]::Escape('"$mount_path" -o remount,bind,ro "$sandbox_root$run_root"'))).Count | Should -Be 2
+        ([regex]::Matches($source, [regex]::Escape('"$mount_path" --bind "$child_writable_root" "$sandbox_root$child_writable_root"'))).Count | Should -Be 2
+        ([regex]::Matches($source, [regex]::Escape('"$mount_path" -o remount,bind,rw "$sandbox_root$child_writable_root"'))).Count | Should -Be 2
+    }
 }
