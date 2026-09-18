@@ -878,7 +878,7 @@ Describe 'Bounded writable-root enumeration behavior' {
         $invokeNative | Should -Not -BeNullOrEmpty
         $source = $invokeNative.Extent.Text
         ([regex]::Matches($source, 'Get-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath')).Count | Should -Be 1
-        ([regex]::Matches($source, 'Assert-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath')).Count | Should -Be 3
+        ([regex]::Matches($source, 'Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath')).Count | Should -Be 3
         $source | Should -Not -Match '(?:Get|Assert)-LinuxWritableRootUsage\s+-Root\s+\$DiagnosticRoot'
     }
 
@@ -1013,13 +1013,14 @@ Describe 'Bounded writable-root enumeration behavior' {
     }
 
     # Scenario: Native tools and protected Pester have different process-boundary identities while both write to the same bounded surface.
-    # Purpose: Bind live unlinked-file accounting to process-group or cgroup membership and scan strictly only after writers stop.
+    # Purpose: Bind live unlinked-file accounting to candidate-only cgroup membership and scan strictly only after writers stop.
     It 'UnitT120_BindsLiveUnlinkedAccountingAndQuiescesNativeFinalScan' {
         $invokeNative = $ast.Find({ param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
         }, $true)
         $nativeSource = $invokeNative.Extent.Text
-        ([regex]::Matches($nativeSource, 'Assert-LinuxWritableRootUsage[^\r\n]*-RootProcessId\s+\$childProcessId[^\r\n]*-ProcessGroupId\s+\$childProcessGroupId')).Count | Should -Be 2
+        ([regex]::Matches($nativeSource, 'Assert-LinuxWritableRootUsage[\s\S]{0,320}-CgroupPath\s+\$linuxNativeWorkloadCgroupPath')).Count | Should -Be 2
+        $nativeSource | Should -Not -Match 'Assert-LinuxWritableRootUsage[^\r\n]*-RootProcessId\s+\$childProcessId'
         $nativeSource | Should -Match '(?s)Stop-ProcessTree.*?\$processTreeStopped\s*=\s*\$true.*?Assert-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath'
 
         $runspace = $ast.Find({ param($node)
@@ -1354,5 +1355,38 @@ namespace Codex.Validation.Tests {
         $source | Should -Match 'entryPaths\.Count > maximumEntries'
         $source | Should -Not -Match 'Directory\.GetFileSystemEntries\(descriptorRoot\)'
         $source | Should -Match 'Could not enumerate every task descriptor in the writable process boundary \(errno '
+    }
+
+    # Scenario: Trusted unshare and mount supervisors can be non-dumpable even though only their child workload executes candidate code.
+    # Purpose: Keep trusted launchers in the bounded parent cgroup and freeze/inspect only a nested workload cgroup that candidate code cannot leave.
+    It 'UnitT170_IsolatesCandidateProcfsInspectionInANestedWorkloadCgroup' {
+        $newWorkload = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-LinuxCandidateWorkloadCgroup'
+        }, $true)
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+
+        $newWorkload | Should -Not -BeNullOrEmpty
+        $invokeNative | Should -Not -BeNullOrEmpty
+        if ($null -in @($newWorkload, $invokeNative)) { return }
+
+        $workloadSource = $newWorkload.Extent.Text
+        $workloadSource | Should -Match 'Join-Path\s+\$ParentCgroupPath\s+''workload'''
+        $workloadSource | Should -Match '\[IO\.Directory\]::CreateDirectory\(\$workloadPath\)'
+        $workloadSource | Should -Match "'cgroup\.procs'"
+        $workloadSource | Should -Match "'cgroup\.freeze'"
+        $workloadSource | Should -Match "'cgroup\.events'"
+
+        $nativeSource = $invokeNative.Extent.Text
+        $nativeSource | Should -Match 'New-LinuxCandidateWorkloadCgroup'
+        $nativeSource | Should -Match 'workload_cgroup_path="\$\{14\}"'
+        $nativeSource | Should -Match '(?s)\$unshare_path.*?/bin/sh\s+-c.*?cgroup\.procs.*?exec.*?\$chroot_path'
+        $nativeSource | Should -Match 'Assert-LinuxWritableRootUsage[\s\S]*?-CgroupPath\s+\$linuxNativeWorkloadCgroupPath'
+        $workloadCleanupIndex = $nativeSource.LastIndexOf('Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeWorkloadCgroupPath', [StringComparison]::Ordinal)
+        $parentCleanupIndex = $nativeSource.LastIndexOf('Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeCgroupPath', [StringComparison]::Ordinal)
+        $workloadCleanupIndex | Should -BeGreaterOrEqual 0
+        $parentCleanupIndex | Should -BeGreaterThan $workloadCleanupIndex
+        $nativeSource | Should -Not -Match 'sudo'
     }
 }

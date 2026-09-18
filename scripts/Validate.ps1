@@ -829,6 +829,47 @@ function Assert-CurrentLinuxCandidateCgroup {
     return $cgroupFullPath
 }
 
+function New-LinuxCandidateWorkloadCgroup {
+    param(
+        [Parameter(Mandatory = $true)][string] $ParentCgroupPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { return $null }
+    $cgroupRoot = Get-LinuxPesterCgroupRoot
+    $parentPath = [IO.Path]::GetFullPath($ParentCgroupPath)
+    if ([IO.Path]::GetDirectoryName($parentPath) -cne $cgroupRoot -or
+        [IO.Path]::GetFileName($parentPath) -notmatch '^codex-validation-candidate-[0-9a-f]{32}$' -or
+        -not (Test-Path -LiteralPath $parentPath -PathType Container)) {
+        throw "$Context requires an exact run-owned parent cgroup before creating the workload boundary."
+    }
+    Assert-NoReparseAncestors -Path $parentPath -Context "$Context parent cgroup"
+    $memoryMaxPath = Join-Path $parentPath 'memory.max'
+    if (-not (Test-Path -LiteralPath $memoryMaxPath -PathType Leaf) -or
+        ([IO.File]::ReadAllText($memoryMaxPath)).Trim() -cne '2147483648') {
+        throw "$Context parent cgroup does not preserve the required aggregate memory limit."
+    }
+    $workloadPath = Join-Path $ParentCgroupPath 'workload'
+    if (Test-Path -LiteralPath $workloadPath) {
+        throw "$Context workload cgroup already exists."
+    }
+    try {
+        [IO.Directory]::CreateDirectory($workloadPath) | Out-Null
+        Assert-NoReparseAncestors -Path $workloadPath -Context "$Context workload cgroup"
+        foreach ($requiredFile in @('cgroup.procs', 'cgroup.freeze', 'cgroup.events')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $workloadPath $requiredFile) -PathType Leaf)) {
+                throw "$Context workload cgroup does not expose $requiredFile."
+            }
+        }
+        return [IO.Path]::GetFullPath($workloadPath)
+    }
+    catch {
+        if (Test-Path -LiteralPath $workloadPath -PathType Container) {
+            try { [IO.Directory]::Delete($workloadPath) } catch { }
+        }
+        throw "$Context could not establish the nested workload cgroup: $($_.Exception.Message)"
+    }
+}
+
 function Remove-LinuxCandidateCgroup {
     param([Parameter()][AllowNull()][string] $CgroupPath)
     if (-not $script:IsLinuxHost -or [string]::IsNullOrWhiteSpace($CgroupPath)) { return }
@@ -4317,6 +4358,7 @@ function Invoke-NativeChecked {
     $linuxSandboxRoot = $null
     $linuxExportManifestPath = $null
     $linuxNativeCgroupPath = $null
+    $linuxNativeWorkloadCgroupPath = $null
     $windowsResumeEventReleaseEligible = $false
     try {
         if ($ProtectRunnerCommandFiles) {
@@ -4419,6 +4461,9 @@ function Invoke-NativeChecked {
                 Assert-NoReparseAncestors -Path $setprivPath -Context "$Context trusted Linux setpriv utility"
                 $nativeCommand = if ($applyLinuxResourceLimitsEffective) { $prlimitPath } else { $setsidPath }
                 $linuxNativeCgroupPath = New-LinuxCandidateCgroup -Context $Context
+                $linuxNativeWorkloadCgroupPath = New-LinuxCandidateWorkloadCgroup `
+                    -ParentCgroupPath $linuxNativeCgroupPath `
+                    -Context $Context
                 $sandboxRoot = Join-Path ([IO.Path]::GetDirectoryName($DiagnosticRoot)) ("sgv1-sandbox-{0}" -f [guid]::NewGuid().ToString('N'))
                 $linuxSandboxRoot = $sandboxRoot
                 [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
@@ -4520,7 +4565,8 @@ unshare_path="${10}"
 manifest_path="${11}"
 bind_count="${12}"
 cgroup_path="${13}"
-shift 13
+workload_cgroup_path="${14}"
+shift 14
 printf '%s\n' "$$" > "$cgroup_path/cgroup.procs"
 IFS= read -r memory_max < "$cgroup_path/memory.max" || exit 126
 [ "$memory_max" = "2147483648" ] || exit 126
@@ -4634,6 +4680,19 @@ done
 "$find_path" "$sandbox_root/dev" -xdev -type s -exec "$mount_path" --bind /dev/null '{}' \; 2>/dev/null || true
 set +e
 "$unshare_path" --mount --pid --fork --kill-child --mount-proc="$sandbox_root/proc" -- \
+    /bin/sh -c '
+        workload_cgroup_path="$1"
+        shift
+        printf "%s\n" "$$" > "$workload_cgroup_path/cgroup.procs" || exit 126
+        relative_workload_cgroup="${workload_cgroup_path#/sys/fs/cgroup}"
+        workload_match=0
+        while IFS= read -r current_cgroup
+        do
+            if [ "$current_cgroup" = "0::$relative_workload_cgroup" ]; then workload_match=1; fi
+        done < /proc/self/cgroup
+        [ "$workload_match" -eq 1 ] || exit 126
+        exec "$@"
+    ' -- "$workload_cgroup_path" \
     "$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"' -- "$working_directory" "$command_path" "$@"
 candidate_status=$?
 set -e
@@ -4662,7 +4721,8 @@ exit "$candidate_status"
                 $networkNamespaceArguments = if ($NetworkProfile -ceq 'Offline') { @('--net') } else { @() }
                 $linuxMountArguments = @(
                     $mountPath, $findPath, $chrootPath, $sandboxRoot, $diagnosticRootFullPath, $childWritableRootPath, $workingDirectory, $Command,
-                    $copyPath, $unsharePath, $linuxExportManifestPath, [string]$linuxReadonlyBindPaths.Count, $linuxNativeCgroupPath
+                    $copyPath, $unsharePath, $linuxExportManifestPath, [string]$linuxReadonlyBindPaths.Count, $linuxNativeCgroupPath,
+                    $linuxNativeWorkloadCgroupPath
                 ) + @($linuxReadonlyBindPaths.ToArray()) + @($Arguments)
                 $namespaceArguments = @(
                     $unsharePath,
@@ -4874,7 +4934,11 @@ finally {
             $processDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             if ($script:IsLinuxHost -and $childProcessGroupId -gt 0 -and -not $childProcess.HasExited) {
-                [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId)
+                [void](Assert-LinuxWritableRootUsage `
+                    -Root $childWritableRootPath `
+                    -BaselineBytes $linuxWritableRootBaselineBytes `
+                    -Context $Context `
+                    -CgroupPath $linuxNativeWorkloadCgroupPath)
                 Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
             }
             while (-not $childProcess.HasExited) {
@@ -4884,7 +4948,11 @@ finally {
                 [void]$childProcess.WaitForExit(100)
                 Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
                 if ($script:IsLinuxHost -and -not $childProcess.HasExited) {
-                    [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId)
+                    [void](Assert-LinuxWritableRootUsage `
+                        -Root $childWritableRootPath `
+                        -BaselineBytes $linuxWritableRootBaselineBytes `
+                        -Context $Context `
+                        -CgroupPath $linuxNativeWorkloadCgroupPath)
                     Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
                 }
             }
@@ -4983,6 +5051,7 @@ finally {
                 if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
             }
             finally {
+                Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeWorkloadCgroupPath
                 Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeCgroupPath
             }
         }
