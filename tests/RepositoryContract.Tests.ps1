@@ -1554,12 +1554,13 @@ namespace Codex.Validation.Tests {
         $invokeNative.Extent.Text | Should -Not -Match '-MaxCpuSeconds\s+900'
     }
 
-    # Scenario: One immutable localization shard relies on Windows PowerShell's null result for a missing optional OrderedDictionary key.
-    # Purpose: Keep that compatibility downgrade inside the exact affected shard while every unrelated oracle test retains StrictMode Latest.
-    It 'UnitT192_ScopesLegacyStrictModeCompatibilityToTheLocalizationShard' {
+    # Scenario: Two immutable localization/source-resume shards rely on Windows PowerShell's null result for a missing optional OrderedDictionary key.
+    # Purpose: Keep that compatibility downgrade inside the exact affected shards while every unrelated oracle test retains StrictMode Latest.
+    It 'UnitT192_ScopesLegacyStrictModeCompatibilityToTheAffectedShards' {
         $source = $ast.Extent.Text
         $source | Should -Match 'Set-StrictMode\s+-Version\s+Latest'
-        $source | Should -Match '(?s)if\s*\(\s*-not\s+\[OperatingSystem\]::IsWindows\(\)\s*-and\s*\[string\]\$selectedPesterTests\[0\]\s+-ceq\s+''LocalizationWorkset\.Tests\.ps1''\s*\)\s*\{\s*Set-StrictMode\s+-Version\s+1\.0\s*\}'
+        $source | Should -Match '(?s)\$legacyNullCompatibilityTests\s*=\s*@\(\s*''LocalizationWorkset\.Tests\.ps1''\s*,\s*''Schema15SourceAcquisition\.Tests\.ps1''\s*\)'
+        $source | Should -Match '(?s)if\s*\(\s*-not\s+\[OperatingSystem\]::IsWindows\(\)\s*-and\s*\$legacyNullCompatibilityTests\s+-ccontains\s+\[string\]\$selectedPesterTests\[0\]\s*\)\s*\{\s*Set-StrictMode\s+-Version\s+1\.0\s*\}'
         $source | Should -Not -Match 'if\s*\(\s*-not\s+\[OperatingSystem\]::IsWindows\(\)\s*\)\s*\{\s*Set-StrictMode\s+-Version\s+1\.0'
     }
 }
