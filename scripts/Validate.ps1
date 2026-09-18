@@ -563,7 +563,8 @@ function Get-LinuxWritableDirectoryEnumerator {
 function Get-LinuxWritableRootUsage {
     param(
         [Parameter(Mandatory = $true)][string] $Root,
-        [Parameter(Mandatory = $true)][string] $Context
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter()][switch] $AllowReparseEntries
     )
     if (-not $script:IsLinuxHost) { throw 'Linux writable-root inspection requires a Linux host.' }
     $rootPath = [IO.Path]::GetFullPath($Root)
@@ -584,6 +585,7 @@ function Get-LinuxWritableRootUsage {
                 $entryCount++
                 if ($entryCount -gt 100000) { throw "$Context exceeded the aggregate writable-entry-count limit of 100000." }
                 if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    if ($AllowReparseEntries) { continue }
                     throw "$Context writable root contains a reparse entry: $($entry.FullName)"
                 }
                 if ($entry -is [IO.DirectoryInfo]) {
@@ -605,9 +607,10 @@ function Assert-LinuxWritableRootUsage {
     param(
         [Parameter(Mandatory = $true)][string] $Root,
         [Parameter(Mandatory = $true)][int64] $BaselineBytes,
-        [Parameter(Mandatory = $true)][string] $Context
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter()][switch] $AllowReparseEntries
     )
-    $usage = Get-LinuxWritableRootUsage -Root $Root -Context $Context
+    $usage = Get-LinuxWritableRootUsage -Root $Root -Context $Context -AllowReparseEntries:$AllowReparseEntries
     $growth = [int64]$usage.bytes - $BaselineBytes
     if ($growth -gt 536870912) {
         throw "$Context exceeded the aggregate writable-root growth limit of 536870912 bytes."
@@ -3695,7 +3698,7 @@ do
             # Do not rbind the host /etc and then unlink its resolv.conf
             # mountpoint. Build a private snapshot first so every mutation
             # remains inside the namespace-owned tmpfs.
-            "$mount_path" -t tmpfs -o size=67108864,nodev,nosuid,noexec tmpfs "$target"
+            "$mount_path" -t tmpfs -o size=268435456,nodev,nosuid,noexec tmpfs "$target"
             # Copy only readable regular files and create them with the
             # namespace user's ownership.  Archive-style copies of /etc are
             # unsafe here: entries such as shadow may be unreadable and
@@ -3896,7 +3899,7 @@ finally {
                 $startInfo.RedirectStandardInput = $true
             }
             $nativeEnvironmentVariables = if ($TerminateProcessTree) {
-                New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
+                New-ContainedProcessEnvironment -DiagnosticRoot $childWritableRootPath
             }
             else {
                 $null
@@ -4276,7 +4279,7 @@ function Invoke-ProtectedPesterServerProxy {
         $errorTask = $null
         $proxyExitCode = 1
         try {
-            $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
+            $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $childWritableRootPath
             $jobHandle = New-WindowsKillOnCloseJob -Context 'Protected Pester server proxy'
             $child = Start-WindowsSuspendedProcess `
                 -FileName $PowerShellPath `
@@ -4419,7 +4422,7 @@ done
 "$mount_path" --bind /dev/null "$sandbox_root/dev/console"
 exec chroot "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-clear -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
 '@
-        $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $DiagnosticRoot
+        $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $childWritableRootPath
         $environment = @{}
         foreach ($name in @($childEnvironment.Keys)) { $environment[[string]$name] = [string]$childEnvironment[$name] }
         $unshareArguments = @(
@@ -4477,6 +4480,16 @@ function Invoke-ProtectedPesterRunspace {
     if (-not (Test-Path -LiteralPath $SupervisorPath -PathType Leaf)) {
         throw "Protected Pester supervisor script is missing: $SupervisorPath"
     }
+    $diagnosticRootFullPath = [IO.Path]::GetFullPath($DiagnosticRoot)
+    $childWritableRootPath = [IO.Path]::GetFullPath($ChildWritableRoot)
+    if (-not (Test-Path -LiteralPath $diagnosticRootFullPath -PathType Container) -or
+        -not (Test-Path -LiteralPath $childWritableRootPath -PathType Container)) {
+        throw 'Protected Pester writable-root accounting requires existing diagnostic and child roots.'
+    }
+    if (-not (Test-PathWithinOrEqual -Path $childWritableRootPath -Root $diagnosticRootFullPath)) {
+        throw 'Protected Pester child-writable root must remain within the diagnostic root.'
+    }
+    Assert-NoReparseAncestors -Path $childWritableRootPath -Context 'Protected Pester child-writable root'
     $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
     $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
     if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
@@ -4512,10 +4525,12 @@ function Invoke-ProtectedPesterRunspace {
     $powerShell = $null
     $asyncResult = $null
     $linuxClockTicksPerSecond = [int64]0
+    $linuxWritableRootBaselineBytes = [int64]0
     $linuxPesterCgroupPath = $null
     try {
         if ($script:IsLinuxHost) {
             $linuxClockTicksPerSecond = Get-LinuxAggregateClockTicksPerSecond
+            $linuxWritableRootBaselineBytes = [int64](Get-LinuxWritableRootUsage -Root $childWritableRootPath -Context 'Protected Pester remote pipeline').bytes
             $linuxPesterCgroupPath = New-LinuxPesterCgroup -Context 'Protected Pester remote pipeline'
         }
         $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null, $serverProcessInstance)
@@ -4561,6 +4576,11 @@ function Invoke-ProtectedPesterRunspace {
         while (-not $asyncResult.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
             if ($serverProcessInstance.HasExited) { break }
             if ($script:IsLinuxHost) {
+                [void](Assert-LinuxWritableRootUsage `
+                    -Root $childWritableRootPath `
+                    -BaselineBytes $linuxWritableRootBaselineBytes `
+                    -Context 'Protected Pester remote pipeline' `
+                    -AllowReparseEntries)
                 Assert-LinuxAggregateResourceUsage `
                     -RootProcessId $serverProcessInstance.Process.Id `
                     -ClockTicksPerSecond $linuxClockTicksPerSecond `
@@ -4571,6 +4591,12 @@ function Invoke-ProtectedPesterRunspace {
         }
         if (-not $asyncResult.IsCompleted) {
             throw 'Protected Pester remote pipeline exceeded its bounded execution timeout.'
+        }
+        if ($script:IsLinuxHost) {
+            [void](Assert-LinuxWritableRootUsage `
+                -Root $childWritableRootPath `
+                -BaselineBytes $linuxWritableRootBaselineBytes `
+                -Context 'Protected Pester remote pipeline')
         }
         $output = @($powerShell.EndInvoke($asyncResult))
         if ($powerShell.InvocationStateInfo.State -ne [Management.Automation.PSInvocationState]::Completed) {

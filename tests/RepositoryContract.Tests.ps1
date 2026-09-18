@@ -861,6 +861,20 @@ Describe 'Bounded writable-root enumeration behavior' {
         $script:CursorState.Disposed | Should -Be 1
     }
 
+    # Scenario: Protected tests intentionally create a temporary symlink or junction and remove it before completion.
+    # Purpose: Count but never follow explicitly allowed in-flight reparse entries while retaining strict default rejection.
+    It 'UnitT45_AllowsOnlyExplicitEphemeralReparseAccounting' {
+        $target = Join-Path $TestDrive 'ephemeral-target'
+        $link = Join-Path $script:UsageRoot 'ephemeral-link'
+        [void](New-Item -ItemType Directory -Path $target)
+        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        [void](New-Item -ItemType $linkType -Path $link -Target $target)
+        { Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Strict fixture' } | Should -Throw '*reparse*'
+        $usage = Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Ephemeral fixture' -AllowReparseEntries
+        $usage.fileCount | Should -Be 2
+        $usage.bytes | Should -Be 0
+    }
+
     # Scenario: Trusted tool installations share the diagnostic parent with a narrower candidate-writable child root.
     # Purpose: Bound only the declared child-writable surface and never treat trusted package symlinks as candidate output.
     It 'UnitT50_AccountsOnlyTheDeclaredChildWritableRoot' {
@@ -883,5 +897,35 @@ Describe 'Bounded writable-root enumeration behavior' {
         ([regex]::Matches($source, [regex]::Escape('"$mount_path" -o remount,bind,ro "$sandbox_root$run_root"'))).Count | Should -Be 2
         ([regex]::Matches($source, [regex]::Escape('"$mount_path" --bind "$child_writable_root" "$sandbox_root$child_writable_root"'))).Count | Should -Be 2
         ([regex]::Matches($source, [regex]::Escape('"$mount_path" -o remount,bind,rw "$sandbox_root$child_writable_root"'))).Count | Should -Be 2
+    }
+
+    # Scenario: Contained HOME/TMP and protected-Pester TestDrive share the sole writable child surface.
+    # Purpose: Keep those paths usable while bounding aggregate growth and rejecting any reparse left at completion.
+    It 'UnitT70_BoundsProtectedPesterChildRootAndKeepsContainedEnvironmentWritable' {
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $proxy = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterServerProxy'
+        }, $true)
+        $runspace = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
+        }, $true)
+        $invokeNative.Extent.Text | Should -Match 'New-ContainedProcessEnvironment\s+-DiagnosticRoot\s+\$childWritableRootPath'
+        ([regex]::Matches($proxy.Extent.Text, 'New-ContainedProcessEnvironment\s+-DiagnosticRoot\s+\$childWritableRootPath')).Count | Should -Be 2
+        ([regex]::Matches($runspace.Extent.Text, 'Get-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath')).Count | Should -Be 1
+        ([regex]::Matches($runspace.Extent.Text, 'Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath')).Count | Should -Be 2
+        ([regex]::Matches($runspace.Extent.Text, 'Assert-LinuxWritableRootUsage[\s\S]{0,240}-AllowReparseEntries')).Count | Should -Be 1
+    }
+
+    # Scenario: The Ubuntu runner's readable /etc snapshot exceeds the former 64 MiB private mount.
+    # Purpose: Preserve a fixed sandbox-local ceiling large enough for the trusted snapshot without using host-writable /etc.
+    It 'UnitT80_BindsThePrivateEtcSnapshotToTheExpandedFixedLimit' {
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $source = $invokeNative.Extent.Text
+        $source | Should -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
+        $source | Should -Not -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=67108864,nodev,nosuid,noexec tmpfs "\$target"'
     }
 }
