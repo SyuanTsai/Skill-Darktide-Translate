@@ -816,7 +816,7 @@ steps:
         $workflow | Should -Match '\+cpu \+memory'
         $workflow | Should -Match 'cgroup\.subtree_control'
         $workflow | Should -Match 'cgroup\.threads'
-        $workflow | Should -Match 'cgroup_parent/cgroup\.procs'
+        $workflow | Should -Match 'cgroup_delegated/cgroup\.procs'
         $workflow | Should -Match 'sudo -n chown'
         $workflow | Should -Match 'trusted-validator'
         $workflow | Should -Match 'Remove delegated Linux cgroup subtree'
@@ -842,6 +842,23 @@ steps:
         $supervisor | Should -Not -Match '\$workerResultLines'
         $supervisor | Should -Not -Match '-StandardInput \$pesterWorkerMarker'
         $supervisor | Should -Not -Match '\$pesterSupervisorPath\s*='
+    }
+
+    It 'UnitT95_KeepsProtectedPesterBelowARootOwnedAggregateCgroup' {
+        # Scenario: Candidate code runs under the delegated runner identity and can write migration controls in that delegated subtree.
+        # Purpose: Keep that whole subtree below a root-owned aggregate boundary and prove every descendant is dead before later steps.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $workflow | Should -Match 'cgroup_delegated="\$cgroup_parent/delegated"'
+        $workflow | Should -Match 'cgroup_supervisor="\$cgroup_delegated/trusted-validator"'
+        $workflow | Should -Match '(?s)''2147483648''.*?"\$cgroup_parent/memory\.max"'
+        $workflow | Should -Match '(?s)''256''.*?"\$cgroup_parent/pids\.max"'
+        $workflow | Should -Not -Match 'chown[^\r\n]*"\$cgroup_parent(?:/cgroup\.(?:procs|threads))?"'
+        $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT=%s[\s\S]*?"\$cgroup_delegated"'
+        $workflow | Should -Match 'cgroup\.kill'
+        $workflow | Should -Match 'cgroup\.events'
+        $workflow | Should -Match '/usr/bin/find "\$cgroup_parent" -mindepth 1 -depth -type d'
+        $workflow | Should -Match 'shell:\s*/usr/bin/sudo -n /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -e -o pipefail \{0\}'
     }
 
     It 'UnitT100_BindsReplacementObjectDiscoveryToTheCandidateWorktree' {

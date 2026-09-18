@@ -736,7 +736,7 @@ function Get-LinuxPesterCgroupRoot {
     if ([string]::IsNullOrWhiteSpace($configuredRoot)) {
         throw 'Protected Pester validation requires a workflow-delegated Linux cgroup v2 root.'
     }
-    if ($configuredRoot -notmatch '^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+$') {
+    if ($configuredRoot -notmatch '^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+/delegated$') {
         throw 'Protected Pester validation received an invalid delegated Linux cgroup root.'
     }
     $rootPath = [IO.Path]::GetFullPath($configuredRoot)

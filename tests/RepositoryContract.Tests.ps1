@@ -1458,4 +1458,20 @@ namespace Codex.Validation.Tests {
         $proxySource | Should -Match "'--cpu=300'"
         $proxySource | Should -Not -Match "'--as=2147483648'"
     }
+
+    # Scenario: The workflow keeps a root-owned outer cgroup boundary and delegates only its nested subtree.
+    # Purpose: Prevent candidate processes from migrating into the host cgroup while retaining writable child-cgroup creation for protected tests.
+    It 'UnitT185_RequiresTheNestedWorkflowDelegationRoot' {
+        $getRoot = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-LinuxPesterCgroupRoot'
+        }, $true)
+
+        $getRoot | Should -Not -BeNullOrEmpty
+        if ($null -eq $getRoot) { return }
+
+        $getRootSource = $getRoot.Extent.Text
+        $getRootSource | Should -Match ([regex]::Escape("^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+/delegated$"))
+        $getRootSource | Should -Not -Match ([regex]::Escape("^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+$"))
+        $getRootSource | Should -Match 'Protected Pester validation is not running inside the delegated Linux cgroup subtree'
+    }
 }
