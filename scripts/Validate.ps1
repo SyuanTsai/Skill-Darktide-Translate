@@ -1061,6 +1061,48 @@ namespace Codex.Validation {
             return fullPath.StartsWith(rootPrefix, StringComparison.Ordinal);
         }
 
+        private static string[] EnumerateProcDirectoryEntryPaths(string directoryPath, int maximumEntries) {
+            if (maximumEntries < 0) { throw new ArgumentOutOfRangeException("maximumEntries"); }
+            int directoryFileDescriptor = Open(directoryPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (directoryFileDescriptor < 0) {
+                int openError = GetErrno();
+                if (openError == ENOENT) {
+                    throw new DirectoryNotFoundException("The frozen procfs descriptor table disappeared: " + directoryPath);
+                }
+                throw new IOException("Could not enumerate every task descriptor in the writable process boundary (errno " + openError + "): " + directoryPath);
+            }
+
+            DirectoryFrame frame = null;
+            try {
+                frame = CreateFrame(directoryFileDescriptor, directoryPath);
+                List<string> entryPaths = new List<string>();
+                while (true) {
+                    ResetErrno();
+                    IntPtr entry = ReadDirectory(frame.Directory);
+                    if (entry == IntPtr.Zero) {
+                        int readError = GetErrno();
+                        if (readError != 0) {
+                            throw new IOException("Could not enumerate every task descriptor in the writable process boundary (errno " + readError + "): " + directoryPath);
+                        }
+                        break;
+                    }
+                    string name = ReadEntryName(entry);
+                    if (name == "." || name == "..") { continue; }
+                    if (name.Length == 0 || name.IndexOf('/') >= 0) {
+                        throw new IOException("Procfs descriptor enumeration received an invalid entry name: " + directoryPath);
+                    }
+                    entryPaths.Add(Path.Combine(directoryPath, name));
+                    if (entryPaths.Count > maximumEntries) {
+                        throw new IOException("Writable process boundary exceeded the bounded Linux descriptor-inspection limit of 262144.");
+                    }
+                }
+                return entryPaths.ToArray();
+            }
+            finally {
+                if (frame != null) { CloseFrame(frame); }
+            }
+        }
+
         public static LinuxWritableRootUsage InspectOpenUnlinked(int[] processIds, string root, int maximumEntries) {
             if (processIds == null) { throw new ArgumentNullException("processIds"); }
             if (String.IsNullOrWhiteSpace(root)) { throw new ArgumentException("Writable root is required.", "root"); }
@@ -1099,7 +1141,7 @@ namespace Codex.Validation {
                     string descriptorRoot = Path.Combine(taskPath, "fd");
                     string[] descriptorPaths;
                     try {
-                        descriptorPaths = Directory.GetFileSystemEntries(descriptorRoot);
+                        descriptorPaths = EnumerateProcDirectoryEntryPaths(descriptorRoot, 262144 - inspectedDescriptorCount);
                     }
                     catch (DirectoryNotFoundException) {
                         continue;
@@ -1109,7 +1151,7 @@ namespace Codex.Validation {
                     }
                     catch (Exception error) {
                         if (!Directory.Exists(taskPath) || !Directory.Exists(processPath)) { continue; }
-                        throw new IOException("Could not enumerate every task descriptor in the writable process boundary: " + descriptorRoot, error);
+                        throw new IOException(error.Message + " [" + error.GetType().FullName + "]", error);
                     }
 
                     foreach (string descriptorPath in descriptorPaths) {

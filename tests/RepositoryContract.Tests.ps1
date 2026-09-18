@@ -1343,4 +1343,16 @@ namespace Codex.Validation.Tests {
         $removeSource | Should -Not -Match 'Remove-Item[^\r\n]*\$CgroupPath'
         $removeSource | Should -Match '\[string\]\$Matches\[''value''\]\s+-eq\s+''0'''
     }
+
+    # Scenario: Managed filesystem enumeration inspects procfs fd symlinks and can reject an otherwise readable frozen task table.
+    # Purpose: Enumerate only bounded procfs descriptor names through native directory handles, then duplicate each descriptor explicitly.
+    It 'UnitT165_EnumeratesFrozenProcDescriptorNamesThroughNativeHandles' {
+        $source = $ast.Extent.Text
+        $source | Should -Match 'EnumerateProcDirectoryEntryPaths'
+        $source | Should -Match '(?s)EnumerateProcDirectoryEntryPaths.*?Open\(directoryPath, O_RDONLY \| O_DIRECTORY \| O_NOFOLLOW \| O_CLOEXEC\).*?ReadDirectory'
+        $source | Should -Match 'EnumerateProcDirectoryEntryPaths\(descriptorRoot, 262144 - inspectedDescriptorCount\)'
+        $source | Should -Match 'entryPaths\.Count > maximumEntries'
+        $source | Should -Not -Match 'Directory\.GetFileSystemEntries\(descriptorRoot\)'
+        $source | Should -Match 'Could not enumerate every task descriptor in the writable process boundary \(errno '
+    }
 }
