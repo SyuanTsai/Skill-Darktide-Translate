@@ -804,7 +804,7 @@ steps:
         $supervisor | Should -Match 'foreach \(\$requiredPesterTest in \$requiredPesterTests\)'
         $supervisor | Should -Match '\$aggregateTotalCount'
         $supervisor | Should -Match 'per-candidate 300-second CPU'
-        $supervisor | Should -Match 'TimeoutMilliseconds 1200000'
+        $supervisor | Should -Match 'TimeoutMilliseconds 1800000'
         $supervisor | Should -Match 'CreateOutOfProcessRunspace'
         $supervisor | Should -Match 'AddScript\(\$workerScriptText\)'
         $supervisor | Should -Match 'InvocationStateInfo\.State'

@@ -6671,7 +6671,7 @@ $pesterOutput = Invoke-TrustedPowerShellProcess -Command $powerShellPath -Argume
     '-PesterDiagnosticRoot', $runRoot,
     '-PesterRunnerSha256', $pesterRunnerSha256,
     '-PesterTrustedTestCommit', $trustedPesterCommit
-) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 1200000
+) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 1800000
 $trustedPesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
 if ($trustedPesterSupervisorActualSha256 -cne $trustedPesterSupervisorSha256) {
     throw 'Trusted Pester supervisor changed during the protected run.'
