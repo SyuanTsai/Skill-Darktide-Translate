@@ -355,6 +355,55 @@ function Get-LinuxAggregateClockTicksPerSecond {
     return [int64]$clockTicks[0]
 }
 
+function Get-LinuxCgroupProcessIds {
+    param(
+        [Parameter(Mandatory = $true)][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $processesPath = Join-Path $CgroupPath 'cgroup.procs'
+    if (-not (Test-Path -LiteralPath $processesPath -PathType Leaf)) {
+        throw "$Context requires live Linux cgroup process membership."
+    }
+    $processIds = [Collections.Generic.HashSet[int]]::new()
+    foreach ($line in @([IO.File]::ReadAllLines($processesPath))) {
+        $value = [string]$line
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        if ($value -notmatch '^[0-9]+$' -or [int64]$value -gt [int]::MaxValue -or [int]$value -le 0) {
+            throw "$Context received an invalid Linux cgroup process identifier."
+        }
+        [void]$processIds.Add([int]$value)
+    }
+    return @($processIds.ToArray())
+}
+
+function Get-LinuxBoundaryProcessIds {
+    param(
+        [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $RootProcessId = 0,
+        [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $ProcessGroupId = 0,
+        [Parameter()][AllowNull()][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { throw 'Linux process-boundary inspection requires a Linux host.' }
+    $candidateIds = [Collections.Generic.HashSet[int]]::new()
+    if ($RootProcessId -gt 0) {
+        if (Test-ProcessIdExists -ProcessId $RootProcessId) { [void]$candidateIds.Add($RootProcessId) }
+        foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
+            [void]$candidateIds.Add([int]$processId)
+        }
+    }
+    if ($ProcessGroupId -gt 0) {
+        foreach ($processId in @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId)) {
+            [void]$candidateIds.Add([int]$processId)
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
+        foreach ($processId in @(Get-LinuxCgroupProcessIds -CgroupPath $CgroupPath -Context $Context)) {
+            [void]$candidateIds.Add([int]$processId)
+        }
+    }
+    return @($candidateIds.ToArray())
+}
+
 function Assert-LinuxAggregateResourceUsage {
     param(
         [Parameter(Mandatory = $true)][int] $RootProcessId,
@@ -363,12 +412,11 @@ function Assert-LinuxAggregateResourceUsage {
         [Parameter()][AllowNull()][string] $CgroupPath,
         [Parameter(Mandatory = $true)][string] $Context
     )
-    $candidateIds = [Collections.Generic.HashSet[int]]::new()
-    if (Test-ProcessIdExists -ProcessId $RootProcessId) { [void]$candidateIds.Add($RootProcessId) }
-    if ($ProcessGroupId -gt 0) {
-        foreach ($processId in @(Get-UnixProcessGroupProcessIds -ProcessGroupId $ProcessGroupId)) { [void]$candidateIds.Add([int]$processId) }
-    }
-    foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) { [void]$candidateIds.Add([int]$processId) }
+    $candidateIds = @(Get-LinuxBoundaryProcessIds `
+        -RootProcessId $RootProcessId `
+        -ProcessGroupId $ProcessGroupId `
+        -CgroupPath $CgroupPath `
+        -Context $Context)
     $memoryBytes = [int64]0
     $cpuTicks = [int64]0
     foreach ($processId in $candidateIds) {
@@ -581,9 +629,13 @@ namespace Codex.Validation {
         private const int O_DIRECTORY = 0x10000;
         private const int O_NOFOLLOW = 0x20000;
         private const int O_CLOEXEC = 0x80000;
+        private const int O_PATH = 0x200000;
         private const int AT_SYMLINK_NOFOLLOW = 0x100;
         private const int AT_NO_AUTOMOUNT = 0x800;
+        private const int AT_EMPTY_PATH = 0x1000;
         private const uint STATX_TYPE = 0x0001;
+        private const uint STATX_NLINK = 0x0004;
+        private const uint STATX_INO = 0x0100;
         private const uint STATX_SIZE = 0x0200;
         private const ushort S_IFMT = 0xF000;
         private const ushort S_IFDIR = 0x4000;
@@ -596,10 +648,18 @@ namespace Codex.Validation {
         private struct Statx {
             [FieldOffset(0)]
             public uint Mask;
+            [FieldOffset(16)]
+            public uint LinkCount;
             [FieldOffset(28)]
             public ushort Mode;
+            [FieldOffset(32)]
+            public ulong Inode;
             [FieldOffset(40)]
             public ulong Size;
+            [FieldOffset(136)]
+            public uint DeviceMajor;
+            [FieldOffset(140)]
+            public uint DeviceMinor;
         }
 
         private sealed class DirectoryFrame {
@@ -644,6 +704,12 @@ namespace Codex.Validation {
 
         [DllImport("libc.so.6", EntryPoint = "close", SetLastError = true)]
         private static extern int CloseFileDescriptor(int fileDescriptor);
+
+        [DllImport("libc.so.6", EntryPoint = "readlink", SetLastError = true)]
+        private static extern IntPtr ReadLink(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            byte[] buffer,
+            UIntPtr bufferSize);
 
         [DllImport("libc.so.6", EntryPoint = "__errno_location")]
         private static extern IntPtr GetErrnoLocation();
@@ -707,6 +773,106 @@ namespace Codex.Validation {
                 out status);
             error = result == 0 ? 0 : GetErrno();
             return result == 0;
+        }
+
+        private static string ReadLinkTarget(string path) {
+            int capacity = 4096;
+            while (capacity <= 1048576) {
+                byte[] buffer = new byte[capacity];
+                long length = ReadLink(path, buffer, (UIntPtr)(uint)buffer.Length).ToInt64();
+                if (length < 0) {
+                    throw new IOException("Could not resolve a duplicated open-file descriptor (errno " + GetErrno() + "): " + path);
+                }
+                if (length < buffer.Length) {
+                    return StrictUtf8.GetString(buffer, 0, (int)length);
+                }
+                capacity *= 2;
+            }
+            throw new IOException("An open-file descriptor target exceeded the bounded path length.");
+        }
+
+        private static bool IsPathInsideRoot(string path, string rootPath) {
+            if (!Path.IsPathRooted(path)) { return false; }
+            string fullPath = Path.GetFullPath(path);
+            string rootPrefix = rootPath.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
+                ? rootPath
+                : rootPath + Path.DirectorySeparatorChar;
+            return fullPath.StartsWith(rootPrefix, StringComparison.Ordinal);
+        }
+
+        public static LinuxWritableRootUsage InspectOpenUnlinked(int[] processIds, string root, int maximumEntries) {
+            if (processIds == null) { throw new ArgumentNullException("processIds"); }
+            if (String.IsNullOrWhiteSpace(root)) { throw new ArgumentException("Writable root is required.", "root"); }
+            if (maximumEntries < 0) { throw new ArgumentOutOfRangeException("maximumEntries"); }
+            string rootPath = Path.GetFullPath(root);
+            HashSet<string> identities = new HashSet<string>(StringComparer.Ordinal);
+            long bytes = 0;
+
+            foreach (int processId in processIds) {
+                if (processId <= 0) { throw new ArgumentOutOfRangeException("processIds"); }
+                string processPath = Path.Combine("/proc", processId.ToString());
+                string descriptorRoot = Path.Combine(processPath, "fd");
+                string[] descriptorPaths;
+                try {
+                    descriptorPaths = Directory.GetFileSystemEntries(descriptorRoot);
+                }
+                catch (DirectoryNotFoundException) {
+                    continue;
+                }
+                catch (FileNotFoundException) {
+                    continue;
+                }
+                catch (Exception error) {
+                    if (!Directory.Exists(processPath)) { continue; }
+                    throw new IOException("Could not enumerate every open descriptor in the writable process boundary: " + descriptorRoot, error);
+                }
+
+                foreach (string descriptorPath in descriptorPaths) {
+                    int duplicatedDescriptor = Open(descriptorPath, O_PATH | O_CLOEXEC);
+                    if (duplicatedDescriptor < 0) {
+                        int openError = GetErrno();
+                        if (openError == ENOENT || !Directory.Exists(processPath)) { continue; }
+                        throw new IOException("Could not duplicate an open descriptor in the writable process boundary (errno " + openError + "): " + descriptorPath);
+                    }
+                    try {
+                        string stableDescriptorPath = Path.Combine("/proc/self/fd", duplicatedDescriptor.ToString());
+                        string target = ReadLinkTarget(stableDescriptorPath);
+                        const string deletedSuffix = " (deleted)";
+                        if (!target.EndsWith(deletedSuffix, StringComparison.Ordinal)) { continue; }
+                        string originalPath = target.Substring(0, target.Length - deletedSuffix.Length);
+                        if (!IsPathInsideRoot(originalPath, rootPath)) { continue; }
+
+                        Statx status;
+                        int result = StatAt(
+                            duplicatedDescriptor,
+                            String.Empty,
+                            AT_EMPTY_PATH | AT_NO_AUTOMOUNT,
+                            STATX_TYPE | STATX_NLINK | STATX_INO | STATX_SIZE,
+                            out status);
+                        if (result != 0) {
+                            throw new IOException("Could not inspect a duplicated unlinked descriptor (errno " + GetErrno() + "): " + stableDescriptorPath);
+                        }
+                        uint requiredMask = STATX_TYPE | STATX_NLINK | STATX_INO | STATX_SIZE;
+                        if ((status.Mask & requiredMask) != requiredMask) {
+                            throw new IOException("Unlinked descriptor inspection did not receive all required metadata: " + stableDescriptorPath);
+                        }
+                        if (status.LinkCount != 0 || (status.Mode & S_IFMT) != S_IFREG) { continue; }
+                        string identity = status.DeviceMajor.ToString() + ":" + status.DeviceMinor.ToString() + ":" + status.Inode.ToString();
+                        if (!identities.Add(identity)) { continue; }
+                        if (identities.Count > maximumEntries) {
+                            throw new IOException("Writable root exceeded the aggregate writable-entry-count limit of " + maximumEntries + " while accounting for open unlinked files.");
+                        }
+                        if (status.Size > Int64.MaxValue || (long)status.Size > Int64.MaxValue - bytes) {
+                            throw new IOException("Open-unlinked size overflowed the bounded accounting range.");
+                        }
+                        bytes += (long)status.Size;
+                    }
+                    finally {
+                        CloseFileDescriptor(duplicatedDescriptor);
+                    }
+                }
+            }
+            return new LinuxWritableRootUsage(bytes, identities.Count);
         }
 
         public static LinuxWritableRootUsage Inspect(string root, bool allowReparseEntries, int maximumEntries) {
@@ -825,6 +991,20 @@ function Invoke-LinuxWritableRootInspection {
     )
 }
 
+function Invoke-LinuxOpenUnlinkedInspection {
+    param(
+        [Parameter(Mandatory = $true)][int[]] $ProcessIds,
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][int] $MaximumEntries
+    )
+    [void](Enable-LinuxWritableRootInspector)
+    return [Codex.Validation.LinuxWritableRootInspector]::InspectOpenUnlinked(
+        $ProcessIds,
+        $Root,
+        $MaximumEntries
+    )
+}
+
 function Get-LinuxWritableRootUsage {
     param(
         [Parameter(Mandatory = $true)][string] $Root,
@@ -853,14 +1033,48 @@ function Assert-LinuxWritableRootUsage {
         [Parameter(Mandatory = $true)][string] $Root,
         [Parameter(Mandatory = $true)][int64] $BaselineBytes,
         [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $RootProcessId = 0,
+        [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $ProcessGroupId = 0,
+        [Parameter()][AllowNull()][string] $CgroupPath,
         [Parameter()][switch] $AllowReparseEntries
     )
     $usage = Get-LinuxWritableRootUsage -Root $Root -Context $Context -AllowReparseEntries:$AllowReparseEntries
-    $growth = [int64]$usage.bytes - $BaselineBytes
+    $unlinkedBytes = [int64]0
+    $unlinkedCount = 0
+    if ($RootProcessId -gt 0 -or $ProcessGroupId -gt 0 -or -not [string]::IsNullOrWhiteSpace($CgroupPath)) {
+        $processIds = @(Get-LinuxBoundaryProcessIds `
+            -RootProcessId $RootProcessId `
+            -ProcessGroupId $ProcessGroupId `
+            -CgroupPath $CgroupPath `
+            -Context $Context)
+        if ($processIds.Count -gt 0) {
+            try {
+                $unlinkedUsage = Invoke-LinuxOpenUnlinkedInspection `
+                    -ProcessIds ([int[]]$processIds) `
+                    -Root ([IO.Path]::GetFullPath($Root)) `
+                    -MaximumEntries (100000 - [int]$usage.fileCount)
+            }
+            catch {
+                throw "$Context open-unlinked writable-root inspection failed: $($_.Exception.Message)"
+            }
+            $unlinkedBytes = [int64]$unlinkedUsage.Bytes
+            $unlinkedCount = [int]$unlinkedUsage.EntryCount
+        }
+    }
+    if ([int]$usage.fileCount + $unlinkedCount -gt 100000) {
+        throw "$Context exceeded the aggregate writable-entry-count limit of 100000."
+    }
+    if ([int64]$usage.bytes -gt [int64]::MaxValue - $unlinkedBytes) {
+        throw "$Context writable-root accounting overflowed the bounded range."
+    }
+    $growth = ([int64]$usage.bytes + $unlinkedBytes) - $BaselineBytes
     if ($growth -gt 536870912) {
         throw "$Context exceeded the aggregate writable-root growth limit of 536870912 bytes."
     }
-    return $usage
+    return [pscustomobject][ordered]@{
+        bytes = [int64]$usage.bytes + $unlinkedBytes
+        fileCount = [int]$usage.fileCount + $unlinkedCount
+    }
 }
 
 function Test-ProcessIdExists {
@@ -4252,7 +4466,7 @@ finally {
             $processDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
             if ($script:IsLinuxHost -and $childProcessGroupId -gt 0 -and -not $childProcess.HasExited) {
-                [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+                [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId)
                 Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
             }
             while (-not $childProcess.HasExited) {
@@ -4262,14 +4476,11 @@ finally {
                 [void]$childProcess.WaitForExit(100)
                 Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
                 if ($script:IsLinuxHost -and -not $childProcess.HasExited) {
-                    [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+                    [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId)
                     Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
                 }
             }
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
-            if ($script:IsLinuxHost) {
-                [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
-            }
             Stop-ProcessTree -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
             $processTreeStopped = $true
             if (-not $childProcess.WaitForExit(5000)) {
@@ -4280,6 +4491,9 @@ finally {
             }
             $stdoutResult = $stdoutTask.GetAwaiter().GetResult()
             $stderrResult = $stderrTask.GetAwaiter().GetResult()
+            if ($script:IsLinuxHost) {
+                [void](Assert-LinuxWritableRootUsage -Root $childWritableRootPath -BaselineBytes $linuxWritableRootBaselineBytes -Context $Context)
+            }
             if ($stdoutResult.Truncated -or $stderrResult.Truncated) {
                 throw "$Context exceeded the bounded native-process output limit of $maxProcessOutputCharacters characters per stream."
             }
@@ -4825,7 +5039,8 @@ function Invoke-ProtectedPesterRunspace {
                     -Root $childWritableRootPath `
                     -BaselineBytes $linuxWritableRootBaselineBytes `
                     -Context 'Protected Pester remote pipeline' `
-                    -AllowReparseEntries)
+                    -AllowReparseEntries `
+                    -CgroupPath $linuxPesterCgroupPath)
                 Assert-LinuxAggregateResourceUsage `
                     -RootProcessId $serverProcessInstance.Process.Id `
                     -ClockTicksPerSecond $linuxClockTicksPerSecond `

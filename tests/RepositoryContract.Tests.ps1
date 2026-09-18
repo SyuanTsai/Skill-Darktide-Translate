@@ -777,6 +777,7 @@ Describe 'Bounded writable-root enumeration behavior' {
         foreach ($name in @(
             'Enable-LinuxWritableRootInspector',
             'Invoke-LinuxWritableRootInspection',
+            'Invoke-LinuxOpenUnlinkedInspection',
             'Get-LinuxWritableRootUsage'
         )) {
             $definition = $ast.Find({ param($node)
@@ -961,5 +962,66 @@ Describe 'Bounded writable-root enumeration behavior' {
         $source = $ast.Extent.Text
         $source | Should -Not -Match '--ambient-clear'
         ([regex]::Matches($source, '--ambient-caps=-all')).Count | Should -Be 2
+    }
+
+    # Scenario: Candidate code keeps deleted files open so pathname traversal cannot see their allocated logical bytes.
+    # Purpose: Inspect stable duplicated procfs descriptors, require link-count zero, and de-duplicate inode identity.
+    It 'UnitT110_AccountsOpenUnlinkedFilesInsideTheWritableRoot' {
+        $source = $ast.Extent.Text
+        $source | Should -Match 'InspectOpenUnlinked'
+        $source | Should -Match 'AT_EMPTY_PATH'
+        $source | Should -Match 'EntryPoint\s*=\s*"readlink"'
+        $source | Should -Match 'LinkCount\s*!=\s*0'
+        $source | Should -Match 'HashSet<string>\s+identities'
+        $assertUsage = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-LinuxWritableRootUsage'
+        }, $true)
+        $assertUsage.Extent.Text | Should -Match 'Get-LinuxBoundaryProcessIds'
+        $assertUsage.Extent.Text | Should -Match 'Invoke-LinuxOpenUnlinkedInspection'
+    }
+
+    # Scenario: Two live descriptors retain the same deleted file inside the writable root.
+    # Purpose: Exercise procfs duplication and verify inode de-duplication with exact logical-byte accounting.
+    It 'InterT115_AccountsARealOpenUnlinkedFileOnce' {
+        if (-not $script:HostIsLinux) {
+            Set-ItResult -Skipped -Because 'open-unlinked procfs accounting is Linux-only'
+            return
+        }
+        $path = Join-Path $script:UsageRoot 'open-unlinked'
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $first = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, $share)
+        $second = $null
+        try {
+            $first.SetLength(65537)
+            $first.Flush($true)
+            $second = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, $share)
+            Remove-Item -LiteralPath $path -Force
+            $usage = Invoke-LinuxOpenUnlinkedInspection `
+                -ProcessIds ([int[]]@($PID)) `
+                -Root $script:UsageRoot `
+                -MaximumEntries 100000
+            $usage.EntryCount | Should -Be 1
+            $usage.Bytes | Should -Be 65537
+        }
+        finally {
+            if ($null -ne $second) { $second.Dispose() }
+            $first.Dispose()
+        }
+    }
+
+    # Scenario: Native tools and protected Pester have different process-boundary identities while both write to the same bounded surface.
+    # Purpose: Bind live unlinked-file accounting to process-group or cgroup membership and scan strictly only after writers stop.
+    It 'UnitT120_BindsLiveUnlinkedAccountingAndQuiescesNativeFinalScan' {
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $nativeSource = $invokeNative.Extent.Text
+        ([regex]::Matches($nativeSource, 'Assert-LinuxWritableRootUsage[^\r\n]*-RootProcessId\s+\$childProcessId[^\r\n]*-ProcessGroupId\s+\$childProcessGroupId')).Count | Should -Be 2
+        $nativeSource | Should -Match '(?s)Stop-ProcessTree.*?\$processTreeStopped\s*=\s*\$true.*?Assert-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath'
+
+        $runspace = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
+        }, $true)
+        $runspace.Extent.Text | Should -Match '(?s)Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath.*?-CgroupPath\s+\$linuxPesterCgroupPath'
     }
 }
