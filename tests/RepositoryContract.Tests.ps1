@@ -924,6 +924,22 @@ Describe 'Bounded writable-root enumeration behavior' {
         $source | Should -Not -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=67108864,nodev,nosuid,noexec tmpfs "\$target"'
     }
 
+    # Scenario: The protected-Pester sandbox bind-mounts a safe device over /dev/console.
+    # Purpose: Ensure the file mount target exists before mount(8) is invoked on a fresh tmpfs /dev.
+    It 'UnitT85_CreatesTheProtectedPesterConsoleMountTargetBeforeBindingIt' {
+        $proxy = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterServerProxy'
+        }, $true)
+        $proxy | Should -Not -BeNullOrEmpty
+        if ($null -eq $proxy) { return }
+
+        $source = $proxy.Extent.Text
+        $createIndex = $source.IndexOf(': > "$sandbox_root/dev/console"', [StringComparison]::Ordinal)
+        $bindIndex = $source.IndexOf('"$mount_path" --bind /dev/null "$sandbox_root/dev/console"', [StringComparison]::Ordinal)
+        $createIndex | Should -BeGreaterOrEqual 0
+        $bindIndex | Should -BeGreaterThan $createIndex
+    }
+
     # Scenario: A writable directory is replaced with a symlink between enumeration and descent.
     # Purpose: Bind traversal to directory descriptors and refuse link following instead of reopening by pathname.
     It 'UnitT90_UsesDescriptorRelativeNoFollowWritableRootTraversal' {

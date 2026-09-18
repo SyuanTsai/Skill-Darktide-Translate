@@ -5456,6 +5456,7 @@ do
     : > "$sandbox_root/dev/$device"
     "$mount_path" --bind "/dev/$device" "$sandbox_root/dev/$device"
 done
+: > "$sandbox_root/dev/console"
 "$mount_path" --bind /dev/null "$sandbox_root/dev/console"
 set +e
 "$unshare_path" --mount --pid --fork --kill-child --mount-proc="$sandbox_root/proc" -- \
