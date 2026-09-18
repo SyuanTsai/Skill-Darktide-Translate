@@ -325,9 +325,9 @@ function ConvertFrom-LinuxProcessResourceUsageMetadata {
     if ($memoryMatch.Success) {
         $memoryBytes = [int64]$memoryMatch.Groups['kilobytes'].Value * 1024
     }
-    elseif ([string]$fields[0] -ceq 'Z' -and $Status -match '(?m)^State:\s+Z(?:\s|$)') {
-        # Linux zombies retain accounted CPU until reaped but have no resident
-        # address space, so /proc/<pid>/status legitimately omits VmRSS.
+    elseif ((@('Z', 'X') -ccontains [string]$fields[0]) -and $Status -match '(?m)^State:\s+[ZX](?:\s|$)') {
+        # Linux zombie and dead processes retain accounted CPU until procfs
+        # removal but have no resident address space, so status omits VmRSS.
         $memoryBytes = [int64]0
     }
     else {

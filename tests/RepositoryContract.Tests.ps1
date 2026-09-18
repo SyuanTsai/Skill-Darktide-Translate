@@ -1027,17 +1027,25 @@ Describe 'Bounded writable-root enumeration behavior' {
         $runspace.Extent.Text | Should -Match '(?s)Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath.*?-CgroupPath\s+\$linuxPesterCgroupPath'
     }
 
-    # Scenario: A reaped-later child is still present as a zombie, whose procfs status omits VmRSS.
-    # Purpose: Preserve its accumulated CPU while treating the kernel-defined no-resident-memory state as zero only for Z.
-    It 'UnitT125_AcceptsMissingVmRssOnlyForZombieProcesses' {
+    # Scenario: A terminated child remains in procfs as a zombie or dead process, whose status omits VmRSS.
+    # Purpose: Preserve its accumulated CPU and accept zero memory only when stat and status both report Z/X.
+    It 'UnitT125_AcceptsMissingVmRssOnlyForExitedProcesses' {
         $stat = '21242 (fixture) Z 1 1 1 0 0 0 0 0 0 0 3 5 7 11'
         $zombieStatus = "Name:`tfixture`nState:`tZ (zombie)`n"
         $usage = ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId 21242 -Stat $stat -Status $zombieStatus
         $usage.memoryBytes | Should -Be 0
         $usage.cpuTicks | Should -Be 26
 
+        $deadStat = $stat -replace '\) Z ', ') X '
+        $deadStatus = "Name:`tfixture`nState:`tX (dead)`n"
+        $deadUsage = ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId 21243 -Stat $deadStat -Status $deadStatus
+        $deadUsage.memoryBytes | Should -Be 0
+        $deadUsage.cpuTicks | Should -Be 26
+
         $liveStat = $stat -replace '\) Z ', ') S '
         { ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId 21242 -Stat $liveStat -Status "Name:`tfixture`nState:`tS (sleeping)`n" } |
+            Should -Throw '*resident memory*'
+        { ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId 21242 -Stat $liveStat -Status $deadStatus } |
             Should -Throw '*resident memory*'
     }
 
