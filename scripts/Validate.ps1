@@ -793,7 +793,7 @@ function New-LinuxCandidateCgroup {
     }
     catch {
         if (Test-Path -LiteralPath $cgroupPath -PathType Container) {
-            Remove-Item -LiteralPath $cgroupPath -Force -ErrorAction SilentlyContinue
+            try { [IO.Directory]::Delete($cgroupPath) } catch { }
         }
         throw "$Context could not establish a hard Linux cgroup boundary: $($_.Exception.Message)"
     }
@@ -848,7 +848,11 @@ function Remove-LinuxCandidateCgroup {
             throw 'Linux candidate cgroup cleanup received an invalid cgroup.events population record.'
         }
         if ([string]$Matches['value'] -eq '0') {
-            try { Remove-Item -LiteralPath $CgroupPath -Force -ErrorAction Stop } catch { }
+            # PowerShell's FileSystem provider treats cgroupfs control files as
+            # ordinary children and prompts for recursive deletion.  A cgroup
+            # must instead be removed with the underlying non-recursive rmdir
+            # operation after cgroup.events proves it is unpopulated.
+            try { [IO.Directory]::Delete($CgroupPath) } catch { }
             if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
         }
         if ([DateTime]::UtcNow -ge $deadline) { break }

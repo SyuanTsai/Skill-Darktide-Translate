@@ -1320,4 +1320,27 @@ namespace Codex.Validation.Tests {
         $runspaceSource | Should -Match '''-PesterProxyCgroupPath'', \$linuxPesterCgroupPath'
         $runspaceSource | Should -Not -Match 'Add-LinuxProcessTreeToCgroup'
     }
+
+    # Scenario: PowerShell's FileSystem provider enumerates cgroupfs control files as children and prompts for recursion.
+    # Purpose: Remove an already-unpopulated cgroup with the non-recursive OS directory operation instead of an interactive provider command.
+    It 'UnitT160_RemovesUnpopulatedLinuxCgroupsWithoutProviderPrompts' {
+        $newCgroup = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-LinuxCandidateCgroup'
+        }, $true)
+        $removeCgroup = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Remove-LinuxCandidateCgroup'
+        }, $true)
+
+        $newCgroup | Should -Not -BeNullOrEmpty
+        $removeCgroup | Should -Not -BeNullOrEmpty
+        if ($null -in @($newCgroup, $removeCgroup)) { return }
+
+        $newSource = $newCgroup.Extent.Text
+        $removeSource = $removeCgroup.Extent.Text
+        $newSource | Should -Match '\[IO\.Directory\]::Delete\(\$cgroupPath\)'
+        $removeSource | Should -Match '\[IO\.Directory\]::Delete\(\$CgroupPath\)'
+        $newSource | Should -Not -Match 'Remove-Item[^\r\n]*\$cgroupPath'
+        $removeSource | Should -Not -Match 'Remove-Item[^\r\n]*\$CgroupPath'
+        $removeSource | Should -Match '\[string\]\$Matches\[''value''\]\s+-eq\s+''0'''
+    }
 }
