@@ -906,9 +906,15 @@ Describe 'Bounded writable-root enumeration behavior' {
         $runspace = $ast.Find({ param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
         }, $true)
+        $supervisor = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterSupervisor'
+        }, $true)
         $invokeNative.Extent.Text | Should -Match 'New-ContainedProcessEnvironment\s+-DiagnosticRoot\s+\$childWritableRootPath'
         ([regex]::Matches($proxy.Extent.Text, 'New-ContainedProcessEnvironment\s+-DiagnosticRoot\s+\$childWritableRootPath')).Count | Should -Be 2
-        ([regex]::Matches($runspace.Extent.Text, 'Get-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath')).Count | Should -Be 1
+        ([regex]::Matches($supervisor.Extent.Text, 'Get-LinuxWritableRootUsage[\s\S]{0,160}?\$ChildWritableRoot')).Count | Should -Be 1
+        ([regex]::Matches($runspace.Extent.Text, 'Get-LinuxWritableRootUsage\s+-Root\s+\$childWritableRootPath')).Count | Should -Be 0
+        $runspace.Extent.Text | Should -Match '\[int64\]\s+\$WritableRootBaselineBytes'
+        ([regex]::Matches($runspace.Extent.Text, '-BaselineBytes\s+\$WritableRootBaselineBytes')).Count | Should -Be 2
         ([regex]::Matches($runspace.Extent.Text, 'Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath')).Count | Should -Be 2
         ([regex]::Matches($runspace.Extent.Text, 'Assert-LinuxWritableRootUsage[\s\S]{0,240}-AllowReparseEntries')).Count | Should -Be 1
     }
@@ -1475,9 +1481,9 @@ namespace Codex.Validation.Tests {
         $getRootSource | Should -Match 'Protected Pester validation is not running inside the delegated Linux cgroup subtree'
     }
 
-    # Scenario: Hosted protected Pester exceeded the former 300-second aggregate CPU ceiling while remaining inside its 15-minute wall deadline.
-    # Purpose: Permit that measured trusted regression workload without loosening the 300-second default for ordinary candidate-native boundaries.
-    It 'UnitT190_UsesASeparateBoundedCpuBudgetForProtectedPester' {
+    # Scenario: The complete hosted regression inventory exceeds one candidate CPU budget, while each immutable test file remains independently bounded.
+    # Purpose: Preserve the 300-second candidate CPU ceiling by giving every trusted test file a fresh protected process/cgroup and aggregating only trusted results.
+    It 'UnitT190_ShardsProtectedPesterUnderTheDefaultCandidateCpuBudget' {
         $aggregate = $ast.Find({ param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-LinuxAggregateResourceUsage'
         }, $true)
@@ -1500,7 +1506,8 @@ namespace Codex.Validation.Tests {
         $aggregateSource | Should -Match 'CPU limit of \$MaxCpuSeconds seconds'
 
         $protectedPesterSource = $protectedPester.Extent.Text
-        $protectedPesterSource | Should -Match 'Assert-LinuxAggregateResourceUsage[\s\S]*?-MaxCpuSeconds\s+900[\s\S]*?-Context ''Protected Pester remote pipeline'''
+        $protectedPesterSource | Should -Match 'Assert-LinuxAggregateResourceUsage[\s\S]*?-Context ''Protected Pester remote pipeline'''
+        $protectedPesterSource | Should -Not -Match '-MaxCpuSeconds\s+900'
         $invokeNative.Extent.Text | Should -Not -Match '-MaxCpuSeconds\s+900'
     }
 }

@@ -758,6 +758,7 @@ steps:
         $supervisor | Should -Match '\$pesterConfiguration\.Run\.PassThru = \$true'
         $supervisor | Should -Match '\$pesterConfiguration\.TestRegistry\.Enabled = \$false'
         $supervisor | Should -Match 'Invoke-Pester -Configuration \$pesterConfiguration'
+        $supervisor | Should -Match 'FailedTests='
         $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
     }
 
@@ -786,8 +787,20 @@ steps:
         $supervisor | Should -Match '\$trustedPesterCommit'
         $supervisor | Should -Match '(?s)Expand-TrustedGitArchive.*?-Revision \$trustedPesterCommit.*?-PathSpec @\(''tests''\).*?-Context ''Trusted base Pester tests'''
         $supervisor | Should -Match '(?s)\$candidateMirrorTestsRoot.*?Remove-Item'
+        $supervisor | Should -Match 'function global:New-Item'
+        $supervisor | Should -Match "'Junction'"
+        $supervisor | Should -Match "'SymbolicLink'"
+        $supervisor | Should -Match 'function global:Get-ChildItem'
+        $supervisor | Should -Match '\.retained-partial-\*'
+        $supervisor | Should -Match 'Set-StrictMode -Version 1\.0'
         $supervisor | Should -Match '\$readOnlyPaths = @\('
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
+        $supervisor | Should -Match '\[string\[\]\] \$TestNames'
+        $supervisor | Should -Match "AddParameter\('TestNames'"
+        $supervisor | Should -Match 'foreach \(\$requiredPesterTest in \$requiredPesterTests\)'
+        $supervisor | Should -Match '\$aggregateTotalCount'
+        $supervisor | Should -Match 'per-candidate 300-second CPU'
+        $supervisor | Should -Match 'TimeoutMilliseconds 1200000'
         $supervisor | Should -Match 'CreateOutOfProcessRunspace'
         $supervisor | Should -Match 'AddScript\(\$workerScriptText\)'
         $supervisor | Should -Match 'InvocationStateInfo\.State'

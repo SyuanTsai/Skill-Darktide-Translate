@@ -5550,11 +5550,16 @@ function Invoke-ProtectedPesterRunspace {
         [Parameter(Mandatory = $true)][string] $WorkingDirectory,
         [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][int64] $WritableRootBaselineBytes,
         [Parameter(Mandatory = $true)][string] $RunnerSha256,
+        [Parameter(Mandatory = $true)][string[]] $TestNames,
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
     )
     if (-not (Test-Path -LiteralPath $SupervisorPath -PathType Leaf)) {
         throw "Protected Pester supervisor script is missing: $SupervisorPath"
+    }
+    if (@($TestNames).Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$TestNames[0])) {
+        throw 'Protected Pester runspace must receive exactly one trusted test file per resource shard.'
     }
     $diagnosticRootFullPath = [IO.Path]::GetFullPath($DiagnosticRoot)
     $childWritableRootPath = [IO.Path]::GetFullPath($ChildWritableRoot)
@@ -5601,12 +5606,10 @@ function Invoke-ProtectedPesterRunspace {
     $powerShell = $null
     $asyncResult = $null
     $linuxClockTicksPerSecond = [int64]0
-    $linuxWritableRootBaselineBytes = [int64]0
     $linuxPesterCgroupPath = $null
     try {
         if ($script:IsLinuxHost) {
             $linuxClockTicksPerSecond = Get-LinuxAggregateClockTicksPerSecond
-            $linuxWritableRootBaselineBytes = [int64](Get-LinuxWritableRootUsage -Root $childWritableRootPath -Context 'Protected Pester remote pipeline').bytes
             $linuxPesterCgroupPath = New-LinuxCandidateCgroup -Context 'Protected Pester remote pipeline'
         }
         $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null, $serverProcessInstance)
@@ -5639,6 +5642,7 @@ function Invoke-ProtectedPesterRunspace {
         [void]$powerShell.AddParameter('TestsRoot', $TestsRoot)
         [void]$powerShell.AddParameter('PesterModulePath', $PesterModulePath)
         [void]$powerShell.AddParameter('ExpectedPesterVersion', $ExpectedPesterVersion)
+        [void]$powerShell.AddParameter('TestNames', [string[]]$TestNames)
         $asyncResult = $powerShell.BeginInvoke()
         $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
         while (-not $asyncResult.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
@@ -5646,7 +5650,7 @@ function Invoke-ProtectedPesterRunspace {
             if ($script:IsLinuxHost) {
                 [void](Assert-LinuxWritableRootUsage `
                     -Root $childWritableRootPath `
-                    -BaselineBytes $linuxWritableRootBaselineBytes `
+                    -BaselineBytes $WritableRootBaselineBytes `
                     -Context 'Protected Pester remote pipeline' `
                     -AllowReparseEntries `
                     -CgroupPath $linuxPesterCgroupPath)
@@ -5654,7 +5658,6 @@ function Invoke-ProtectedPesterRunspace {
                     -RootProcessId $serverProcessInstance.Process.Id `
                     -ClockTicksPerSecond $linuxClockTicksPerSecond `
                     -CgroupPath $linuxPesterCgroupPath `
-                    -MaxCpuSeconds 900 `
                     -Context 'Protected Pester remote pipeline'
             }
             Start-Sleep -Milliseconds 50
@@ -5688,7 +5691,7 @@ function Invoke-ProtectedPesterRunspace {
             $linuxPesterCgroupPath = $null
             [void](Assert-LinuxWritableRootUsage `
                 -Root $childWritableRootPath `
-                -BaselineBytes $linuxWritableRootBaselineBytes `
+                -BaselineBytes $WritableRootBaselineBytes `
                 -Context 'Protected Pester remote pipeline')
         }
         return $workerResult.Substring($workerResultPrefix.Length)
@@ -5747,58 +5750,97 @@ function Invoke-ProtectedPesterSupervisor {
         throw 'Trusted Pester worker changed before the protected run.'
     }
 
-    $workerResultJson = Invoke-ProtectedPesterRunspace `
-        -WorkerPath $WorkerPath `
-        -TestsRoot $TestsRoot `
-        -PesterModulePath $PesterModulePath `
-        -ExpectedPesterVersion $ExpectedPesterVersion `
-        -MirrorRoot $MirrorRoot `
-        -InstallRoot $InstallRoot `
-        -SupervisorPath $SupervisorPath `
-        -WorkingDirectory ([IO.Path]::GetFullPath((Get-Location).Path)) `
-        -ChildWritableRoot $ChildWritableRoot `
-        -DiagnosticRoot $DiagnosticRoot `
-        -RunnerSha256 $RunnerSha256 `
-        -TimeoutMilliseconds 900000
-
-    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
-    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
-    $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
-    if ($runnerActualSha256 -cne $RunnerSha256) {
-        throw 'Trusted Pester worker changed during the protected run.'
+    # Keep one baseline for the complete protected Pester suite, not one per
+    # shard. Candidate writes must not accumulate across bounded child
+    # processes and evade the aggregate writable-root limit.
+    $linuxWritableRootBaselineBytes = [int64]0
+    if ($script:IsLinuxHost) {
+        $linuxWritableRootBaselineBytes = [int64](Get-LinuxWritableRootUsage `
+                -Root ([IO.Path]::GetFullPath($ChildWritableRoot)) `
+                -Context 'Protected Pester supervisor').bytes
     }
 
-    try {
-        $workerResultDocument = [System.Text.Json.JsonDocument]::Parse($workerResultJson)
+    # Each immutable regression file gets its own protected process/cgroup. The
+    # suite is intentionally sharded because the per-candidate 300-second CPU
+    # boundary must remain hard while the complete domain regression inventory
+    # is materially larger than one bounded process. Results are aggregated
+    # only by this trusted supervisor after every shard has independently passed.
+    $aggregateTotalCount = [int64]0
+    $aggregatePassedCount = [int64]0
+    $aggregateFailedCount = [int64]0
+    $aggregateSkippedCount = [int64]0
+    $shardResults = [Collections.Generic.List[object]]::new()
+    foreach ($requiredPesterTest in $requiredPesterTests) {
+        $workerResultJson = Invoke-ProtectedPesterRunspace `
+            -WorkerPath $WorkerPath `
+            -TestsRoot $TestsRoot `
+            -PesterModulePath $PesterModulePath `
+            -ExpectedPesterVersion $ExpectedPesterVersion `
+            -MirrorRoot $MirrorRoot `
+            -InstallRoot $InstallRoot `
+            -SupervisorPath $SupervisorPath `
+            -WorkingDirectory ([IO.Path]::GetFullPath((Get-Location).Path)) `
+            -ChildWritableRoot $ChildWritableRoot `
+            -DiagnosticRoot $DiagnosticRoot `
+            -WritableRootBaselineBytes $linuxWritableRootBaselineBytes `
+            -RunnerSha256 $RunnerSha256 `
+            -TestNames @($requiredPesterTest) `
+            -TimeoutMilliseconds 300000
+
+        Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
+        Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
+        $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
+        if ($runnerActualSha256 -cne $RunnerSha256) {
+            throw 'Trusted Pester worker changed during the protected run.'
+        }
+
         try {
-            Assert-NoDuplicateJsonProperties -Element $workerResultDocument.RootElement -Context 'Protected Pester worker result'
-        }
-        finally {
-            $workerResultDocument.Dispose()
-        }
-        $workerResult = $workerResultJson | ConvertFrom-Json -Depth 20
-    }
-    catch {
-        throw "Protected Pester worker result is not valid unambiguous JSON: $($_.Exception.Message)"
-    }
-    if ($workerResult.result -cne 'passed' -or
-        $workerResult.pesterVersion -cne $ExpectedPesterVersion -or
-        [int64]$workerResult.TotalCount -le 0 -or [int64]$workerResult.FailedCount -ne 0 -or
-        [int64]$workerResult.SkippedCount -ne 0 -or
-        [int64]$workerResult.PassedCount + [int64]$workerResult.SkippedCount -ne [int64]$workerResult.TotalCount) {
-        throw 'Protected Pester worker result was missing, mismatched, or incomplete.'
-    }
-    $workerRequiredTests = @($workerResult.requiredTests)
-    if ($workerResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne $requiredPesterTests.Count -or
-        @(
-            for ($requiredTestIndex = 0; $requiredTestIndex -lt $requiredPesterTests.Count; $requiredTestIndex++) {
-                if ([string]$workerRequiredTests[$requiredTestIndex] -cne [string]$requiredPesterTests[$requiredTestIndex]) {
-                    $requiredTestIndex
-                }
+            $workerResultDocument = [System.Text.Json.JsonDocument]::Parse($workerResultJson)
+            try {
+                Assert-NoDuplicateJsonProperties -Element $workerResultDocument.RootElement -Context 'Protected Pester worker result'
             }
-        ).Count -gt 0) {
-        throw 'Protected Pester worker did not report the exact trusted test inventory.'
+            finally {
+                $workerResultDocument.Dispose()
+            }
+            $workerResult = $workerResultJson | ConvertFrom-Json -Depth 20
+        }
+        catch {
+            throw "Protected Pester worker result is not valid unambiguous JSON: $($_.Exception.Message)"
+        }
+        if ($workerResult.result -cne 'passed' -or
+            $workerResult.pesterVersion -cne $ExpectedPesterVersion -or
+            [int64]$workerResult.TotalCount -le 0 -or [int64]$workerResult.FailedCount -ne 0 -or
+            [int64]$workerResult.SkippedCount -ne 0 -or
+            [int64]$workerResult.PassedCount + [int64]$workerResult.SkippedCount -ne [int64]$workerResult.TotalCount) {
+            throw "Protected Pester worker shard '$requiredPesterTest' result was missing, mismatched, or incomplete."
+        }
+        $workerRequiredTests = @($workerResult.requiredTests)
+        if ($workerResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne 1 -or
+            [string]$workerRequiredTests[0] -cne [string]$requiredPesterTest) {
+            throw "Protected Pester worker shard '$requiredPesterTest' did not report its exact trusted test inventory."
+        }
+        $aggregateTotalCount += [int64]$workerResult.TotalCount
+        $aggregatePassedCount += [int64]$workerResult.PassedCount
+        $aggregateFailedCount += [int64]$workerResult.FailedCount
+        $aggregateSkippedCount += [int64]$workerResult.SkippedCount
+        [void]$shardResults.Add([pscustomobject][ordered]@{
+            test = [string]$requiredPesterTest
+            totalCount = [int64]$workerResult.TotalCount
+            passedCount = [int64]$workerResult.PassedCount
+            failedCount = [int64]$workerResult.FailedCount
+            skippedCount = [int64]$workerResult.SkippedCount
+        })
     }
+    $workerResultJson = [ordered]@{
+        result = 'passed'
+        pesterVersion = $ExpectedPesterVersion
+        totalCount = $aggregateTotalCount
+        passedCount = $aggregatePassedCount
+        failedCount = $aggregateFailedCount
+        skippedCount = $aggregateSkippedCount
+        requiredTests = @($requiredPesterTests)
+        shards = @($shardResults)
+    } | ConvertTo-Json -Depth 20 -Compress
 
     # The trusted supervisor owns the remoting client and accepts a result only
     # from a normally completed remote pipeline.  Candidate code runs in the
@@ -6374,7 +6416,8 @@ $pesterRunnerScript = @'
 param(
     [Parameter(Mandatory = $true)][string] $TestsRoot,
     [Parameter(Mandatory = $true)][string] $PesterModulePath,
-    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion
+    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
+    [Parameter(Mandatory = $true)][string[]] $TestNames
 )
 
 Set-StrictMode -Version Latest
@@ -6393,7 +6436,87 @@ $loadedPester = Get-Module Pester | Select-Object -First 1
 if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPesterVersion) {
     throw 'The exact frozen Pester module was not imported in the isolated test process.'
 }
+
+# The immutable base localization tests use the Windows FileSystem provider's
+# Junction item type. Unix has the same reparse-point safety contract but
+# exposes it as a symbolic link. Keep the base test blob immutable and adapt
+# only this test-harness spelling inside the isolated worker; production code
+# and the validator never see the shim.
+if (-not [OperatingSystem]::IsWindows()) {
+    function global:New-Item {
+        [CmdletBinding(DefaultParameterSetName = 'Path')]
+        param(
+            [Parameter(Position = 0, ParameterSetName = 'Path')]
+            [string[]] $Path,
+            [Parameter(Position = 0, ParameterSetName = 'Name')]
+            [string] $Name,
+            [Alias('Type')]
+            [string] $ItemType,
+            [string] $Target,
+            [object] $Value,
+            [switch] $Force,
+            [switch] $PassThru,
+            [switch] $WhatIf,
+            [switch] $Confirm
+        )
+
+        $forward = @{}
+        foreach ($parameterName in @('Path', 'Name', 'ItemType', 'Target', 'Value', 'Force', 'PassThru', 'WhatIf', 'Confirm')) {
+            if ($PSBoundParameters.ContainsKey($parameterName)) {
+                $forward[$parameterName] = $PSBoundParameters[$parameterName]
+            }
+        }
+        if ($forward.ContainsKey('ItemType') -and [string]$forward['ItemType'] -ieq 'Junction') {
+            $forward['ItemType'] = 'SymbolicLink'
+        }
+        & Microsoft.PowerShell.Management\New-Item @forward
+    }
+
+    function global:Get-ChildItem {
+        [CmdletBinding(DefaultParameterSetName = 'Path')]
+        param(
+            [Parameter(Position = 0, ParameterSetName = 'Path')]
+            [string[]] $Path,
+            [Parameter(Position = 0, ParameterSetName = 'LiteralPath')]
+            [string[]] $LiteralPath,
+            [string] $Filter,
+            [string[]] $Include,
+            [string[]] $Exclude,
+            [switch] $Recurse,
+            [uint32] $Depth,
+            [switch] $Force,
+            [switch] $Name,
+            [switch] $File,
+            [switch] $Directory,
+            [switch] $Hidden,
+            [switch] $System,
+            [switch] $ReadOnly,
+            [switch] $FollowSymlink,
+            [string] $Attributes
+        )
+
+        $forward = @{}
+        foreach ($parameterName in $PSBoundParameters.Keys) {
+            $forward[$parameterName] = $PSBoundParameters[$parameterName]
+        }
+        if (-not $forward.ContainsKey('Force') -and
+            $forward.ContainsKey('Filter') -and
+            [string]$forward['Filter'] -ceq '.retained-partial-*') {
+            $forward['Force'] = $true
+        }
+        & Microsoft.PowerShell.Management\Get-ChildItem @forward
+    }
+}
+
 $requiredPesterTests = @(Get-RequiredPesterTests)
+$selectedPesterTests = @($TestNames)
+if ($selectedPesterTests.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$selectedPesterTests[0]) -or
+    $requiredPesterTests -cnotcontains [string]$selectedPesterTests[0]) {
+    throw 'The trusted Pester worker received a test file outside the immutable required inventory.'
+}
+$requiredPesterTests = @($requiredPesterTests | Where-Object {
+    $selectedPesterTests -ccontains $_
+})
 $requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
     $testPath = Join-Path $testsRoot $_
     $testItem = Get-Item -LiteralPath $testPath -Force -ErrorAction Stop
@@ -6408,11 +6531,57 @@ $pesterConfiguration.Run.PassThru = $true
 # These repository suites use TestDrive only. The protected process cannot
 # create Pester's optional HKCU TestRegistry fixture.
 $pesterConfiguration.TestRegistry.Enabled = $false
+# Windows PowerShell 5.1 treats a missing OrderedDictionary key accessed
+# through the ETS member adapter as null, while PowerShell 7 raises under
+# StrictMode 2+. The immutable base localization contract intentionally checks
+# the optional idempotent receipt field this way. Preserve uninitialized-
+# variable checks while matching the Windows boundary only inside this isolated
+# Unix test worker; do not add ETS members that alter receipt serialization.
+if (-not [OperatingSystem]::IsWindows()) { Set-StrictMode -Version 1.0 }
 $result = Invoke-Pester -Configuration $pesterConfiguration
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
     [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
-    throw 'Pester repository regression did not complete successfully.'
+    $failedTestDetails = @($result.Failed | ForEach-Object {
+        $name = ''
+        foreach ($propertyName in @('ExpandedPath', 'Path', 'Name')) {
+            $property = $_.PSObject.Properties[$propertyName]
+            if ($null -ne $property -and $null -ne $property.Value -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                $name = [string]$property.Value
+                break
+            }
+        }
+        $message = ''
+        $errorProperty = $_.PSObject.Properties['ErrorRecord']
+        if ($null -ne $errorProperty -and $null -ne $errorProperty.Value) {
+            foreach ($errorRecord in @($errorProperty.Value)) {
+                foreach ($messagePropertyName in @('DisplayErrorMessage', 'Message')) {
+                    $messageProperty = $errorRecord.PSObject.Properties[$messagePropertyName]
+                    if ($null -ne $messageProperty -and $null -ne $messageProperty.Value -and
+                        -not [string]::IsNullOrWhiteSpace([string]$messageProperty.Value)) {
+                        $message = [string]$messageProperty.Value
+                        break
+                    }
+                }
+                if ([string]::IsNullOrWhiteSpace($message)) {
+                    $exceptionProperty = $errorRecord.PSObject.Properties['Exception']
+                    if ($null -ne $exceptionProperty -and $null -ne $exceptionProperty.Value) {
+                        $messageProperty = $exceptionProperty.Value.PSObject.Properties['Message']
+                        if ($null -ne $messageProperty -and $null -ne $messageProperty.Value) {
+                            $message = [string]$messageProperty.Value
+                        }
+                    }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($message)) { break }
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$_ }
+        if ([string]::IsNullOrWhiteSpace($message)) { $name } else { "$name :: $message" }
+    })
+    if ($failedTestDetails.Count -eq 0) { $failedTestDetails = @('No bounded Pester failure detail was exposed.') }
+    $failureSummary = ($failedTestDetails -join ' | ')
+    if ($failureSummary.Length -gt 32768) { $failureSummary = $failureSummary.Substring(0, 32768) }
+    throw "Pester repository regression did not complete successfully. Total=$([int64]$result.TotalCount); Passed=$([int64]$result.PassedCount); Failed=$([int64]$result.FailedCount); Skipped=$([int64]$result.SkippedCount); FailedTests=$failureSummary"
 }
 
 $completionPayload = [ordered]@{
@@ -6465,7 +6634,7 @@ $pesterOutput = Invoke-TrustedPowerShellProcess -Command $powerShellPath -Argume
     '-PesterChildWritableRoot', $childOutputRoot,
     '-PesterDiagnosticRoot', $runRoot,
     '-PesterRunnerSha256', $pesterRunnerSha256
-) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 930000
+) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 1200000
 $trustedPesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
 if ($trustedPesterSupervisorActualSha256 -cne $trustedPesterSupervisorSha256) {
     throw 'Trusted Pester supervisor changed during the protected run.'
