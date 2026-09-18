@@ -5140,6 +5140,19 @@ function Get-RequiredPesterTests {
     )
 }
 
+function Get-ProtectedPesterShardTimeoutMilliseconds {
+    param([Parameter(Mandatory = $true)][string] $TestName)
+    if (@(Get-RequiredPesterTests) -cnotcontains $TestName) {
+        throw "Protected Pester shard '$TestName' is outside the immutable required inventory."
+    }
+
+    # ModUpdateAutomation is the one measured I/O-heavy shard whose wall time
+    # exceeds five minutes. This does not widen the separate 300-second CPU,
+    # memory, PID, cgroup, or aggregate writable-root boundaries.
+    if ($TestName -ceq 'ModUpdateAutomation.Tests.ps1') { return 600000 }
+    return 300000
+}
+
 function Invoke-TrustedPowerShellProcess {
     param(
         [Parameter(Mandatory = $true)][string] $Command,
@@ -5778,6 +5791,7 @@ function Invoke-ProtectedPesterSupervisor {
     $aggregateSkippedCount = [int64]0
     $shardResults = [Collections.Generic.List[object]]::new()
     foreach ($requiredPesterTest in $requiredPesterTests) {
+        $shardTimeoutMilliseconds = Get-ProtectedPesterShardTimeoutMilliseconds -TestName $requiredPesterTest
         $workerResultJson = Invoke-ProtectedPesterRunspace `
             -WorkerPath $WorkerPath `
             -TestsRoot $TestsRoot `
@@ -5793,7 +5807,7 @@ function Invoke-ProtectedPesterSupervisor {
             -RunnerSha256 $RunnerSha256 `
             -TestNames @($requiredPesterTest) `
             -TrustedTestCommit $TrustedTestCommit `
-            -TimeoutMilliseconds 300000
+            -TimeoutMilliseconds $shardTimeoutMilliseconds
 
         Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
         Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
