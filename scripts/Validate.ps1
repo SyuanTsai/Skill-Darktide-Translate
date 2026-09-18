@@ -278,6 +278,7 @@ function Get-UnixProcessInfo {
     }
     return [pscustomobject][ordered]@{
         processId = $ProcessId
+        state = [string]$fields[0]
         parentProcessId = [int]$fields[1]
         processGroupId = [int]$fields[2]
         startTime = [string]$fields[19]
@@ -421,6 +422,236 @@ function Get-LinuxBoundaryProcessIds {
         }
     }
     return [int[]]@($candidateIds | Sort-Object)
+}
+
+function Test-LinuxProcessTasksStopped {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { throw 'Linux task-state inspection requires a Linux host.' }
+    if ($ProcessId -le 0) { throw 'Linux task-state inspection requires a positive process id.' }
+    $processPath = Join-Path '/proc' ([string]$ProcessId)
+    $taskRoot = Join-Path $processPath 'task'
+    try {
+        $firstTaskPaths = @([IO.Directory]::GetDirectories($taskRoot) | Sort-Object)
+    }
+    catch {
+        if (Test-ProcessIdExists -ProcessId $ProcessId) {
+            throw "$Context could not enumerate every task for process ${ProcessId}: $($_.Exception.Message)"
+        }
+        return $true
+    }
+    if ($firstTaskPaths.Count -gt 256) {
+        throw "$Context process $ProcessId exceeded the Linux task-count limit of 256 while freezing writable-root accounting."
+    }
+    foreach ($taskPath in $firstTaskPaths) {
+        $taskName = [IO.Path]::GetFileName($taskPath)
+        if ($taskName -notmatch '^[0-9]+$') {
+            throw "$Context received an invalid Linux task identifier for process ${ProcessId}."
+        }
+        $statPath = Join-Path $taskPath 'stat'
+        try {
+            $stat = [IO.File]::ReadAllText($statPath)
+        }
+        catch {
+            if ((Test-Path -LiteralPath $taskPath -PathType Container) -and
+                (Test-ProcessIdExists -ProcessId $ProcessId)) {
+                throw "$Context could not inspect task $taskName for process ${ProcessId}: $($_.Exception.Message)"
+            }
+            return $false
+        }
+        $closeParen = $stat.LastIndexOf(')')
+        if ($closeParen -lt 0) {
+            throw "$Context could not parse task $taskName for process ${ProcessId}."
+        }
+        $fields = @([regex]::Split($stat.Substring($closeParen + 1).Trim(), '\s+'))
+        if ($fields.Count -lt 1 -or [string]$fields[0] -notmatch '^\S$') {
+            throw "$Context could not parse task-state metadata for task $taskName in process ${ProcessId}."
+        }
+        if (@('T', 't', 'Z', 'X', 'x') -cnotcontains [string]$fields[0]) { return $false }
+    }
+    try {
+        $secondTaskPaths = @([IO.Directory]::GetDirectories($taskRoot) | Sort-Object)
+    }
+    catch {
+        if (Test-ProcessIdExists -ProcessId $ProcessId) {
+            throw "$Context could not verify the task set for process ${ProcessId}: $($_.Exception.Message)"
+        }
+        return $true
+    }
+    return ($firstTaskPaths -join "`n") -ceq ($secondTaskPaths -join "`n")
+}
+
+function Set-LinuxCgroupFrozen {
+    param(
+        [Parameter(Mandatory = $true)][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][bool] $Frozen,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { throw 'Linux cgroup freezing requires a Linux host.' }
+    $cgroupFullPath = [IO.Path]::GetFullPath($CgroupPath)
+    if (-not $cgroupFullPath.StartsWith('/sys/fs/cgroup/', [StringComparison]::Ordinal)) {
+        throw "$Context received a cgroup outside the trusted cgroup v2 hierarchy."
+    }
+    $freezePath = Join-Path $cgroupFullPath 'cgroup.freeze'
+    $eventsPath = Join-Path $cgroupFullPath 'cgroup.events'
+    if (-not (Test-Path -LiteralPath $freezePath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $eventsPath -PathType Leaf)) {
+        throw "$Context requires cgroup.freeze and cgroup.events."
+    }
+    $expectedValue = if ($Frozen) { '1' } else { '0' }
+    try {
+        [IO.File]::WriteAllText($freezePath, $expectedValue)
+    }
+    catch {
+        throw "$Context could not set cgroup.freeze to ${expectedValue}: $($_.Exception.Message)"
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(2)
+    do {
+        if (-not (Test-Path -LiteralPath $eventsPath -PathType Leaf)) {
+            throw "$Context lost cgroup.events while changing the freezer state."
+        }
+        $events = [IO.File]::ReadAllText($eventsPath)
+        $frozenMatch = [regex]::Match($events, '(?m)^frozen\s+(?<value>[01])\s*$')
+        if (-not $frozenMatch.Success) {
+            throw "$Context received an invalid cgroup.events freezer record."
+        }
+        if ([string]$frozenMatch.Groups['value'].Value -ceq $expectedValue) { return }
+        Start-Sleep -Milliseconds 10
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "$Context did not reach cgroup freezer state $expectedValue within the bounded wait."
+}
+
+function Suspend-LinuxWritableRootBoundary {
+    param(
+        [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $RootProcessId = 0,
+        [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $ProcessGroupId = 0,
+        [Parameter()][AllowNull()][string] $CgroupPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { throw 'Linux writable-root boundary freezing requires a Linux host.' }
+    if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
+        try {
+            Set-LinuxCgroupFrozen -CgroupPath $CgroupPath -Frozen $true -Context $Context
+        }
+        catch {
+            try { Set-LinuxCgroupFrozen -CgroupPath $CgroupPath -Frozen $false -Context $Context } catch { }
+            throw
+        }
+        return [pscustomobject][ordered]@{
+            kind = 'cgroup'
+            cgroupPath = [IO.Path]::GetFullPath($CgroupPath)
+            resumeIdentities = $null
+        }
+    }
+
+    $knownIdentities = [Collections.Generic.Dictionary[int,string]]::new()
+    $resumeIdentities = [Collections.Generic.Dictionary[int,string]]::new()
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(2)
+        do {
+            $processIds = @(Get-LinuxBoundaryProcessIds `
+                -RootProcessId $RootProcessId `
+                -ProcessGroupId $ProcessGroupId `
+                -Context $Context)
+            if ($processIds.Count -gt 256) {
+                throw "$Context exceeded the aggregate Linux process-count limit of 256 while freezing writable-root accounting."
+            }
+            foreach ($processId in $processIds) {
+                try {
+                    $processInfo = Get-UnixProcessInfo -ProcessId ([int]$processId)
+                    if (@('Z', 'X') -ccontains [string]$processInfo.state) { continue }
+                    $identity = Get-ProcessIdentity -ProcessId ([int]$processId)
+                }
+                catch {
+                    if (Test-ProcessIdExists -ProcessId ([int]$processId)) {
+                        throw "$Context could not bind process $processId before freezing writable-root accounting: $($_.Exception.Message)"
+                    }
+                    continue
+                }
+                $knownIdentities[[int]$processId] = [string]$identity
+                $tasksStopped = Test-LinuxProcessTasksStopped -ProcessId ([int]$processId) -Context $Context
+                if ((@('T', 't') -ccontains [string]$processInfo.state) -and $tasksStopped) { continue }
+                if (-not (Stop-UnixProcessByIdentity -ProcessId ([int]$processId) -Identity ([string]$identity) -Signal 19) -and
+                    (Test-ProcessIdentity -ProcessId ([int]$processId) -Identity ([string]$identity))) {
+                    throw "$Context could not stop process $processId for a consistent writable-root snapshot."
+                }
+                $resumeIdentities[[int]$processId] = [string]$identity
+            }
+
+            Start-Sleep -Milliseconds 10
+            $verificationIds = @(Get-LinuxBoundaryProcessIds `
+                -RootProcessId $RootProcessId `
+                -ProcessGroupId $ProcessGroupId `
+                -Context $Context)
+            if ($verificationIds.Count -gt 256) {
+                throw "$Context exceeded the aggregate Linux process-count limit of 256 while verifying the frozen boundary."
+            }
+            $isStable = $true
+            foreach ($processId in $verificationIds) {
+                try {
+                    $processInfo = Get-UnixProcessInfo -ProcessId ([int]$processId)
+                    if (@('Z', 'X') -ccontains [string]$processInfo.state) { continue }
+                    $identity = Get-ProcessIdentity -ProcessId ([int]$processId)
+                }
+                catch {
+                    if (Test-ProcessIdExists -ProcessId ([int]$processId)) {
+                        throw "$Context could not verify process $processId in the frozen writable-root boundary: $($_.Exception.Message)"
+                    }
+                    continue
+                }
+                $tasksStopped = Test-LinuxProcessTasksStopped -ProcessId ([int]$processId) -Context $Context
+                if (-not $knownIdentities.ContainsKey([int]$processId) -or
+                    $knownIdentities[[int]$processId] -cne [string]$identity -or
+                    @('T', 't') -cnotcontains [string]$processInfo.state -or
+                    -not $tasksStopped) {
+                    $isStable = $false
+                }
+            }
+            if ($isStable) {
+                return [pscustomobject][ordered]@{
+                    kind = 'signals'
+                    cgroupPath = $null
+                    resumeIdentities = $resumeIdentities
+                }
+            }
+        } while ([DateTime]::UtcNow -lt $deadline)
+        throw "$Context could not freeze the complete Linux process boundary within the bounded wait."
+    }
+    catch {
+        foreach ($entry in @($resumeIdentities.GetEnumerator())) {
+            [void](Stop-UnixProcessByIdentity -ProcessId ([int]$entry.Key) -Identity ([string]$entry.Value) -Signal 18)
+        }
+        throw
+    }
+}
+
+function Resume-LinuxWritableRootBoundary {
+    param(
+        [Parameter(Mandatory = $true)] $BoundaryState,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    if (-not $script:IsLinuxHost) { throw 'Linux writable-root boundary resumption requires a Linux host.' }
+    if ([string]$BoundaryState.kind -ceq 'cgroup') {
+        Set-LinuxCgroupFrozen -CgroupPath ([string]$BoundaryState.cgroupPath) -Frozen $false -Context $Context
+        return
+    }
+    if ([string]$BoundaryState.kind -cne 'signals' -or $null -eq $BoundaryState.resumeIdentities) {
+        throw "$Context received an invalid writable-root boundary freeze state."
+    }
+    $failedProcessIds = [Collections.Generic.List[int]]::new()
+    foreach ($entry in @($BoundaryState.resumeIdentities.GetEnumerator() | Sort-Object Key -Descending)) {
+        $processId = [int]$entry.Key
+        $identity = [string]$entry.Value
+        if (-not (Stop-UnixProcessByIdentity -ProcessId $processId -Identity $identity -Signal 18) -and
+            (Test-ProcessIdentity -ProcessId $processId -Identity $identity)) {
+            [void]$failedProcessIds.Add($processId)
+        }
+    }
+    if ($failedProcessIds.Count -gt 0) {
+        throw "$Context could not resume every process after writable-root accounting: $($failedProcessIds -join ', ')."
+    }
 }
 
 function Assert-LinuxAggregateResourceUsage {
@@ -1086,27 +1317,43 @@ function Assert-LinuxWritableRootUsage {
         [Parameter()][AllowNull()][string] $CgroupPath,
         [Parameter()][switch] $AllowReparseEntries
     )
-    $usage = Get-LinuxWritableRootUsage -Root $Root -Context $Context -AllowReparseEntries:$AllowReparseEntries
+    $boundaryState = $null
+    $usage = $null
     $unlinkedBytes = [int64]0
     $unlinkedCount = 0
-    if ($RootProcessId -gt 0 -or $ProcessGroupId -gt 0 -or -not [string]::IsNullOrWhiteSpace($CgroupPath)) {
-        $processIds = @(Get-LinuxBoundaryProcessIds `
-            -RootProcessId $RootProcessId `
-            -ProcessGroupId $ProcessGroupId `
-            -CgroupPath $CgroupPath `
-            -Context $Context)
-        if ($processIds.Count -gt 0) {
-            try {
+    $hasLiveBoundary = $RootProcessId -gt 0 -or $ProcessGroupId -gt 0 -or
+        -not [string]::IsNullOrWhiteSpace($CgroupPath)
+    try {
+        if ($hasLiveBoundary) {
+            $boundaryState = Suspend-LinuxWritableRootBoundary `
+                -RootProcessId $RootProcessId `
+                -ProcessGroupId $ProcessGroupId `
+                -CgroupPath $CgroupPath `
+                -Context $Context
+        }
+        $usage = Get-LinuxWritableRootUsage -Root $Root -Context $Context -AllowReparseEntries:$AllowReparseEntries
+        if ($hasLiveBoundary) {
+            $processIds = @(Get-LinuxBoundaryProcessIds `
+                -RootProcessId $RootProcessId `
+                -ProcessGroupId $ProcessGroupId `
+                -CgroupPath $CgroupPath `
+                -Context $Context)
+            if ($processIds.Count -gt 0) {
                 $unlinkedUsage = Invoke-LinuxOpenUnlinkedInspection `
                     -ProcessIds ([int[]]$processIds) `
                     -Root ([IO.Path]::GetFullPath($Root)) `
                     -MaximumEntries (100000 - [int]$usage.fileCount)
+                $unlinkedBytes = [int64]$unlinkedUsage.Bytes
+                $unlinkedCount = [int]$unlinkedUsage.EntryCount
             }
-            catch {
-                throw "$Context open-unlinked writable-root inspection failed: $($_.Exception.Message)"
-            }
-            $unlinkedBytes = [int64]$unlinkedUsage.Bytes
-            $unlinkedCount = [int]$unlinkedUsage.EntryCount
+        }
+    }
+    catch {
+        throw "$Context consistent writable-root inspection failed: $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $boundaryState) {
+            Resume-LinuxWritableRootBoundary -BoundaryState $boundaryState -Context $Context
         }
     }
     if ([int]$usage.fileCount + $unlinkedCount -gt 100000) {

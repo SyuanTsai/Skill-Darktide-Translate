@@ -1172,4 +1172,49 @@ namespace Codex.Validation.Tests {
             [Codex.Validation.Tests.PrivateDescriptorTableFixture]::Stop()
         }
     }
+
+    # Scenario: A hostile boundary churns thread-private descriptor tables while quota accounting takes a snapshot.
+    # Purpose: Freeze the complete process boundary before both pathname and open-unlinked accounting, then always resume it.
+    It 'UnitT145_FreezesTheBoundaryForOneConsistentWritableRootSnapshot' {
+        $setCgroupFrozen = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Set-LinuxCgroupFrozen'
+        }, $true)
+        $testTasksStopped = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Test-LinuxProcessTasksStopped'
+        }, $true)
+        $suspend = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Suspend-LinuxWritableRootBoundary'
+        }, $true)
+        $resume = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Resume-LinuxWritableRootBoundary'
+        }, $true)
+        $assertUsage = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Assert-LinuxWritableRootUsage'
+        }, $true)
+
+        $setCgroupFrozen | Should -Not -BeNullOrEmpty
+        $testTasksStopped | Should -Not -BeNullOrEmpty
+        $suspend | Should -Not -BeNullOrEmpty
+        $resume | Should -Not -BeNullOrEmpty
+        if ($null -eq $setCgroupFrozen -or $null -eq $testTasksStopped -or $null -eq $suspend -or $null -eq $resume -or $null -eq $assertUsage) { return }
+
+        $cgroupSource = $setCgroupFrozen.Extent.Text
+        $taskStateSource = $testTasksStopped.Extent.Text
+        $suspendSource = $suspend.Extent.Text
+        $resumeSource = $resume.Extent.Text
+        $assertSource = $assertUsage.Extent.Text
+        $cgroupSource | Should -Match "'cgroup\.freeze'"
+        $cgroupSource | Should -Match "'cgroup\.events'"
+        $taskStateSource | Should -Match "'task'"
+        $taskStateSource | Should -Match "'stat'"
+        $suspendSource | Should -Match 'Test-LinuxProcessTasksStopped'
+        $suspendSource | Should -Match 'Stop-UnixProcessByIdentity[\s\S]*?-Signal\s+19'
+        $resumeSource | Should -Match 'Stop-UnixProcessByIdentity[\s\S]*?-Signal\s+18'
+        $assertSource | Should -Match '(?s)Suspend-LinuxWritableRootBoundary.*?Get-LinuxWritableRootUsage.*?Invoke-LinuxOpenUnlinkedInspection.*?finally\s*\{.*?Resume-LinuxWritableRootBoundary'
+    }
 }
