@@ -826,14 +826,16 @@ namespace Codex.Validation {
             string rootPath = Path.GetFullPath(root);
             HashSet<string> identities = new HashSet<string>(StringComparer.Ordinal);
             long bytes = 0;
+            int inspectedTaskCount = 0;
+            int inspectedDescriptorCount = 0;
 
             foreach (int processId in processIds) {
                 if (processId <= 0) { throw new ArgumentOutOfRangeException("processIds"); }
                 string processPath = Path.Combine("/proc", processId.ToString());
-                string descriptorRoot = Path.Combine(processPath, "fd");
-                string[] descriptorPaths;
+                string taskRoot = Path.Combine(processPath, "task");
+                string[] taskPaths;
                 try {
-                    descriptorPaths = Directory.GetFileSystemEntries(descriptorRoot);
+                    taskPaths = Directory.GetDirectories(taskRoot);
                 }
                 catch (DirectoryNotFoundException) {
                     continue;
@@ -843,51 +845,78 @@ namespace Codex.Validation {
                 }
                 catch (Exception error) {
                     if (!Directory.Exists(processPath)) { continue; }
-                    throw new IOException("Could not enumerate every open descriptor in the writable process boundary: " + descriptorRoot, error);
+                    throw new IOException("Could not enumerate every task in the writable process boundary: " + taskRoot, error);
                 }
 
-                foreach (string descriptorPath in descriptorPaths) {
-                    int duplicatedDescriptor = Open(descriptorPath, O_PATH | O_CLOEXEC);
-                    if (duplicatedDescriptor < 0) {
-                        int openError = GetErrno();
-                        if (openError == ENOENT || !Directory.Exists(processPath)) { continue; }
-                        throw new IOException("Could not duplicate an open descriptor in the writable process boundary (errno " + openError + "): " + descriptorPath);
+                foreach (string taskPath in taskPaths) {
+                    inspectedTaskCount++;
+                    if (inspectedTaskCount > 256) {
+                        throw new IOException("Writable process boundary exceeded the aggregate Linux task-count limit of 256 while accounting for open unlinked files.");
                     }
-                    try {
-                        string stableDescriptorPath = Path.Combine("/proc/self/fd", duplicatedDescriptor.ToString());
-                        string target = ReadLinkTarget(stableDescriptorPath);
-                        const string deletedSuffix = " (deleted)";
-                        if (!target.EndsWith(deletedSuffix, StringComparison.Ordinal)) { continue; }
-                        string originalPath = target.Substring(0, target.Length - deletedSuffix.Length);
-                        if (!IsPathInsideRoot(originalPath, rootPath)) { continue; }
 
-                        Statx status;
-                        int result = StatAt(
-                            duplicatedDescriptor,
-                            String.Empty,
-                            AT_EMPTY_PATH | AT_NO_AUTOMOUNT,
-                            STATX_TYPE | STATX_NLINK | STATX_INO | STATX_SIZE,
-                            out status);
-                        if (result != 0) {
-                            throw new IOException("Could not inspect a duplicated unlinked descriptor (errno " + GetErrno() + "): " + stableDescriptorPath);
-                        }
-                        uint requiredMask = STATX_TYPE | STATX_NLINK | STATX_INO | STATX_SIZE;
-                        if ((status.Mask & requiredMask) != requiredMask) {
-                            throw new IOException("Unlinked descriptor inspection did not receive all required metadata: " + stableDescriptorPath);
-                        }
-                        if (status.LinkCount != 0 || (status.Mode & S_IFMT) != S_IFREG) { continue; }
-                        string identity = status.DeviceMajor.ToString() + ":" + status.DeviceMinor.ToString() + ":" + status.Inode.ToString();
-                        if (!identities.Add(identity)) { continue; }
-                        if (identities.Count > maximumEntries) {
-                            throw new IOException("Writable root exceeded the aggregate writable-entry-count limit of " + maximumEntries + " while accounting for open unlinked files.");
-                        }
-                        if (status.Size > Int64.MaxValue || (long)status.Size > Int64.MaxValue - bytes) {
-                            throw new IOException("Open-unlinked size overflowed the bounded accounting range.");
-                        }
-                        bytes += (long)status.Size;
+                    string descriptorRoot = Path.Combine(taskPath, "fd");
+                    string[] descriptorPaths;
+                    try {
+                        descriptorPaths = Directory.GetFileSystemEntries(descriptorRoot);
                     }
-                    finally {
-                        CloseFileDescriptor(duplicatedDescriptor);
+                    catch (DirectoryNotFoundException) {
+                        continue;
+                    }
+                    catch (FileNotFoundException) {
+                        continue;
+                    }
+                    catch (Exception error) {
+                        if (!Directory.Exists(taskPath) || !Directory.Exists(processPath)) { continue; }
+                        throw new IOException("Could not enumerate every task descriptor in the writable process boundary: " + descriptorRoot, error);
+                    }
+
+                    foreach (string descriptorPath in descriptorPaths) {
+                        inspectedDescriptorCount++;
+                        if (inspectedDescriptorCount > 262144) {
+                            throw new IOException("Writable process boundary exceeded the bounded Linux descriptor-inspection limit of 262144.");
+                        }
+                        int duplicatedDescriptor = Open(descriptorPath, O_PATH | O_CLOEXEC);
+                        if (duplicatedDescriptor < 0) {
+                            int openError = GetErrno();
+                            if (openError == ENOENT || !Directory.Exists(taskPath) || !Directory.Exists(processPath)) { continue; }
+                            throw new IOException("Could not duplicate an open task descriptor in the writable process boundary (errno " + openError + "): " + descriptorPath);
+                        }
+                        try {
+                            string stableDescriptorPath = Path.Combine("/proc/self/fd", duplicatedDescriptor.ToString());
+                            string target = ReadLinkTarget(stableDescriptorPath);
+                            const string deletedSuffix = " (deleted)";
+                            if (!target.EndsWith(deletedSuffix, StringComparison.Ordinal)) { continue; }
+                            string originalPath = target.Substring(0, target.Length - deletedSuffix.Length);
+                            if (!IsPathInsideRoot(originalPath, rootPath)) { continue; }
+
+                            Statx status;
+                            int result = StatAt(
+                                duplicatedDescriptor,
+                                String.Empty,
+                                AT_EMPTY_PATH | AT_NO_AUTOMOUNT,
+                                STATX_TYPE | STATX_NLINK | STATX_INO | STATX_SIZE,
+                                out status);
+                            if (result != 0) {
+                                throw new IOException("Could not inspect a duplicated unlinked descriptor (errno " + GetErrno() + "): " + stableDescriptorPath);
+                            }
+                            uint requiredMask = STATX_TYPE | STATX_NLINK | STATX_INO | STATX_SIZE;
+                            if ((status.Mask & requiredMask) != requiredMask) {
+                                throw new IOException("Unlinked descriptor inspection did not receive all required metadata: " + stableDescriptorPath);
+                            }
+                            if (status.LinkCount != 0 || (status.Mode & S_IFMT) != S_IFREG) { continue; }
+                            string identity = status.DeviceMajor.ToString() + ":" + status.DeviceMinor.ToString() + ":" + status.Inode.ToString();
+                            if (!identities.Add(identity)) { continue; }
+                            if (identities.Count > maximumEntries) {
+                                throw new IOException("Writable root exceeded the aggregate writable-entry-count limit of " + maximumEntries + " while accounting for open unlinked files.");
+                            }
+                            if (status.Size > Int64.MaxValue || (long)status.Size > Int64.MaxValue - bytes) {
+                                throw new IOException("Open-unlinked size overflowed the bounded accounting range.");
+                            }
+                            bytes += (long)status.Size;
+                        }
+                        finally {
+                            CloseFileDescriptor(duplicatedDescriptor);
+                        }
                     }
                 }
             }

@@ -1064,4 +1064,112 @@ Describe 'Bounded writable-root enumeration behavior' {
         }, $true)
         $boundary.Extent.Text | Should -Not -Match '\.ToArray\(\)'
     }
+
+    # Scenario: A worker thread unshares CLONE_FILES and owns an fd table that /proc/<tgid>/fd does not expose.
+    # Purpose: Require open-unlinked accounting to enumerate every /proc/<tgid>/task/<tid>/fd table.
+    It 'UnitT135_EnumeratesEveryBoundaryTaskDescriptorTable' {
+        $source = $ast.Extent.Text
+        $source | Should -Match 'Path\.Combine\(processPath, "task"\)'
+        $source | Should -Match 'Directory\.GetDirectories\(taskRoot\)'
+        $source | Should -Match 'Path\.Combine\(taskPath, "fd"\)'
+        $source | Should -Not -Match 'Path\.Combine\(processPath, "fd"\)'
+    }
+
+    # Scenario: A real managed worker thread owns an unshared descriptor table and retains one deleted file.
+    # Purpose: Prove the native inspector accounts the thread-private fd instead of scanning only the TGID table.
+    It 'InterT140_AccountsAThreadPrivateOpenUnlinkedFile' {
+        if (-not $script:HostIsLinux) {
+            Set-ItResult -Skipped -Because 'thread-private procfs descriptor accounting is Linux-only'
+            return
+        }
+        if ($null -eq ('Codex.Validation.Tests.PrivateDescriptorTableFixture' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace Codex.Validation.Tests {
+    public static class PrivateDescriptorTableFixture {
+        private const int CloneFiles = 0x00000400;
+        private const int OpenReadWrite = 0x0002;
+        private const int OpenCreate = 0x0040;
+        private const int OpenExclusive = 0x0080;
+        private const int OpenCloseOnExec = 0x80000;
+        private static ManualResetEventSlim ready;
+        private static ManualResetEventSlim release;
+        private static Thread worker;
+        private static Exception workerError;
+
+        [DllImport("libc.so.6", EntryPoint = "unshare", SetLastError = true)]
+        private static extern int Unshare(int flags);
+        [DllImport("libc.so.6", EntryPoint = "open", SetLastError = true)]
+        private static extern int Open(string path, int flags, uint mode);
+        [DllImport("libc.so.6", EntryPoint = "ftruncate", SetLastError = true)]
+        private static extern int Truncate(int fileDescriptor, long length);
+        [DllImport("libc.so.6", EntryPoint = "unlink", SetLastError = true)]
+        private static extern int Unlink(string path);
+        [DllImport("libc.so.6", EntryPoint = "close", SetLastError = true)]
+        private static extern int Close(int fileDescriptor);
+
+        public static void Start(string path, long length) {
+            if (worker != null) throw new InvalidOperationException("The private descriptor fixture is already running.");
+            ready = new ManualResetEventSlim(false);
+            release = new ManualResetEventSlim(false);
+            workerError = null;
+            worker = new Thread(() => {
+                int fileDescriptor = -1;
+                try {
+                    if (Unshare(CloneFiles) != 0) throw new IOException("unshare(CLONE_FILES) failed with errno " + Marshal.GetLastWin32Error() + ".");
+                    fileDescriptor = Open(path, OpenReadWrite | OpenCreate | OpenExclusive | OpenCloseOnExec, 384);
+                    if (fileDescriptor < 0) throw new IOException("open failed with errno " + Marshal.GetLastWin32Error() + ".");
+                    if (Truncate(fileDescriptor, length) != 0) throw new IOException("ftruncate failed with errno " + Marshal.GetLastWin32Error() + ".");
+                    if (Unlink(path) != 0) throw new IOException("unlink failed with errno " + Marshal.GetLastWin32Error() + ".");
+                    ready.Set();
+                    release.Wait();
+                }
+                catch (Exception error) {
+                    workerError = error;
+                    ready.Set();
+                }
+                finally {
+                    if (fileDescriptor >= 0) Close(fileDescriptor);
+                }
+            });
+            worker.IsBackground = true;
+            worker.Start();
+            if (!ready.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("The private descriptor fixture did not become ready.");
+            if (workerError != null) throw new InvalidOperationException("The private descriptor fixture failed.", workerError);
+        }
+
+        public static void Stop() {
+            if (worker == null) return;
+            release.Set();
+            if (!worker.Join(TimeSpan.FromSeconds(10))) throw new TimeoutException("The private descriptor fixture did not stop.");
+            ready.Dispose();
+            release.Dispose();
+            worker = null;
+            ready = null;
+            release = null;
+            workerError = null;
+        }
+    }
+}
+'@
+        }
+
+        $path = Join-Path $script:UsageRoot 'thread-private-open-unlinked'
+        [Codex.Validation.Tests.PrivateDescriptorTableFixture]::Start($path, 65539)
+        try {
+            $usage = Invoke-LinuxOpenUnlinkedInspection `
+                -ProcessIds ([int[]]@($PID)) `
+                -Root $script:UsageRoot `
+                -MaximumEntries 100000
+            $usage.EntryCount | Should -Be 1
+            $usage.Bytes | Should -Be 65539
+        }
+        finally {
+            [Codex.Validation.Tests.PrivateDescriptorTableFixture]::Stop()
+        }
+    }
 }
