@@ -1474,4 +1474,33 @@ namespace Codex.Validation.Tests {
         $getRootSource | Should -Not -Match ([regex]::Escape("^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+$"))
         $getRootSource | Should -Match 'Protected Pester validation is not running inside the delegated Linux cgroup subtree'
     }
+
+    # Scenario: Hosted protected Pester exceeded the former 300-second aggregate CPU ceiling while remaining inside its 15-minute wall deadline.
+    # Purpose: Permit that measured trusted regression workload without loosening the 300-second default for ordinary candidate-native boundaries.
+    It 'UnitT190_UsesASeparateBoundedCpuBudgetForProtectedPester' {
+        $aggregate = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-LinuxAggregateResourceUsage'
+        }, $true)
+        $protectedPester = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
+        }, $true)
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+
+        foreach ($functionAst in @($aggregate, $protectedPester, $invokeNative)) {
+            $functionAst | Should -Not -BeNullOrEmpty
+        }
+        if ($null -in @($aggregate, $protectedPester, $invokeNative)) { return }
+
+        $aggregateSource = $aggregate.Extent.Text
+        $aggregateSource | Should -Match '\[int64\]\s+\$MaxCpuSeconds\s*=\s*300'
+        $aggregateSource | Should -Match '\$MaxCpuSeconds\s*\*\s*1000000'
+        $aggregateSource | Should -Match '\$MaxCpuSeconds\s*\*\s*\$ClockTicksPerSecond'
+        $aggregateSource | Should -Match 'CPU limit of \$MaxCpuSeconds seconds'
+
+        $protectedPesterSource = $protectedPester.Extent.Text
+        $protectedPesterSource | Should -Match 'Assert-LinuxAggregateResourceUsage[\s\S]*?-MaxCpuSeconds\s+900[\s\S]*?-Context ''Protected Pester remote pipeline'''
+        $invokeNative.Extent.Text | Should -Not -Match '-MaxCpuSeconds\s+900'
+    }
 }

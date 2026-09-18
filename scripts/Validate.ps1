@@ -662,6 +662,7 @@ function Assert-LinuxAggregateResourceUsage {
         [Parameter(Mandatory = $true)][int64] $ClockTicksPerSecond,
         [Parameter()][AllowNull()][string] $CgroupPath,
         [Parameter()][AllowNull()][string] $CgroupAccountingPath,
+        [Parameter()][ValidateRange(1, 3600)][int64] $MaxCpuSeconds = 300,
         [Parameter(Mandatory = $true)][string] $Context
     )
     if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
@@ -686,8 +687,9 @@ function Assert-LinuxAggregateResourceUsage {
             throw "$Context exceeded the kernel-accounted Linux cgroup process-count limit of 256."
         }
         $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $accountingPath -Context $Context
-        if ($cgroupCpuMicroseconds -gt [int64]300000000) {
-            throw "$Context exceeded the kernel-accounted Linux cgroup CPU limit of 300 seconds."
+        $cpuLimitMicroseconds = [int64]$MaxCpuSeconds * 1000000
+        if ($cgroupCpuMicroseconds -gt $cpuLimitMicroseconds) {
+            throw "$Context exceeded the kernel-accounted Linux cgroup CPU limit of $MaxCpuSeconds seconds."
         }
         return
     }
@@ -711,7 +713,7 @@ function Assert-LinuxAggregateResourceUsage {
     }
     if ($candidateIds.Count -gt 256) { throw "$Context exceeded the aggregate Linux process-count limit of 256." }
     if ($memoryBytes -gt 2147483648) { throw "$Context exceeded the aggregate Linux resident-memory limit of 2147483648 bytes." }
-    if ($cpuTicks -gt ([int64]300 * $ClockTicksPerSecond)) { throw "$Context exceeded the aggregate Linux CPU limit of 300 seconds." }
+    if ($cpuTicks -gt ([int64]$MaxCpuSeconds * $ClockTicksPerSecond)) { throw "$Context exceeded the aggregate Linux CPU limit of $MaxCpuSeconds seconds." }
 }
 
 function Get-LinuxCgroupCpuUsage {
@@ -5652,6 +5654,7 @@ function Invoke-ProtectedPesterRunspace {
                     -RootProcessId $serverProcessInstance.Process.Id `
                     -ClockTicksPerSecond $linuxClockTicksPerSecond `
                     -CgroupPath $linuxPesterCgroupPath `
+                    -MaxCpuSeconds 900 `
                     -Context 'Protected Pester remote pipeline'
             }
             Start-Sleep -Milliseconds 50
