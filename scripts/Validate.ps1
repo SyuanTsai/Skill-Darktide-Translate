@@ -6600,11 +6600,14 @@ $pesterConfiguration.Run.PassThru = $true
 $pesterConfiguration.TestRegistry.Enabled = $false
 # Windows PowerShell 5.1 treats a missing OrderedDictionary key accessed
 # through the ETS member adapter as null, while PowerShell 7 raises under
-# StrictMode 2+. The immutable base localization contract intentionally checks
-# the optional idempotent receipt field this way. Preserve uninitialized-
-# variable checks while matching the Windows boundary only inside this isolated
-# Unix test worker; do not add ETS members that alter receipt serialization.
-if (-not [OperatingSystem]::IsWindows()) { Set-StrictMode -Version 1.0 }
+# StrictMode 2+. Only the immutable localization shard relies on that legacy
+# behavior for an optional idempotent receipt field. Preserve StrictMode Latest
+# for every unrelated shard so missing-schema regressions remain terminating;
+# do not add ETS members that alter receipt serialization.
+if (-not [OperatingSystem]::IsWindows() -and
+    [string]$selectedPesterTests[0] -ceq 'LocalizationWorkset.Tests.ps1') {
+    Set-StrictMode -Version 1.0
+}
 $result = Invoke-Pester -Configuration $pesterConfiguration
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
