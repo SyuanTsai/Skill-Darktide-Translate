@@ -797,6 +797,10 @@ steps:
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
         $supervisor | Should -Match '\[string\[\]\] \$TestNames'
         $supervisor | Should -Match "AddParameter\('TestNames'"
+        $supervisor | Should -Match '\[string\] \$PesterTrustedTestCommit'
+        $supervisor | Should -Match "AddParameter\('TrustedTestCommit'"
+        $supervisor | Should -Match "Set-Variable -Name 'trustedTestCommit' -Scope Global"
+        $supervisor | Should -Match "BootstrapTransition\.Tests\.ps1"
         $supervisor | Should -Match 'foreach \(\$requiredPesterTest in \$requiredPesterTests\)'
         $supervisor | Should -Match '\$aggregateTotalCount'
         $supervisor | Should -Match 'per-candidate 300-second CPU'

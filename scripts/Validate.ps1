@@ -27,6 +27,7 @@ param(
     [string] $PesterChildWritableRoot,
     [string] $PesterDiagnosticRoot,
     [string] $PesterRunnerSha256,
+    [string] $PesterTrustedTestCommit,
     [string] $PesterProxyPowerShellPath,
     [string] $PesterProxyWorkingDirectory,
     [string] $PesterProxyDiagnosticRoot,
@@ -5553,6 +5554,7 @@ function Invoke-ProtectedPesterRunspace {
         [Parameter(Mandatory = $true)][int64] $WritableRootBaselineBytes,
         [Parameter(Mandatory = $true)][string] $RunnerSha256,
         [Parameter(Mandatory = $true)][string[]] $TestNames,
+        [Parameter(Mandatory = $true)][string] $TrustedTestCommit,
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
     )
     if (-not (Test-Path -LiteralPath $SupervisorPath -PathType Leaf)) {
@@ -5560,6 +5562,9 @@ function Invoke-ProtectedPesterRunspace {
     }
     if (@($TestNames).Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$TestNames[0])) {
         throw 'Protected Pester runspace must receive exactly one trusted test file per resource shard.'
+    }
+    if ($TrustedTestCommit -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'Protected Pester runspace requires the exact trusted test authority commit.'
     }
     $diagnosticRootFullPath = [IO.Path]::GetFullPath($DiagnosticRoot)
     $childWritableRootPath = [IO.Path]::GetFullPath($ChildWritableRoot)
@@ -5643,6 +5648,7 @@ function Invoke-ProtectedPesterRunspace {
         [void]$powerShell.AddParameter('PesterModulePath', $PesterModulePath)
         [void]$powerShell.AddParameter('ExpectedPesterVersion', $ExpectedPesterVersion)
         [void]$powerShell.AddParameter('TestNames', [string[]]$TestNames)
+        [void]$powerShell.AddParameter('TrustedTestCommit', $TrustedTestCommit)
         $asyncResult = $powerShell.BeginInvoke()
         $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
         while (-not $asyncResult.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
@@ -5732,7 +5738,8 @@ function Invoke-ProtectedPesterSupervisor {
         [Parameter(Mandatory = $true)][string] $SupervisorPath,
         [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
-        [Parameter(Mandatory = $true)][string] $RunnerSha256
+        [Parameter(Mandatory = $true)][string] $RunnerSha256,
+        [Parameter(Mandatory = $true)][string] $TrustedTestCommit
     )
     $completionMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
     if ($completionMarker -notmatch '^SGV1-Pester-Supervisor-[0-9a-f]{32}:$') {
@@ -5785,6 +5792,7 @@ function Invoke-ProtectedPesterSupervisor {
             -WritableRootBaselineBytes $linuxWritableRootBaselineBytes `
             -RunnerSha256 $RunnerSha256 `
             -TestNames @($requiredPesterTest) `
+            -TrustedTestCommit $TrustedTestCommit `
             -TimeoutMilliseconds 300000
 
         Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
@@ -5861,7 +5869,8 @@ if ($ProtectedPesterSupervisor) {
         -SupervisorPath $PesterSupervisorPath `
         -ChildWritableRoot $PesterChildWritableRoot `
         -DiagnosticRoot $PesterDiagnosticRoot `
-        -RunnerSha256 $PesterRunnerSha256
+        -RunnerSha256 $PesterRunnerSha256 `
+        -TrustedTestCommit $PesterTrustedTestCommit
     exit 0
 }
 
@@ -6417,7 +6426,8 @@ param(
     [Parameter(Mandatory = $true)][string] $TestsRoot,
     [Parameter(Mandatory = $true)][string] $PesterModulePath,
     [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
-    [Parameter(Mandatory = $true)][string[]] $TestNames
+    [Parameter(Mandatory = $true)][string[]] $TestNames,
+    [Parameter(Mandatory = $true)][string] $TrustedTestCommit
 )
 
 Set-StrictMode -Version Latest
@@ -6513,6 +6523,18 @@ $selectedPesterTests = @($TestNames)
 if ($selectedPesterTests.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$selectedPesterTests[0]) -or
     $requiredPesterTests -cnotcontains [string]$selectedPesterTests[0]) {
     throw 'The trusted Pester worker received a test file outside the immutable required inventory.'
+}
+if ($TrustedTestCommit -cnotmatch '^[0-9a-f]{40}$') {
+    throw 'The trusted Pester worker received an invalid trusted test authority commit.'
+}
+# The immutable bootstrap binding test extracts the canonical workflow fragment
+# beginning after its trustedTestCommit assignment. Windows test execution had
+# resolved the surrounding workflow-scope value; provide that same already
+# verified authority value explicitly on Unix without weakening StrictMode or
+# changing the immutable oracle file.
+if (-not [OperatingSystem]::IsWindows() -and
+    [string]$selectedPesterTests[0] -ceq 'BootstrapTransition.Tests.ps1') {
+    Set-Variable -Name 'trustedTestCommit' -Scope Global -Value $TrustedTestCommit
 }
 $requiredPesterTests = @($requiredPesterTests | Where-Object {
     $selectedPesterTests -ccontains $_
@@ -6633,7 +6655,8 @@ $pesterOutput = Invoke-TrustedPowerShellProcess -Command $powerShellPath -Argume
     '-PesterSupervisorPath', $trustedPesterSupervisorPath,
     '-PesterChildWritableRoot', $childOutputRoot,
     '-PesterDiagnosticRoot', $runRoot,
-    '-PesterRunnerSha256', $pesterRunnerSha256
+    '-PesterRunnerSha256', $pesterRunnerSha256,
+    '-PesterTrustedTestCommit', $trustedPesterCommit
 ) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 1200000
 $trustedPesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
 if ($trustedPesterSupervisorActualSha256 -cne $trustedPesterSupervisorSha256) {
