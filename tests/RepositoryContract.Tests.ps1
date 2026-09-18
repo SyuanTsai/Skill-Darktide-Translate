@@ -1383,10 +1383,35 @@ namespace Codex.Validation.Tests {
         $nativeSource | Should -Match 'workload_cgroup_path="\$\{14\}"'
         $nativeSource | Should -Match '(?s)\$unshare_path.*?/bin/sh\s+-c.*?cgroup\.procs.*?exec.*?\$chroot_path'
         $nativeSource | Should -Match 'Assert-LinuxWritableRootUsage[\s\S]*?-CgroupPath\s+\$linuxNativeWorkloadCgroupPath'
+        ([regex]::Matches(
+            $nativeSource,
+            'Assert-LinuxAggregateResourceUsage[\s\S]{0,320}?-CgroupPath\s+\$linuxNativeWorkloadCgroupPath'
+        )).Count | Should -Be 2
         $workloadCleanupIndex = $nativeSource.LastIndexOf('Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeWorkloadCgroupPath', [StringComparison]::Ordinal)
         $parentCleanupIndex = $nativeSource.LastIndexOf('Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeCgroupPath', [StringComparison]::Ordinal)
         $workloadCleanupIndex | Should -BeGreaterOrEqual 0
         $parentCleanupIndex | Should -BeGreaterThan $workloadCleanupIndex
         $nativeSource | Should -Not -Match 'sudo'
+    }
+
+    # Scenario: Short-lived candidate descendants may disappear from procfs while their cgroup accounting remains durable.
+    # Purpose: Require cgroup-backed native boundaries to use kernel memory, PID and CPU totals without falling back to racy per-process sampling.
+    It 'UnitT175_UsesKernelAggregateAccountingForNativeWorkloadCgroups' {
+        $aggregate = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-LinuxAggregateResourceUsage'
+        }, $true)
+        $aggregate | Should -Not -BeNullOrEmpty
+        if ($null -eq $aggregate) { return }
+
+        $aggregateSource = $aggregate.Extent.Text
+        $aggregateSource | Should -Match 'Join-Path\s+\$CgroupPath\s+''memory\.current'''
+        $aggregateSource | Should -Match 'Join-Path\s+\$CgroupPath\s+''pids\.current'''
+        $aggregateSource | Should -Match 'Get-LinuxCgroupCpuUsage\s+-CgroupPath\s+\$CgroupPath'
+        $cgroupBranchIndex = $aggregateSource.IndexOf("if (-not [string]::IsNullOrWhiteSpace(`$CgroupPath))", [StringComparison]::Ordinal)
+        $procfsIndex = $aggregateSource.IndexOf('Get-LinuxBoundaryProcessIds', [StringComparison]::Ordinal)
+        $cgroupReturnIndex = $aggregateSource.IndexOf('return', $cgroupBranchIndex, [StringComparison]::Ordinal)
+        $cgroupBranchIndex | Should -BeGreaterOrEqual 0
+        $cgroupReturnIndex | Should -BeGreaterThan $cgroupBranchIndex
+        $procfsIndex | Should -BeGreaterThan $cgroupReturnIndex
     }
 }

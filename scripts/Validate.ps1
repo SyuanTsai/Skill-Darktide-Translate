@@ -663,6 +663,31 @@ function Assert-LinuxAggregateResourceUsage {
         [Parameter()][AllowNull()][string] $CgroupPath,
         [Parameter(Mandatory = $true)][string] $Context
     )
+    if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
+        $memoryCurrentPath = Join-Path $CgroupPath 'memory.current'
+        $pidsCurrentPath = Join-Path $CgroupPath 'pids.current'
+        foreach ($requiredPath in @($memoryCurrentPath, $pidsCurrentPath)) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+                throw "$Context requires kernel-maintained Linux cgroup aggregate accounting."
+            }
+        }
+        $memoryCurrentText = ([IO.File]::ReadAllText($memoryCurrentPath)).Trim()
+        $pidsCurrentText = ([IO.File]::ReadAllText($pidsCurrentPath)).Trim()
+        if ($memoryCurrentText -notmatch '^[0-9]+$' -or $pidsCurrentText -notmatch '^[0-9]+$') {
+            throw "$Context received invalid Linux cgroup aggregate accounting."
+        }
+        if ([int64]$memoryCurrentText -gt 2147483648) {
+            throw "$Context exceeded the kernel-accounted Linux cgroup memory limit of 2147483648 bytes."
+        }
+        if ([int64]$pidsCurrentText -gt 256) {
+            throw "$Context exceeded the kernel-accounted Linux cgroup process-count limit of 256."
+        }
+        $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $CgroupPath -Context $Context
+        if ($cgroupCpuMicroseconds -gt [int64]300000000) {
+            throw "$Context exceeded the kernel-accounted Linux cgroup CPU limit of 300 seconds."
+        }
+        return
+    }
     $candidateIds = @(Get-LinuxBoundaryProcessIds `
         -RootProcessId $RootProcessId `
         -ProcessGroupId $ProcessGroupId `
@@ -684,12 +709,6 @@ function Assert-LinuxAggregateResourceUsage {
     if ($candidateIds.Count -gt 256) { throw "$Context exceeded the aggregate Linux process-count limit of 256." }
     if ($memoryBytes -gt 2147483648) { throw "$Context exceeded the aggregate Linux resident-memory limit of 2147483648 bytes." }
     if ($cpuTicks -gt ([int64]300 * $ClockTicksPerSecond)) { throw "$Context exceeded the aggregate Linux CPU limit of 300 seconds." }
-    if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
-        $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $CgroupPath -Context $Context
-        if ($cgroupCpuMicroseconds -gt [int64]300000000) {
-            throw "$Context exceeded the kernel-accounted Linux cgroup CPU limit of 300 seconds."
-        }
-    }
 }
 
 function Get-LinuxCgroupCpuUsage {
@@ -4939,7 +4958,12 @@ finally {
                     -BaselineBytes $linuxWritableRootBaselineBytes `
                     -Context $Context `
                     -CgroupPath $linuxNativeWorkloadCgroupPath)
-                Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
+                Assert-LinuxAggregateResourceUsage `
+                    -RootProcessId $childProcessId `
+                    -ProcessGroupId $childProcessGroupId `
+                    -ClockTicksPerSecond $linuxClockTicksPerSecond `
+                    -CgroupPath $linuxNativeWorkloadCgroupPath `
+                    -Context $Context
             }
             while (-not $childProcess.HasExited) {
                 if ([DateTime]::UtcNow -ge $processDeadline) {
@@ -4953,7 +4977,12 @@ finally {
                         -BaselineBytes $linuxWritableRootBaselineBytes `
                         -Context $Context `
                         -CgroupPath $linuxNativeWorkloadCgroupPath)
-                    Assert-LinuxAggregateResourceUsage -RootProcessId $childProcessId -ProcessGroupId $childProcessGroupId -ClockTicksPerSecond $linuxClockTicksPerSecond -Context $Context
+                    Assert-LinuxAggregateResourceUsage `
+                        -RootProcessId $childProcessId `
+                        -ProcessGroupId $childProcessGroupId `
+                        -ClockTicksPerSecond $linuxClockTicksPerSecond `
+                        -CgroupPath $linuxNativeWorkloadCgroupPath `
+                        -Context $Context
                 }
             }
             Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -ProcessGroupId $childProcessGroupId -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
