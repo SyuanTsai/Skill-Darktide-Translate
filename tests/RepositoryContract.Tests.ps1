@@ -1344,27 +1344,34 @@ namespace Codex.Validation.Tests {
         $runspaceSource | Should -Not -Match 'Add-LinuxProcessTreeToCgroup'
     }
 
-    # Scenario: PowerShell's FileSystem provider enumerates cgroupfs control files as children and prompts for recursion.
-    # Purpose: Remove an already-unpopulated cgroup with the non-recursive OS directory operation instead of an interactive provider command.
+    # Scenario: CPU accounting must remain readable after every cgroup process is killed, while cgroupfs still rejects recursive provider deletion.
+    # Purpose: Separate bounded evacuation from non-recursive removal so callers can inspect persistent counters between those phases.
     It 'UnitT160_RemovesUnpopulatedLinuxCgroupsWithoutProviderPrompts' {
         $newCgroup = $ast.Find({ param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-LinuxCandidateCgroup'
+        }, $true)
+        $stopCgroup = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Stop-LinuxCandidateCgroup'
         }, $true)
         $removeCgroup = $ast.Find({ param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Remove-LinuxCandidateCgroup'
         }, $true)
 
         $newCgroup | Should -Not -BeNullOrEmpty
+        $stopCgroup | Should -Not -BeNullOrEmpty
         $removeCgroup | Should -Not -BeNullOrEmpty
-        if ($null -in @($newCgroup, $removeCgroup)) { return }
+        if ($null -in @($newCgroup, $stopCgroup, $removeCgroup)) { return }
 
         $newSource = $newCgroup.Extent.Text
+        $stopSource = $stopCgroup.Extent.Text
         $removeSource = $removeCgroup.Extent.Text
         $newSource | Should -Match '\[IO\.Directory\]::Delete\(\$cgroupPath\)'
+        $stopSource | Should -Match '\[string\]\$Matches\[''value''\]\s+-eq\s+''0'''
+        $removeSource | Should -Match 'Stop-LinuxCandidateCgroup\s+-CgroupPath\s+\$CgroupPath'
         $removeSource | Should -Match '\[IO\.Directory\]::Delete\(\$CgroupPath\)'
         $newSource | Should -Not -Match 'Remove-Item[^\r\n]*\$cgroupPath'
+        $stopSource | Should -Not -Match 'Remove-Item[^\r\n]*\$CgroupPath'
         $removeSource | Should -Not -Match 'Remove-Item[^\r\n]*\$CgroupPath'
-        $removeSource | Should -Match '\[string\]\$Matches\[''value''\]\s+-eq\s+''0'''
     }
 
     # Scenario: Managed filesystem enumeration inspects procfs fd symlinks and can reject an otherwise readable frozen task table.
@@ -1408,7 +1415,7 @@ namespace Codex.Validation.Tests {
         ([regex]::Matches(
             $nativeSource,
             'Assert-LinuxAggregateResourceUsage[\s\S]{0,320}?-CgroupPath\s+\$linuxNativeWorkloadCgroupPath'
-        )).Count | Should -Be 2
+        )).Count | Should -Be 3
         $workloadCleanupIndex = $nativeSource.LastIndexOf('Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeWorkloadCgroupPath', [StringComparison]::Ordinal)
         $parentCleanupIndex = $nativeSource.LastIndexOf('Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeCgroupPath', [StringComparison]::Ordinal)
         $workloadCleanupIndex | Should -BeGreaterOrEqual 0
@@ -1445,7 +1452,43 @@ namespace Codex.Validation.Tests {
         ([regex]::Matches(
             $nativeSource,
             'Assert-LinuxAggregateResourceUsage[\s\S]{0,420}?-CgroupPath\s+\$linuxNativeWorkloadCgroupPath[\s\S]{0,160}?-CgroupAccountingPath\s+\$linuxNativeCgroupPath'
-        )).Count | Should -Be 2
+        )).Count | Should -Be 3
+    }
+
+    # Scenario: A Linux candidate can cross the aggregate CPU limit and exit between the last live poll and completion handling.
+    # Purpose: Require both native and protected-Pester paths to read persistent cgroup CPU usage once more before removing the cgroup.
+    It 'UnitT177_RechecksPersistentCgroupCpuAfterSuccessfulProcessCompletion' {
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $protectedPester = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
+        }, $true)
+
+        foreach ($functionAst in @($invokeNative, $protectedPester)) {
+            $functionAst | Should -Not -BeNullOrEmpty
+        }
+        if ($null -in @($invokeNative, $protectedPester)) { return }
+
+        $nativeSource = $invokeNative.Extent.Text
+        $nativeCompletionIndex = $nativeSource.IndexOf('if (-not $childProcess.WaitForExit(5000))', [StringComparison]::Ordinal)
+        $nativeFinalCheckIndex = $nativeSource.IndexOf('Assert-LinuxAggregateResourceUsage', $nativeCompletionIndex, [StringComparison]::Ordinal)
+        $nativeCleanupIndex = $nativeSource.LastIndexOf('Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeWorkloadCgroupPath', [StringComparison]::Ordinal)
+        $nativeCompletionIndex | Should -BeGreaterOrEqual 0
+        $nativeFinalCheckIndex | Should -BeGreaterThan $nativeCompletionIndex
+        $nativeCleanupIndex | Should -BeGreaterThan $nativeFinalCheckIndex
+        $nativeSource.Substring($nativeFinalCheckIndex, $nativeCleanupIndex - $nativeFinalCheckIndex) |
+            Should -Match 'CgroupAccountingPath\s+\$linuxNativeCgroupPath'
+
+        $protectedSource = $protectedPester.Extent.Text
+        $protectedCompletionIndex = $protectedSource.IndexOf('$output = @($powerShell.EndInvoke($asyncResult))', [StringComparison]::Ordinal)
+        $protectedQuiesceIndex = $protectedSource.IndexOf('Stop-LinuxCandidateCgroup -CgroupPath $linuxPesterCgroupPath', $protectedCompletionIndex, [StringComparison]::Ordinal)
+        $protectedFinalCheckIndex = $protectedSource.IndexOf('Assert-LinuxAggregateResourceUsage', $protectedCompletionIndex, [StringComparison]::Ordinal)
+        $protectedCleanupIndex = $protectedSource.IndexOf('Remove-LinuxCandidateCgroup -CgroupPath $linuxPesterCgroupPath', $protectedCompletionIndex, [StringComparison]::Ordinal)
+        $protectedCompletionIndex | Should -BeGreaterOrEqual 0
+        $protectedQuiesceIndex | Should -BeGreaterThan $protectedCompletionIndex
+        $protectedFinalCheckIndex | Should -BeGreaterThan $protectedQuiesceIndex
+        $protectedCleanupIndex | Should -BeGreaterThan $protectedFinalCheckIndex
     }
 
     # Scenario: .NET reserves more virtual address space than its live resident memory while opening the protected Pester server.

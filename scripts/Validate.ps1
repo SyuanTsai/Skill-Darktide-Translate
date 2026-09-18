@@ -895,7 +895,7 @@ function New-LinuxCandidateWorkloadCgroup {
     }
 }
 
-function Remove-LinuxCandidateCgroup {
+function Stop-LinuxCandidateCgroup {
     param([Parameter()][AllowNull()][string] $CgroupPath)
     if (-not $script:IsLinuxHost -or [string]::IsNullOrWhiteSpace($CgroupPath)) { return }
     $killPath = Join-Path $CgroupPath 'cgroup.kill'
@@ -913,19 +913,33 @@ function Remove-LinuxCandidateCgroup {
         if ($events -notmatch '(?m)^populated\s+(?<value>[01])\s*$') {
             throw 'Linux candidate cgroup cleanup received an invalid cgroup.events population record.'
         }
-        if ([string]$Matches['value'] -eq '0') {
-            # PowerShell's FileSystem provider treats cgroupfs control files as
-            # ordinary children and prompts for recursive deletion.  A cgroup
-            # must instead be removed with the underlying non-recursive rmdir
-            # operation after cgroup.events proves it is unpopulated.
-            try { [IO.Directory]::Delete($CgroupPath) } catch { }
-            if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
-        }
+        if ([string]$Matches['value'] -eq '0') { return }
         if ([DateTime]::UtcNow -ge $deadline) { break }
         Start-Sleep -Milliseconds 25
     }
     if (Test-Path -LiteralPath $CgroupPath -PathType Container) {
-        throw 'Linux candidate cgroup cleanup did not evacuate and remove the cgroup within the bounded cleanup window.'
+        throw 'Linux candidate cgroup cleanup did not evacuate the cgroup within the bounded cleanup window.'
+    }
+}
+
+function Remove-LinuxCandidateCgroup {
+    param([Parameter()][AllowNull()][string] $CgroupPath)
+    if (-not $script:IsLinuxHost -or [string]::IsNullOrWhiteSpace($CgroupPath)) { return }
+    Stop-LinuxCandidateCgroup -CgroupPath $CgroupPath
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    for ($attempt = 0; $attempt -lt 120; $attempt++) {
+        if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
+        # PowerShell's FileSystem provider treats cgroupfs control files as
+        # ordinary children and prompts for recursive deletion.  A cgroup must
+        # instead use the underlying non-recursive rmdir operation after the
+        # stop phase proves cgroup.events is unpopulated.
+        try { [IO.Directory]::Delete($CgroupPath) } catch { }
+        if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        Start-Sleep -Milliseconds 25
+    }
+    if (Test-Path -LiteralPath $CgroupPath -PathType Container) {
+        throw 'Linux candidate cgroup cleanup did not remove the evacuated cgroup within the bounded cleanup window.'
     }
 }
 
@@ -4999,6 +5013,15 @@ finally {
             if (-not $childProcess.WaitForExit(5000)) {
                 throw "$Context process did not terminate after process-boundary cleanup."
             }
+            if ($script:IsLinuxHost) {
+                Assert-LinuxAggregateResourceUsage `
+                    -RootProcessId $childProcessId `
+                    -ProcessGroupId $childProcessGroupId `
+                    -ClockTicksPerSecond $linuxClockTicksPerSecond `
+                    -CgroupPath $linuxNativeWorkloadCgroupPath `
+                    -CgroupAccountingPath $linuxNativeCgroupPath `
+                    -Context $Context
+            }
             if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
                 throw "$Context left redirected output handles open after process-tree cleanup."
             }
@@ -5687,6 +5710,14 @@ function Invoke-ProtectedPesterRunspace {
         $output = @($powerShell.EndInvoke($asyncResult))
         if ($powerShell.InvocationStateInfo.State -ne [Management.Automation.PSInvocationState]::Completed) {
             throw "Protected Pester remote pipeline did not complete normally: $($powerShell.InvocationStateInfo.State)."
+        }
+        if ($script:IsLinuxHost) {
+            Stop-LinuxCandidateCgroup -CgroupPath $linuxPesterCgroupPath
+            Assert-LinuxAggregateResourceUsage `
+                -RootProcessId $serverProcessInstance.Process.Id `
+                -ClockTicksPerSecond $linuxClockTicksPerSecond `
+                -CgroupPath $linuxPesterCgroupPath `
+                -Context 'Protected Pester remote pipeline'
         }
         if ($output.Count -ne 1) {
             throw 'Protected Pester remote pipeline did not return exactly one completion payload.'
