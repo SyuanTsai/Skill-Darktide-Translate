@@ -307,6 +307,43 @@ function Get-UnixProcessGroupProcessIds {
     return @($members.ToArray())
 }
 
+function ConvertFrom-LinuxProcessResourceUsageMetadata {
+    param(
+        [Parameter(Mandatory = $true)][int] $ProcessId,
+        [Parameter(Mandatory = $true)][string] $Stat,
+        [Parameter(Mandatory = $true)][string] $Status
+    )
+    $closeParen = $Stat.LastIndexOf(')')
+    if ($closeParen -lt 0) { throw "Could not parse Linux process ${ProcessId} resource metadata." }
+    $fields = @([regex]::Split($Stat.Substring($closeParen + 1).Trim(), '\s+'))
+    if ($fields.Count -lt 15 -or
+        [string]$fields[11] -notmatch '^[0-9]+$' -or [string]$fields[12] -notmatch '^[0-9]+$' -or
+        [string]$fields[13] -notmatch '^[0-9]+$' -or [string]$fields[14] -notmatch '^[0-9]+$') {
+        throw "Could not parse Linux CPU usage for process ${ProcessId}."
+    }
+    $memoryMatch = [regex]::Match($Status, '(?m)^VmRSS:\s+(?<kilobytes>[0-9]+)\s+kB\s*$')
+    if ($memoryMatch.Success) {
+        $memoryBytes = [int64]$memoryMatch.Groups['kilobytes'].Value * 1024
+    }
+    elseif ([string]$fields[0] -ceq 'Z' -and $Status -match '(?m)^State:\s+Z(?:\s|$)') {
+        # Linux zombies retain accounted CPU until reaped but have no resident
+        # address space, so /proc/<pid>/status legitimately omits VmRSS.
+        $memoryBytes = [int64]0
+    }
+    else {
+        throw "Could not parse Linux resident memory for process ${ProcessId}."
+    }
+    return [pscustomobject][ordered]@{
+        processId = $ProcessId
+        memoryBytes = $memoryBytes
+        # utime/stime cover the live process; cutime/cstime preserve CPU
+        # consumed by children that have already been reaped by this process.
+        # Summing them across live processes does not double-count live
+        # descendants because Linux only reports child time after wait/reap.
+        cpuTicks = [int64]$fields[11] + [int64]$fields[12] + [int64]$fields[13] + [int64]$fields[14]
+    }
+}
+
 function Get-LinuxProcessResourceUsage {
     param(
         [Parameter(Mandatory = $true)][int] $ProcessId
@@ -321,25 +358,7 @@ function Get-LinuxProcessResourceUsage {
     catch {
         throw "Could not inspect Linux resource usage for process ${ProcessId}: $($_.Exception.Message)"
     }
-    $closeParen = $stat.LastIndexOf(')')
-    if ($closeParen -lt 0) { throw "Could not parse Linux process ${ProcessId} resource metadata." }
-    $fields = @([regex]::Split($stat.Substring($closeParen + 1).Trim(), '\s+'))
-    if ($fields.Count -lt 15 -or
-        [string]$fields[11] -notmatch '^[0-9]+$' -or [string]$fields[12] -notmatch '^[0-9]+$' -or
-        [string]$fields[13] -notmatch '^[0-9]+$' -or [string]$fields[14] -notmatch '^[0-9]+$') {
-        throw "Could not parse Linux CPU usage for process ${ProcessId}."
-    }
-    $memoryMatch = [regex]::Match($status, '(?m)^VmRSS:\s+(?<kilobytes>[0-9]+)\s+kB\s*$')
-    if (-not $memoryMatch.Success) { throw "Could not parse Linux resident memory for process ${ProcessId}." }
-    return [pscustomobject][ordered]@{
-        processId = $ProcessId
-        memoryBytes = [int64]$memoryMatch.Groups['kilobytes'].Value * 1024
-        # utime/stime cover the live process; cutime/cstime preserve CPU
-        # consumed by children that have already been reaped by this process.
-        # Summing them across live processes does not double-count live
-        # descendants because Linux only reports child time after wait/reap.
-        cpuTicks = [int64]$fields[11] + [int64]$fields[12] + [int64]$fields[13] + [int64]$fields[14]
-    }
+    return ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId $ProcessId -Stat $stat -Status $status
 }
 
 function Get-LinuxAggregateClockTicksPerSecond {

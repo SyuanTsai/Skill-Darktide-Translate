@@ -775,6 +775,7 @@ Describe 'Bounded writable-root enumeration behavior' {
         if (@($errors).Count -ne 0) { throw 'Validator must parse before behavioral testing.' }
         $script:HostIsLinux = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
         foreach ($name in @(
+            'ConvertFrom-LinuxProcessResourceUsageMetadata',
             'Enable-LinuxWritableRootInspector',
             'Invoke-LinuxWritableRootInspection',
             'Invoke-LinuxOpenUnlinkedInspection',
@@ -1023,5 +1024,19 @@ Describe 'Bounded writable-root enumeration behavior' {
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
         }, $true)
         $runspace.Extent.Text | Should -Match '(?s)Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath.*?-CgroupPath\s+\$linuxPesterCgroupPath'
+    }
+
+    # Scenario: A reaped-later child is still present as a zombie, whose procfs status omits VmRSS.
+    # Purpose: Preserve its accumulated CPU while treating the kernel-defined no-resident-memory state as zero only for Z.
+    It 'UnitT125_AcceptsMissingVmRssOnlyForZombieProcesses' {
+        $stat = '21242 (fixture) Z 1 1 1 0 0 0 0 0 0 0 3 5 7 11'
+        $zombieStatus = "Name:`tfixture`nState:`tZ (zombie)`n"
+        $usage = ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId 21242 -Stat $stat -Status $zombieStatus
+        $usage.memoryBytes | Should -Be 0
+        $usage.cpuTicks | Should -Be 26
+
+        $liveStat = $stat -replace '\) Z ', ') S '
+        { ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId 21242 -Stat $liveStat -Status "Name:`tfixture`nState:`tS (sleeping)`n" } |
+            Should -Throw '*resident memory*'
     }
 }
