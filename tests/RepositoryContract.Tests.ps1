@@ -1236,6 +1236,10 @@ namespace Codex.Validation.Tests {
             $source | Should -Match ([regex]::Escape('"$mount_path" -t tmpfs -o size=536870912,nr_inodes=100001,nodev,nosuid tmpfs "$sandbox_root$child_writable_root"'))
             $source | Should -Not -Match ([regex]::Escape('"$mount_path" --bind "$child_writable_root" "$sandbox_root$child_writable_root"'))
             $source | Should -Match ([regex]::Escape('"$unshare_path" --mount --pid --fork --kill-child --mount-proc="$sandbox_root/proc"'))
+            $source | Should -Match '\[IO\.FileMode\]::CreateNew'
+            $source | Should -Match '\.child-writable-export-manifest'
+            $source | Should -Match ([regex]::Escape('manifest_path="${11}"'))
+            $source | Should -Not -Match ([regex]::Escape('manifest_path="$sandbox_root/'))
             $source | Should -Match "-xdev -mindepth 1 -printf '%y %s\\n'"
             $source | Should -Match 'd\|f\)'
             $source | Should -Not -Match '(?i)remove_path|rm\s+-rf'

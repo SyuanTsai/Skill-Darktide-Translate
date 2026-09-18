@@ -4262,6 +4262,7 @@ function Invoke-NativeChecked {
     $stderrTask = $null
     $maxProcessOutputCharacters = 4 * 1024 * 1024
     $linuxSandboxRoot = $null
+    $linuxExportManifestPath = $null
     $windowsResumeEventReleaseEligible = $false
     try {
         if ($ProtectRunnerCommandFiles) {
@@ -4367,6 +4368,16 @@ function Invoke-NativeChecked {
                 $linuxSandboxRoot = $sandboxRoot
                 [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
                 Assert-NoReparseAncestors -Path $sandboxRoot -Context "$Context Linux sandbox root"
+                $linuxExportManifestPath = "$sandboxRoot.child-writable-export-manifest"
+                $manifestStream = [IO.File]::Open(
+                    $linuxExportManifestPath,
+                    [IO.FileMode]::CreateNew,
+                    [IO.FileAccess]::Write,
+                    [IO.FileShare]::None
+                )
+                try { $manifestStream.Flush($true) }
+                finally { $manifestStream.Dispose() }
+                Assert-NoReparseAncestors -Path $linuxExportManifestPath -Context "$Context Linux export manifest"
                 $linuxReadonlyBindPaths = [Collections.Generic.List[string]]::new()
                 $addLinuxReadonlyBindPath = {
                     param([Parameter(Mandatory = $true)][string] $Path)
@@ -4451,8 +4462,9 @@ working_directory="$7"
 command_path="$8"
 copy_path="$9"
 unshare_path="${10}"
-bind_count="${11}"
-shift 11
+manifest_path="${11}"
+bind_count="${12}"
+shift 12
 "$mount_path" --make-rprivate /
 "$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
 mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
@@ -4559,7 +4571,6 @@ set +e
     "$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"' -- "$working_directory" "$command_path" "$@"
 candidate_status=$?
 set -e
-manifest_path="$sandbox_root/.child-writable-export-manifest"
 "$find_path" "$sandbox_root$child_writable_root" -xdev -mindepth 1 -printf '%y %s\n' > "$manifest_path"
 entry_count=0
 total_bytes=0
@@ -4585,7 +4596,7 @@ exit "$candidate_status"
                 $networkNamespaceArguments = if ($NetworkProfile -ceq 'Offline') { @('--net') } else { @() }
                 $linuxMountArguments = @(
                     $mountPath, $findPath, $chrootPath, $sandboxRoot, $diagnosticRootFullPath, $childWritableRootPath, $workingDirectory, $Command,
-                    $copyPath, $unsharePath, [string]$linuxReadonlyBindPaths.Count
+                    $copyPath, $unsharePath, $linuxExportManifestPath, [string]$linuxReadonlyBindPaths.Count
                 ) + @($linuxReadonlyBindPaths.ToArray()) + @($Arguments)
                 $namespaceArguments = @(
                     $unsharePath,
@@ -4885,6 +4896,14 @@ finally {
                 }
             }
             if ($null -ne $childProcess) { $childProcess.Dispose() }
+            if ($script:IsLinuxHost -and -not [string]::IsNullOrWhiteSpace($linuxExportManifestPath)) {
+                if (Test-Path -LiteralPath $linuxExportManifestPath -PathType Leaf) {
+                    Remove-Item -LiteralPath $linuxExportManifestPath -Force -ErrorAction Stop
+                }
+                if (Test-Path -LiteralPath $linuxExportManifestPath) {
+                    throw "$Context Linux export manifest remained after trusted cleanup: $linuxExportManifestPath"
+                }
+            }
             if ($script:IsLinuxHost -and -not [string]::IsNullOrWhiteSpace($linuxSandboxRoot) -and
                 ([IO.Path]::GetFileName($linuxSandboxRoot) -match '^sgv1-sandbox-[0-9a-f]{32}$')) {
                 if (Test-Path -LiteralPath $linuxSandboxRoot -PathType Container) {
@@ -5130,9 +5149,19 @@ function Invoke-ProtectedPesterServerProxy {
         ("sgv1-pester-psrp-sandbox-{0}" -f [guid]::NewGuid().ToString('N'))
     [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
     Assert-NoReparseAncestors -Path $sandboxRoot -Context 'Protected Pester server Linux sandbox root'
+    $exportManifestPath = "$sandboxRoot.child-writable-export-manifest"
     $proxyProcess = $null
     $proxyExitCode = 1
     try {
+        $manifestStream = [IO.File]::Open(
+            $exportManifestPath,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        try { $manifestStream.Flush($true) }
+        finally { $manifestStream.Dispose() }
+        Assert-NoReparseAncestors -Path $exportManifestPath -Context 'Protected Pester server Linux export manifest'
         $unshareCommand = Get-Command unshare -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $unsharePath = [IO.Path]::GetFullPath([string]$unshareCommand.Path)
         $prlimitCommand = Get-Command prlimit -CommandType Application -ErrorAction Stop | Select-Object -First 1
@@ -5163,8 +5192,9 @@ find_path="$7"
 chroot_path="$8"
 copy_path="$9"
 unshare_path="${10}"
-readonly_count="${11}"
-shift 11
+manifest_path="${11}"
+readonly_count="${12}"
+shift 12
 "$mount_path" --make-rprivate /
 "$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
 mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
@@ -5231,7 +5261,6 @@ set +e
     "$chroot_path" "$sandbox_root" /bin/sh -c 'cd "$1" || exit 126; shift; exec /usr/bin/setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$@"' -- "$working_directory" "$command_path" -s -NoLogo -NoProfile -NonInteractive
 candidate_status=$?
 set -e
-manifest_path="$sandbox_root/.child-writable-export-manifest"
 "$find_path" "$sandbox_root$child_writable_root" -xdev -mindepth 1 -printf '%y %s\n' > "$manifest_path"
 entry_count=0
 total_bytes=0
@@ -5262,7 +5291,7 @@ exit "$candidate_status"
             '--', $shellPath, '-c', $maskHostSocketsScript, '--',
             $mountPath, $sandboxRoot, $diagnosticRootPath, [IO.Path]::GetFullPath($WorkingDirectory),
             [IO.Path]::GetFullPath($PowerShellPath), $childWritableRootPath, $findPath, $chrootPath, $copyPath, $unsharePath,
-            [string]$readOnlyPaths.Count
+            $exportManifestPath, [string]$readOnlyPaths.Count
         ) + @($readOnlyPaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
         $nativeArguments = @(
             '--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',
@@ -5288,6 +5317,12 @@ exit "$candidate_status"
     }
     finally {
         if ($null -ne $proxyProcess) { $proxyProcess.Dispose() }
+        if (Test-Path -LiteralPath $exportManifestPath -PathType Leaf) {
+            Remove-Item -LiteralPath $exportManifestPath -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $exportManifestPath) {
+            throw "Protected Pester server Linux export manifest remained after trusted cleanup: $exportManifestPath"
+        }
         if (Test-Path -LiteralPath $sandboxRoot -PathType Container) {
             Remove-Item -LiteralPath $sandboxRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
