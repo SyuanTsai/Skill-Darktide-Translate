@@ -956,7 +956,7 @@ Describe 'Bounded writable-root enumeration behavior' {
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
         }, $true)
         $source = $runspace.Extent.Text
-        $source | Should -Match '(?s)Remove-LinuxPesterCgroup\s+-CgroupPath\s+\$linuxPesterCgroupPath\s+\$linuxPesterCgroupPath\s*=\s*\$null.*?Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath'
+        $source | Should -Match '(?s)Remove-LinuxCandidateCgroup\s+-CgroupPath\s+\$linuxPesterCgroupPath\s+\$linuxPesterCgroupPath\s*=\s*\$null.*?Assert-LinuxWritableRootUsage[\s\x60]+-Root\s+\$childWritableRootPath'
     }
 
     # Scenario: Ubuntu's util-linux setpriv rejects the nonexistent --ambient-clear option.
@@ -1255,5 +1255,69 @@ namespace Codex.Validation.Tests {
             $manifestIndex | Should -BeLessThan $exportIndex
             $exportIndex | Should -BeLessThan $statusExitIndex
         }
+    }
+
+    # Scenario: A candidate creates arbitrarily many hard links to one tmpfs inode while it is still running.
+    # Purpose: Charge live dentry and other kernel-memory growth to a hard cgroup limit before either sandbox can execute candidate code.
+    It 'UnitT155_BindsBothLinuxSandboxesToAKernelMemoryCgroupBeforeCandidateExecution' {
+        $newCgroup = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-LinuxCandidateCgroup'
+        }, $true)
+        $assertCgroup = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-CurrentLinuxCandidateCgroup'
+        }, $true)
+        $removeCgroup = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Remove-LinuxCandidateCgroup'
+        }, $true)
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $proxy = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterServerProxy'
+        }, $true)
+        $runspace = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
+        }, $true)
+
+        $newCgroup | Should -Not -BeNullOrEmpty
+        $assertCgroup | Should -Not -BeNullOrEmpty
+        $removeCgroup | Should -Not -BeNullOrEmpty
+        $invokeNative | Should -Not -BeNullOrEmpty
+        $proxy | Should -Not -BeNullOrEmpty
+        $runspace | Should -Not -BeNullOrEmpty
+        if ($null -in @($newCgroup, $assertCgroup, $removeCgroup, $invokeNative, $proxy, $runspace)) { return }
+
+        $newSource = $newCgroup.Extent.Text
+        $assertSource = $assertCgroup.Extent.Text
+        $newSource | Should -Match 'codex-validation-candidate-\{0\}'
+        $newSource | Should -Match '\[IO\.File\]::WriteAllText\(\$memoryMaxPath, ''2147483648''\)'
+        $assertSource | Should -Match '/proc/\$PID/cgroup'
+        $assertSource | Should -Match '\[IO\.File\]::ReadAllText\(\$memoryMaxPath\)'
+
+        $nativeSource = $invokeNative.Extent.Text
+        $nativeSource | Should -Match 'New-LinuxCandidateCgroup\s+-Context\s+\$Context'
+        $nativeSource | Should -Match 'Remove-LinuxCandidateCgroup\s+-CgroupPath\s+\$linuxNativeCgroupPath'
+        $nativeSource | Should -Match ([regex]::Escape('cgroup_path="${13}"'))
+        $selfMigration = 'printf ''%s\n'' "$$" > "$cgroup_path/cgroup.procs"'
+        $nativeSource | Should -Match ([regex]::Escape($selfMigration))
+        $nativeCgroupIndex = $nativeSource.IndexOf($selfMigration, [StringComparison]::Ordinal)
+        $nativeCandidateIndex = $nativeSource.IndexOf('"$unshare_path" --mount --pid --fork --kill-child', [StringComparison]::Ordinal)
+        $nativeCgroupIndex | Should -BeGreaterOrEqual 0
+        $nativeCgroupIndex | Should -BeLessThan $nativeCandidateIndex
+
+        $proxySource = $proxy.Extent.Text
+        $proxySource | Should -Match 'Assert-CurrentLinuxCandidateCgroup'
+        $proxySource | Should -Match '\[IO\.File\]::WriteAllText\([\s\S]*?cgroup\.procs'
+        $proxySource | Should -Match ([regex]::Escape('cgroup_path="${13}"'))
+        $proxySource | Should -Match ([regex]::Escape($selfMigration))
+        $proxyMigrationIndex = $proxySource.IndexOf("(Join-Path `$linuxProxyCgroupPath 'cgroup.procs')", [StringComparison]::Ordinal)
+        $proxySandboxIndex = $proxySource.IndexOf('$maskHostSocketsScript =', [StringComparison]::Ordinal)
+        $proxyMigrationIndex | Should -BeGreaterOrEqual 0
+        $proxyMigrationIndex | Should -BeLessThan $proxySandboxIndex
+        $runspaceSource = $runspace.Extent.Text
+        $runspaceSource | Should -Match 'New-LinuxCandidateCgroup'
+        $runspaceSource | Should -Match 'Remove-LinuxCandidateCgroup'
+        $runspaceSource | Should -Match '''-PesterProxyCgroupPath'', \$linuxPesterCgroupPath'
+        $runspaceSource | Should -Not -Match 'Add-LinuxProcessTreeToCgroup'
     }
 }

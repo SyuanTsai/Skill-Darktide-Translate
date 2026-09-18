@@ -31,7 +31,8 @@ param(
     [string] $PesterProxyWorkingDirectory,
     [string] $PesterProxyDiagnosticRoot,
     [string] $PesterProxyChildWritableRoot,
-    [string] $PesterProxyReadOnlyPathsJson
+    [string] $PesterProxyReadOnlyPathsJson,
+    [string] $PesterProxyCgroupPath
 )
 
 Set-StrictMode -Version Latest
@@ -750,7 +751,7 @@ function Get-LinuxPesterCgroupRoot {
     return $rootPath
 }
 
-function New-LinuxPesterCgroup {
+function New-LinuxCandidateCgroup {
     param([Parameter(Mandatory = $true)][string] $Context)
     if (-not $script:IsLinuxHost) { return $null }
     $cgroupRoot = Get-LinuxPesterCgroupRoot
@@ -764,7 +765,7 @@ function New-LinuxPesterCgroup {
         $controllers -notmatch '(^|\s)cpu(\s|$)') {
         throw "$Context requires the Linux cgroup v2 memory and CPU controllers."
     }
-    $cgroupPath = Join-Path $cgroupRoot ("codex-validation-pester-{0}" -f [guid]::NewGuid().ToString('N'))
+    $cgroupPath = Join-Path $cgroupRoot ("codex-validation-candidate-{0}" -f [guid]::NewGuid().ToString('N'))
     try {
         [IO.Directory]::CreateDirectory($cgroupPath) | Out-Null
         Assert-NoReparseAncestors -Path $cgroupPath -Context "$Context cgroup"
@@ -772,17 +773,21 @@ function New-LinuxPesterCgroup {
         if (-not (Test-Path -LiteralPath $memoryMaxPath -PathType Leaf)) {
             throw 'The Linux cgroup v2 memory controller is not enabled for the new cgroup.'
         }
+        # cgroup v2 memory.max charges both candidate userspace and kernel
+        # allocations such as tmpfs pages, dentries and inodes.  The tmpfs
+        # size/inode ceilings remain narrower output-policy limits, while this
+        # live hard bound prevents hard-link dentry growth before final export.
         [IO.File]::WriteAllText($memoryMaxPath, '2147483648')
         $memoryMax = ([IO.File]::ReadAllText($memoryMaxPath)).Trim()
         if ($memoryMax -cne '2147483648') {
-            throw "The Linux Pester cgroup memory.max is '$memoryMax', not the required hard limit."
+            throw "The Linux candidate cgroup memory.max is '$memoryMax', not the required hard limit."
         }
         [void](Get-LinuxCgroupCpuUsage -CgroupPath $cgroupPath -Context "$Context cgroup")
         $pidsMaxPath = Join-Path $cgroupPath 'pids.max'
         if (Test-Path -LiteralPath $pidsMaxPath -PathType Leaf) {
             [IO.File]::WriteAllText($pidsMaxPath, '256')
             $pidsMax = ([IO.File]::ReadAllText($pidsMaxPath)).Trim()
-            if ($pidsMax -cne '256') { throw "The Linux Pester cgroup pids.max is '$pidsMax', not 256." }
+            if ($pidsMax -cne '256') { throw "The Linux candidate cgroup pids.max is '$pidsMax', not 256." }
         }
         return $cgroupPath
     }
@@ -794,35 +799,37 @@ function New-LinuxPesterCgroup {
     }
 }
 
-function Add-LinuxProcessTreeToCgroup {
+function Assert-CurrentLinuxCandidateCgroup {
     param(
         [Parameter(Mandatory = $true)][string] $CgroupPath,
-        [Parameter(Mandatory = $true)][int] $RootProcessId,
         [Parameter(Mandatory = $true)][string] $Context
     )
     if (-not $script:IsLinuxHost) { return }
-    $processFile = Join-Path $CgroupPath 'cgroup.procs'
-    for ($attempt = 0; $attempt -lt 3; $attempt++) {
-        $processIds = [Collections.Generic.HashSet[int]]::new()
-        [void]$processIds.Add($RootProcessId)
-        foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
-            [void]$processIds.Add([int]$processId)
-        }
-        foreach ($processId in $processIds) {
-            if (-not (Test-ProcessIdExists -ProcessId ([int]$processId))) { continue }
-            try {
-                [IO.File]::WriteAllText($processFile, ([string]$processId + [Environment]::NewLine))
-            }
-            catch {
-                if (Test-ProcessIdExists -ProcessId ([int]$processId)) {
-                    throw "$Context could not place process $processId in the hard Linux cgroup: $($_.Exception.Message)"
-                }
-            }
-        }
+    $cgroupRoot = Get-LinuxPesterCgroupRoot
+    $cgroupFullPath = [IO.Path]::GetFullPath($CgroupPath)
+    if ([IO.Path]::GetDirectoryName($cgroupFullPath) -cne $cgroupRoot -or
+        [IO.Path]::GetFileName($cgroupFullPath) -notmatch '^codex-validation-candidate-[0-9a-f]{32}$' -or
+        -not (Test-Path -LiteralPath $cgroupFullPath -PathType Container)) {
+        throw "$Context requires an exact run-owned Linux candidate cgroup."
     }
+    Assert-NoReparseAncestors -Path $cgroupFullPath -Context "$Context candidate cgroup"
+    $relativeCgroupPath = $cgroupFullPath.Substring('/sys/fs/cgroup'.Length)
+    $currentCgroup = [IO.File]::ReadAllText("/proc/$PID/cgroup")
+    if ($currentCgroup -notmatch ("(?m)^0::" + [regex]::Escape($relativeCgroupPath) + '\s*$')) {
+        throw "$Context is not executing inside its hard Linux candidate cgroup."
+    }
+    $memoryMaxPath = Join-Path $cgroupFullPath 'memory.max'
+    if (-not (Test-Path -LiteralPath $memoryMaxPath -PathType Leaf)) {
+        throw "$Context candidate cgroup does not expose memory.max."
+    }
+    $memoryMax = ([IO.File]::ReadAllText($memoryMaxPath)).Trim()
+    if ($memoryMax -cne '2147483648') {
+        throw "$Context candidate cgroup memory.max is '$memoryMax', not the required hard limit."
+    }
+    return $cgroupFullPath
 }
 
-function Remove-LinuxPesterCgroup {
+function Remove-LinuxCandidateCgroup {
     param([Parameter()][AllowNull()][string] $CgroupPath)
     if (-not $script:IsLinuxHost -or [string]::IsNullOrWhiteSpace($CgroupPath)) { return }
     $killPath = Join-Path $CgroupPath 'cgroup.kill'
@@ -834,11 +841,11 @@ function Remove-LinuxPesterCgroup {
     for ($attempt = 0; $attempt -lt 120; $attempt++) {
         if (-not (Test-Path -LiteralPath $CgroupPath -PathType Container)) { return }
         if (-not (Test-Path -LiteralPath $eventsPath -PathType Leaf)) {
-            throw 'Protected Pester cgroup cleanup could not observe cgroup.events.'
+            throw 'Linux candidate cgroup cleanup could not observe cgroup.events.'
         }
         $events = [IO.File]::ReadAllText($eventsPath)
         if ($events -notmatch '(?m)^populated\s+(?<value>[01])\s*$') {
-            throw 'Protected Pester cgroup cleanup received an invalid cgroup.events population record.'
+            throw 'Linux candidate cgroup cleanup received an invalid cgroup.events population record.'
         }
         if ([string]$Matches['value'] -eq '0') {
             try { Remove-Item -LiteralPath $CgroupPath -Force -ErrorAction Stop } catch { }
@@ -848,7 +855,7 @@ function Remove-LinuxPesterCgroup {
         Start-Sleep -Milliseconds 25
     }
     if (Test-Path -LiteralPath $CgroupPath -PathType Container) {
-        throw 'Protected Pester cgroup cleanup did not evacuate and remove the cgroup within the bounded cleanup window.'
+        throw 'Linux candidate cgroup cleanup did not evacuate and remove the cgroup within the bounded cleanup window.'
     }
 }
 
@@ -4263,6 +4270,7 @@ function Invoke-NativeChecked {
     $maxProcessOutputCharacters = 4 * 1024 * 1024
     $linuxSandboxRoot = $null
     $linuxExportManifestPath = $null
+    $linuxNativeCgroupPath = $null
     $windowsResumeEventReleaseEligible = $false
     try {
         if ($ProtectRunnerCommandFiles) {
@@ -4364,6 +4372,7 @@ function Invoke-NativeChecked {
                 }
                 Assert-NoReparseAncestors -Path $setprivPath -Context "$Context trusted Linux setpriv utility"
                 $nativeCommand = if ($applyLinuxResourceLimitsEffective) { $prlimitPath } else { $setsidPath }
+                $linuxNativeCgroupPath = New-LinuxCandidateCgroup -Context $Context
                 $sandboxRoot = Join-Path ([IO.Path]::GetDirectoryName($DiagnosticRoot)) ("sgv1-sandbox-{0}" -f [guid]::NewGuid().ToString('N'))
                 $linuxSandboxRoot = $sandboxRoot
                 [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
@@ -4464,7 +4473,18 @@ copy_path="$9"
 unshare_path="${10}"
 manifest_path="${11}"
 bind_count="${12}"
-shift 12
+cgroup_path="${13}"
+shift 13
+printf '%s\n' "$$" > "$cgroup_path/cgroup.procs"
+IFS= read -r memory_max < "$cgroup_path/memory.max" || exit 126
+[ "$memory_max" = "2147483648" ] || exit 126
+relative_cgroup="${cgroup_path#/sys/fs/cgroup}"
+current_cgroup_match=0
+while IFS= read -r current_cgroup
+do
+    if [ "$current_cgroup" = "0::$relative_cgroup" ]; then current_cgroup_match=1; fi
+done < /proc/self/cgroup
+[ "$current_cgroup_match" -eq 1 ] || exit 126
 "$mount_path" --make-rprivate /
 "$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
 mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
@@ -4596,7 +4616,7 @@ exit "$candidate_status"
                 $networkNamespaceArguments = if ($NetworkProfile -ceq 'Offline') { @('--net') } else { @() }
                 $linuxMountArguments = @(
                     $mountPath, $findPath, $chrootPath, $sandboxRoot, $diagnosticRootFullPath, $childWritableRootPath, $workingDirectory, $Command,
-                    $copyPath, $unsharePath, $linuxExportManifestPath, [string]$linuxReadonlyBindPaths.Count
+                    $copyPath, $unsharePath, $linuxExportManifestPath, [string]$linuxReadonlyBindPaths.Count, $linuxNativeCgroupPath
                 ) + @($linuxReadonlyBindPaths.ToArray()) + @($Arguments)
                 $namespaceArguments = @(
                     $unsharePath,
@@ -4876,44 +4896,49 @@ finally {
             }
         }
         finally {
-            if ($null -ne $windowsResumeEvent) {
-                $windowsResumeEvent.Dispose()
-                $windowsResumeEvent = $null
-            }
-            if ($windowsJobHandle -ne [IntPtr]::Zero) {
-                Close-WindowsProcessJob -JobHandle $windowsJobHandle
-                $windowsJobHandle = [IntPtr]::Zero
-            }
-            if ($runnerCommandFileIsolationStarted) {
-                foreach ($name in $runnerCommandFileNames) {
-                    if ($previousRunnerCommandFileValues.Contains($name)) {
-                        [Environment]::SetEnvironmentVariable(
-                            $name,
-                            $previousRunnerCommandFileValues[$name],
-                            [EnvironmentVariableTarget]::Process
-                        )
+            try {
+                if ($null -ne $windowsResumeEvent) {
+                    $windowsResumeEvent.Dispose()
+                    $windowsResumeEvent = $null
+                }
+                if ($windowsJobHandle -ne [IntPtr]::Zero) {
+                    Close-WindowsProcessJob -JobHandle $windowsJobHandle
+                    $windowsJobHandle = [IntPtr]::Zero
+                }
+                if ($runnerCommandFileIsolationStarted) {
+                    foreach ($name in $runnerCommandFileNames) {
+                        if ($previousRunnerCommandFileValues.Contains($name)) {
+                            [Environment]::SetEnvironmentVariable(
+                                $name,
+                                $previousRunnerCommandFileValues[$name],
+                                [EnvironmentVariableTarget]::Process
+                            )
+                        }
                     }
                 }
+                if ($null -ne $childProcess) { $childProcess.Dispose() }
+                if ($script:IsLinuxHost -and -not [string]::IsNullOrWhiteSpace($linuxExportManifestPath)) {
+                    if (Test-Path -LiteralPath $linuxExportManifestPath -PathType Leaf) {
+                        Remove-Item -LiteralPath $linuxExportManifestPath -Force -ErrorAction Stop
+                    }
+                    if (Test-Path -LiteralPath $linuxExportManifestPath) {
+                        throw "$Context Linux export manifest remained after trusted cleanup: $linuxExportManifestPath"
+                    }
+                }
+                if ($script:IsLinuxHost -and -not [string]::IsNullOrWhiteSpace($linuxSandboxRoot) -and
+                    ([IO.Path]::GetFileName($linuxSandboxRoot) -match '^sgv1-sandbox-[0-9a-f]{32}$')) {
+                    if (Test-Path -LiteralPath $linuxSandboxRoot -PathType Container) {
+                        Remove-Item -LiteralPath $linuxSandboxRoot -Recurse -Force -ErrorAction Stop
+                    }
+                    if (Test-Path -LiteralPath $linuxSandboxRoot) {
+                        throw "$Context Linux sandbox root remained after trusted cleanup: $linuxSandboxRoot"
+                    }
+                }
+                if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
             }
-            if ($null -ne $childProcess) { $childProcess.Dispose() }
-            if ($script:IsLinuxHost -and -not [string]::IsNullOrWhiteSpace($linuxExportManifestPath)) {
-                if (Test-Path -LiteralPath $linuxExportManifestPath -PathType Leaf) {
-                    Remove-Item -LiteralPath $linuxExportManifestPath -Force -ErrorAction Stop
-                }
-                if (Test-Path -LiteralPath $linuxExportManifestPath) {
-                    throw "$Context Linux export manifest remained after trusted cleanup: $linuxExportManifestPath"
-                }
+            finally {
+                Remove-LinuxCandidateCgroup -CgroupPath $linuxNativeCgroupPath
             }
-            if ($script:IsLinuxHost -and -not [string]::IsNullOrWhiteSpace($linuxSandboxRoot) -and
-                ([IO.Path]::GetFileName($linuxSandboxRoot) -match '^sgv1-sandbox-[0-9a-f]{32}$')) {
-                if (Test-Path -LiteralPath $linuxSandboxRoot -PathType Container) {
-                    Remove-Item -LiteralPath $linuxSandboxRoot -Recurse -Force -ErrorAction Stop
-                }
-                if (Test-Path -LiteralPath $linuxSandboxRoot) {
-                    throw "$Context Linux sandbox root remained after trusted cleanup: $linuxSandboxRoot"
-                }
-            }
-            if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
         }
     }
 }
@@ -5047,7 +5072,8 @@ function Invoke-ProtectedPesterServerProxy {
         [Parameter(Mandatory = $true)][string] $WorkingDirectory,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
         [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
-        [Parameter(Mandatory = $true)][string] $ReadOnlyPathsJson
+        [Parameter(Mandatory = $true)][string] $ReadOnlyPathsJson,
+        [Parameter()][AllowNull()][AllowEmptyString()][string] $CgroupPath
     )
     if (-not (Test-Path -LiteralPath $PowerShellPath -PathType Leaf)) {
         throw "Protected Pester server executable is missing: $PowerShellPath"
@@ -5145,6 +5171,21 @@ function Invoke-ProtectedPesterServerProxy {
     if (-not $script:IsLinuxHost) {
         throw 'Protected Pester server proxy requires a supported Windows or Linux host.'
     }
+    $linuxProxyCgroupRoot = Get-LinuxPesterCgroupRoot
+    $linuxProxyCgroupPath = [IO.Path]::GetFullPath($CgroupPath)
+    if ([IO.Path]::GetDirectoryName($linuxProxyCgroupPath) -cne $linuxProxyCgroupRoot -or
+        [IO.Path]::GetFileName($linuxProxyCgroupPath) -notmatch '^codex-validation-candidate-[0-9a-f]{32}$' -or
+        -not (Test-Path -LiteralPath $linuxProxyCgroupPath -PathType Container)) {
+        throw 'Protected Pester server Linux proxy requires an exact run-owned candidate cgroup.'
+    }
+    Assert-NoReparseAncestors -Path $linuxProxyCgroupPath -Context 'Protected Pester server Linux proxy cgroup'
+    [IO.File]::WriteAllText(
+        (Join-Path $linuxProxyCgroupPath 'cgroup.procs'),
+        ([string]$PID + [Environment]::NewLine)
+    )
+    $linuxProxyCgroupPath = Assert-CurrentLinuxCandidateCgroup `
+        -CgroupPath $linuxProxyCgroupPath `
+        -Context 'Protected Pester server Linux proxy'
     $sandboxRoot = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($DiagnosticRoot))) `
         ("sgv1-pester-psrp-sandbox-{0}" -f [guid]::NewGuid().ToString('N'))
     [void](New-Item -ItemType Directory -Path $sandboxRoot -Force)
@@ -5194,7 +5235,18 @@ copy_path="$9"
 unshare_path="${10}"
 manifest_path="${11}"
 readonly_count="${12}"
-shift 12
+cgroup_path="${13}"
+shift 13
+printf '%s\n' "$$" > "$cgroup_path/cgroup.procs"
+IFS= read -r memory_max < "$cgroup_path/memory.max" || exit 126
+[ "$memory_max" = "2147483648" ] || exit 126
+relative_cgroup="${cgroup_path#/sys/fs/cgroup}"
+current_cgroup_match=0
+while IFS= read -r current_cgroup
+do
+    if [ "$current_cgroup" = "0::$relative_cgroup" ]; then current_cgroup_match=1; fi
+done < /proc/self/cgroup
+[ "$current_cgroup_match" -eq 1 ] || exit 126
 "$mount_path" --make-rprivate /
 "$mount_path" -t tmpfs -o size=536870912,nodev,nosuid tmpfs "$sandbox_root"
 mkdir -p "$sandbox_root/proc" "$sandbox_root/dev" "$sandbox_root/tmp" "$sandbox_root/run" "$sandbox_root/var/tmp" "$sandbox_root/dev/shm"
@@ -5291,7 +5343,7 @@ exit "$candidate_status"
             '--', $shellPath, '-c', $maskHostSocketsScript, '--',
             $mountPath, $sandboxRoot, $diagnosticRootPath, [IO.Path]::GetFullPath($WorkingDirectory),
             [IO.Path]::GetFullPath($PowerShellPath), $childWritableRootPath, $findPath, $chrootPath, $copyPath, $unsharePath,
-            $exportManifestPath, [string]$readOnlyPaths.Count
+            $exportManifestPath, [string]$readOnlyPaths.Count, $linuxProxyCgroupPath
         ) + @($readOnlyPaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
         $nativeArguments = @(
             '--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',
@@ -5399,7 +5451,7 @@ function Invoke-ProtectedPesterRunspace {
         if ($script:IsLinuxHost) {
             $linuxClockTicksPerSecond = Get-LinuxAggregateClockTicksPerSecond
             $linuxWritableRootBaselineBytes = [int64](Get-LinuxWritableRootUsage -Root $childWritableRootPath -Context 'Protected Pester remote pipeline').bytes
-            $linuxPesterCgroupPath = New-LinuxPesterCgroup -Context 'Protected Pester remote pipeline'
+            $linuxPesterCgroupPath = New-LinuxCandidateCgroup -Context 'Protected Pester remote pipeline'
         }
         $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null, $serverProcessInstance)
         $startInfoField = $serverProcessInstance.GetType().GetField('_startInfo', [Reflection.BindingFlags]'Instance,NonPublic')
@@ -5414,7 +5466,8 @@ function Invoke-ProtectedPesterRunspace {
             '-PesterProxyWorkingDirectory', $WorkingDirectory,
             '-PesterProxyDiagnosticRoot', $DiagnosticRoot,
             '-PesterProxyChildWritableRoot', $ChildWritableRoot,
-            '-PesterProxyReadOnlyPathsJson', $readOnlyPathsJson
+            '-PesterProxyReadOnlyPathsJson', $readOnlyPathsJson,
+            '-PesterProxyCgroupPath', $linuxPesterCgroupPath
         )
         $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
         if ($null -ne $argumentListProperty) {
@@ -5424,15 +5477,6 @@ function Invoke-ProtectedPesterRunspace {
         else { $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $proxyArguments }
 
         $runspace.Open()
-        if ($script:IsLinuxHost) {
-            if ($null -eq $serverProcessInstance.Process) {
-                throw 'Protected Pester remote pipeline did not expose its Linux proxy process.'
-            }
-            Add-LinuxProcessTreeToCgroup `
-                -CgroupPath $linuxPesterCgroupPath `
-                -RootProcessId $serverProcessInstance.Process.Id `
-                -Context 'Protected Pester remote pipeline'
-        }
         $powerShell = [Management.Automation.PowerShell]::Create()
         $powerShell.Runspace = $runspace
         [void]$powerShell.AddScript($workerScriptText)
@@ -5483,7 +5527,7 @@ function Invoke-ProtectedPesterRunspace {
             throw 'Protected Pester remote pipeline returned an unexpected completion payload.'
         }
         if ($script:IsLinuxHost) {
-            Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath
+            Remove-LinuxCandidateCgroup -CgroupPath $linuxPesterCgroupPath
             $linuxPesterCgroupPath = $null
             [void](Assert-LinuxWritableRootUsage `
                 -Root $childWritableRootPath `
@@ -5497,7 +5541,7 @@ function Invoke-ProtectedPesterRunspace {
             try { $serverProcessInstance.Process.Kill($true) } catch { }
         }
         $linuxPesterCgroupCleanupException = $null
-        try { Remove-LinuxPesterCgroup -CgroupPath $linuxPesterCgroupPath }
+        try { Remove-LinuxCandidateCgroup -CgroupPath $linuxPesterCgroupPath }
         catch { $linuxPesterCgroupCleanupException = $_.Exception }
         if ($null -ne $powerShell) { $powerShell.Dispose() }
         if ($null -ne $runspace) { $runspace.Dispose() }
@@ -5512,7 +5556,8 @@ if ($ProtectedPesterServerProxy) {
         -WorkingDirectory $PesterProxyWorkingDirectory `
         -DiagnosticRoot $PesterProxyDiagnosticRoot `
         -ChildWritableRoot $PesterProxyChildWritableRoot `
-        -ReadOnlyPathsJson $PesterProxyReadOnlyPathsJson
+        -ReadOnlyPathsJson $PesterProxyReadOnlyPathsJson `
+        -CgroupPath $PesterProxyCgroupPath
     exit $proxyExitCode
 }
 
