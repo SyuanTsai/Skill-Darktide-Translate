@@ -828,8 +828,8 @@ steps:
         $supervisor | Should -Match '\$PesterProxyReadOnlyPathsJson'
         $supervisor | Should -Match 'EnvironmentVariables\.Remove\(\$gateEnvironmentName\)'
         $supervisor | Should -Match '\[ ! -e "\$target" \]'
-        $supervisor | Should -Match 'exec "\$chroot_path"'
-        $supervisor | Should -Match 'exec chroot "\$sandbox_root"'
+        ([regex]::Matches($supervisor, [regex]::Escape('"$unshare_path" --mount --pid --fork --kill-child --mount-proc="$sandbox_root/proc"'))).Count | Should -Be 2
+        ([regex]::Matches($supervisor, [regex]::Escape('"$chroot_path" "$sandbox_root"'))).Count | Should -Be 2
         $supervisor | Should -Match 'SGV1-Pester-Result:'
         $supervisor | Should -Match 'Invoke-TrustedPowerShellProcess'
         $supervisor | Should -Match 'Invoke-ProtectedPesterSupervisor'

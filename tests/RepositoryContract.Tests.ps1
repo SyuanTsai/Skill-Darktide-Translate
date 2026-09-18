@@ -889,8 +889,9 @@ Describe 'Bounded writable-root enumeration behavior' {
         $source | Should -Match 'Test-PathWithinOrEqual\s+-Path\s+\$childWritableRootPath\s+-Root\s+\$diagnosticRootFullPath'
         ([regex]::Matches($source, [regex]::Escape('child_writable_root="$6"'))).Count | Should -Be 2
         ([regex]::Matches($source, [regex]::Escape('"$mount_path" -o remount,bind,ro "$sandbox_root$run_root"'))).Count | Should -Be 2
-        ([regex]::Matches($source, [regex]::Escape('"$mount_path" --bind "$child_writable_root" "$sandbox_root$child_writable_root"'))).Count | Should -Be 2
-        ([regex]::Matches($source, [regex]::Escape('"$mount_path" -o remount,bind,rw "$sandbox_root$child_writable_root"'))).Count | Should -Be 2
+        ([regex]::Matches($source, [regex]::Escape('"$mount_path" --bind "$child_writable_root" "$sandbox_root$child_writable_root"'))).Count | Should -Be 0
+        ([regex]::Matches($source, [regex]::Escape('"$mount_path" -o remount,bind,rw "$sandbox_root$child_writable_root"'))).Count | Should -Be 0
+        ([regex]::Matches($source, [regex]::Escape('"$mount_path" -t tmpfs -o size=536870912,nr_inodes=100001,nodev,nosuid tmpfs "$sandbox_root$child_writable_root"'))).Count | Should -Be 2
     }
 
     # Scenario: Contained HOME/TMP and protected-Pester TestDrive share the sole writable child surface.
@@ -1216,5 +1217,39 @@ namespace Codex.Validation.Tests {
         $suspendSource | Should -Match 'Stop-UnixProcessByIdentity[\s\S]*?-Signal\s+19'
         $resumeSource | Should -Match 'Stop-UnixProcessByIdentity[\s\S]*?-Signal\s+18'
         $assertSource | Should -Match '(?s)Suspend-LinuxWritableRootBoundary.*?Get-LinuxWritableRootUsage.*?Invoke-LinuxOpenUnlinkedInspection.*?finally\s*\{.*?Resume-LinuxWritableRootBoundary'
+    }
+
+    # Scenario: A candidate passes deleted writable-root files through SCM_RIGHTS, leaving their only references queued in sockets.
+    # Purpose: Make the kernel enforce the live aggregate allocation bound, then export only a bounded visible snapshot after the candidate PID namespace is empty.
+    It 'UnitT150_UsesAKernelBoundedWritableTmpfsAndPostNamespaceExport' {
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $proxy = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterServerProxy'
+        }, $true)
+        $invokeNative | Should -Not -BeNullOrEmpty
+        $proxy | Should -Not -BeNullOrEmpty
+        if ($null -eq $invokeNative -or $null -eq $proxy) { return }
+
+        foreach ($source in @($invokeNative.Extent.Text, $proxy.Extent.Text)) {
+            $source | Should -Match ([regex]::Escape('"$mount_path" -t tmpfs -o size=536870912,nr_inodes=100001,nodev,nosuid tmpfs "$sandbox_root$child_writable_root"'))
+            $source | Should -Not -Match ([regex]::Escape('"$mount_path" --bind "$child_writable_root" "$sandbox_root$child_writable_root"'))
+            $source | Should -Match ([regex]::Escape('"$unshare_path" --mount --pid --fork --kill-child --mount-proc="$sandbox_root/proc"'))
+            $source | Should -Match "-xdev -mindepth 1 -printf '%y %s\\n'"
+            $source | Should -Match 'd\|f\)'
+            $source | Should -Not -Match '(?i)remove_path|rm\s+-rf'
+            $source | Should -Match 'entry_count\s*=\s*\$\(\(entry_count \+ 1\)\)'
+            $source | Should -Match '\[ "\$entry_count" -le 100000 \]'
+            $source | Should -Match '\[ "\$total_bytes" -le 536870912 \]'
+            $candidateExitIndex = $source.IndexOf('candidate_status=$?', [StringComparison]::Ordinal)
+            $manifestIndex = $source.IndexOf('entry_count=0', [StringComparison]::Ordinal)
+            $exportIndex = $source.IndexOf('"$copy_path" -a -- "$sandbox_root$child_writable_root/." "$child_writable_root/"', [StringComparison]::Ordinal)
+            $statusExitIndex = $source.IndexOf('exit "$candidate_status"', [StringComparison]::Ordinal)
+            $candidateExitIndex | Should -BeGreaterOrEqual 0
+            $candidateExitIndex | Should -BeLessThan $manifestIndex
+            $manifestIndex | Should -BeLessThan $exportIndex
+            $exportIndex | Should -BeLessThan $statusExitIndex
+        }
     }
 }
