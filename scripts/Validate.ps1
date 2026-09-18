@@ -665,21 +665,22 @@ function Assert-LinuxAggregateResourceUsage {
     )
     if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
         $memoryCurrentPath = Join-Path $CgroupPath 'memory.current'
-        $pidsCurrentPath = Join-Path $CgroupPath 'pids.current'
-        foreach ($requiredPath in @($memoryCurrentPath, $pidsCurrentPath)) {
+        $cgroupProcsPath = Join-Path $CgroupPath 'cgroup.procs'
+        foreach ($requiredPath in @($memoryCurrentPath, $cgroupProcsPath)) {
             if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
                 throw "$Context requires kernel-maintained Linux cgroup aggregate accounting."
             }
         }
         $memoryCurrentText = ([IO.File]::ReadAllText($memoryCurrentPath)).Trim()
-        $pidsCurrentText = ([IO.File]::ReadAllText($pidsCurrentPath)).Trim()
-        if ($memoryCurrentText -notmatch '^[0-9]+$' -or $pidsCurrentText -notmatch '^[0-9]+$') {
+        $cgroupProcessIds = @([IO.File]::ReadAllLines($cgroupProcsPath) | ForEach-Object { $_.Trim() } | Where-Object { $_ -cne '' })
+        if ($memoryCurrentText -notmatch '^[0-9]+$' -or
+            @($cgroupProcessIds | Where-Object { $_ -notmatch '^[0-9]+$' }).Count -gt 0) {
             throw "$Context received invalid Linux cgroup aggregate accounting."
         }
         if ([int64]$memoryCurrentText -gt 2147483648) {
             throw "$Context exceeded the kernel-accounted Linux cgroup memory limit of 2147483648 bytes."
         }
-        if ([int64]$pidsCurrentText -gt 256) {
+        if ($cgroupProcessIds.Count -gt 256) {
             throw "$Context exceeded the kernel-accounted Linux cgroup process-count limit of 256."
         }
         $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $CgroupPath -Context $Context

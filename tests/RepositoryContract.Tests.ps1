@@ -1405,7 +1405,8 @@ namespace Codex.Validation.Tests {
 
         $aggregateSource = $aggregate.Extent.Text
         $aggregateSource | Should -Match 'Join-Path\s+\$CgroupPath\s+''memory\.current'''
-        $aggregateSource | Should -Match 'Join-Path\s+\$CgroupPath\s+''pids\.current'''
+        $aggregateSource | Should -Match 'Join-Path\s+\$CgroupPath\s+''cgroup\.procs'''
+        $aggregateSource | Should -Not -Match 'pids\.current'
         $aggregateSource | Should -Match 'Get-LinuxCgroupCpuUsage\s+-CgroupPath\s+\$CgroupPath'
         $cgroupBranchIndex = $aggregateSource.IndexOf("if (-not [string]::IsNullOrWhiteSpace(`$CgroupPath))", [StringComparison]::Ordinal)
         $procfsIndex = $aggregateSource.IndexOf('Get-LinuxBoundaryProcessIds', [StringComparison]::Ordinal)
