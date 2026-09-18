@@ -392,7 +392,7 @@ function Get-LinuxCgroupProcessIds {
         }
         [void]$processIds.Add([int]$value)
     }
-    return @($processIds.ToArray())
+    return [int[]]@($processIds | Sort-Object)
 }
 
 function Get-LinuxBoundaryProcessIds {
@@ -420,7 +420,7 @@ function Get-LinuxBoundaryProcessIds {
             [void]$candidateIds.Add([int]$processId)
         }
     }
-    return @($candidateIds.ToArray())
+    return [int[]]@($candidateIds | Sort-Object)
 }
 
 function Assert-LinuxAggregateResourceUsage {

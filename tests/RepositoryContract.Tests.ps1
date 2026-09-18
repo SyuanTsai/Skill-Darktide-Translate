@@ -776,6 +776,7 @@ Describe 'Bounded writable-root enumeration behavior' {
         $script:HostIsLinux = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
         foreach ($name in @(
             'ConvertFrom-LinuxProcessResourceUsageMetadata',
+            'Get-LinuxCgroupProcessIds',
             'Enable-LinuxWritableRootInspector',
             'Invoke-LinuxWritableRootInspection',
             'Invoke-LinuxOpenUnlinkedInspection',
@@ -1038,5 +1039,21 @@ Describe 'Bounded writable-root enumeration behavior' {
         $liveStat = $stat -replace '\) Z ', ') S '
         { ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId 21242 -Stat $liveStat -Status "Name:`tfixture`nState:`tS (sleeping)`n" } |
             Should -Throw '*resident memory*'
+    }
+
+    # Scenario: HashSet<T> exposes ToArray only as a LINQ extension, so PowerShell member enumeration targets its integer elements.
+    # Purpose: Return a stable integer collection from both Linux process-boundary helpers without a scalar method call.
+    It 'UnitT130_ReturnsCgroupProcessIdsWithoutHashSetToArray' {
+        $cgroupPath = Join-Path $TestDrive 'cgroup'
+        [void](New-Item -ItemType Directory -Path $cgroupPath)
+        [IO.File]::WriteAllLines((Join-Path $cgroupPath 'cgroup.procs'), [string[]]@('21243', '21242', '21243'))
+
+        $actual = @(Get-LinuxCgroupProcessIds -CgroupPath $cgroupPath -Context 'Cgroup fixture')
+        (($actual | Sort-Object) -join ',') | Should -BeExactly '21242,21243'
+
+        $boundary = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-LinuxBoundaryProcessIds'
+        }, $true)
+        $boundary.Extent.Text | Should -Not -Match '\.ToArray\(\)'
     }
 }
