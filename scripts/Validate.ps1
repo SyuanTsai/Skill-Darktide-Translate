@@ -5496,7 +5496,11 @@ exit "$candidate_status"
             $exportManifestPath, [string]$readOnlyPaths.Count, $linuxProxyCgroupPath
         ) + @($readOnlyPaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
         $nativeArguments = @(
-            '--as=2147483648', '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',
+            # cgroup v2 memory.max is the hard 2 GiB live-memory boundary for
+            # this whole process tree. RLIMIT_AS is intentionally omitted:
+            # .NET reserves more virtual address space than its resident use
+            # while opening the out-of-process PowerShell runspace.
+            '--cpu=300', '--nproc=256', '--nofile=1024', '--fsize=67108864', '--core=0', '--',
             $unsharePath
         ) + @($unshareArguments)
         $startInfo = [Diagnostics.ProcessStartInfo]::new()

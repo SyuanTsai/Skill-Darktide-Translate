@@ -1441,4 +1441,21 @@ namespace Codex.Validation.Tests {
             'Assert-LinuxAggregateResourceUsage[\s\S]{0,420}?-CgroupPath\s+\$linuxNativeWorkloadCgroupPath[\s\S]{0,160}?-CgroupAccountingPath\s+\$linuxNativeCgroupPath'
         )).Count | Should -Be 2
     }
+
+    # Scenario: .NET reserves more virtual address space than its live resident memory while opening the protected Pester server.
+    # Purpose: Bound real memory with cgroup v2 without imposing a 2 GiB RLIMIT_AS that makes PowerShell remoting fail at startup.
+    It 'UnitT180_UsesCgroupMemoryWithoutAProtectedPesterAddressSpaceCeiling' {
+        $proxy = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterServerProxy'
+        }, $true)
+
+        $proxy | Should -Not -BeNullOrEmpty
+        if ($null -eq $proxy) { return }
+
+        $proxySource = $proxy.Extent.Text
+        $proxySource | Should -Match 'Assert-CurrentLinuxCandidateCgroup'
+        $proxySource | Should -Match '\[ "\$memory_max" = "2147483648" \]'
+        $proxySource | Should -Match "'--cpu=300'"
+        $proxySource | Should -Not -Match "'--as=2147483648'"
+    }
 }
