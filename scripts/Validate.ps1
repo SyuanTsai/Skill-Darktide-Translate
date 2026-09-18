@@ -661,10 +661,12 @@ function Assert-LinuxAggregateResourceUsage {
         [Parameter()][ValidateRange(0, [int]::MaxValue)][int] $ProcessGroupId = 0,
         [Parameter(Mandatory = $true)][int64] $ClockTicksPerSecond,
         [Parameter()][AllowNull()][string] $CgroupPath,
+        [Parameter()][AllowNull()][string] $CgroupAccountingPath,
         [Parameter(Mandatory = $true)][string] $Context
     )
     if (-not [string]::IsNullOrWhiteSpace($CgroupPath)) {
-        $memoryCurrentPath = Join-Path $CgroupPath 'memory.current'
+        $accountingPath = if ([string]::IsNullOrWhiteSpace($CgroupAccountingPath)) { $CgroupPath } else { $CgroupAccountingPath }
+        $memoryCurrentPath = Join-Path $accountingPath 'memory.current'
         $cgroupProcsPath = Join-Path $CgroupPath 'cgroup.procs'
         foreach ($requiredPath in @($memoryCurrentPath, $cgroupProcsPath)) {
             if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
@@ -683,7 +685,7 @@ function Assert-LinuxAggregateResourceUsage {
         if ($cgroupProcessIds.Count -gt 256) {
             throw "$Context exceeded the kernel-accounted Linux cgroup process-count limit of 256."
         }
-        $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $CgroupPath -Context $Context
+        $cgroupCpuMicroseconds = Get-LinuxCgroupCpuUsage -CgroupPath $accountingPath -Context $Context
         if ($cgroupCpuMicroseconds -gt [int64]300000000) {
             throw "$Context exceeded the kernel-accounted Linux cgroup CPU limit of 300 seconds."
         }
@@ -4964,6 +4966,7 @@ finally {
                     -ProcessGroupId $childProcessGroupId `
                     -ClockTicksPerSecond $linuxClockTicksPerSecond `
                     -CgroupPath $linuxNativeWorkloadCgroupPath `
+                    -CgroupAccountingPath $linuxNativeCgroupPath `
                     -Context $Context
             }
             while (-not $childProcess.HasExited) {
@@ -4983,6 +4986,7 @@ finally {
                         -ProcessGroupId $childProcessGroupId `
                         -ClockTicksPerSecond $linuxClockTicksPerSecond `
                         -CgroupPath $linuxNativeWorkloadCgroupPath `
+                        -CgroupAccountingPath $linuxNativeCgroupPath `
                         -Context $Context
                 }
             }

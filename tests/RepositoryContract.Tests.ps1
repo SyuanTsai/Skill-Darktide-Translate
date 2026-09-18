@@ -1404,15 +1404,25 @@ namespace Codex.Validation.Tests {
         if ($null -eq $aggregate) { return }
 
         $aggregateSource = $aggregate.Extent.Text
-        $aggregateSource | Should -Match 'Join-Path\s+\$CgroupPath\s+''memory\.current'''
+        $aggregateSource | Should -Match '\[string\]\s+\$CgroupAccountingPath'
+        $aggregateSource | Should -Match 'Join-Path\s+\$accountingPath\s+''memory\.current'''
         $aggregateSource | Should -Match 'Join-Path\s+\$CgroupPath\s+''cgroup\.procs'''
         $aggregateSource | Should -Not -Match 'pids\.current'
-        $aggregateSource | Should -Match 'Get-LinuxCgroupCpuUsage\s+-CgroupPath\s+\$CgroupPath'
+        $aggregateSource | Should -Match 'Get-LinuxCgroupCpuUsage\s+-CgroupPath\s+\$accountingPath'
         $cgroupBranchIndex = $aggregateSource.IndexOf("if (-not [string]::IsNullOrWhiteSpace(`$CgroupPath))", [StringComparison]::Ordinal)
         $procfsIndex = $aggregateSource.IndexOf('Get-LinuxBoundaryProcessIds', [StringComparison]::Ordinal)
         $cgroupReturnIndex = $aggregateSource.IndexOf('return', $cgroupBranchIndex, [StringComparison]::Ordinal)
         $cgroupBranchIndex | Should -BeGreaterOrEqual 0
         $cgroupReturnIndex | Should -BeGreaterThan $cgroupBranchIndex
         $procfsIndex | Should -BeGreaterThan $cgroupReturnIndex
+
+        $invokeNative = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
+        }, $true)
+        $nativeSource = $invokeNative.Extent.Text
+        ([regex]::Matches(
+            $nativeSource,
+            'Assert-LinuxAggregateResourceUsage[\s\S]{0,420}?-CgroupPath\s+\$linuxNativeWorkloadCgroupPath[\s\S]{0,160}?-CgroupAccountingPath\s+\$linuxNativeCgroupPath'
+        )).Count | Should -Be 2
     }
 }
