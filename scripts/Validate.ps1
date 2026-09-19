@@ -6941,6 +6941,15 @@ if (-not [OperatingSystem]::IsWindows() -and
     $legacyNullCompatibilityTests -ccontains [string]$selectedPesterTests[0]) {
     Set-StrictMode -Version 1.0
 }
+# The immutable RepositoryContract fixture initializes HostIsLinux but reads
+# IsLinuxHost before assigning it. Shared-process execution can accidentally
+# seed that script variable; the protected runner deliberately isolates every
+# trusted file. Preserve the fixture's Windows PowerShell-compatible null read
+# only for this exact shard while keeping StrictMode Latest everywhere else.
+if (-not [OperatingSystem]::IsWindows() -and
+    [string]$selectedPesterTests[0] -ceq 'RepositoryContract.Tests.ps1') {
+    Set-StrictMode -Version 1.0
+}
 $result = Invoke-Pester -Configuration $pesterConfiguration
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
     [int64]$result.SkippedCount -ne 0 -or
