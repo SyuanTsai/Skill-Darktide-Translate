@@ -97,13 +97,13 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         }
     }
 
-    # Scenario: Protected pull requests, trusted pushes, and manually dispatched runs enter the same validation contract.
-    # Purpose: Preserve one candidate execution while allowing only trigger/security-adapter differences.
-    It 'UnitT40_MapsProtectedTrustedAndManualEventsToOneCanonicalValidator' {
+    # Scenario: A pull request must execute the workflow definition owned by its trusted base.
+    # Purpose: Preserve base-owned pull-request validation and exclude ref-selected manual dispatch.
+    It 'UnitT40_MapsProtectedAndTrustedEventsToOneCanonicalValidator' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:WorkflowRoot 'standard-v1-protected.yml') -Raw
         $workflow | Should -Match '(?m)^\s{2}pull_request_target:\s*$'
         $workflow | Should -Match '(?ms)^\s{2}push:\s*\r?\n\s{4}branches:\s*\r?\n\s{6}- main'
-        $workflow | Should -Match '(?m)^\s{2}workflow_dispatch:\s*$'
+        $workflow | Should -Not -Match '(?m)^\s{2}workflow_dispatch:\s*$'
         $workflow | Should -Not -Match '(?m)^\s{2}pull_request:\s*$'
         $workflow | Should -Match 'trustedValidator = Join-Path \$env:TRUSTED_SUPERVISOR_ROOT .+scripts/Validate\.ps1'
         ([regex]::Matches($workflow, 'id: canonical-validation')).Count | Should -Be 1
@@ -145,14 +145,43 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $repositoryValidator | Should -Not -Match '\[IO\.File\]::WriteAllText\(\$outputFullPath'
     }
 
-    It 'keeps the protected Pester inventory complete across supervisor, parent, and worker lists' {
-        $canonicalValidator = Get-Content -LiteralPath $script:CanonicalValidatorPath -Raw
-        foreach ($requiredTest in @(
+    It 'keeps one exact protected Pester inventory across supervisor, parent, and worker execution' {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $script:CanonicalValidatorPath, [ref]$tokens, [ref]$errors)
+        @($errors).Count | Should -Be 0
+        $definition = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Get-RequiredPesterTests'
+        }, $true)
+        $definition | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($definition.Extent.Text))
+
+        $expected = @(
+            'BootstrapTransition.Tests.ps1'
+            'LocalizationWorkset.Tests.ps1'
+            'ModUpdateAutomation.Tests.ps1'
+            'RepositoryContract.Tests.ps1'
+            'RepositoryValidation.Tests.ps1'
+            'Schema15Coordination.Tests.ps1'
+            'Schema15SourceAcquisition.Tests.ps1'
+            'SkillContract.Tests.ps1'
+            'SourcePin.Tests.ps1'
+            'ValidationTransition.Tests.ps1'
+            'AtomicValidationOutput.Tests.ps1'
             'CanonicalValidation.Tests.ps1'
             'StandardV1Conformance.Tests.ps1'
             'Test-Repository.Tests.ps1'
-        )) {
-            ([regex]::Matches($canonicalValidator, [regex]::Escape("'$requiredTest'"))).Count | Should -Be 3
+        )
+        @(Get-RequiredPesterTests) | Should -Be $expected
+
+        $canonicalValidator = $ast.Extent.Text
+        foreach ($requiredTest in $expected) {
+            ([regex]::Matches($definition.Extent.Text, [regex]::Escape("'$requiredTest'"))).Count | Should -Be 1
         }
+        ([regex]::Matches($canonicalValidator, '@\(Get-RequiredPesterTests\)')).Count | Should -Be 4
+        $canonicalValidator | Should -Match '\$requiredPesterTestsFunction = \(Get-Command Get-RequiredPesterTests'
+        $canonicalValidator | Should -Match '__REQUIRED_PESTER_TESTS_FUNCTION__'
+        $canonicalValidator | Should -Match '\.Replace\(''__REQUIRED_PESTER_TESTS_FUNCTION__'', \$requiredPesterTestsFunctionDefinition\)'
     }
 }

@@ -200,10 +200,10 @@ Describe 'Darktide bootstrap transition' {
     It 'UnitT85_UsesKernelCgroupAccountingWhenAvailable' {
         $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
 
-        $supervisor | Should -Match '\$hasKernelCpuAccounting = -not \[string\]::IsNullOrWhiteSpace\(\$CgroupPath\)'
-        $supervisor | Should -Match 'if \(-not \$hasKernelCpuAccounting -and \$cpuTicks -gt'
-        $supervisor | Should -Match 'if \(\$hasKernelCpuAccounting\)'
-        $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage -CgroupPath \$CgroupPath'
+        $supervisor | Should -Match 'if \(-not \[string\]::IsNullOrWhiteSpace\(\$CgroupPath\)\)'
+        $supervisor | Should -Match '\$accountingPath = if \(\[string\]::IsNullOrWhiteSpace\(\$CgroupAccountingPath\)\)'
+        $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage -CgroupPath \$accountingPath -Context \$Context'
+        $supervisor | Should -Match 'if \(\$cpuTicks -gt \(\[int64\]\$MaxCpuSeconds \* \$ClockTicksPerSecond\)\)'
     }
 
     It 'UnitT90SeparatesChildOutputAndTrustedPesterContent' {
@@ -223,29 +223,39 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'function global:New-Item'
         $supervisor | Should -Match "'Junction'"
         $supervisor | Should -Match "'SymbolicLink'"
+        $supervisor | Should -Match 'function global:Get-ChildItem'
+        $supervisor | Should -Match '\.retained-partial-\*'
+        $supervisor | Should -Match 'Set-StrictMode -Version 1\.0'
         $supervisor | Should -Match '\$readOnlyPaths = @\('
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
         $supervisor | Should -Match '\[string\[\]\] \$TestNames'
         $supervisor | Should -Match "AddParameter\('TestNames'"
+        $supervisor | Should -Match '\[string\] \$PesterTrustedTestCommit'
+        $supervisor | Should -Match "AddParameter\('TrustedTestCommit'"
+        $supervisor | Should -Match "Set-Variable -Name 'trustedTestCommit' -Scope Global"
+        $supervisor | Should -Match "BootstrapTransition\.Tests\.ps1"
         $supervisor | Should -Match 'foreach \(\$requiredPesterTest in \$requiredPesterTests\)'
+        $supervisor | Should -Match '\$requiredPesterTestsFunction = \(Get-Command Get-RequiredPesterTests'
+        $supervisor | Should -Match '__REQUIRED_PESTER_TESTS_FUNCTION__'
+        $supervisor | Should -Match '\.Replace\(''__REQUIRED_PESTER_TESTS_FUNCTION__'', \$requiredPesterTestsFunctionDefinition\)'
         $supervisor | Should -Match '\$aggregateTotalCount'
         $supervisor | Should -Match 'per-candidate 300-second CPU'
-        $supervisor | Should -Match 'TimeoutMilliseconds 1200000'
+        $supervisor | Should -Match 'TimeoutMilliseconds 1800000'
         $supervisor | Should -Match 'CreateOutOfProcessRunspace'
         $supervisor | Should -Match 'AddScript\(\$workerScriptText\)'
         $supervisor | Should -Match 'InvocationStateInfo\.State'
         $supervisor | Should -Match '\$powerShell\.Stop\(\)'
         $supervisor | Should -Match '\$runspace\.Close\(\)'
         $supervisor | Should -Match 'serverProcessInstance\.Process\.WaitForExit\(5000\)'
-        $supervisor | Should -Match 'Get-Command rmdir -CommandType Application'
-        $supervisor | Should -Match '\$rmdirPath -- \$CgroupPath'
+        $supervisor | Should -Match 'Stop-LinuxCandidateCgroup -CgroupPath \$CgroupPath'
+        $supervisor | Should -Match '\[IO\.Directory\]::Delete\(\$CgroupPath\)'
         $supervisor | Should -Match ': > "\$sandbox_root/dev/console"'
         $supervisor | Should -Match 'protected-pester-proxy\.log'
         $supervisor | Should -Match 'Proxy startup diagnostics:'
-        $supervisor | Should -Match 'stateMatch = \[regex\]::Match'
-        $supervisor | Should -Match "-cne 'Z'"
+        $supervisor | Should -Match 'ConvertFrom-LinuxProcessResourceUsageMetadata'
+        $supervisor | Should -Match "@\('Z', 'X'\)"
         $supervisor | Should -Match 'statmPath = Join-Path ''/proc'''
-        $supervisor | Should -Match 'statmMemoryBytes'
+        $supervisor | Should -Match '-Statm \$statm'
         $supervisor | Should -Match 'Assert-LinuxAggregateResourceUsage'
         $supervisor | Should -Match 'Get-LinuxAggregateClockTicksPerSecond'
         $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage'
@@ -253,7 +263,7 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
         $supervisor | Should -Match 'Get-LinuxPesterCgroupRoot'
         $supervisor | Should -Match '/proc/\$PID/cgroup'
-        $supervisor | Should -Match 'New-LinuxPesterCgroup'
+        $supervisor | Should -Match 'New-LinuxCandidateCgroup'
         $supervisor | Should -Match 'memory\.max'
         $supervisor | Should -Match 'cpu\.stat'
         $supervisor | Should -Match 'usage_usec'
@@ -262,7 +272,8 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'populated'
         $supervisor | Should -Match 'Start-Sleep -Milliseconds 25'
         $supervisor | Should -Match 'linuxPesterCgroupCleanupException'
-        $supervisor | Should -Match 'Add-LinuxProcessTreeToCgroup'
+        $supervisor | Should -Match 'PesterProxyCgroupPath'
+        $supervisor | Should -Match '\[IO\.File\]::WriteAllText\([\s\S]*?cgroup\.procs'
         $workflow | Should -Match 'Delegate Linux cgroup v2 subtree'
         $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
         $workflow | Should -Match 'CODEX_PESTER_VALIDATOR_CGROUP'
@@ -270,7 +281,7 @@ Describe 'Darktide bootstrap transition' {
         $workflow | Should -Match '\+cpu \+memory'
         $workflow | Should -Match 'cgroup\.subtree_control'
         $workflow | Should -Match 'cgroup\.threads'
-        $workflow | Should -Match 'cgroup_parent/cgroup\.procs'
+        $workflow | Should -Match 'cgroup_delegated/cgroup\.procs'
         $workflow | Should -Match 'sudo -n chown'
         $workflow | Should -Match 'trusted-validator'
         $workflow | Should -Match 'Remove delegated Linux cgroup subtree'
@@ -283,8 +294,8 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$PesterProxyReadOnlyPathsJson'
         $supervisor | Should -Match 'EnvironmentVariables\.Remove\(\$gateEnvironmentName\)'
         $supervisor | Should -Match '\[ ! -e "\$target" \]'
-        $supervisor | Should -Match 'exec "\$chroot_path"'
-        $supervisor | Should -Match 'exec chroot "\$sandbox_root"'
+        ([regex]::Matches($supervisor, [regex]::Escape('"$unshare_path" --mount --pid --fork --kill-child --mount-proc="$sandbox_root/proc"'))).Count | Should -Be 2
+        ([regex]::Matches($supervisor, [regex]::Escape('"$chroot_path" "$sandbox_root"'))).Count | Should -Be 2
         $supervisor | Should -Match 'SGV1-Pester-Result:'
         $supervisor | Should -Match 'Invoke-TrustedPowerShellProcess'
         $supervisor | Should -Match 'Invoke-ProtectedPesterSupervisor'
@@ -297,4 +308,284 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Not -Match '-StandardInput \$pesterWorkerMarker'
         $supervisor | Should -Not -Match '\$pesterSupervisorPath\s*='
     }
+
+    It 'UnitT92_BoundsOnlyTheMeasuredSlowPesterShardWithExtraWallTime' {
+        # Scenario: ModUpdateAutomation is a measured 300-second-plus wall-clock shard while the other immutable files stay below the default.
+        # Purpose: Give only that explicit trusted file enough wall time without widening the 300-second CPU or default shard boundary.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+        $tokens = $null
+        $errors = $null
+        $supervisorAst = [Management.Automation.Language.Parser]::ParseInput($supervisor, [ref]$tokens, [ref]$errors)
+        $errors.Count | Should -Be 0
+        $timeoutFunction = @($supervisorAst.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Get-ProtectedPesterShardTimeoutMilliseconds'
+        }, $true))
+        $requiredTestsFunction = @($supervisorAst.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Get-RequiredPesterTests'
+        }, $true))
+
+        $timeoutFunction.Count | Should -Be 1
+        $requiredTestsFunction.Count | Should -Be 1
+        if ($timeoutFunction.Count -ne 1 -or $requiredTestsFunction.Count -ne 1) { return }
+
+        $moduleSource = $requiredTestsFunction[0].Extent.Text + [Environment]::NewLine + $timeoutFunction[0].Extent.Text
+        $timeoutModule = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $requiredTests = @(& $timeoutModule { Get-RequiredPesterTests })
+        $expectedRequiredTests = @(
+            'BootstrapTransition.Tests.ps1'
+            'LocalizationWorkset.Tests.ps1'
+            'ModUpdateAutomation.Tests.ps1'
+            'RepositoryContract.Tests.ps1'
+            'RepositoryValidation.Tests.ps1'
+            'Schema15Coordination.Tests.ps1'
+            'Schema15SourceAcquisition.Tests.ps1'
+            'SkillContract.Tests.ps1'
+            'SourcePin.Tests.ps1'
+            'ValidationTransition.Tests.ps1'
+            'AtomicValidationOutput.Tests.ps1'
+            'CanonicalValidation.Tests.ps1'
+            'StandardV1Conformance.Tests.ps1'
+            'Test-Repository.Tests.ps1'
+        )
+        $requiredTests.Count | Should -Be 14
+        ($requiredTests -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
+        $supervisor | Should -Not -Match '(?s)\$requiredPesterTests\s*=\s*@\(\s*''BootstrapTransition\.Tests\.ps1'''
+        foreach ($testName in $requiredTests) {
+            $actualTimeout = & $timeoutModule {
+                param($name)
+                Get-ProtectedPesterShardTimeoutMilliseconds -TestName $name
+            } $testName
+            $expectedTimeout = if ($testName -ceq 'ModUpdateAutomation.Tests.ps1') { 600000 } else { 300000 }
+            $actualTimeout | Should -Be $expectedTimeout
+        }
+        { & $timeoutModule { Get-ProtectedPesterShardTimeoutMilliseconds -TestName 'CandidateControlled.Tests.ps1' } } |
+            Should -Throw '*outside the immutable required inventory*'
+        $supervisor | Should -Match '\$shardTimeoutMilliseconds\s*=\s*Get-ProtectedPesterShardTimeoutMilliseconds'
+        $supervisor | Should -Match '-TimeoutMilliseconds\s+\$shardTimeoutMilliseconds'
+        $supervisor | Should -Match 'per-candidate 300-second CPU'
+    }
+
+    It 'UnitT95_KeepsProtectedPesterBelowARootOwnedAggregateCgroup' {
+        # Scenario: Candidate code runs under the delegated runner identity and can write migration controls in that delegated subtree.
+        # Purpose: Keep that whole subtree below a root-owned aggregate boundary and prove every descendant is dead before later steps.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $workflow | Should -Match 'cgroup_delegated="\$cgroup_parent/delegated"'
+        $workflow | Should -Match 'cgroup_supervisor="\$cgroup_delegated/trusted-validator"'
+        $workflow | Should -Match '(?s)''2147483648''.*?"\$cgroup_parent/memory\.max"'
+        $workflow | Should -Match '(?s)''256''.*?"\$cgroup_parent/pids\.max"'
+        $workflow | Should -Not -Match 'chown[^\r\n]*"\$cgroup_parent(?:/cgroup\.(?:procs|threads))?"'
+        $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT=%s[\s\S]*?"\$cgroup_delegated"'
+        $workflow | Should -Match 'cgroup\.kill'
+        $workflow | Should -Match 'cgroup\.events'
+        $workflow | Should -Match '/usr/bin/find "\$cgroup_parent" -mindepth 1 -depth -type d'
+        $workflow | Should -Match 'shell:\s*/usr/bin/sudo -n /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -e -o pipefail \{0\}'
+    }
+
+    It 'UnitT100_BindsReplacementObjectDiscoveryToTheCandidateWorktree' {
+        # Scenario: Git does not trust the runner checkout through ambient global configuration.
+        # Purpose: Make the replacement-object preflight use the same explicit repository trust boundary as every later Git read.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $supervisor | Should -Match '(?s)function Assert-NoGitReplacementObjects.*?safe\.directory=\$RepositoryRoot.*?core\.worktree=\$RepositoryRoot.*?rev-parse --git-path refs/replace'
+        $workflow | Should -Match '(?s)\$gitPath\s*=.*?\$gitArguments\s*=\s*@\(.*?safe\.directory=\$repositoryRoot.*?core\.worktree=\$repositoryRoot.*?rev-parse HEAD.*?merge-base --is-ancestor'
+
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $script:Supervisor,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        @($parseErrors).Count | Should -Be 0
+        $functionAst = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Assert-NoGitReplacementObjects'
+            }, $true)
+        $functionAst | Should -Not -BeNullOrEmpty
+        $guardModule = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+
+        $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+        $emptyGitConfig = Join-Path $TestDrive 'empty-git-config'
+        New-Item -ItemType File -Path $emptyGitConfig -Force | Out-Null
+        $savedAssumeDifferentOwner = $env:GIT_TEST_ASSUME_DIFFERENT_OWNER
+        $savedGlobalConfig = $env:GIT_CONFIG_GLOBAL
+        $savedSystemConfig = $env:GIT_CONFIG_SYSTEM
+        $savedNoSystemConfig = $env:GIT_CONFIG_NOSYSTEM
+        try {
+            $env:GIT_TEST_ASSUME_DIFFERENT_OWNER = '1'
+            $env:GIT_CONFIG_GLOBAL = $emptyGitConfig
+            $env:GIT_CONFIG_SYSTEM = $emptyGitConfig
+            $env:GIT_CONFIG_NOSYSTEM = '1'
+
+            & $gitPath -C $script:ValidatorRepositoryRoot rev-parse --git-path refs/replace 2>$null | Out-Null
+            $LASTEXITCODE | Should -Not -Be 0
+
+            {
+                & $guardModule {
+                    param($ResolvedGitPath, $RepositoryRoot)
+                    Assert-NoGitReplacementObjects `
+                        -GitPath $ResolvedGitPath `
+                        -RepositoryRoot $RepositoryRoot `
+                        -Context 'Unit test candidate'
+                } $gitPath $script:ValidatorRepositoryRoot
+            } | Should -Not -Throw
+        }
+        finally {
+            $env:GIT_TEST_ASSUME_DIFFERENT_OWNER = $savedAssumeDifferentOwner
+            $env:GIT_CONFIG_GLOBAL = $savedGlobalConfig
+            $env:GIT_CONFIG_SYSTEM = $savedSystemConfig
+            $env:GIT_CONFIG_NOSYSTEM = $savedNoSystemConfig
+            Remove-Module $guardModule -Force
+        }
+    }
+
+    It 'UnitT110_RejectsNonUtf8PowerShellSourceBytes' {
+        # Scenario: Windows PowerShell 5.1 parses trusted local source fixtures encoded as UTF-8 with or without a BOM, while UTF-16 and UTF-32 source is rejected.
+        # Purpose: Prevent host ANSI source interpretation from accepting malformed candidate PowerShell while preserving non-ASCII UTF-8 code.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $workflow | Should -Match '\[IO\.File\]::ReadAllBytes\(\$candidatePath\)'
+        $workflow | Should -Not -Match '\$candidateSource\s*=\s*\[IO\.File\]::ReadAllText\('
+        $workflow | Should -Match '(?s)\$candidateBytes\[0\] -eq 0xEF.*?\$candidateBytes\[1\] -eq 0xBB.*?\$candidateBytes\[2\] -eq 0xBF'
+        $workflow | Should -Match '(?s)\[Text\.UTF8Encoding\]::new\(\$false, \$true\)\.GetString\(.*?\$candidateBytes.*?\$candidateOffset.*?\$candidateBytes\.Length - \$candidateOffset'
+
+        $compatibilityTokens = $null
+        $compatibilityParseErrors = $null
+        $compatibilityAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1'),
+            [ref]$compatibilityTokens,
+            [ref]$compatibilityParseErrors
+        )
+        @($compatibilityParseErrors).Count | Should -Be 0
+        $sourceParserAst = $compatibilityAst.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Assert-StrictUtf8PowerShellFile'
+            }, $true)
+        $sourceParserAst | Should -Not -BeNullOrEmpty
+
+        $fixtureRoot = Join-Path $TestDrive 'windows-powershell-utf8-fixtures'
+        New-Item -ItemType Directory -Path $fixtureRoot -Force | Out-Null
+        $plainPath = Join-Path $fixtureRoot 'plain-utf8.ps1'
+        $bomPath = Join-Path $fixtureRoot 'bom-utf8.ps1'
+        $utf16Path = Join-Path $fixtureRoot 'utf16.ps1'
+        $utf32Path = Join-Path $fixtureRoot 'utf32.ps1'
+        $malformedPath = Join-Path $fixtureRoot 'malformed-utf8.ps1'
+        $fixtureSource = "`$message = '" + [string][char]0x6E2C + [char]0x8A66 + "'"
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        $utf16 = [Text.Encoding]::Unicode
+        $utf32 = [Text.UTF32Encoding]::new($false, $true)
+        [IO.File]::WriteAllBytes($plainPath, $utf8.GetBytes($fixtureSource))
+        [IO.File]::WriteAllBytes($bomPath, ([byte[]]@(0xEF, 0xBB, 0xBF) + $utf8.GetBytes($fixtureSource)))
+        [IO.File]::WriteAllBytes($utf16Path, ($utf16.GetPreamble() + $utf16.GetBytes($fixtureSource)))
+        [IO.File]::WriteAllBytes($utf32Path, ($utf32.GetPreamble() + $utf32.GetBytes($fixtureSource)))
+        [IO.File]::WriteAllBytes($malformedPath, $utf8.GetBytes('if ('))
+
+        $sourceParserModule = New-Module -ScriptBlock ([scriptblock]::Create($sourceParserAst.Extent.Text))
+        try {
+            foreach ($validPath in @($plainPath, $bomPath)) {
+                {
+                    & $sourceParserModule {
+                        param($Path)
+                        Assert-StrictUtf8PowerShellFile -Path $Path
+                    } $validPath
+                } | Should -Not -Throw
+            }
+            foreach ($invalidPath in @($utf16Path, $utf32Path, $malformedPath)) {
+                {
+                    & $sourceParserModule {
+                        param($Path)
+                        Assert-StrictUtf8PowerShellFile -Path $Path
+                    } $invalidPath
+                } | Should -Throw
+            }
+        }
+        finally {
+            Remove-Module $sourceParserModule -Force
+        }
+
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+            $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+            $systemRoot | Should -Not -BeNullOrEmpty
+            $windowsPowerShellPath = [IO.Path]::GetFullPath((Join-Path $systemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+            Test-Path -LiteralPath $windowsPowerShellPath -PathType Leaf | Should -BeTrue
+            $runnerPath = Join-Path $fixtureRoot 'parse-fixtures.ps1'
+            $runnerSource = @(
+                'param([string] $PlainPath, [string] $BomPath, [string] $Utf16Path, [string] $Utf32Path, [string] $MalformedPath)'
+                '$ErrorActionPreference = ''Stop'''
+                $sourceParserAst.Extent.Text
+                'Assert-StrictUtf8PowerShellFile -Path $PlainPath'
+                'Assert-StrictUtf8PowerShellFile -Path $BomPath'
+                'foreach ($invalidPath in @($Utf16Path, $Utf32Path, $MalformedPath)) { try { Assert-StrictUtf8PowerShellFile -Path $invalidPath; throw "Expected strict UTF-8 parsing to reject $invalidPath." } catch { if ($_.Exception.Message -like "Expected strict UTF-8 parsing*") { throw } } }'
+            ) -join [Environment]::NewLine
+            [IO.File]::WriteAllText($runnerPath, $runnerSource, [Text.UTF8Encoding]::new($false))
+            & $windowsPowerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runnerPath $plainPath $bomPath $utf16Path $utf32Path $malformedPath
+            $LASTEXITCODE | Should -Be 0
+        }
+
+        foreach ($validatorPath in @($script:Supervisor, $script:RepositoryValidator)) {
+            $validatorSource = Get-Content -LiteralPath $validatorPath -Raw
+            $validatorSource | Should -Match 'Read-StrictUtf8File -Path'
+            $validatorSource | Should -Not -Match '\[IO\.File\]::ReadAllText\([^\r\n]+\[Text\.UTF8Encoding\]::new\(\$false,\s*\$true\)\)'
+            $tokens = $null
+            $parseErrors = $null
+            $validatorAst = [Management.Automation.Language.Parser]::ParseFile(
+                $validatorPath,
+                [ref]$tokens,
+                [ref]$parseErrors
+            )
+            @($parseErrors).Count | Should -Be 0
+            $readerAst = $validatorAst.Find({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                        $node.Name -eq 'Read-StrictUtf8File'
+                }, $true)
+            $readerAst | Should -Not -BeNullOrEmpty
+            $readerAst.Extent.Text | Should -Match '\[IO\.File\]::ReadAllBytes\(\$Path\)'
+            $readerAst.Extent.Text | Should -Match '(?s)\$bytes\[0\] -eq 0xEF.*?\$bytes\[1\] -eq 0xBB.*?\$bytes\[2\] -eq 0xBF'
+            $readerAst.Extent.Text | Should -Match '\[Text\.UTF8Encoding\]::new\(\$false, \$true\)\.GetString\('
+
+            $readerModule = New-Module -ScriptBlock ([scriptblock]::Create($readerAst.Extent.Text))
+            try {
+                $validatorName = [IO.Path]::GetFileNameWithoutExtension($validatorPath)
+                $invalidPath = Join-Path $TestDrive "$validatorName-utf16.txt"
+                $plainPath = Join-Path $TestDrive "$validatorName-utf8.txt"
+                $bomPath = Join-Path $TestDrive "$validatorName-utf8-bom.txt"
+                [IO.File]::WriteAllBytes($invalidPath, [byte[]]@(0xFF, 0xFE, 0x23, 0x00))
+                [IO.File]::WriteAllBytes($plainPath, [byte[]]@(0x23, 0x20, 0x6F, 0x6B))
+                [IO.File]::WriteAllBytes($bomPath, [byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B))
+
+                { & $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $invalidPath } |
+                    Should -Throw
+                (& $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $plainPath) |
+                    Should -Be '# ok'
+                (& $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $bomPath) |
+                    Should -Be '# ok'
+            }
+            finally {
+                Remove-Module $readerModule -Force
+            }
+        }
+
+        $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+        { $strictUtf8.GetString([byte[]]@(0xFF, 0xFE, 0x23, 0x00), 0, 4) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0xFE, 0xFF, 0x00, 0x23), 0, 4) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0xFF, 0xFE, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00), 0, 8) } |
+            Should -Throw
+        { $strictUtf8.GetString([byte[]]@(0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x23), 0, 8) } |
+            Should -Throw
+        $strictUtf8.GetString([byte[]]@(0x23, 0x20, 0x6F, 0x6B), 0, 4) |
+            Should -Be '# ok'
+        $strictUtf8.GetString([byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B), 3, 4) |
+            Should -Be '# ok'
+    }
+
 }

@@ -318,32 +318,52 @@ jobs:
             echo "The delegated cgroup path already exists: $cgroup_parent" >&2
             exit 1
           fi
-          cgroup_supervisor="$cgroup_parent/trusted-validator"
+          cgroup_delegated="$cgroup_parent/delegated"
+          cgroup_supervisor="$cgroup_delegated/trusted-validator"
           cleanup_on_error() {
             sudo -n rmdir -- "$cgroup_supervisor" 2>/dev/null || true
+            sudo -n rmdir -- "$cgroup_delegated" 2>/dev/null || true
             sudo -n rmdir -- "$cgroup_parent" 2>/dev/null || true
           }
           trap cleanup_on_error ERR
-          sudo -n mkdir -- "$cgroup_parent"
-          sudo -n chown "$(id -u):$(id -g)" -- "$cgroup_parent"
-          sudo -n chmod 0755 -- "$cgroup_parent"
+          sudo -n install -d -m 0755 -o root -g root -- "$cgroup_parent"
+          if [[ "$(sudo -n stat -c '%u:%g:%a' "$cgroup_parent")" != '0:0:755' ]]; then
+            echo 'The outer protected Pester cgroup boundary is not root-owned.' >&2
+            exit 1
+          fi
+          printf '%s\n' '2147483648' | sudo -n tee "$cgroup_parent/memory.max" >/dev/null
+          if [[ "$(< "$cgroup_parent/memory.max")" != '2147483648' ]]; then
+            echo 'The outer protected Pester cgroup did not retain its aggregate memory limit.' >&2
+            exit 1
+          fi
+          if [[ -e "$cgroup_parent/pids.max" ]]; then
+            printf '%s\n' '256' | sudo -n tee "$cgroup_parent/pids.max" >/dev/null
+            if [[ "$(< "$cgroup_parent/pids.max")" != '256' ]]; then
+              echo 'The outer protected Pester cgroup did not retain its aggregate PID limit.' >&2
+              exit 1
+            fi
+          fi
           controllers_to_enable='+cpu +memory'
           if [[ " $controllers " =~ [[:space:]]pids[[:space:]] ]]; then
             controllers_to_enable+=' +pids'
           fi
           printf '%s\n' "$controllers_to_enable" | sudo -n tee "$cgroup_parent/cgroup.subtree_control" >/dev/null
+          sudo -n mkdir -- "$cgroup_delegated"
+          printf '%s\n' "$controllers_to_enable" | sudo -n tee "$cgroup_delegated/cgroup.subtree_control" >/dev/null
           for delegation_file in \
-            "$cgroup_parent/cgroup.procs" \
-            "$cgroup_parent/cgroup.threads" \
-            "$cgroup_parent/cgroup.subtree_control"; do
+            "$cgroup_delegated/cgroup.procs" \
+            "$cgroup_delegated/cgroup.threads" \
+            "$cgroup_delegated/cgroup.subtree_control"; do
             sudo -n chown "$(id -u):$(id -g)" -- "$delegation_file"
           done
-          delegated_controls="$(< "$cgroup_parent/cgroup.subtree_control")"
+          sudo -n chown "$(id -u):$(id -g)" -- "$cgroup_delegated"
+          sudo -n chmod 0755 -- "$cgroup_delegated"
+          delegated_controls="$(< "$cgroup_delegated/cgroup.subtree_control")"
           if [[ ! " $delegated_controls " =~ [[:space:]]memory[[:space:]] || ! " $delegated_controls " =~ [[:space:]]cpu[[:space:]] ]]; then
             echo 'The delegated cgroup root did not enable the memory and CPU controllers.' >&2
             exit 1
           fi
-          if [[ ! -w "$cgroup_parent" ]]; then
+          if [[ -w "$cgroup_parent/cgroup.procs" || ! -w "$cgroup_delegated" ]]; then
             echo 'The delegated cgroup root is not writable by the validation runner.' >&2
             exit 1
           fi
@@ -353,7 +373,7 @@ jobs:
             exit 1
           fi
           printf 'CODEX_PESTER_CGROUP_ROOT=%s\nCODEX_PESTER_VALIDATOR_CGROUP=%s\n' \
-            "$cgroup_parent" "$cgroup_supervisor" >> "$GITHUB_ENV"
+            "$cgroup_delegated" "$cgroup_supervisor" >> "$GITHUB_ENV"
           trap - ERR
 
       - name: Enable unprivileged Linux user namespaces
@@ -382,7 +402,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $validatorCgroup = [string]$env:CODEX_PESTER_VALIDATOR_CGROUP
-          if ($validatorCgroup -notmatch '^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+/trusted-validator$') {
+          if ($validatorCgroup -notmatch '^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+/delegated/trusted-validator$') {
             throw 'The trusted canonical validator cgroup path is missing or invalid.'
           }
           $validatorPid = [string]$PID
@@ -455,27 +475,33 @@ jobs:
 
       - name: Remove delegated Linux cgroup subtree
         if: ${{ always() }}
-        shell: bash
+        shell: /usr/bin/sudo -n /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
-          cgroup_parent="${CODEX_PESTER_CGROUP_ROOT:-}"
-          if [[ -z "$cgroup_parent" ]]; then
-            exit 0
-          fi
+          cgroup_parent="/sys/fs/cgroup/codex-validation-${{ github.run_id }}-${{ github.run_attempt }}"
           if [[ ! "$cgroup_parent" =~ ^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+$ ]]; then
             echo 'The cleanup cgroup path did not match the expected run-bound format.' >&2
             exit 1
           fi
           if [[ -e "$cgroup_parent" ]]; then
-            cgroup_supervisor="${CODEX_PESTER_VALIDATOR_CGROUP:-$cgroup_parent/trusted-validator}"
-            if [[ ! "$cgroup_supervisor" =~ ^/sys/fs/cgroup/codex-validation-[0-9]+-[0-9]+/trusted-validator$ ]]; then
-              echo 'The cleanup validator cgroup path did not match the expected run-bound format.' >&2
-              exit 1
-            fi
-            if [[ -e "$cgroup_supervisor" ]]; then
-              sudo -n rmdir -- "$cgroup_supervisor"
-            fi
-            sudo -n rmdir -- "$cgroup_parent"
+            [[ "$(/usr/bin/stat -c '%u:%g:%a' "$cgroup_parent")" == '0:0:755' ]]
+            [[ -f "$cgroup_parent/cgroup.kill" && -f "$cgroup_parent/cgroup.events" ]]
+            /usr/bin/printf '%s\n' '1' > "$cgroup_parent/cgroup.kill"
+            cgroup_unpopulated=0
+            for cleanup_attempt in {1..120}; do
+              if /usr/bin/grep -qx 'populated 0' "$cgroup_parent/cgroup.events"; then
+                cgroup_unpopulated=1
+                break
+              fi
+              /usr/bin/sleep 0.025
+            done
+            [[ "$cgroup_unpopulated" == '1' ]]
+            mapfile -t descendant_cgroups < <(/usr/bin/find "$cgroup_parent" -mindepth 1 -depth -type d -print)
+            for descendant_cgroup in "${descendant_cgroups[@]}"; do
+              /usr/bin/rmdir -- "$descendant_cgroup"
+            done
+            /usr/bin/rmdir -- "$cgroup_parent"
+            [[ ! -e "$cgroup_parent" ]]
           fi
 
       - name: Verify canonical validation evidence
