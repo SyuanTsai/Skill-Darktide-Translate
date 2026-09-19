@@ -6614,15 +6614,18 @@ if (-not [OperatingSystem]::IsWindows() -and
     Set-StrictMode -Version 1.0
 }
 # The immutable RepositoryContract fixture initializes HostIsLinux but reads
-# IsLinuxHost before assigning it. Seed only that fixture's script scope from
-# a trusted Pester container; keep StrictMode Latest and the test file bytes
-# unchanged while every unrelated shard continues to use its direct path.
+# IsLinuxHost before assigning it. Seed only that fixture's run-phase script
+# scope from a trusted Pester container; discovery-scope variables are not
+# retained by Pester 6. Keep StrictMode Latest and the test file bytes unchanged
+# while every unrelated shard continues to use its direct path.
 if (-not [OperatingSystem]::IsWindows() -and
     [string]$selectedPesterTests[0] -ceq 'RepositoryContract.Tests.ps1') {
     $repositoryContractContainer = New-PesterContainer -ScriptBlock {
         param($TrustedRepositoryContractPath)
         Set-StrictMode -Version Latest
-        $script:IsLinuxHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
+        BeforeAll {
+            $script:IsLinuxHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
+        }
         . $TrustedRepositoryContractPath
     } -Data @{
         TrustedRepositoryContractPath = [string]$requiredPesterPaths[0]
