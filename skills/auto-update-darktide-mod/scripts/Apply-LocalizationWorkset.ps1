@@ -13,6 +13,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -155,7 +156,8 @@ function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
+    if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Workset NEW path escapes its recorded staging root.'
     }
     $candidateFull
@@ -164,16 +166,31 @@ function Assert-ContainedPath {
 function Assert-NoReparsePath {
     param([string] $Path, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root)
-    $current = Get-Item -LiteralPath $Path
-    while ($true) {
-        if ($current.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    $currentPath = [IO.Path]::GetFullPath($Path)
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $currentPath)
+    for ($depth = 0; $depth -lt 2048; $depth++) {
+        $current = $null
+        try {
+            $current = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $currentPath -Label 'Workset NEW localization') {
+                throw 'Workset NEW localization path contains a symlink or reparse point.'
+            }
+            throw
+        }
+        catch {
+            throw "Unable to inspect Workset NEW localization physical containment component: $($_.Exception.Message)"
+        }
+        if (Test-PortableReparseItem -Path $currentPath -Item $current -Label 'Workset NEW localization') {
             throw 'Workset NEW localization path contains a symlink or reparse point.'
         }
-        if ($current.FullName.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { break }
-        $parent = Split-Path -Parent $current.FullName
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw 'Unable to prove Workset NEW localization containment.' }
-        $current = Get-Item -LiteralPath $parent
+        if ($currentPath.Equals($rootFull, $comparison)) { return }
+        $parent = [IO.DirectoryInfo]::new($currentPath).Parent
+        if ($null -eq $parent) { throw 'Unable to prove Workset NEW localization containment.' }
+        $currentPath = $parent.FullName
     }
+    throw 'Unable to prove Workset NEW localization containment within 2048 path components.'
 }
 
 function ConvertTo-NewlineStyle {
@@ -214,7 +231,7 @@ function Get-RemovalEdits {
     $fieldStart = [int64]$Expression.fieldStartByte
     $fieldLength = [int64]$Expression.fieldLengthByte
     if ([int64]$Expression.separatorLengthByte -gt 0) {
-        $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE'))
+        $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation (([char[]](82, 69, 77, 79, 86, 69)) -join '')))
         return @($edits)
     }
     $cursor = $fieldStart - 1
@@ -225,7 +242,7 @@ function Get-RemovalEdits {
     if ($cursor -ge 0 -and $Bytes[$cursor] -in @(44, 59)) {
         $edits.Add((New-Edit -Start $cursor -Length 1 -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE_SEPARATOR'))
     }
-    $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE'))
+    $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation (([char[]](82, 69, 77, 79, 86, 69)) -join '')))
     @($edits)
 }
 

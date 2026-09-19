@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 SyuanTsai
+﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Deterministic Darktide MOD update automation' {
     BeforeAll {
@@ -39,6 +39,39 @@ Describe 'Deterministic Darktide MOD update automation' {
             $scriptContent = Get-Content -LiteralPath $scriptFile.FullName -Raw
             $scriptContent | Should -Not -Match '(?im)^\s*\$(?:input|matches)\s*=' -Because $scriptFile.Name
         }
+    }
+
+    # Scenario: A tree iterator passes the provider's authoritative directory entry.
+    # Purpose: Avoid repeating an ancestor walk for every existing item while keeping
+    # the missing-path fallback responsible for detecting broken-link ancestors.
+    It 'UnitT106_InspectsRawAncestorsAfterProviderResolution' {
+        $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
+        $pathSafety = Get-Content -LiteralPath $pathSafetyPath -Raw
+        $pathSafety | Should -Match '(?s)if \(& \$inspectProviderItem \$Item\) \{ return \$true \}.*?always walk raw lexical ancestors even when \$Item exists'
+        $pathSafety | Should -Not -Match 'if \(\$null -ne \$Item\) \{ return \$false \}'
+        $pathSafety | Should -Not -Match 'knownSafePhysicalPaths'
+    }
+
+    It 'UnitT107_UsesKernelIdentityForCaseOnlyPhysicalNormalization' {
+        $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
+        $runner = Get-Content -LiteralPath $runnerPath -Raw
+
+        $pathSafety | Should -Match 'TryGetPhysicalFileIdentity'
+        $pathSafety | Should -Match 'Test-PortablePhysicalIdentity'
+        $runner | Should -Match 'Test-PortablePhysicalIdentity'
+        $runner | Should -Match '\$samePhysicalPath'
+    }
+
+    # Scenario: The native case-sensitivity query is unavailable and the Win32 fallback is used.
+    # Purpose: Pass each API its own information-class enum value; the numeric values are not interchangeable.
+    It 'UnitT108_UsesDistinctNativeAndWin32CaseSensitivityClasses' {
+        $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
+
+        $pathSafety | Should -Match 'private const int NtFileCaseSensitiveInformation = 71;'
+        $pathSafety | Should -Match 'private const int Win32FileCaseSensitiveInformation = 23;'
+        $pathSafety | Should -Match '(?s)NtQueryInformationFile\(.*?NtFileCaseSensitiveInformation\)'
+        $pathSafety | Should -Match '(?s)GetFileInformationByHandleEx\(.*?Win32FileCaseSensitiveInformation\s*,'
+        $pathSafety | Should -Not -Match '(?s)GetFileInformationByHandleEx\(\s*handle,\s*FileCaseSensitiveInformation\s*,'
     }
 
     # Scenario: A caller invokes a single stage or resumes the same run.
@@ -190,6 +223,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $finalizer | Should -Match 'Read-ActiveReservationOwner'
         $finalizer | Should -Match 'Suspend-ModReservationWorker -State \$State'
         $finalizer | Should -Match 'Exit-RunWriterLock -Lease \$script:writerLease'
+        $finalizer | Should -Match 'Remove-DirectoryTreeWithHeartbeat -Path \$fullPath -Root \$rootFull'
         $finalizer | Should -Not -Match '@\(''branch'', ''-D'''
         $finalizer | Should -Not -Match 'Remove-Item\s+-Recurse'
     }
@@ -222,7 +256,12 @@ Describe 'Deterministic Darktide MOD update automation' {
                 $node.Name -eq 'Test-ModUpdateWorktreeRegistered'
         }, $true)
         $functionAst | Should -Not -BeNullOrEmpty
-        $module = New-Module -ScriptBlock ([scriptblock]::Create($functionAst.Extent.Text))
+        $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
+        $module = New-Module -ArgumentList $pathSafetyPath, $functionAst.Extent.Text -ScriptBlock {
+            param($modulePath, $functionSource)
+            Import-Module -Name $modulePath -Force -ErrorAction Stop
+            . ([scriptblock]::Create($functionSource))
+        }
         try {
             $nativePath = 'F:\Runs\Darktide Update'
             $porcelain = "worktree F:/Runs/Darktide Update`nHEAD $('a' * 40)`nbranch refs/heads/Update/example"
@@ -922,6 +961,9 @@ function Suspend-Stage {
         $runner | Should -Match 'function Read-FileBytesWithHeartbeat'
         $runner | Should -Match 'function Copy-FileWithHeartbeat'
         $runner | Should -Match 'function Remove-DirectoryTreeWithHeartbeat'
+        $runner | Should -Match '\[IO\.Directory\]::Move\(\$removalRoot, \$quarantine\)'
+        $runner | Should -Match 'Assert-NoReparseTree -Path \$quarantine -Root \$containmentRoot'
+        $runner | Should -Match 'Assert-NoReparsePath -Path \$item\.FullName -Root \$quarantine'
         $runner | Should -Match 'function Write-BytesWithHeartbeat'
         $runner | Should -Match '\.CopyToAsync\(\$memory\)'
         $runner | Should -Not -Match '\.WaitForExit\(\)'
@@ -960,7 +1002,9 @@ function Suspend-Stage {
             $functionAst | Should -Not -BeNullOrEmpty
             $functionAst.Extent.Text
         }
-        $module = New-Module -ScriptBlock ([scriptblock]::Create(($functionTexts -join "`n")))
+        $pathSafetyModule = Join-Path $skillRoot 'scripts/PathSafety.psm1'
+        $moduleSource = "Import-Module -Name '$($pathSafetyModule.Replace("'", "''"))' -Force`n" + ($functionTexts -join "`n")
+        $module = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
         $repository = Join-Path $TestDrive 'old-reservation-token-repository'
         $lockPath = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod/test.lock'
         New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
@@ -2412,7 +2456,7 @@ function Get-SourceTupleContractSha256 {
         $worktreeModRoot = Join-Path ([string]$preInstallState.worktreePath) 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
         $outsideInstallTarget = Join-Path $TestDrive 'install-junction-target'
         Move-Item -LiteralPath $worktreeModRoot -Destination $outsideInstallTarget
-        New-Item -ItemType Junction -Path $worktreeModRoot -Target $outsideInstallTarget | Out-Null
+        New-TestReparsePoint -Path $worktreeModRoot -Target $outsideInstallTarget | Out-Null
         try {
             { & $runnerPath install -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
                 Should -Throw '*reparse*'
@@ -3062,7 +3106,7 @@ function Get-SourceTupleContractSha256 {
         $ownerPath = Join-Path $outside 'owner.json'
         [IO.File]::WriteAllText($ownerPath, ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         $ownerBefore = [IO.File]::ReadAllBytes($ownerPath)
-        New-Item -ItemType Junction -Path $lockPath -Target $outside | Out-Null
+        New-TestReparsePoint -Path $lockPath -Target $outside | Out-Null
 
         { & $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru } |
             Should -Throw '*reparse*'

@@ -10,6 +10,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $skillRoot = Split-Path -Parent $PSScriptRoot
 
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function Invoke-Heartbeat {
     if ($HeartbeatAction) { $null = & $HeartbeatAction }
 }
@@ -57,20 +59,34 @@ function Assert-NoReparsePath {
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    if (-not $pathFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
-        -not $pathFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    if (-not $pathFull.Equals($rootFull, $comparison) -and
+        -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Name escapes its physical verification root."
     }
     $current = $pathFull
     for ($depth = 0; $depth -lt 2048; $depth++) {
-        if (-not (Test-Path -LiteralPath $current)) { throw "$Name path component is missing." }
-        if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        $item = $null
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label $Name) {
+                throw "$Name path contains a symlink or reparse point."
+            }
+            throw "$Name path component is missing."
+        }
+        catch {
+            throw "Unable to inspect $Name physical containment component: $($_.Exception.Message)"
+        }
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Name) {
             throw "$Name path contains a symlink or reparse point."
         }
-        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw "Unable to prove $Name physical containment." }
-        $current = $parent
+        if ($current.Equals($rootFull, $comparison)) { return $pathFull }
+        $parentInfo = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parentInfo) { throw "Unable to prove $Name physical containment." }
+        $current = $parentInfo.FullName
     }
     throw "Unable to prove $Name physical containment within 2048 path components."
 }
@@ -160,7 +176,7 @@ function Test-Document {
 
     $candidate = [IO.Path]::GetFullPath((Join-Path $skillRoot $Document.packagedPath))
     $expectedPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
-    if (-not $candidate.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $candidate.StartsWith($expectedPrefix, (Get-PortablePathComparison -Paths @($resolvedSkillRoot, $candidate)))) {
         throw "$Name reference escaped the Skill root."
     }
     $candidate = Assert-NoReparsePath -Path $candidate -Root $skillRoot -Name "$Name reference"
@@ -182,28 +198,27 @@ function Test-Document {
         throw "$Name package Git blob OID mismatch."
     }
 
-    $packageStream = [IO.File]::OpenRead($candidate)
-    try {
-        $gzipStream = [IO.Compression.GZipStream]::new(
-            $packageStream,
-            [IO.Compression.CompressionMode]::Decompress
-        )
+    if ([IO.Path]::GetExtension($candidate) -ieq '.gz') {
+        $packageStream = [IO.File]::OpenRead($candidate)
         try {
-            $expandedStream = [IO.MemoryStream]::new()
+            $gzipStream = [IO.Compression.GZipStream]::new(
+                $packageStream,
+                [IO.Compression.CompressionMode]::Decompress
+            )
             try {
-                Copy-StreamWithHeartbeat -Source $gzipStream -Destination $expandedStream
-                $expandedBytes = $expandedStream.ToArray()
+                $expandedStream = [IO.MemoryStream]::new()
+                try {
+                    Copy-StreamWithHeartbeat -Source $gzipStream -Destination $expandedStream
+                    $expandedBytes = $expandedStream.ToArray()
+                }
+                finally { $expandedStream.Dispose() }
             }
-            finally {
-                $expandedStream.Dispose()
-            }
+            finally { $gzipStream.Dispose() }
         }
-        finally {
-            $gzipStream.Dispose()
-        }
+        finally { $packageStream.Dispose() }
     }
-    finally {
-        $packageStream.Dispose()
+    else {
+        $expandedBytes = $packageBytes
     }
 
     $contentSha = Get-Sha256Bytes -Bytes $expandedBytes
@@ -255,7 +270,7 @@ function Test-Schema15Extension {
     $relativePath = ConvertTo-NormalizedRepositoryPath -Path $extensionProvenance.path -Name 'Schema 15 reference path'
     $candidate = [IO.Path]::GetFullPath((Join-Path $skillRoot $relativePath))
     $expectedPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
-    if (-not $candidate.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Schema 15 reference escaped the Skill root.' }
+    if (-not $candidate.StartsWith($expectedPrefix, (Get-PortablePathComparison -Paths @($resolvedSkillRoot, $candidate)))) { throw 'Schema 15 reference escaped the Skill root.' }
     $candidate = Assert-NoReparsePath -Path $candidate -Root $skillRoot -Name 'Schema 15 reference'
     $bytes = Read-FileBytesWithHeartbeat -Path $candidate
     $sha256 = Get-Sha256Bytes -Bytes $bytes
@@ -307,7 +322,7 @@ function Test-SkillSourcePin {
         $expectedByPath[$repositoryPath] = $entry
     }
     $actualItems = @(Get-ChildItem -LiteralPath $skillRoot -Recurse -Force)
-    if (@($actualItems | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count -ne 0) {
+    if (@($actualItems | Where-Object { Test-PortableReparseItem -Path $_.FullName -Item $_ -Label 'Installed Skill source' }).Count -ne 0) {
         throw 'Installed Skill source contains a reparse-point path.'
     }
     $actualFiles = @($actualItems | Where-Object { -not $_.PSIsContainer })

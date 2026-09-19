@@ -31,9 +31,15 @@ $resolvedOutputRoot = $outputRoot.TrimEnd(
     [IO.Path]::AltDirectorySeparatorChar
 )
 $skillPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
+$pathComparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    [StringComparison]::OrdinalIgnoreCase
+}
+else {
+    [StringComparison]::Ordinal
+}
 if (
-    $resolvedOutputRoot.Equals($resolvedSkillRoot, [StringComparison]::OrdinalIgnoreCase) -or
-    $resolvedOutputRoot.StartsWith($skillPrefix, [StringComparison]::OrdinalIgnoreCase)
+    $resolvedOutputRoot.Equals($resolvedSkillRoot, $pathComparison) -or
+    $resolvedOutputRoot.StartsWith($skillPrefix, $pathComparison)
 ) {
     throw 'OutputDirectory must be outside the Skill source.'
 }
@@ -56,34 +62,31 @@ if (Test-Path -LiteralPath $outputPath) {
 
 $created = $false
 try {
-    $packageStream = [IO.File]::OpenRead($packagePath)
+    $outputStream = [IO.File]::Open(
+        $outputPath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    $created = $true
     try {
-        $gzipStream = [IO.Compression.GZipStream]::new(
-            $packageStream,
-            [IO.Compression.CompressionMode]::Decompress
-        )
+        $packageStream = [IO.File]::OpenRead($packagePath)
         try {
-            $outputStream = [IO.File]::Open(
-                $outputPath,
-                [IO.FileMode]::CreateNew,
-                [IO.FileAccess]::Write,
-                [IO.FileShare]::None
-            )
-            $created = $true
-            try {
-                $gzipStream.CopyTo($outputStream)
+            if ([IO.Path]::GetExtension($packagePath) -ieq '.gz') {
+                $gzipStream = [IO.Compression.GZipStream]::new(
+                    $packageStream,
+                    [IO.Compression.CompressionMode]::Decompress
+                )
+                try { $gzipStream.CopyTo($outputStream) }
+                finally { $gzipStream.Dispose() }
             }
-            finally {
-                $outputStream.Dispose()
+            else {
+                $packageStream.CopyTo($outputStream)
             }
         }
-        finally {
-            $gzipStream.Dispose()
-        }
+        finally { $packageStream.Dispose() }
     }
-    finally {
-        $packageStream.Dispose()
-    }
+    finally { $outputStream.Dispose() }
 
     $outputFile = Get-Item -LiteralPath $outputPath
     $outputSha = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash.ToLowerInvariant()

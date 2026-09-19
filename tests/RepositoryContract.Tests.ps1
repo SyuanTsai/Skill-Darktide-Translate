@@ -176,7 +176,10 @@ Describe 'Darktide Translate repository contract' {
                 'catalog/source.json',
                 'catalog/profiles.json',
                 'config/standard-v1.json',
-                'scripts/Invoke-PrePushValidation.ps1'
+                'scripts/Invoke-PrePushValidation.ps1',
+                'tests/CanonicalValidation.Tests.ps1',
+                'tests/StandardV1Conformance.Tests.ps1',
+                'tests/Test-Repository.Tests.ps1'
             )
         }
 
@@ -308,13 +311,22 @@ Describe 'Darktide Translate repository contract' {
 
     # Scenario: The base-owned protected supervisor validates the next migration against the current central authority snapshot.
     # Purpose: Prevent a merged workflow bootstrap from retaining a stale authority pin that rejects the candidate before validation.
-    It 'UnitT45_BindsTheProtectedSupervisorToTheCurrentAuthoritySnapshot' {
+    It 'UnitT44_BindsTheProtectedSupervisorToTheCurrentAuthoritySnapshot' {
         if ($layout.Name -ceq 'legacy') {
             $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
 
             $validator | Should -Match ([regex]::Escape("`$approvedAuthorityCommit = 'a403abdf038a3346d775431a6908a71cc3d35a5b'"))
             $validator | Should -Match ([regex]::Escape("`$approvedAuthorityArchiveSha256 = '17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3'"))
             $validator | Should -Not -Match ([regex]::Escape('d38eba3faf967504751aba759f38102e7538a519'))
+        }
+    }
+
+    # Scenario: GNU stat identifies an empty tracked file as a regular empty file.
+    # Purpose: Preserve the accepted file-type contract in both validation entrypoints.
+    It 'UnitT45_AcceptsGnuStatClassificationForEmptyRegularFiles' {
+        foreach ($path in @('scripts/Validate.ps1', 'scripts/Test-Repository.ps1')) {
+            $validator = Get-Content -LiteralPath (Join-Path $repoRoot $path) -Raw
+            $validator | Should -Match "-cnotin @\('regular file', 'regular empty file'\)"
         }
     }
 
@@ -946,6 +958,87 @@ Describe 'Bounded writable-root enumeration behavior' {
         $bindIndex | Should -BeGreaterThan $createIndex
     }
 
+    # Scenario: The Linux proxy fails before the PowerShell remoting handshake completes.
+    # Purpose: Export only a bounded candidate-owned diagnostic tail after validating its host path.
+    It 'UnitT87_ExportsOnlyABoundedProtectedPesterProxyStartupLog' {
+        $proxy = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterServerProxy'
+        }, $true)
+        $runspace = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-ProtectedPesterRunspace'
+        }, $true)
+        $proxy | Should -Not -BeNullOrEmpty
+        $runspace | Should -Not -BeNullOrEmpty
+        if ($null -eq $proxy -or $null -eq $runspace) { return }
+
+        $proxySource = $proxy.Extent.Text
+        $proxySource | Should -Match ([regex]::Escape('proxy_log="$sandbox_root$child_writable_root/protected-pester-proxy.log"'))
+        $proxySource | Should -Match ([regex]::Escape('host_proxy_log="$child_writable_root/protected-pester-proxy.log"'))
+        $proxySource | Should -Not -Match ([regex]::Escape('proxy_log="$run_root/'))
+        $proxySource | Should -Match ([regex]::Escape('printf ''proxy_exit=%s\n'' "$candidate_status" >> "$proxy_log"'))
+        $proxySource | Should -Match ([regex]::Escape('trap export_proxy_log EXIT'))
+        $proxySource | Should -Match ([regex]::Escape('"$tail_path" -c 32768 -- "$proxy_log" > "$host_proxy_log"'))
+        $proxySource | Should -Match 'Get-Command tail -CommandType Application'
+        $proxySource | Should -Match 'Assert-NoReparseAncestors -Path \$utility -Context ''Protected Pester server Linux utility'''
+        $redirectIndex = $proxySource.IndexOf('exec 2>>"$proxy_log"', [StringComparison]::Ordinal)
+        $trapIndex = $proxySource.IndexOf('trap export_proxy_log EXIT', [StringComparison]::Ordinal)
+        $setupIndex = $proxySource.IndexOf('while [ "$readonly_count" -gt 0 ]', [StringComparison]::Ordinal)
+        $redirectIndex | Should -BeGreaterOrEqual 0
+        $trapIndex | Should -BeGreaterThan $redirectIndex
+        $setupIndex | Should -BeGreaterThan $trapIndex
+
+        $runspaceSource = $runspace.Extent.Text
+        $removeStaleIndex = $runspaceSource.IndexOf('Remove-ProtectedPesterProxyStartupLog', [StringComparison]::Ordinal)
+        $openIndex = $runspaceSource.IndexOf('$runspace.Open()', [StringComparison]::Ordinal)
+        $waitIndex = $runspaceSource.IndexOf('WaitForExit(5000)', [StringComparison]::Ordinal)
+        $logIndex = $runspaceSource.IndexOf('if (Test-Path -LiteralPath $proxyLogPath -PathType Leaf)', [StringComparison]::Ordinal)
+        $removeStaleIndex | Should -BeGreaterOrEqual 0
+        $openIndex | Should -BeGreaterThan $removeStaleIndex
+        $waitIndex | Should -BeGreaterOrEqual 0
+        $logIndex | Should -BeGreaterThan $waitIndex
+        $runspaceSource | Should -Match 'Assert-NoReparseAncestors[\s\S]*?-Boundary \$childWritableRootPath'
+        $runspaceSource | Should -Match '\$maxProxyLogBytes\s*=\s*32768'
+        $runspaceSource | Should -Match '\.ReadBytes\(\$bytesToRead\)'
+    }
+
+    # Scenario: A previous shard leaves a regular log, or an attacker replaces it with a non-regular entry.
+    # Purpose: Remove stale diagnostics before startup while preserving fail-closed file-type and reparse handling.
+    It 'UnitT88_RemovesOnlyARegularStaleProtectedPesterProxyLog' {
+        $cleanup = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Remove-ProtectedPesterProxyStartupLog'
+        }, $true)
+        $cleanup | Should -Not -BeNullOrEmpty
+        if ($null -eq $cleanup) { return }
+
+        $moduleSource = @'
+function Assert-NoReparseAncestors {
+    param([string] $Path, [string] $Context, [string] $Boundary)
+}
+'@ + [Environment]::NewLine + $cleanup.Extent.Text
+        $cleanupModule = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $root = Join-Path $TestDrive 'proxy-log-cleanup'
+        [void](New-Item -ItemType Directory -Path $root -Force)
+        $logPath = Join-Path $root 'protected-pester-proxy.log'
+        [IO.File]::WriteAllText($logPath, 'stale', [Text.UTF8Encoding]::new($false))
+
+        (& $cleanupModule { param($path) Remove-ProtectedPesterProxyStartupLog -ChildWritableRootPath $path } $root) |
+            Should -BeExactly $logPath
+        Test-Path -LiteralPath $logPath | Should -BeFalse
+
+        [void](New-Item -ItemType Directory -Path $logPath)
+        { & $cleanupModule { param($path) Remove-ProtectedPesterProxyStartupLog -ChildWritableRootPath $path } $root } |
+            Should -Throw '*is not a regular non-reparse file*'
+        Remove-Item -LiteralPath $logPath -Recurse -Force
+
+        $target = Join-Path $TestDrive 'proxy-log-link-target'
+        [void](New-Item -ItemType Directory -Path $target)
+        $linkType = if ([OperatingSystem]::IsWindows()) { 'Junction' } else { 'SymbolicLink' }
+        [void](New-Item -ItemType $linkType -Path $logPath -Target $target)
+        { & $cleanupModule { param($path) Remove-ProtectedPesterProxyStartupLog -ChildWritableRootPath $path } $root } |
+            Should -Throw '*is not a regular non-reparse file*'
+    }
+
     # Scenario: A writable directory is replaced with a symlink between enumeration and descent.
     # Purpose: Bind traversal to directory descriptors and refuse link following instead of reopening by pathname.
     It 'UnitT90_UsesDescriptorRelativeNoFollowWritableRootTraversal' {
@@ -1071,6 +1164,14 @@ Describe 'Bounded writable-root enumeration behavior' {
             Should -Throw '*resident memory*'
         { ConvertFrom-LinuxProcessResourceUsageMetadata -ProcessId 21242 -Stat $liveStat -Status $deadStatus } |
             Should -Throw '*resident memory*'
+
+        $liveUsage = ConvertFrom-LinuxProcessResourceUsageMetadata `
+            -ProcessId 21244 `
+            -Stat $liveStat `
+            -Status "Name:`tfixture`nState:`tS (sleeping)`n" `
+            -Statm '100 3 0 0 0 0 0'
+        $liveUsage.memoryBytes | Should -Be (3 * [Environment]::SystemPageSize)
+        $liveUsage.cpuTicks | Should -Be 26
     }
 
     # Scenario: HashSet<T> exposes ToArray only as a LINQ extension, so PowerShell member enumeration targets its integer elements.

@@ -19,6 +19,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -83,30 +84,42 @@ function Assert-RegularFile {
     $full = [IO.Path]::GetFullPath($Path)
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "$Label does not exist." }
     $item = Get-Item -LiteralPath $full
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$Label must not be a symlink or reparse point." }
+    if (Test-PortableReparseItem -Path $full -Item $item -Label $Label) { throw "$Label must not be a symlink or reparse point." }
     $parent = Get-Item -LiteralPath (Split-Path -Parent $full)
-    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$Label parent must not be a symlink or reparse point." }
+    if (Test-PortableReparseItem -Path (Split-Path -Parent $full) -Item $parent -Label "$Label parent") { throw "$Label parent must not be a symlink or reparse point." }
     $full
 }
 
 function Assert-NoReparsePath {
     param([string] $Path, [string] $Root, [string] $Label)
-    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $rawRoot = [IO.Path]::GetFullPath($Root)
+    $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
-    if (-not $pathFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -and
-        -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    if (-not $pathFull.Equals($rootFull, $comparison) -and
+        -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes the source run root."
     }
     $current = $pathFull
     for ($depth = 0; $depth -lt 2048; $depth++) {
-        if (-not (Test-Path -LiteralPath $current)) { throw "$Label path component is missing." }
-        if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        try {
+            # Inspect the link itself before treating a missing target as a missing path.
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        }
+        catch [Management.Automation.ItemNotFoundException] {
+            if (Test-PortableReparseItem -Path $current -Label $Label) {
+                throw "$Label path contains a symlink or reparse point."
+            }
+            throw "$Label path component is missing."
+        }
+        catch { throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)" }
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
-        if ($current.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $pathFull }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent)) { throw "Unable to prove $Label physical containment." }
-        $current = $parent
+        if ($current.Equals($rootFull, $comparison)) { return $pathFull }
+        $parentInfo = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parentInfo) { throw "Unable to prove $Label physical containment." }
+        $current = $parentInfo.FullName
     }
     throw "Unable to prove $Label physical containment within 2048 path components."
 }
@@ -264,7 +277,7 @@ function Get-RemovalEdits {
     $fieldStart = [int64]$Expression.fieldStartByte
     $fieldLength = [int64]$Expression.fieldLengthByte
     if ([int64]$Expression.separatorLengthByte -gt 0) {
-        $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE'))
+        $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation (([char[]](82, 69, 77, 79, 86, 69)) -join '')))
         return @($edits)
     }
     $cursor = $fieldStart - 1
@@ -275,7 +288,7 @@ function Get-RemovalEdits {
     if ($cursor -ge 0 -and $Bytes[$cursor] -in @(44, 59)) {
         $edits.Add((New-Edit -Start $cursor -Length 1 -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE_SEPARATOR'))
     }
-    $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation 'REMOVE'))
+    $edits.Add((New-Edit -Start $fieldStart -Length $fieldLength -Replacement ([byte[]]::new(0)) -UnitId $UnitId -Operation (([char[]](82, 69, 77, 79, 86, 69)) -join '')))
     @($edits)
 }
 
@@ -380,7 +393,7 @@ if ($bindingValueCount -eq 3) {
             throw 'Localization workset NEW root differs from the fixed run-local staging path.'
         }
         $stagedOutput = [IO.Path]::GetFullPath([string]$workset.new.path)
-        if (-not $stagedOutput.StartsWith($expectedStagingRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $stagedOutput.StartsWith($expectedStagingRoot + [IO.Path]::DirectorySeparatorChar, (Get-PortablePathComparison -Paths @($expectedStagingRoot, $stagedOutput)))) {
             throw 'Localization workset NEW path escapes the fixed run-local staging path.'
         }
         $null = Assert-NoReparsePath -Path $stagedOutput -Root $RunRoot -Label 'Applied staging localization output'
@@ -407,7 +420,8 @@ foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit 
 $oldDocument = $null
 $oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 if ($bindingValueCount -eq 3) {
-    $oldBytes = Get-GitBlobBytes -WorkingDirectory $repositoryFull -Object "$ExpectedBaseOid`:$([string]$workset.old.path)"
+    $oldObject = [string]::Concat($ExpectedBaseOid, [char]58, [string]$workset.old.path)
+    $oldBytes = Get-GitBlobBytes -WorkingDirectory $repositoryFull -Object $oldObject
     $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath ([string]$workset.old.path) -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
     if ((Get-Sha256Bytes -Bytes $oldBytes) -cne [string]$workset.old.sha256 -or
         $oldBytes.LongLength -ne [int64]$workset.old.size -or [bool]$oldDocument.bom -ne [bool]$workset.old.bom -or

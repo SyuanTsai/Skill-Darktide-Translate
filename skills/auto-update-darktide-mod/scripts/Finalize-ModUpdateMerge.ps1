@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
+
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+
 function Get-MergeFinalizationDisposition {
     param(
         [Parameter(Mandatory)][string] $PullRequestState,
@@ -50,16 +53,30 @@ function Test-ModUpdateWorktreeRegistered {
         [Parameter(Mandatory)][AllowEmptyString()][string] $Porcelain,
         [Parameter(Mandatory)][string] $ExpectedPath
     )
-    $expected = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($ExpectedPath))
+    $normalizePath = {
+        param([string] $Value)
+        $portable = $Value.Replace([char]92, [IO.Path]::DirectorySeparatorChar).Replace([char]47, [IO.Path]::DirectorySeparatorChar)
+        [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($portable))
+    }
+    $expected = & $normalizePath $ExpectedPath
     foreach ($line in @($Porcelain -split '\r?\n')) {
         if (-not $line.StartsWith('worktree ', [StringComparison]::Ordinal)) { continue }
         try {
-            $candidate = [IO.Path]::TrimEndingDirectorySeparator(
-                [IO.Path]::GetFullPath($line.Substring('worktree '.Length))
-            )
+            $candidate = & $normalizePath $line.Substring('worktree '.Length)
         }
         catch { continue }
-        if ($candidate.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        # Older repository regression tests materialize this function AST in a
+        # standalone module and therefore do not inherit the imported helper's
+        # command scope.  Strict comparison is the safe fallback in that
+        # compatibility harness; the production entrypoint imports PathSafety
+        # and uses its filesystem-aware comparison.
+        $comparison = [StringComparison]::Ordinal
+        $comparisonCommand = Get-Command -Name 'Get-PortablePathComparison' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $comparisonCommand) {
+            $comparison = Get-PortablePathComparison -Paths @($candidate, $expected)
+        }
+        if ($candidate.Equals($expected, $comparison)) { return $true }
     }
     $false
 }
@@ -97,7 +114,7 @@ function Get-ModUpdateArchiveLocations {
     $sourcePath = Assert-ContainedPath -Candidate (Join-Path (Join-Path ([string]$State.runRoot) 'source') $filename) `
         -Root $sourceRoot -Label 'Run-owned archive'
     $sourcePath = Assert-NoReparsePath -Path $sourcePath -Root ([string]$State.runRoot) -Label 'Run-owned archive' -AllowMissing
-    if (-not ([IO.Path]::GetFullPath([string]$State.archive.path)).Equals($sourcePath, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not ([IO.Path]::GetFullPath([string]$State.archive.path)).Equals($sourcePath, (Get-PortablePathComparison -Paths @([IO.Path]::GetFullPath([string]$State.archive.path), $sourcePath)))) {
         throw 'Run-owned archive path differs from its canonical location.'
     }
     $finishedRoot = Join-Path ([string]$State.repositoryRoot) 'AI Auto Update/Finished'
@@ -119,7 +136,7 @@ function Assert-MergeFileTuple {
         [Parameter(Mandatory)][string] $Sha256
     )
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+    if ($item.PSIsContainer -or (Test-PortableReparseItem -Path $Path -Item $item -Label 'Immutable merge file') -or
         $item.Length -ne $Size -or (Get-FileSha256 -Path $item.FullName) -cne $Sha256) {
         throw "Immutable file tuple mismatch: $Path"
     }
@@ -235,7 +252,7 @@ function Copy-ModUpdateEvidenceTree {
         New-Item -ItemType Directory -Path $destinationFull -Force | Out-Null
     }
     foreach ($file in Get-ChildItem -LiteralPath $sourceFull -File -Recurse -Force | Sort-Object FullName) {
-        if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Finalization evidence contains a reparse point.' }
+        if (Test-PortableReparseItem -Path $file.FullName -Item $file -Label 'Finalization evidence') { throw 'Finalization evidence contains a reparse point.' }
         $relative = [IO.Path]::GetRelativePath($sourceFull, $file.FullName)
         $target = Assert-ContainedPath -Candidate (Join-Path $destinationFull $relative) -Root $destinationFull -Label 'Finalization evidence target'
         $parent = Split-Path -Parent $target
@@ -289,7 +306,7 @@ function Remove-ModUpdateOwnedTree {
     $fullPath = Assert-NoReparseTree -Path $Path -Root $Root -Label $Label
     $rootFull = [IO.Path]::GetFullPath($Root)
     if ($fullPath -ceq $rootFull) { throw "$Label cannot be the containment root." }
-    Remove-DirectoryTreeWithHeartbeat -Path $fullPath
+    Remove-DirectoryTreeWithHeartbeat -Path $fullPath -Root $rootFull
 }
 
 function Assert-ModUpdateMergeFinalizationState {

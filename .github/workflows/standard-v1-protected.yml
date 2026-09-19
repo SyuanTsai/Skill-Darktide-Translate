@@ -4,15 +4,18 @@ name: Darktide Translate Standard v1 Protected Validation
 # This workflow is base-owned for pull_request_target. Candidate files are
 # checked out only as data; trusted supervisor files are materialized from
 # github.sha, the event-bound base commit.
-# This bootstrap copy intentionally exposes only pull_request_target; push and
-# workflow_dispatch are enabled by the migration after this trust anchor lands.
 
 on:
+  push:
+    branches:
+      - main
   pull_request_target:
+
+# No workflow_dispatch: its selected ref owns the workflow definition and could
+# replace guards before requesting the required-check publisher's permission.
 
 permissions:
   contents: read
-  checks: write
 
 jobs:
   repository-contract-windows-powershell:
@@ -30,6 +33,7 @@ jobs:
         shell: powershell
         env:
           TRUSTED_SUPERVISOR_COMMIT: ${{ github.sha }}
+          TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           $ErrorActionPreference = 'Stop'
           $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
@@ -43,6 +47,19 @@ jobs:
           [void](New-Item -ItemType Directory -Path $trustedRoot -Force)
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $defaultBranch = [string]$env:TRUSTED_DEFAULT_BRANCH
+            if ($defaultBranch -notmatch '^[A-Za-z0-9._/-]+$' -or
+                $defaultBranch -cmatch '(^|/)\.{1,2}(/|$)') {
+              throw 'The trusted default branch name is invalid.'
+            }
+            $defaultRef = "refs/remotes/origin/$defaultBranch"
+            $resolvedDefaultCommit = ((& $gitPath rev-parse --verify "$defaultRef^{commit}" 2>$null) | Select-Object -First 1).Trim()
+            if ($LASTEXITCODE -ne 0 -or $resolvedDefaultCommit -notmatch '^[0-9a-f]{40}$') {
+              throw 'The default branch trusted supervisor commit could not be resolved.'
+            }
+            $trustedCommit = $resolvedDefaultCommit
+          }
           $relativePath = 'tests/validate-windows-powershell.ps1'
           $revision = "${trustedCommit}:$relativePath"
           $actualBlob = ((& $gitPath rev-parse $revision 2>$null) | Select-Object -First 1).Trim()
@@ -178,6 +195,7 @@ jobs:
         shell: pwsh
         env:
           TRUSTED_SUPERVISOR_COMMIT: ${{ github.sha }}
+          TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           $ErrorActionPreference = 'Stop'
           $trustedCommit = [string]$env:TRUSTED_SUPERVISOR_COMMIT
@@ -192,6 +210,19 @@ jobs:
           [void](New-Item -ItemType Directory -Path $trustedScriptsRoot -Force)
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $defaultBranch = [string]$env:TRUSTED_DEFAULT_BRANCH
+            if ($defaultBranch -notmatch '^[A-Za-z0-9._/-]+$' -or
+                $defaultBranch -cmatch '(^|/)\.{1,2}(/|$)') {
+              throw 'The trusted default branch name is invalid.'
+            }
+            $defaultRef = "refs/remotes/origin/$defaultBranch"
+            $resolvedDefaultCommit = ((& $gitPath rev-parse --verify "$defaultRef^{commit}" 2>$null) | Select-Object -First 1).Trim()
+            if ($LASTEXITCODE -ne 0 -or $resolvedDefaultCommit -notmatch '^[0-9a-f]{40}$') {
+              throw 'The default branch trusted supervisor commit could not be resolved.'
+            }
+            $trustedCommit = $resolvedDefaultCommit
+          }
           $files = @(
             [pscustomobject]@{ RelativePath = 'scripts/Validate.ps1' },
             [pscustomobject]@{ RelativePath = 'scripts/Test-Repository.ps1' }
@@ -230,6 +261,7 @@ jobs:
             throw 'Protected supervisor root must be a regular non-reparse directory.'
           }
           "TRUSTED_SUPERVISOR_ROOT=$trustedRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TRUSTED_SUPERVISOR_SHA=$trustedCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up approved Go runtime
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -385,6 +417,15 @@ jobs:
           $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
           $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
           $gitArguments = @('-c', "safe.directory=$repositoryRoot", '-c', "core.worktree=$repositoryRoot")
+          $trustedTestCommit = [string]$env:TRUSTED_SUPERVISOR_SHA
+          if ($trustedTestCommit -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'The resolved trusted supervisor SHA is missing or invalid.'
+          }
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and
+              -not [string]::IsNullOrWhiteSpace($env:PULL_REQUEST_BASE_SHA) -and
+              $env:PULL_REQUEST_BASE_SHA -cne $trustedTestCommit) {
+            throw 'The manual base must match the resolved trusted supervisor SHA.'
+          }
           $baseCandidate = if ($env:GITHUB_EVENT_NAME -in @('pull_request_target', 'workflow_dispatch')) {
             $env:PULL_REQUEST_BASE_SHA
           }
@@ -417,6 +458,7 @@ jobs:
             RepositoryRoot = [IO.Path]::GetFullPath((Get-Location).Path)
             ArtifactsRoot = $env:RUNNER_TEMP
             BaseCommit = $baseCommit
+            TrustedTestCommit = $trustedTestCommit
             ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION
             OutputPath = $outputPath
           }
@@ -675,11 +717,7 @@ jobs:
         run: |
           set -euo pipefail
           gh --version
-          skill_publish_root='.'
-          if [[ -d '.agents/skills' && ! -d 'skills' ]]; then
-            skill_publish_root='.agents/skills'
-          fi
-          gh skill publish --dry-run "$skill_publish_root"
+          gh skill publish --dry-run .
 
   # GitHub attaches pull_request_target workflow jobs to the base commit. Publish
   # the exact required contexts explicitly against the immutable PR head instead
@@ -743,7 +781,8 @@ jobs:
 
   publish-head-required-checks:
     name: publish head-bound required checks
-    if: ${{ always() }}
+    # Defense in depth; ref-selectable manual dispatch is not exposed above.
+    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
     needs:
       - repository-contract-windows-powershell
       - canonical-validation
@@ -758,7 +797,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event_name == 'push' && github.sha || '' }}
           WINDOWS_RESULT: ${{ needs['repository-contract-windows-powershell'].result }}
           CANONICAL_RESULT: ${{ needs['canonical-validation'].result }}
           EVIDENCE_UPLOAD_RESULT: ${{ needs['upload-canonical-validation-evidence'].result }}

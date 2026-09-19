@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 SyuanTsai
+﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Schema 15 source acquisition contract' {
     BeforeAll {
@@ -60,7 +60,7 @@ Describe 'Schema 15 source acquisition contract' {
             version = '2.0.0'; fileName = 'ExampleMod.rar'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
         $linkedArtifacts = Join-Path $runRoot 'review-artifacts'
-        New-Item -ItemType Junction -Path $linkedArtifacts -Target $outside | Out-Null
+        New-TestReparsePoint -Path $linkedArtifacts -Target $outside | Out-Null
 
         { & (Join-Path $scriptRoot 'Receive-NexusMainFile.ps1') `
                 -SourceRequestPath (Join-Path $linkedArtifacts 'source-request.json') `
@@ -102,7 +102,7 @@ Describe 'Schema 15 source acquisition contract' {
             schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
             version = '2.0.0'; fileName = 'ExampleMod.rar'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outside 'source-request.json') -NoNewline
-        New-Item -ItemType Junction -Path $linked -Target $outside | Out-Null
+        New-TestReparsePoint -Path $linked -Target $outside | Out-Null
 
         { & (Join-Path $scriptRoot 'mod-update.ps1') acquire-source `
                 -RepositoryRoot $repository -ModDirectory 'ExampleMod' `
@@ -301,7 +301,7 @@ Describe 'Schema 15 source acquisition contract' {
         Copy-Item -LiteralPath $receiptPath -Destination (Join-Path $outsideArtifacts 'source-receipt.json')
         Copy-Item -LiteralPath $requestPath -Destination (Join-Path $outsideArtifacts 'source-request.json')
         $linkedArtifacts = Join-Path $reparseRunRoot 'review-artifacts'
-        New-Item -ItemType Junction -Path $linkedArtifacts -Target $outsideArtifacts | Out-Null
+        New-TestReparsePoint -Path $linkedArtifacts -Target $outsideArtifacts | Out-Null
         { & (Join-Path $scriptRoot 'Test-SourceReceipt.ps1') `
                 -ReceiptPath (Join-Path $linkedArtifacts 'source-receipt.json') `
                 -SourceRequestPath (Join-Path $linkedArtifacts 'source-request.json') `
@@ -534,7 +534,7 @@ Describe 'Schema 15 source acquisition contract' {
         $result.status | Should -Be 'waiting-system'
         $result.waitingReason.code | Should -Be 'api_download_uri_unavailable'
         Test-Path -LiteralPath $partialPath | Should -Be $false
-        @(Get-ChildItem -LiteralPath $incoming -File -Filter '.retained-partial-*').Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $incoming -File -Filter '.retained-partial-*' -Force).Count | Should -Be 1
     }
 
     # Scenario: The apparent incoming directory is a junction to a different physical location.
@@ -544,9 +544,10 @@ Describe 'Schema 15 source acquisition contract' {
         $outside = Join-Path $TestDrive 'reparse-target'
         New-Item -ItemType Directory -Path $runRoot, $outside -Force | Out-Null
         $incoming = Join-Path $runRoot '.incoming-test-run'
-        New-Item -ItemType Junction -Path $incoming -Target $outside | Out-Null
+        New-TestReparsePoint -Path $incoming -Target $outside | Out-Null
         $downloadPath = Join-Path $incoming 'ExampleMod.zip'
-        $stream = [IO.File]::Open($downloadPath, [IO.FileMode]::CreateNew)
+        $physicalDownloadPath = Join-Path $outside 'ExampleMod.zip'
+        $stream = [IO.File]::Open($physicalDownloadPath, [IO.FileMode]::CreateNew)
         $zip = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $false)
         try { $null = $zip.CreateEntry('ExampleMod/file.txt') } finally { $zip.Dispose(); $stream.Dispose() }
         $requestPath = Join-Path $runRoot 'source-request.json'
@@ -570,7 +571,7 @@ Describe 'Schema 15 source acquisition contract' {
         $outside = Join-Path $TestDrive 'reparse-parent-target'
         $redirected = Join-Path $runRoot 'redirected'
         New-Item -ItemType Directory -Path $runRoot, $outside -Force | Out-Null
-        New-Item -ItemType Junction -Path $redirected -Target $outside | Out-Null
+        New-TestReparsePoint -Path $redirected -Target $outside | Out-Null
         $incoming = Join-Path $redirected '.incoming-test-run'
         New-Item -ItemType Directory -Path $incoming -Force | Out-Null
         $downloadPath = Join-Path $incoming 'ExampleMod.zip'
@@ -753,7 +754,7 @@ Describe 'Schema 15 source acquisition contract' {
         $resumed.result | Should -Be 'passed'
         $resumed.stage | Should -Be 'localization'
         $resumed.status | Should -Be 'localized'
-        $resumed.idempotent | Should -BeNullOrEmpty
+        $resumed.PSObject.Properties.Name | Should -Not -Contain 'idempotent'
     }
 
     # Scenario: A complete Schema 15 candidate has one unchanged localization file, but mutable state is edited to omit its localization record.
@@ -965,7 +966,7 @@ Describe 'Schema 15 source acquisition contract' {
             -PassThru
         $relocatedRunRoot = Join-Path $TestDrive 'runner-reparse-run-root-target'
         Move-Item -LiteralPath $runRoot -Destination $relocatedRunRoot
-        New-Item -ItemType Junction -Path $runRoot -Target $relocatedRunRoot | Out-Null
+        New-TestReparsePoint -Path $runRoot -Target $relocatedRunRoot | Out-Null
         try {
             { & $runner acquire-source -RepositoryRoot $repository -ModDirectory 'ExampleMod' -RunId $runId `
                     -SourceRequestPath $requestPath -SkillSourcePinPath $script:skillSourcePinPath `
@@ -973,7 +974,7 @@ Describe 'Schema 15 source acquisition contract' {
                 Should -Throw '*reparse*'
         }
         finally {
-            Remove-Item -LiteralPath $runRoot -Force
+            [IO.Directory]::Delete($runRoot, $false)
             Move-Item -LiteralPath $relocatedRunRoot -Destination $runRoot
         }
         $interruptedReceipt = Get-Content -LiteralPath $acquired.receiptPath -Raw | ConvertFrom-TestJson
