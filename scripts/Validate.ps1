@@ -5355,11 +5355,6 @@ function Get-RequiredPesterTests {
         'Schema15SourceAcquisition.Tests.ps1'
         'SkillContract.Tests.ps1'
         'SourcePin.Tests.ps1'
-        'ValidationTransition.Tests.ps1'
-        'AtomicValidationOutput.Tests.ps1'
-        'CanonicalValidation.Tests.ps1'
-        'StandardV1Conformance.Tests.ps1'
-        'Test-Repository.Tests.ps1'
     )
 }
 

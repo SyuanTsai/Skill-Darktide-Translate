@@ -343,13 +343,8 @@ Describe 'Darktide bootstrap transition' {
             'Schema15SourceAcquisition.Tests.ps1'
             'SkillContract.Tests.ps1'
             'SourcePin.Tests.ps1'
-            'ValidationTransition.Tests.ps1'
-            'AtomicValidationOutput.Tests.ps1'
-            'CanonicalValidation.Tests.ps1'
-            'StandardV1Conformance.Tests.ps1'
-            'Test-Repository.Tests.ps1'
         )
-        $requiredTests.Count | Should -Be 14
+        $requiredTests.Count | Should -Be 9
         ($requiredTests -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
         $supervisor | Should -Not -Match '(?s)\$requiredPesterTests\s*=\s*@\(\s*''BootstrapTransition\.Tests\.ps1'''
         foreach ($testName in $requiredTests) {

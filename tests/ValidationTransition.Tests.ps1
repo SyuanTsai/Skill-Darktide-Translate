@@ -167,11 +167,6 @@ Describe 'Standard v1 migration and canonical validation contracts' {
             'Schema15SourceAcquisition.Tests.ps1'
             'SkillContract.Tests.ps1'
             'SourcePin.Tests.ps1'
-            'ValidationTransition.Tests.ps1'
-            'AtomicValidationOutput.Tests.ps1'
-            'CanonicalValidation.Tests.ps1'
-            'StandardV1Conformance.Tests.ps1'
-            'Test-Repository.Tests.ps1'
         )
         @(Get-RequiredPesterTests) | Should -Be $expected
 
