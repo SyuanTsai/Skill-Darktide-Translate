@@ -973,17 +973,70 @@ Describe 'Bounded writable-root enumeration behavior' {
 
         $proxySource = $proxy.Extent.Text
         $proxySource | Should -Match ([regex]::Escape('proxy_log="$sandbox_root$child_writable_root/protected-pester-proxy.log"'))
+        $proxySource | Should -Match ([regex]::Escape('host_proxy_log="$child_writable_root/protected-pester-proxy.log"'))
         $proxySource | Should -Not -Match ([regex]::Escape('proxy_log="$run_root/'))
         $proxySource | Should -Match ([regex]::Escape('printf ''proxy_exit=%s\n'' "$candidate_status" >> "$proxy_log"'))
+        $proxySource | Should -Match ([regex]::Escape('trap export_proxy_log EXIT'))
+        $proxySource | Should -Match ([regex]::Escape('"$tail_path" -c 32768 -- "$proxy_log" > "$host_proxy_log"'))
+        $proxySource | Should -Match 'Get-Command tail -CommandType Application'
+        $proxySource | Should -Match 'Assert-NoReparseAncestors -Path \$utility -Context ''Protected Pester server Linux utility'''
+        $redirectIndex = $proxySource.IndexOf('exec 2>>"$proxy_log"', [StringComparison]::Ordinal)
+        $trapIndex = $proxySource.IndexOf('trap export_proxy_log EXIT', [StringComparison]::Ordinal)
+        $setupIndex = $proxySource.IndexOf('while [ "$readonly_count" -gt 0 ]', [StringComparison]::Ordinal)
+        $redirectIndex | Should -BeGreaterOrEqual 0
+        $trapIndex | Should -BeGreaterThan $redirectIndex
+        $setupIndex | Should -BeGreaterThan $trapIndex
 
         $runspaceSource = $runspace.Extent.Text
+        $removeStaleIndex = $runspaceSource.IndexOf('Remove-ProtectedPesterProxyStartupLog', [StringComparison]::Ordinal)
+        $openIndex = $runspaceSource.IndexOf('$runspace.Open()', [StringComparison]::Ordinal)
         $waitIndex = $runspaceSource.IndexOf('WaitForExit(5000)', [StringComparison]::Ordinal)
-        $logIndex = $runspaceSource.IndexOf("Join-Path `$childWritableRootPath 'protected-pester-proxy.log'", [StringComparison]::Ordinal)
+        $logIndex = $runspaceSource.IndexOf('if (Test-Path -LiteralPath $proxyLogPath -PathType Leaf)', [StringComparison]::Ordinal)
+        $removeStaleIndex | Should -BeGreaterOrEqual 0
+        $openIndex | Should -BeGreaterThan $removeStaleIndex
         $waitIndex | Should -BeGreaterOrEqual 0
         $logIndex | Should -BeGreaterThan $waitIndex
         $runspaceSource | Should -Match 'Assert-NoReparseAncestors[\s\S]*?-Boundary \$childWritableRootPath'
         $runspaceSource | Should -Match '\$maxProxyLogBytes\s*=\s*32768'
         $runspaceSource | Should -Match '\.ReadBytes\(\$bytesToRead\)'
+    }
+
+    # Scenario: A previous shard leaves a regular log, or an attacker replaces it with a non-regular entry.
+    # Purpose: Remove stale diagnostics before startup while preserving fail-closed file-type and reparse handling.
+    It 'UnitT88_RemovesOnlyARegularStaleProtectedPesterProxyLog' {
+        $cleanup = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Remove-ProtectedPesterProxyStartupLog'
+        }, $true)
+        $cleanup | Should -Not -BeNullOrEmpty
+        if ($null -eq $cleanup) { return }
+
+        $moduleSource = @'
+function Assert-NoReparseAncestors {
+    param([string] $Path, [string] $Context, [string] $Boundary)
+}
+'@ + [Environment]::NewLine + $cleanup.Extent.Text
+        $cleanupModule = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $root = Join-Path $TestDrive 'proxy-log-cleanup'
+        [void](New-Item -ItemType Directory -Path $root -Force)
+        $logPath = Join-Path $root 'protected-pester-proxy.log'
+        [IO.File]::WriteAllText($logPath, 'stale', [Text.UTF8Encoding]::new($false))
+
+        (& $cleanupModule { param($path) Remove-ProtectedPesterProxyStartupLog -ChildWritableRootPath $path } $root) |
+            Should -BeExactly $logPath
+        Test-Path -LiteralPath $logPath | Should -BeFalse
+
+        [void](New-Item -ItemType Directory -Path $logPath)
+        { & $cleanupModule { param($path) Remove-ProtectedPesterProxyStartupLog -ChildWritableRootPath $path } $root } |
+            Should -Throw '*is not a regular non-reparse file*'
+        Remove-Item -LiteralPath $logPath -Recurse -Force
+
+        $target = Join-Path $TestDrive 'proxy-log-link-target'
+        [void](New-Item -ItemType Directory -Path $target)
+        $linkType = if ([OperatingSystem]::IsWindows()) { 'Junction' } else { 'SymbolicLink' }
+        [void](New-Item -ItemType $linkType -Path $logPath -Target $target)
+        { & $cleanupModule { param($path) Remove-ProtectedPesterProxyStartupLog -ChildWritableRootPath $path } $root } |
+            Should -Throw '*is not a regular non-reparse file*'
     }
 
     # Scenario: A writable directory is replaced with a symlink between enumeration and descent.

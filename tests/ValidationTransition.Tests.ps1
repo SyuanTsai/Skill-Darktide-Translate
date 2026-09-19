@@ -169,12 +169,16 @@ Describe 'Standard v1 migration and canonical validation contracts' {
             'SourcePin.Tests.ps1'
         )
         @(Get-RequiredPesterTests) | Should -Be $expected
+        @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests) | Should -Be @(
+            $expected
+            'InstalledClosureOrdering.Tests.ps1'
+        )
 
         $canonicalValidator = $ast.Extent.Text
         foreach ($requiredTest in $expected) {
             ([regex]::Matches($definition.Extent.Text, [regex]::Escape("'$requiredTest'"))).Count | Should -Be 1
         }
-        ([regex]::Matches($canonicalValidator, '@\(Get-RequiredPesterTests\)')).Count | Should -Be 4
+        ([regex]::Matches($canonicalValidator, 'Get-RequiredPesterTests -IncludeTrustedPostPromotionTests')).Count | Should -Be 4
         $canonicalValidator | Should -Match '\$requiredPesterTestsFunction = \(Get-Command Get-RequiredPesterTests'
         $canonicalValidator | Should -Match '__REQUIRED_PESTER_TESTS_FUNCTION__'
         $canonicalValidator | Should -Match '\.Replace\(''__REQUIRED_PESTER_TESTS_FUNCTION__'', \$requiredPesterTestsFunctionDefinition\)'

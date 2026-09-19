@@ -333,6 +333,7 @@ Describe 'Darktide bootstrap transition' {
         $moduleSource = $requiredTestsFunction[0].Extent.Text + [Environment]::NewLine + $timeoutFunction[0].Extent.Text
         $timeoutModule = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
         $requiredTests = @(& $timeoutModule { Get-RequiredPesterTests })
+        $postPromotionTests = @(& $timeoutModule { Get-RequiredPesterTests -IncludeTrustedPostPromotionTests })
         $expectedRequiredTests = @(
             'BootstrapTransition.Tests.ps1'
             'LocalizationWorkset.Tests.ps1'
@@ -346,6 +347,9 @@ Describe 'Darktide bootstrap transition' {
         )
         $requiredTests.Count | Should -Be 9
         ($requiredTests -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
+        $postPromotionTests.Count | Should -Be 10
+        ($postPromotionTests[0..8] -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
+        $postPromotionTests[9] | Should -BeExactly 'InstalledClosureOrdering.Tests.ps1'
         $supervisor | Should -Not -Match '(?s)\$requiredPesterTests\s*=\s*@\(\s*''BootstrapTransition\.Tests\.ps1'''
         foreach ($testName in $requiredTests) {
             $actualTimeout = & $timeoutModule {
@@ -355,6 +359,8 @@ Describe 'Darktide bootstrap transition' {
             $expectedTimeout = if ($testName -ceq 'ModUpdateAutomation.Tests.ps1') { 600000 } else { 300000 }
             $actualTimeout | Should -Be $expectedTimeout
         }
+        (& $timeoutModule { Get-ProtectedPesterShardTimeoutMilliseconds -TestName 'InstalledClosureOrdering.Tests.ps1' }) |
+            Should -Be 300000
         { & $timeoutModule { Get-ProtectedPesterShardTimeoutMilliseconds -TestName 'CandidateControlled.Tests.ps1' } } |
             Should -Throw '*outside the immutable required inventory*'
         $supervisor | Should -Match '\$shardTimeoutMilliseconds\s*=\s*Get-ProtectedPesterShardTimeoutMilliseconds'

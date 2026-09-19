@@ -5345,7 +5345,9 @@ function Test-SecurityRelevantSkillChange {
 }
 
 function Get-RequiredPesterTests {
-    return @(
+    param([switch] $IncludeTrustedPostPromotionTests)
+
+    $tests = @(
         'BootstrapTransition.Tests.ps1'
         'LocalizationWorkset.Tests.ps1'
         'ModUpdateAutomation.Tests.ps1'
@@ -5356,11 +5358,15 @@ function Get-RequiredPesterTests {
         'SkillContract.Tests.ps1'
         'SourcePin.Tests.ps1'
     )
+    if ($IncludeTrustedPostPromotionTests) {
+        $tests += 'InstalledClosureOrdering.Tests.ps1'
+    }
+    return @($tests)
 }
 
 function Get-ProtectedPesterShardTimeoutMilliseconds {
     param([Parameter(Mandatory = $true)][string] $TestName)
-    if (@(Get-RequiredPesterTests) -cnotcontains $TestName) {
+    if (@(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests) -cnotcontains $TestName) {
         throw "Protected Pester shard '$TestName' is outside the immutable required inventory."
     }
 
@@ -5600,7 +5606,9 @@ function Invoke-ProtectedPesterServerProxy {
         $chrootPath = [IO.Path]::GetFullPath([string]$chrootCommand.Path)
         $copyCommand = Get-Command cp -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $copyPath = [IO.Path]::GetFullPath([string]$copyCommand.Path)
-        foreach ($utility in @($unsharePath, $prlimitPath, $mountPath, $shellPath, $findPath, $chrootPath, $copyPath)) {
+        $tailCommand = Get-Command tail -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $tailPath = [IO.Path]::GetFullPath([string]$tailCommand.Path)
+        foreach ($utility in @($unsharePath, $prlimitPath, $mountPath, $shellPath, $findPath, $chrootPath, $copyPath, $tailPath)) {
             if (-not (Test-Path -LiteralPath $utility -PathType Leaf)) { throw "Protected Pester server Linux utility is missing: $utility" }
             Assert-NoReparseAncestors -Path $utility -Context 'Protected Pester server Linux utility'
         }
@@ -5619,7 +5627,8 @@ unshare_path="${10}"
 manifest_path="${11}"
 readonly_count="${12}"
 cgroup_path="${13}"
-shift 13
+tail_path="${14}"
+shift 14
 printf '%s\n' "$$" > "$cgroup_path/cgroup.procs"
 IFS= read -r memory_max < "$cgroup_path/memory.max" || exit 126
 [ "$memory_max" = "2147483648" ] || exit 126
@@ -5655,8 +5664,19 @@ mkdir -p "$sandbox_root$child_writable_root"
 "$mount_path" -t tmpfs -o size=536870912,nr_inodes=100001,nodev,nosuid tmpfs "$sandbox_root$child_writable_root"
 "$copy_path" -a -- "$child_writable_root/." "$sandbox_root$child_writable_root/"
 proxy_log="$sandbox_root$child_writable_root/protected-pester-proxy.log"
+host_proxy_log="$child_writable_root/protected-pester-proxy.log"
 : > "$proxy_log"
 exec 2>>"$proxy_log"
+export_proxy_log() {
+    proxy_status=$?
+    trap - EXIT
+    set +e
+    if [ -f "$proxy_log" ] && [ ! -L "$proxy_log" ]; then
+        "$tail_path" -c 32768 -- "$proxy_log" > "$host_proxy_log"
+    fi
+    exit "$proxy_status"
+}
+trap export_proxy_log EXIT
 while [ "$readonly_count" -gt 0 ]
 do
     readonly_path="$1"
@@ -5731,7 +5751,7 @@ exit "$candidate_status"
             '--', $shellPath, '-c', $maskHostSocketsScript, '--',
             $mountPath, $sandboxRoot, $diagnosticRootPath, [IO.Path]::GetFullPath($WorkingDirectory),
             [IO.Path]::GetFullPath($PowerShellPath), $childWritableRootPath, $findPath, $chrootPath, $copyPath, $unsharePath,
-            $exportManifestPath, [string]$readOnlyPaths.Count, $linuxProxyCgroupPath
+            $exportManifestPath, [string]$readOnlyPaths.Count, $linuxProxyCgroupPath, $tailPath
         ) + @($readOnlyPaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
         # The delegated cgroup is the hard 2 GiB resident-memory boundary for
         # the protected Pester server. Do not add RLIMIT_AS here: pwsh can
@@ -5778,6 +5798,28 @@ exit "$candidate_status"
     return $proxyExitCode
 }
 
+function Remove-ProtectedPesterProxyStartupLog {
+    param([Parameter(Mandatory = $true)][string] $ChildWritableRootPath)
+
+    $proxyLogPath = Join-Path $ChildWritableRootPath 'protected-pester-proxy.log'
+    if (Test-Path -LiteralPath $proxyLogPath) {
+        Assert-NoReparseAncestors `
+            -Path $proxyLogPath `
+            -Context 'Protected Pester stale proxy startup log' `
+            -Boundary $ChildWritableRootPath
+        $staleProxyLogItem = Get-Item -LiteralPath $proxyLogPath -Force
+        if ($staleProxyLogItem.PSIsContainer -or
+            ($staleProxyLogItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Protected Pester stale proxy startup log is not a regular non-reparse file.'
+        }
+        [IO.File]::Delete($proxyLogPath)
+    }
+    if (Test-Path -LiteralPath $proxyLogPath) {
+        throw 'Protected Pester stale proxy startup log remained after trusted cleanup.'
+    }
+    return $proxyLogPath
+}
+
 function Invoke-ProtectedPesterRunspace {
     param(
         [Parameter(Mandatory = $true)][string] $WorkerPath,
@@ -5815,6 +5857,7 @@ function Invoke-ProtectedPesterRunspace {
         throw 'Protected Pester child-writable root must remain within the diagnostic root.'
     }
     Assert-NoReparseAncestors -Path $childWritableRootPath -Context 'Protected Pester child-writable root'
+    $proxyLogPath = Remove-ProtectedPesterProxyStartupLog -ChildWritableRootPath $childWritableRootPath
     $powerShellExecutableName = if ($script:IsWindowsHost) { 'pwsh.exe' } else { 'pwsh' }
     $powerShellPath = Join-Path $PSHOME $powerShellExecutableName
     if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
@@ -5885,7 +5928,6 @@ function Invoke-ProtectedPesterRunspace {
             if ($null -ne $serverProcessInstance.Process -and -not $serverProcessInstance.HasExited) {
                 [void]$serverProcessInstance.Process.WaitForExit(5000)
             }
-            $proxyLogPath = Join-Path $childWritableRootPath 'protected-pester-proxy.log'
             $proxyLog = 'The protected Pester proxy did not create its bounded startup log.'
             try {
                 if (Test-Path -LiteralPath $proxyLogPath -PathType Leaf) {
@@ -6051,7 +6093,7 @@ function Invoke-ProtectedPesterSupervisor {
         throw 'The trusted Pester supervisor requires an immutable runner SHA-256.'
     }
 
-    $requiredPesterTests = @(Get-RequiredPesterTests)
+    $requiredPesterTests = @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests)
     $requiredPesterTests = @($requiredPesterTests | Where-Object {
         Test-Path -LiteralPath (Join-Path $TestsRoot $_) -PathType Leaf
     })
@@ -6729,7 +6771,7 @@ foreach ($name in @($semanticCredentialEnvironment.Keys)) {
 # The worker receives only this read-only mirror, so it cannot replace a test
 # after the protected inventory has been checked or mutate the candidate tree
 # while the suite is running.
-$requiredPesterTests = @(Get-RequiredPesterTests)
+$requiredPesterTests = @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests)
 $trustedPesterCommit = [string]$TrustedTestCommit
 if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and [string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
     throw 'Manual validation requires the resolved trusted supervisor SHA for its tests.'
@@ -6891,7 +6933,7 @@ if (-not [OperatingSystem]::IsWindows()) {
     }
 }
 
-$requiredPesterTests = @(Get-RequiredPesterTests)
+$requiredPesterTests = @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests)
 $selectedPesterTests = @($TestNames)
 if ($selectedPesterTests.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$selectedPesterTests[0]) -or
     $requiredPesterTests -cnotcontains [string]$selectedPesterTests[0]) {
