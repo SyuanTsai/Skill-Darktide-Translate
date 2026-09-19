@@ -758,6 +758,7 @@ steps:
         $supervisor | Should -Match '\$pesterConfiguration\.Run\.PassThru = \$true'
         $supervisor | Should -Match '\$pesterConfiguration\.TestRegistry\.Enabled = \$false'
         $supervisor | Should -Match 'Invoke-Pester -Configuration \$pesterConfiguration'
+        $supervisor | Should -Match 'FailedTests='
         $supervisor | Should -Not -Match '\$requiredPesterTests = @\(\)'
     }
 
@@ -786,8 +787,24 @@ steps:
         $supervisor | Should -Match '\$trustedPesterCommit'
         $supervisor | Should -Match '(?s)Expand-TrustedGitArchive.*?-Revision \$trustedPesterCommit.*?-PathSpec @\(''tests''\).*?-Context ''Trusted base Pester tests'''
         $supervisor | Should -Match '(?s)\$candidateMirrorTestsRoot.*?Remove-Item'
+        $supervisor | Should -Match 'function global:New-Item'
+        $supervisor | Should -Match "'Junction'"
+        $supervisor | Should -Match "'SymbolicLink'"
+        $supervisor | Should -Match 'function global:Get-ChildItem'
+        $supervisor | Should -Match '\.retained-partial-\*'
+        $supervisor | Should -Match 'Set-StrictMode -Version 1\.0'
         $supervisor | Should -Match '\$readOnlyPaths = @\('
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
+        $supervisor | Should -Match '\[string\[\]\] \$TestNames'
+        $supervisor | Should -Match "AddParameter\('TestNames'"
+        $supervisor | Should -Match '\[string\] \$PesterTrustedTestCommit'
+        $supervisor | Should -Match "AddParameter\('TrustedTestCommit'"
+        $supervisor | Should -Match "Set-Variable -Name 'trustedTestCommit' -Scope Global"
+        $supervisor | Should -Match "BootstrapTransition\.Tests\.ps1"
+        $supervisor | Should -Match 'foreach \(\$requiredPesterTest in \$requiredPesterTests\)'
+        $supervisor | Should -Match '\$aggregateTotalCount'
+        $supervisor | Should -Match 'per-candidate 300-second CPU'
+        $supervisor | Should -Match 'TimeoutMilliseconds 1800000'
         $supervisor | Should -Match 'CreateOutOfProcessRunspace'
         $supervisor | Should -Match 'AddScript\(\$workerScriptText\)'
         $supervisor | Should -Match 'InvocationStateInfo\.State'
@@ -798,7 +815,7 @@ steps:
         $supervisor | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
         $supervisor | Should -Match 'Get-LinuxPesterCgroupRoot'
         $supervisor | Should -Match '/proc/\$PID/cgroup'
-        $supervisor | Should -Match 'New-LinuxPesterCgroup'
+        $supervisor | Should -Match 'New-LinuxCandidateCgroup'
         $supervisor | Should -Match 'memory\.max'
         $supervisor | Should -Match 'cpu\.stat'
         $supervisor | Should -Match 'usage_usec'
@@ -807,7 +824,8 @@ steps:
         $supervisor | Should -Match 'populated'
         $supervisor | Should -Match 'Start-Sleep -Milliseconds 25'
         $supervisor | Should -Match 'linuxPesterCgroupCleanupException'
-        $supervisor | Should -Match 'Add-LinuxProcessTreeToCgroup'
+        $supervisor | Should -Match 'PesterProxyCgroupPath'
+        $supervisor | Should -Match '\[IO\.File\]::WriteAllText\([\s\S]*?cgroup\.procs'
         $workflow | Should -Match 'Delegate Linux cgroup v2 subtree'
         $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
         $workflow | Should -Match 'CODEX_PESTER_VALIDATOR_CGROUP'
@@ -815,7 +833,7 @@ steps:
         $workflow | Should -Match '\+cpu \+memory'
         $workflow | Should -Match 'cgroup\.subtree_control'
         $workflow | Should -Match 'cgroup\.threads'
-        $workflow | Should -Match 'cgroup_parent/cgroup\.procs'
+        $workflow | Should -Match 'cgroup_delegated/cgroup\.procs'
         $workflow | Should -Match 'sudo -n chown'
         $workflow | Should -Match 'trusted-validator'
         $workflow | Should -Match 'Remove delegated Linux cgroup subtree'
@@ -828,8 +846,8 @@ steps:
         $supervisor | Should -Match '\$PesterProxyReadOnlyPathsJson'
         $supervisor | Should -Match 'EnvironmentVariables\.Remove\(\$gateEnvironmentName\)'
         $supervisor | Should -Match '\[ ! -e "\$target" \]'
-        $supervisor | Should -Match 'exec "\$chroot_path"'
-        $supervisor | Should -Match 'exec chroot "\$sandbox_root"'
+        ([regex]::Matches($supervisor, [regex]::Escape('"$unshare_path" --mount --pid --fork --kill-child --mount-proc="$sandbox_root/proc"'))).Count | Should -Be 2
+        ([regex]::Matches($supervisor, [regex]::Escape('"$chroot_path" "$sandbox_root"'))).Count | Should -Be 2
         $supervisor | Should -Match 'SGV1-Pester-Result:'
         $supervisor | Should -Match 'Invoke-TrustedPowerShellProcess'
         $supervisor | Should -Match 'Invoke-ProtectedPesterSupervisor'
@@ -841,6 +859,63 @@ steps:
         $supervisor | Should -Not -Match '\$workerResultLines'
         $supervisor | Should -Not -Match '-StandardInput \$pesterWorkerMarker'
         $supervisor | Should -Not -Match '\$pesterSupervisorPath\s*='
+    }
+
+    It 'UnitT92_BoundsOnlyTheMeasuredSlowPesterShardWithExtraWallTime' {
+        # Scenario: ModUpdateAutomation is a measured 300-second-plus wall-clock shard while the other immutable files stay below the default.
+        # Purpose: Give only that explicit trusted file enough wall time without widening the 300-second CPU or default shard boundary.
+        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
+        $tokens = $null
+        $errors = $null
+        $supervisorAst = [Management.Automation.Language.Parser]::ParseInput($supervisor, [ref]$tokens, [ref]$errors)
+        $errors.Count | Should -Be 0
+        $timeoutFunction = @($supervisorAst.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Get-ProtectedPesterShardTimeoutMilliseconds'
+        }, $true))
+        $requiredTestsFunction = @($supervisorAst.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Get-RequiredPesterTests'
+        }, $true))
+
+        $timeoutFunction.Count | Should -Be 1
+        $requiredTestsFunction.Count | Should -Be 1
+        if ($timeoutFunction.Count -ne 1 -or $requiredTestsFunction.Count -ne 1) { return }
+
+        $moduleSource = $requiredTestsFunction[0].Extent.Text + [Environment]::NewLine + $timeoutFunction[0].Extent.Text
+        $timeoutModule = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
+        $requiredTests = @(& $timeoutModule { Get-RequiredPesterTests })
+        $requiredTests.Count | Should -Be 9
+        foreach ($testName in $requiredTests) {
+            $actualTimeout = & $timeoutModule {
+                param($name)
+                Get-ProtectedPesterShardTimeoutMilliseconds -TestName $name
+            } $testName
+            $expectedTimeout = if ($testName -ceq 'ModUpdateAutomation.Tests.ps1') { 600000 } else { 300000 }
+            $actualTimeout | Should -Be $expectedTimeout
+        }
+        { & $timeoutModule { Get-ProtectedPesterShardTimeoutMilliseconds -TestName 'CandidateControlled.Tests.ps1' } } |
+            Should -Throw '*outside the immutable required inventory*'
+        $supervisor | Should -Match '\$shardTimeoutMilliseconds\s*=\s*Get-ProtectedPesterShardTimeoutMilliseconds'
+        $supervisor | Should -Match '-TimeoutMilliseconds\s+\$shardTimeoutMilliseconds'
+        $supervisor | Should -Match 'per-candidate 300-second CPU'
+    }
+
+    It 'UnitT95_KeepsProtectedPesterBelowARootOwnedAggregateCgroup' {
+        # Scenario: Candidate code runs under the delegated runner identity and can write migration controls in that delegated subtree.
+        # Purpose: Keep that whole subtree below a root-owned aggregate boundary and prove every descendant is dead before later steps.
+        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+
+        $workflow | Should -Match 'cgroup_delegated="\$cgroup_parent/delegated"'
+        $workflow | Should -Match 'cgroup_supervisor="\$cgroup_delegated/trusted-validator"'
+        $workflow | Should -Match '(?s)''2147483648''.*?"\$cgroup_parent/memory\.max"'
+        $workflow | Should -Match '(?s)''256''.*?"\$cgroup_parent/pids\.max"'
+        $workflow | Should -Not -Match 'chown[^\r\n]*"\$cgroup_parent(?:/cgroup\.(?:procs|threads))?"'
+        $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT=%s[\s\S]*?"\$cgroup_delegated"'
+        $workflow | Should -Match 'cgroup\.kill'
+        $workflow | Should -Match 'cgroup\.events'
+        $workflow | Should -Match '/usr/bin/find "\$cgroup_parent" -mindepth 1 -depth -type d'
+        $workflow | Should -Match 'shell:\s*/usr/bin/sudo -n /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -e -o pipefail \{0\}'
     }
 
     It 'UnitT100_BindsReplacementObjectDiscoveryToTheCandidateWorktree' {
