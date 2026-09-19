@@ -6942,13 +6942,24 @@ if (-not [OperatingSystem]::IsWindows() -and
     Set-StrictMode -Version 1.0
 }
 # The immutable RepositoryContract fixture initializes HostIsLinux but reads
-# IsLinuxHost before assigning it. Shared-process execution can accidentally
-# seed that script variable; the protected runner deliberately isolates every
-# trusted file. Preserve the fixture's Windows PowerShell-compatible null read
-# only for this exact shard while keeping StrictMode Latest everywhere else.
+# IsLinuxHost before assigning it. Seed only that fixture's run-phase script
+# scope from a trusted Pester container; discovery-scope variables are not
+# retained by Pester 6. Keep StrictMode Latest and the test file bytes unchanged
+# while every unrelated shard continues to use its direct path.
 if (-not [OperatingSystem]::IsWindows() -and
     [string]$selectedPesterTests[0] -ceq 'RepositoryContract.Tests.ps1') {
-    Set-StrictMode -Version 1.0
+    $repositoryContractContainer = New-PesterContainer -ScriptBlock {
+        param($TrustedRepositoryContractPath)
+        Set-StrictMode -Version Latest
+        BeforeAll {
+            $script:IsLinuxHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
+        }
+        . $TrustedRepositoryContractPath
+    } -Data @{
+        TrustedRepositoryContractPath = [string]$requiredPesterPaths[0]
+    }
+    $pesterConfiguration.Run.Path = @()
+    $pesterConfiguration.Run.Container = @($repositoryContractContainer)
 }
 $result = Invoke-Pester -Configuration $pesterConfiguration
 if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
