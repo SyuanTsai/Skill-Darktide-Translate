@@ -28,7 +28,7 @@ $expanded = ./scripts/Expand-Schema14Reference.ps1 -Document Workflow -OutputDir
 Get-Content -LiteralPath $expanded.path -Raw
 ```
 
-Keep the temporary materialization outside the Skill source and target MOD repository. Do not reuse an existing output file.
+Keep the temporary materialization outside the Skill source and target MOD repository. Do not route the Skill source or output directory through a symbolic link or junction, and do not reuse an existing output file.
 
 ## Select the operation
 

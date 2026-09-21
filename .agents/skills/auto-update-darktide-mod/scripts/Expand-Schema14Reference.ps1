@@ -19,6 +19,27 @@ if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
     throw 'OutputDirectory must be an existing directory.'
 }
 
+function Assert-NoReparsePointInDirectoryPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name
+    )
+
+    $current = Get-Item -LiteralPath $Path -Force
+    while ($null -ne $current) {
+        if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Name must not traverse a symbolic link or junction."
+        }
+        $current = $current.Parent
+    }
+}
+
+Assert-NoReparsePointInDirectoryPath -Path $skillRoot -Name 'Skill source'
+Assert-NoReparsePointInDirectoryPath -Path $OutputDirectory -Name 'OutputDirectory'
+
 $resolvedSkillRoot = [IO.Path]::GetFullPath($skillRoot).TrimEnd(
     [IO.Path]::DirectorySeparatorChar,
     [IO.Path]::AltDirectorySeparatorChar

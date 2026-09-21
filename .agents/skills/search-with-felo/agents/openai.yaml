@@ -1,0 +1,4 @@
+interface:
+  display_name: "Search With FELO"
+  short_description: "Search public web safely with compact FELO results"
+  default_prompt: "Use $search-with-felo to research current public information with compact cited results."

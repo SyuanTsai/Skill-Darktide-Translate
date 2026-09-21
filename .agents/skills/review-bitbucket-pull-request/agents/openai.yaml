@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Bitbucket Pull Request"
+  short_description: "Review Bitbucket PRs via Git and comment safely"
+  default_prompt: "Use $review-bitbucket-pull-request to review this Bitbucket pull request from its local Git diff, read all feedback, and prepare comments."

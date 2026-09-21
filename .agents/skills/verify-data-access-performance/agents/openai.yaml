@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify Data Access Performance"
+  short_description: "Validate query shape, counts, and benchmarks"
+  default_prompt: "Use $verify-data-access-performance to validate this data-access performance change."

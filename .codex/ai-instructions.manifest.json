@@ -1,0 +1,217 @@
+{
+  "schemaVersion": 1,
+  "sourceRepository": "SyuanTsai/SyuanTsai-AI-Instructions",
+  "sourceRef": "main",
+  "files": [
+    {
+      "sourcePath": ".agents/skills/capture-private-course-knowledge/agents/openai.yaml",
+      "targetPath": ".agents/skills/capture-private-course-knowledge/agents/openai.yaml",
+      "sha256": "c513ef2e6be452e0c5fba84e795cdbb31c650a2f3d2235c0523858f47147a42f"
+    },
+    {
+      "sourcePath": ".agents/skills/capture-private-course-knowledge/references/course-notes-format.md",
+      "targetPath": ".agents/skills/capture-private-course-knowledge/references/course-notes-format.md",
+      "sha256": "0b60fc3dce7b3829b1d4058763e98ad3f803832d556d038aa0afa2246a5fc1d1"
+    },
+    {
+      "sourcePath": ".agents/skills/capture-private-course-knowledge/references/notebooklm-export.md",
+      "targetPath": ".agents/skills/capture-private-course-knowledge/references/notebooklm-export.md",
+      "sha256": "fb577036757929ec18e790e1a1f593784abec895f45ef1ff270223696b5b48c1"
+    },
+    {
+      "sourcePath": ".agents/skills/capture-private-course-knowledge/references/pdf-material-capture.md",
+      "targetPath": ".agents/skills/capture-private-course-knowledge/references/pdf-material-capture.md",
+      "sha256": "1676a4d67d3e38c679570da46b4d1c304833015462414ff7e0603ea9276b27d5"
+    },
+    {
+      "sourcePath": ".agents/skills/capture-private-course-knowledge/references/syuantsai-github-article.md",
+      "targetPath": ".agents/skills/capture-private-course-knowledge/references/syuantsai-github-article.md",
+      "sha256": "a9f51a06d5f73548d4afe8820a3335ef1fbd146afc1dcc1115d51a994247d7bb"
+    },
+    {
+      "sourcePath": ".agents/skills/capture-private-course-knowledge/references/video-capture.md",
+      "targetPath": ".agents/skills/capture-private-course-knowledge/references/video-capture.md",
+      "sha256": "f9323b8c6d52d067aa1514ffe696942256a088b617b2da51e99be8d7ca377df2"
+    },
+    {
+      "sourcePath": ".agents/skills/capture-private-course-knowledge/SKILL.md",
+      "targetPath": ".agents/skills/capture-private-course-knowledge/SKILL.md",
+      "sha256": "6c96f07855c319c8f82780c1bca6e8a865cedd7e065651345dd17acd9cee7fc9"
+    },
+    {
+      "sourcePath": ".agents/skills/configure-jira-api-access/agents/openai.yaml",
+      "targetPath": ".agents/skills/configure-jira-api-access/agents/openai.yaml",
+      "sha256": "b61eabc96fbbf0f0ef63cf2614cd44e0616e2ec955c651d9942c8bf73b007955"
+    },
+    {
+      "sourcePath": ".agents/skills/configure-jira-api-access/references/configuration.md",
+      "targetPath": ".agents/skills/configure-jira-api-access/references/configuration.md",
+      "sha256": "d0e9647f80d24fd29c3a24303451aa246eae85963c90b817e881c022340fd074"
+    },
+    {
+      "sourcePath": ".agents/skills/configure-jira-api-access/SKILL.md",
+      "targetPath": ".agents/skills/configure-jira-api-access/SKILL.md",
+      "sha256": "f2c2047bf35a576bc8966b35622790e83358a217de358a1bbd708211c7d9ff34"
+    },
+    {
+      "sourcePath": ".agents/skills/investigate-datadog-logs/agents/openai.yaml",
+      "targetPath": ".agents/skills/investigate-datadog-logs/agents/openai.yaml",
+      "sha256": "4d2c836757a2d06a424c10cc4c645872e9ba91e1930287ae4ca0727f552c564d"
+    },
+    {
+      "sourcePath": ".agents/skills/investigate-datadog-logs/SKILL.md",
+      "targetPath": ".agents/skills/investigate-datadog-logs/SKILL.md",
+      "sha256": "4ae19f697bf251b395d47df30596a6ebff19f9eee2ae4e6c4da7553b2749cc2f"
+    },
+    {
+      "sourcePath": ".agents/skills/plan-production-change/agents/openai.yaml",
+      "targetPath": ".agents/skills/plan-production-change/agents/openai.yaml",
+      "sha256": "0100cbf8b488bd8f4592628fe932d983d1fd7116e06fa19ccb9db82c2b00c880"
+    },
+    {
+      "sourcePath": ".agents/skills/plan-production-change/SKILL.md",
+      "targetPath": ".agents/skills/plan-production-change/SKILL.md",
+      "sha256": "c70008ebaca16b0ad53f8c817bfa218f7825e6d6b58418a20f5aecafa605c93f"
+    },
+    {
+      "sourcePath": ".agents/skills/publish-requirements-to-confluence/agents/openai.yaml",
+      "targetPath": ".agents/skills/publish-requirements-to-confluence/agents/openai.yaml",
+      "sha256": "aee8fa0167896d45881f59dd923d619976903bd375856ae1792b884e53fcbec1"
+    },
+    {
+      "sourcePath": ".agents/skills/publish-requirements-to-confluence/references/confluence-cloud-api.md",
+      "targetPath": ".agents/skills/publish-requirements-to-confluence/references/confluence-cloud-api.md",
+      "sha256": "59873d23b12cd6573d83db85f58462ed9a91c127346f8bb6508864e8ecd04b72"
+    },
+    {
+      "sourcePath": ".agents/skills/publish-requirements-to-confluence/references/requirements-structure.md",
+      "targetPath": ".agents/skills/publish-requirements-to-confluence/references/requirements-structure.md",
+      "sha256": "0c81090cbb75a05c9c0c1e01b3003ac77c99d5cdbe2e205d12a7eb2aa631eda4"
+    },
+    {
+      "sourcePath": ".agents/skills/publish-requirements-to-confluence/SKILL.md",
+      "targetPath": ".agents/skills/publish-requirements-to-confluence/SKILL.md",
+      "sha256": "2c7e9bb1371b69c92125e0920e606321c67fb5c2927e0a0e676182fa91381609"
+    },
+    {
+      "sourcePath": ".agents/skills/review-bitbucket-pull-request/agents/openai.yaml",
+      "targetPath": ".agents/skills/review-bitbucket-pull-request/agents/openai.yaml",
+      "sha256": "8cd5c6d44494bf7a2c4bd2cea748bf9ce3122ae4b93fc1d68dca339b06a1aa2d"
+    },
+    {
+      "sourcePath": ".agents/skills/review-bitbucket-pull-request/references/bitbucket-cloud-api.md",
+      "targetPath": ".agents/skills/review-bitbucket-pull-request/references/bitbucket-cloud-api.md",
+      "sha256": "03be0dbbf1d98166273b4e20609032779ae03c5dbaf810d82e27c490b2129c89"
+    },
+    {
+      "sourcePath": ".agents/skills/review-bitbucket-pull-request/SKILL.md",
+      "targetPath": ".agents/skills/review-bitbucket-pull-request/SKILL.md",
+      "sha256": "3f36363f6a38f8019fc32855fb7efc267ba50befd5b3dfbeba5db2a0704f085b"
+    },
+    {
+      "sourcePath": ".agents/skills/search-with-felo/agents/openai.yaml",
+      "targetPath": ".agents/skills/search-with-felo/agents/openai.yaml",
+      "sha256": "819cf4391c776f7da1476f90d25649bf51e6ddd08dac183d579485fdc10301f2"
+    },
+    {
+      "sourcePath": ".agents/skills/search-with-felo/scripts/search-with-felo.ps1",
+      "targetPath": ".agents/skills/search-with-felo/scripts/search-with-felo.ps1",
+      "sha256": "7ffcc1c208da91f048856f815c1c155184fb44423a309acbf901d1129ce4751b"
+    },
+    {
+      "sourcePath": ".agents/skills/search-with-felo/scripts/SearchWithFelo.psm1",
+      "targetPath": ".agents/skills/search-with-felo/scripts/SearchWithFelo.psm1",
+      "sha256": "9151e56b505b8a7fca35043773b77b2f4139ebabbb8935e809317f31f8eab2ed"
+    },
+    {
+      "sourcePath": ".agents/skills/search-with-felo/SKILL.md",
+      "targetPath": ".agents/skills/search-with-felo/SKILL.md",
+      "sha256": "2571f6141031f56ecc7adbdf36be07d9c14efc832e58726aa82f4711959fecb6"
+    },
+    {
+      "sourcePath": ".agents/skills/verify-data-access-performance/agents/openai.yaml",
+      "targetPath": ".agents/skills/verify-data-access-performance/agents/openai.yaml",
+      "sha256": "55a5f2d31bd9992cbb28fe1cb526cb9210dd18b7ec221d303a564cd9dd9d1bc9"
+    },
+    {
+      "sourcePath": ".agents/skills/verify-data-access-performance/SKILL.md",
+      "targetPath": ".agents/skills/verify-data-access-performance/SKILL.md",
+      "sha256": "4a99e84c1261aff1ae375ea4af5a451e915ab53f66c09ed54d374915512878a4"
+    },
+    {
+      "sourcePath": ".agents/skills/work-with-jira/agents/openai.yaml",
+      "targetPath": ".agents/skills/work-with-jira/agents/openai.yaml",
+      "sha256": "0f8141bcda9e48d43ba51e3736f09ff4e2230de2de480f34d33debafd9820b7b"
+    },
+    {
+      "sourcePath": ".agents/skills/work-with-jira/SKILL.md",
+      "targetPath": ".agents/skills/work-with-jira/SKILL.md",
+      "sha256": "2e1192fd25d14b77b69658aeaef2dfa13114ef13ef054ad04c129478abd27c97"
+    },
+    {
+      "sourcePath": ".agents/skills/write-copilot-implementation-prompt/agents/openai.yaml",
+      "targetPath": ".agents/skills/write-copilot-implementation-prompt/agents/openai.yaml",
+      "sha256": "2037b73ac787839dc610ebc0754541b660ff0b78a8d9a025576b1cdfe50a08bc"
+    },
+    {
+      "sourcePath": ".agents/skills/write-copilot-implementation-prompt/SKILL.md",
+      "targetPath": ".agents/skills/write-copilot-implementation-prompt/SKILL.md",
+      "sha256": "a05d904a1b3e0a1a2367ccfd74fe502a89ec7e9e0df9873bfb689cb8c0e5d069"
+    },
+    {
+      "sourcePath": ".codex/AI-Rules/CodeReview.en.md",
+      "targetPath": ".codex/AI-Rules/CodeReview.en.md",
+      "sha256": "891b70c10b9b87b5c74f0f503ffe76119f41af13fafff13f39cd71e9631b6336"
+    },
+    {
+      "sourcePath": ".codex/AI-Rules/Database.en.md",
+      "targetPath": ".codex/AI-Rules/Database.en.md",
+      "sha256": "44735c0e0310411fe8e2d9912e7884429e0737e34e93a264b62d559a3f0ba722"
+    },
+    {
+      "sourcePath": ".codex/AI-Rules/ExternalResearch.en.md",
+      "targetPath": ".codex/AI-Rules/ExternalResearch.en.md",
+      "sha256": "611fc70a451213553e668f6ab2cd2c17d632807224066e777f114180d2e65b52"
+    },
+    {
+      "sourcePath": ".codex/AI-Rules/Testing.en.md",
+      "targetPath": ".codex/AI-Rules/Testing.en.md",
+      "sha256": "abc13377a711aeac855b4d5da66569a1639b17622eab88a78c62a7c066b26ec5"
+    },
+    {
+      "sourcePath": ".github/AI-Rules/CodeReview.en.md",
+      "targetPath": ".github/AI-Rules/CodeReview.en.md",
+      "sha256": "d2a09cfc132e1dea8dff3ea5c16d23cc628baed1bc0aed89db7e374fb6754524"
+    },
+    {
+      "sourcePath": ".github/AI-Rules/Database.en.md",
+      "targetPath": ".github/AI-Rules/Database.en.md",
+      "sha256": "44735c0e0310411fe8e2d9912e7884429e0737e34e93a264b62d559a3f0ba722"
+    },
+    {
+      "sourcePath": ".github/AI-Rules/ExternalResearch.en.md",
+      "targetPath": ".github/AI-Rules/ExternalResearch.en.md",
+      "sha256": "611fc70a451213553e668f6ab2cd2c17d632807224066e777f114180d2e65b52"
+    },
+    {
+      "sourcePath": ".github/AI-Rules/GitCommit.en.md",
+      "targetPath": ".github/AI-Rules/GitCommit.en.md",
+      "sha256": "ec9e88fa030aaa5ee71c0ee40d3e86892a55523cb4b019af56df8ffad5d6ccb0"
+    },
+    {
+      "sourcePath": ".github/AI-Rules/Testing.en.md",
+      "targetPath": ".github/AI-Rules/Testing.en.md",
+      "sha256": "abc13377a711aeac855b4d5da66569a1639b17622eab88a78c62a7c066b26ec5"
+    },
+    {
+      "sourcePath": ".github/copilot-instructions.en.md",
+      "targetPath": ".github/copilot-instructions.md",
+      "sha256": "78f8bbfd0881ea9b2e981bfabacec84e8c17389a63c794456cf2074cb92b837c"
+    },
+    {
+      "sourcePath": ".codex/AGENTS.en.md",
+      "targetPath": "AGENTS.md",
+      "sha256": "34be7f55f741bdc9ea2bd3ec88f7fe4411d125ee7b8e9c9cc3b8f2057287258f"
+    }
+  ]
+}

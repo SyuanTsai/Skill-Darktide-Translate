@@ -1,0 +1,4 @@
+interface:
+  display_name: "Capture Private Course Knowledge"
+  short_description: "Unify videos, PDFs, code, recall, and exports"
+  default_prompt: "Use $capture-private-course-knowledge to capture this authorized course across videos, PDFs, slides, code, and attachments as evidence-linked notes, then create the requested NotebookLM sources or website article."

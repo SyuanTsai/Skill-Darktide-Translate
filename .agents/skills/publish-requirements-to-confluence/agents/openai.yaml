@@ -1,0 +1,4 @@
+interface:
+  display_name: "Publish Requirements to Confluence"
+  short_description: "Structure and publish requirements to Confluence"
+  default_prompt: "Use $publish-requirements-to-confluence to organize these analyzed requirements and publish them to the confirmed Confluence destination."

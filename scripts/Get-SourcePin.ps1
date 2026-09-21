@@ -22,8 +22,14 @@ if ($resolvedCommit -notmatch '^[0-9a-f]{40}$') {
 }
 
 $treeLines = @(
-    Invoke-GitText -Arguments @('ls-tree', '-r', '--full-tree', $resolvedCommit) |
-        Sort-Object -CaseSensitive
+    Invoke-GitText -Arguments @(
+        '-c',
+        'core.quotePath=true',
+        'ls-tree',
+        '-r',
+        '--full-tree',
+        $resolvedCommit
+    )
 )
 if ($treeLines.Count -eq 0) {
     throw "Ref '$Ref' contains no tracked files."

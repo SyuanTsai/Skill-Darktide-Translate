@@ -32,9 +32,9 @@ Describe 'Darktide Translate repository contract' {
         $profile.includes[0] | Should -Be 'auto-update-darktide-mod'
     }
 
-    # Scenario: The repository is packaged as one independently versioned Skill source.
-    # Purpose: Prevent missing metadata, tests, workflows, or release/rollback controls.
-    It 'UnitT20_ContainsEveryRequiredRepositoryArtifact' {
+    # Scenario: The repository is packaged as one independently versioned tracked Skill source while local bootstrap files coexist.
+    # Purpose: Prevent missing release artifacts without treating untracked PersonalAgent Skills as publishable product content.
+    It 'UnitT20_ContainsEveryRequiredTrackedRepositoryArtifact' {
         $expectedPaths = @(
             '.agents/skills/auto-update-darktide-mod/SKILL.md',
             '.agents/skills/auto-update-darktide-mod/agents/openai.yaml',
@@ -59,12 +59,47 @@ Describe 'Darktide Translate repository contract' {
         }
 
         $skillRoot = Join-Path $repoRoot '.agents/skills'
-        $actualSkillDirectories = @(
-            Get-ChildItem -LiteralPath $skillRoot -Directory |
-                Select-Object -ExpandProperty Name |
-                Sort-Object
-        )
-        ($actualSkillDirectories -join "`n") | Should -Be 'auto-update-darktide-mod'
+        & git -C $repoRoot rev-parse --show-toplevel 2>$null | Out-Null
+        $hasGitRepository = $LASTEXITCODE -eq 0
+        $untrackedFixture = Join-Path $skillRoot 'contract-untracked-fixture'
+        try {
+            if ($hasGitRepository) {
+                New-Item -ItemType Directory -Path $untrackedFixture | Out-Null
+            }
+
+            if ($hasGitRepository) {
+                $trackedSkillFiles = @(
+                    & git -C $repoRoot ls-files -- '.agents/skills/*/SKILL.md'
+                )
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'Unable to enumerate tracked Skill entrypoints.'
+                }
+                $actualSkillDirectories = @(
+                    $trackedSkillFiles |
+                        ForEach-Object {
+                            $normalizedPath = $_ -replace '\\', '/'
+                            if ($normalizedPath -notmatch '^\.agents/skills/([^/]+)/SKILL\.md$') {
+                                throw "Unexpected tracked Skill entrypoint: $normalizedPath"
+                            }
+                            $Matches[1]
+                        } |
+                        Sort-Object -Unique
+                )
+            }
+            else {
+                $actualSkillDirectories = @(
+                    Get-ChildItem -LiteralPath $skillRoot -Directory |
+                        Select-Object -ExpandProperty Name |
+                        Sort-Object
+                )
+            }
+            ($actualSkillDirectories -join "`n") | Should -Be 'auto-update-darktide-mod'
+        }
+        finally {
+            if (Test-Path -LiteralPath $untrackedFixture) {
+                Remove-Item -LiteralPath $untrackedFixture -Recurse -Force
+            }
+        }
     }
 
     # Scenario: A release process resolves the repository version before pin generation.

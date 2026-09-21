@@ -101,9 +101,42 @@ Describe 'Auto Update Darktide MOD Skill contract' {
             Should -Throw '*outside the Skill source*'
     }
 
+    # Scenario: An outside-looking output directory is a junction that resolves into the installed Skill.
+    # Purpose: Prevent reparse-point traversal from bypassing the no-write Skill source boundary.
+    It 'UnitT29_RefusesAReparsePointOutputPath' {
+        $fixtureRoot = Join-Path $TestDrive 'linked-skill-output'
+        Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
+        $physicalOutput = Join-Path $fixtureRoot 'generated'
+        New-Item -ItemType Directory -Path $physicalOutput | Out-Null
+        $linkedOutputRoot = Join-Path $TestDrive 'outside-looking-link'
+        New-Item -ItemType Junction -Path $linkedOutputRoot -Target $fixtureRoot | Out-Null
+        $linkedOutput = Join-Path $linkedOutputRoot 'generated'
+        $fixtureExpander = Join-Path $fixtureRoot 'scripts/Expand-Schema14Reference.ps1'
+
+        { & $fixtureExpander -Document Workflow -OutputDirectory $linkedOutput -PassThru } |
+            Should -Throw '*symbolic link or junction*'
+        Test-Path -LiteralPath (Join-Path $physicalOutput 'workflow-schema-14.md') |
+            Should -Be $false
+    }
+
+    # Scenario: The installed Skill is reached through a junction while output names its physical source directory.
+    # Purpose: Prevent a linked Skill alias from defeating the same no-write source boundary.
+    It 'UnitT30_RefusesAReparsePointSkillSourcePath' {
+        $physicalSkill = Join-Path $TestDrive 'physical-skill-source'
+        Copy-Item -LiteralPath $skillRoot -Destination $physicalSkill -Recurse
+        $linkedSkill = Join-Path $TestDrive 'linked-skill-source'
+        New-Item -ItemType Junction -Path $linkedSkill -Target $physicalSkill | Out-Null
+        $linkedExpander = Join-Path $linkedSkill 'scripts/Expand-Schema14Reference.ps1'
+
+        { & $linkedExpander -Document Workflow -OutputDirectory $physicalSkill -PassThru } |
+            Should -Throw '*symbolic link or junction*'
+        Test-Path -LiteralPath (Join-Path $physicalSkill 'workflow-schema-14.md') |
+            Should -Be $false
+    }
+
     # Scenario: The Skill runs outside the original MOD repository prompt location.
     # Purpose: Preserve immutable source pinning without requiring AI Prompt files in the target repository.
-    It 'UnitT30_MapsOriginalWorkflowLocationsToTheInstalledSkillSource' {
+    It 'UnitT35_MapsOriginalWorkflowLocationsToTheInstalledSkillSource' {
         $bindingPath = Join-Path $skillRoot 'references/package-binding.md'
         Test-Path -LiteralPath $bindingPath | Should -Be $true
         $binding = Get-Content -LiteralPath $bindingPath -Raw
@@ -117,6 +150,7 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $binding | Should -Match 'packagedGitBlobOid'
         $binding | Should -Match 'sourceGitBlobOid'
         $binding | Should -Match 'repository-relative path'
+        $binding | Should -Match 'symbolic link or junction'
     }
 
     # Scenario: The Skill appears in Codex UI and may be selected automatically for matching maintenance work.

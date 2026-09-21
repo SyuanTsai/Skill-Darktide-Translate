@@ -1,0 +1,4 @@
+interface:
+  display_name: "Configure Jira API Access"
+  short_description: "Guide secure Jira API token setup and validation"
+  default_prompt: "Use $configure-jira-api-access to guide me through checking and configuring Jira API access safely."

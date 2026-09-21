@@ -4,6 +4,8 @@
 
 This repository is versioned independently from the target DARKTIDE MOD repository and from AI-Instructions consumers. Use SemVer-compatible tags (`vMAJOR.MINOR.PATCH`) and keep `VERSION` equal to the tag without the leading `v`.
 
+`Get-SourcePin.ps1` computes the deterministic repository content SHA-256 from the UTF-8 bytes of `git -c core.quotePath=true ls-tree -r --full-tree <commit>`, preserving Git's canonical tree order, joining records with LF, and retaining one trailing LF. Do not locale-sort or use the caller's `core.quotePath` setting.
+
 ## Release checklist
 
 1. Run `pwsh -File ./tests/Invoke-Tests.ps1`.

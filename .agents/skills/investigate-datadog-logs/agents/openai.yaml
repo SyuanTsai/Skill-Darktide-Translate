@@ -1,0 +1,4 @@
+interface:
+  display_name: "Investigate Datadog Logs"
+  short_description: "Investigate Datadog logs and APM telemetry"
+  default_prompt: "Use $investigate-datadog-logs to investigate this Datadog log or APM issue through the configured connector."

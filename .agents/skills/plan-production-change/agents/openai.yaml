@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Production Change"
+  short_description: "Create risk-proportionate implementation plans"
+  default_prompt: "Use $plan-production-change to create an implementation plan for this change."
