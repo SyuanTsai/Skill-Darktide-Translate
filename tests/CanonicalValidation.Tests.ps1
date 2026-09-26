@@ -185,6 +185,31 @@ Describe 'Canonical Standard v1 validation adapter' {
         $skillToolsValidator | Should -Match 'skill-tools SARIF contains a malformed or error-level result'
     }
 
+    # Scenario: A candidate's package checker fails before the static scanner could run.
+    # Purpose: Keep both required package tools in Gate 1 and make the report reflect their actual execution stage.
+    It 'UnitT35_RunsBothPackageToolsBeforeStaticAndReportsTheirGate' {
+        $packageStart = $script:Validator.IndexOf('# Stage 3: Package Validation.', [StringComparison]::Ordinal)
+        $staticStart = $script:Validator.IndexOf('# Stage 4: SkillSpector Static.', [StringComparison]::Ordinal)
+        $testStart = $script:Validator.IndexOf('# Stage 5: Repository Tests.', [StringComparison]::Ordinal)
+        $skillToolsCheck = $script:Validator.IndexOf("'check', `$skillRoot, '--format', 'sarif'", [StringComparison]::Ordinal)
+        $skillToolsAssertion = $script:Validator.IndexOf('Assert-SkillToolsReport -Report $toolsReport', [StringComparison]::Ordinal)
+
+        $packageStart | Should -BeGreaterThan -1
+        $staticStart | Should -BeGreaterThan $packageStart
+        $testStart | Should -BeGreaterThan $staticStart
+        $skillToolsCheck | Should -BeGreaterThan $packageStart
+        $skillToolsCheck | Should -BeLessThan $staticStart
+        $skillToolsAssertion | Should -BeGreaterThan $skillToolsCheck
+        $skillToolsAssertion | Should -BeLessThan $staticStart
+
+        $summaryStart = $script:Validator.IndexOf('$summary = [pscustomobject][ordered]@{', $testStart, [StringComparison]::Ordinal)
+        $summaryStart | Should -BeGreaterThan $testStart
+        $summary = $script:Validator.Substring($summaryStart)
+        $summary | Should -Match '(?m)^\s*schemaVersion = 2$'
+        $summary | Should -Match '(?s)packageValidation = \[ordered\]@\{[^}]*skillTools = \$skillToolsReports'
+        $summary | Should -Not -Match '(?s)repositoryTests = \[ordered\]@\{[^}]*skillTools = \$skillToolsReports'
+    }
+
     # Scenario: Canonical validation emits run-owned evidence after the security preflight.
     # Purpose: Keep candidate-controlled paths out of evidence and retain every required review boundary.
     It 'UnitT70_KeepsReportsInTheRunArtifactsRootAndRecordsReviewBoundaries' {

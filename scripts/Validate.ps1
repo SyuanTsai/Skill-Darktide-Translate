@@ -6548,6 +6548,13 @@ foreach ($skillId in $skillIds) {
     $checkReport = Read-JsonFile -Path $checkReportPath -Context "skill-validator full check report for $skillId"
     Assert-SkillValidatorReport -Report $checkReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
     $skillValidatorCheckReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($checkReportPath) }
+
+    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools package validation for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $toolsReportPath = Join-Path $runRoot "skill-tools-$skillId.sarif.json"
+    [IO.File]::WriteAllText($toolsReportPath, $toolsOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    $toolsReport = Read-JsonFile -Path $toolsReportPath -Context "skill-tools package validation report for $skillId"
+    Assert-SkillToolsReport -Report $toolsReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
+    $skillToolsReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($toolsReportPath) }
 }
 
 # Stage 4: SkillSpector Static.
@@ -6664,20 +6671,6 @@ else {
 $diffOutput = @(& $gitPath @diffArguments 2>&1)
 if ($LASTEXITCODE -ne 0) {
     throw "Whitespace validation failed for the candidate event range.`n$($diffOutput -join [Environment]::NewLine)"
-}
-
-foreach ($skillId in $skillIds) {
-    $skillRoot = Join-Path $repoRoot "skills/$skillId"
-    $expectedInventoryPaths = @(
-        @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
-            ForEach-Object { [string]$_.path }
-    )
-    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
-    $toolsReportPath = Join-Path $runRoot "skill-tools-$skillId.sarif.json"
-    [IO.File]::WriteAllText($toolsReportPath, $toolsOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    $toolsReport = Read-JsonFile -Path $toolsReportPath -Context "skill-tools report for $skillId"
-    Assert-SkillToolsReport -Report $toolsReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
-    $skillToolsReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($toolsReportPath) }
 }
 
 $routeCases = @(
@@ -7268,7 +7261,7 @@ Assert-RepositoryRawSnapshotUnchanged -Before $prePesterRepositoryRawSnapshot -A
 $repositoryReport = $postPesterRepositoryReport
 
 $summary = [pscustomobject][ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     standardVersion = 'v1'
     runId = $runId
     authority = [ordered]@{
@@ -7319,11 +7312,10 @@ $summary = [pscustomobject][ordered]@{
     stages = [ordered]@{
         controlledAcquisition = 'passed'
         integrityVerification = 'passed'
-        packageValidation = [ordered]@{ structure = $skillValidatorReports; fullCheck = $skillValidatorCheckReports }
+        packageValidation = [ordered]@{ structure = $skillValidatorReports; fullCheck = $skillValidatorCheckReports; skillTools = $skillToolsReports }
         skillspectorStatic = $staticReports
         repositoryTests = [ordered]@{
             repositoryValidation = 'passed'
-            skillTools = $skillToolsReports
             routing = $skillToolsRouteReports
             pester = [ordered]@{
                 result = 'passed'
