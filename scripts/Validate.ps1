@@ -4808,7 +4808,7 @@ emit_private_snapshot_capacity() {
         printf 'trusted-capacity %s bytes\n' "$label" >&2
         /usr/bin/df -B1 --output=size,used,avail -- "$path" >&2 || true
         printf 'trusted-capacity %s inodes\n' "$label" >&2
-        /usr/bin/df -i --output=itotal,iused,iavail -- "$path" >&2 || true
+        /usr/bin/df --output=itotal,iused,iavail -- "$path" >&2 || true
     fi
 }
 printf '%s\n' "$$" > "$cgroup_path/cgroup.procs"

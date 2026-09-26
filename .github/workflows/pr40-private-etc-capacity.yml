@@ -31,7 +31,7 @@ jobs:
             printf 'capacity-probe ceiling=%s bytes-before\n' "$ceiling"
             /usr/bin/df -B1 --output=size,used,avail -- "$target"
             printf 'capacity-probe ceiling=%s inodes-before\n' "$ceiling"
-            /usr/bin/df -i --output=itotal,iused,iavail -- "$target"
+            /usr/bin/df --output=itotal,iused,iavail -- "$target"
             sudo -u runner -g runner bash -s -- "$target" <<'COPY'
           set -u
           target="$1"
@@ -52,7 +52,7 @@ jobs:
             printf 'capacity-probe ceiling=%s bytes-after\n' "$ceiling"
             /usr/bin/df -B1 --output=size,used,avail -- "$target"
             printf 'capacity-probe ceiling=%s inodes-after\n' "$ceiling"
-            /usr/bin/df -i --output=itotal,iused,iavail -- "$target"
+            /usr/bin/df --output=itotal,iused,iavail -- "$target"
             umount "$target"
           done
           MOUNT
