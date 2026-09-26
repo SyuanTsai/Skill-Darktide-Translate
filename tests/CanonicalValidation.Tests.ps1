@@ -118,7 +118,7 @@ Describe 'Canonical Standard v1 validation adapter' {
     }
 
     It 'sizes the private Linux etc projection for hosted runner images' {
-        $script:Validator | Should -Match 'size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
+        $script:Validator | Should -Match 'size=1073741824,nodev,nosuid,noexec tmpfs "\$target"'
     }
 
     It 'uses the portable setpriv syntax for clearing ambient capabilities' {
