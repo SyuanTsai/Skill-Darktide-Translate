@@ -1,0 +1,58 @@
+# Development diagnostic only. This workflow never publishes protected checks.
+name: PR40 private etc capacity diagnostic
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/pr40-private-etc-capacity.yml
+      - scripts/Validate.ps1
+
+permissions: {}
+
+jobs:
+  private-etc-capacity:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'codex/SYP-154-darktide-etc-capacity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Compare private tmpfs ceilings without candidate checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe_root="$(mktemp -d "$RUNNER_TEMP/etc-capacity.XXXXXX")"
+          trap 'rmdir "$probe_root"' EXIT
+          sudo -n unshare --mount --propagation private -- bash -s -- "$probe_root" <<'MOUNT'
+          set -euo pipefail
+          target="$1"
+          for ceiling in 268435456 1073741824; do
+            mount -t tmpfs -o "size=$ceiling,nodev,nosuid,noexec" tmpfs "$target"
+            chmod 0777 "$target"
+            printf 'capacity-probe ceiling=%s bytes-before\n' "$ceiling"
+            /usr/bin/df -B1 --output=size,used,avail -- "$target"
+            printf 'capacity-probe ceiling=%s inodes-before\n' "$ceiling"
+            /usr/bin/df -i --output=itotal,iused,iavail -- "$target"
+            sudo -u runner -g runner bash -s -- "$target" <<'COPY'
+          set -u
+          target="$1"
+          copy_status=0
+          while IFS= read -r -d '' source; do
+            destination="$target$source"
+            /bin/mkdir -p -- "$(dirname "$destination")"
+            if ! /bin/cat -- "$source" > "$destination"; then
+              copy_status=1
+              break
+            fi
+          done < <(/usr/bin/find /etc -xdev -type f -readable -print0 2>/dev/null)
+          if [ "$copy_status" -eq 0 ] && [ -e /etc/resolv.conf ]; then
+            /bin/cat -- /etc/resolv.conf > "$target/resolv.conf" || copy_status=1
+          fi
+          printf 'capacity-probe copy-status=%s\n' "$copy_status"
+          COPY
+            printf 'capacity-probe ceiling=%s bytes-after\n' "$ceiling"
+            /usr/bin/df -B1 --output=size,used,avail -- "$target"
+            printf 'capacity-probe ceiling=%s inodes-after\n' "$ceiling"
+            /usr/bin/df -i --output=itotal,iused,iavail -- "$target"
+            umount "$target"
+          done
+          MOUNT
