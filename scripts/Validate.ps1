@@ -4823,7 +4823,7 @@ do
             # Do not rbind the host /etc and then unlink its resolv.conf
             # mountpoint. Build a private snapshot first so every mutation
             # remains inside the namespace-owned tmpfs.
-            "$mount_path" -t tmpfs -o size=268435456,nodev,nosuid,noexec tmpfs "$target"
+            "$mount_path" -t tmpfs -o size=1073741824,nodev,nosuid,noexec tmpfs "$target"
             # Copy only readable regular files and create them with the
             # namespace user's ownership.  Archive-style copies of /etc are
             # unsafe here: entries such as shadow may be unreadable and

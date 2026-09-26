@@ -931,15 +931,15 @@ Describe 'Bounded writable-root enumeration behavior' {
         ([regex]::Matches($runspace.Extent.Text, 'Assert-LinuxWritableRootUsage[\s\S]{0,240}-AllowReparseEntries')).Count | Should -Be 1
     }
 
-    # Scenario: The Ubuntu runner's readable /etc snapshot exceeds the former 64 MiB private mount.
-    # Purpose: Preserve a fixed sandbox-local ceiling large enough for the trusted snapshot without using host-writable /etc.
+    # Scenario: The Ubuntu runner's readable /etc snapshot exhausts the former 256 MiB private mount.
+    # Purpose: Preserve a fixed sandbox-local ceiling with headroom for the trusted snapshot without using host-writable /etc.
     It 'UnitT80_BindsThePrivateEtcSnapshotToTheExpandedFixedLimit' {
         $invokeNative = $ast.Find({ param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-NativeChecked'
         }, $true)
         $source = $invokeNative.Extent.Text
-        $source | Should -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
-        $source | Should -Not -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=67108864,nodev,nosuid,noexec tmpfs "\$target"'
+        $source | Should -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=1073741824,nodev,nosuid,noexec tmpfs "\$target"'
+        $source | Should -Not -Match '(?s)if \[ "\$system_root" = "/etc" \]; then.*?size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
     }
 
     # Scenario: The protected-Pester sandbox bind-mounts a safe device over /dev/console.
