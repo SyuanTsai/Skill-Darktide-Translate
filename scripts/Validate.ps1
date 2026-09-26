@@ -4801,6 +4801,16 @@ bind_count="${12}"
 cgroup_path="${13}"
 workload_cgroup_path="${14}"
 shift 14
+emit_private_snapshot_capacity() {
+    label="$1"
+    path="$2"
+    if [ -x /usr/bin/df ]; then
+        printf 'trusted-capacity %s bytes\n' "$label" >&2
+        /usr/bin/df -B1 --output=size,used,avail -- "$path" >&2 || true
+        printf 'trusted-capacity %s inodes\n' "$label" >&2
+        /usr/bin/df -i --output=itotal,iused,iavail -- "$path" >&2 || true
+    fi
+}
 printf '%s\n' "$$" > "$cgroup_path/cgroup.procs"
 IFS= read -r memory_max < "$cgroup_path/memory.max" || exit 126
 [ "$memory_max" = "2147483648" ] || exit 126
@@ -4824,6 +4834,8 @@ do
             # mountpoint. Build a private snapshot first so every mutation
             # remains inside the namespace-owned tmpfs.
             "$mount_path" -t tmpfs -o size=1073741824,nodev,nosuid,noexec tmpfs "$target"
+            emit_private_snapshot_capacity etc-before-copy "$target"
+            emit_private_snapshot_capacity outer-before-copy "$sandbox_root"
             # Copy only readable regular files and create them with the
             # namespace user's ownership.  Archive-style copies of /etc are
             # unsafe here: entries such as shadow may be unreadable and
@@ -4848,6 +4860,8 @@ do
                     /bin/cat -- "$source" > "$destination"
                 done
             ' sh "$system_root" "$target" {} + 2>/dev/null || true
+            emit_private_snapshot_capacity etc-after-copy "$target"
+            emit_private_snapshot_capacity outer-after-copy "$sandbox_root"
             rm -f "$target/resolv.conf"
             if [ -e "$system_root/resolv.conf" ]; then
                 /bin/cat -- "$system_root/resolv.conf" > "$target/resolv.conf"
