@@ -22,12 +22,13 @@ Describe 'Base-owned repository authority inventory compatibility' {
         $script:Adapters=@{
             old=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/ApprovedA403Adapter.json') -Raw | ConvertFrom-Json)
             new=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/Reviewed8aAdapter.json') -Raw | ConvertFrom-Json)
+            corrected=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/Reviewed513Adapter.json') -Raw | ConvertFrom-Json)
         }
     }
 
-    # Scenario: Trusted repository inventory sees either exact version and its expected closure.
+    # Scenario: Trusted repository inventory sees the baseline or either exact current version and its expected closure.
     # Purpose: Remove the demonstrated26-member rejection while preserving14-member baseline.
-    It 'UnitT10_AcceptsVersionBoundInventory_<Version>' -TestCases @(@{Version='old'},@{Version='new'}) {
+    It 'UnitT10_AcceptsVersionBoundInventory_<Version>' -TestCases @(@{Version='old'},@{Version='new'},@{Version='corrected'}) {
         param($Version)
         @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests) | Should -Contain 'BaseRepositoryAuthorityInventory.Tests.ps1'
         $adapter=$script:Adapters[$Version]

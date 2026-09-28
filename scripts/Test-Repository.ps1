@@ -1102,7 +1102,8 @@ $requiredAuthorityPaths = @(
     'scripts/Resolve-PythonWheelClosure.py',
     'scripts/Resolve-StandardValidationTool.ps1'
 )
-if ($adapter.authority.commit -ceq '8aabd22694a05771f98639f6d726cc9a620eb94b') {
+if ($adapter.authority.commit -ceq '8aabd22694a05771f98639f6d726cc9a620eb94b' -or
+    $adapter.authority.commit -ceq '51399617ddebe21656fe4265a8d9ad116a943583') {
     $requiredAuthorityPaths = @(
         'docs/standards/README.md',
         'docs/standards/managed-skill-lifecycle.md',
@@ -1133,7 +1134,7 @@ if ($adapter.authority.commit -ceq '8aabd22694a05771f98639f6d726cc9a620eb94b') {
     )
 }
 elseif ($adapter.authority.commit -cne 'a403abdf038a3346d775431a6908a71cc3d35a5b') {
-    throw 'Authority revision is not one of the two exact approved snapshots.'
+    throw 'Authority revision is not one of the three exact approved snapshots.'
 }
 if ($adapter.authority.files -isnot [array] -or @($adapter.authority.files).Count -ne $requiredAuthorityPaths.Count) {
     throw 'config/standard-v1.json authority file inventory is incomplete.'

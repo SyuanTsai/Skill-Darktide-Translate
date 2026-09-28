@@ -16,22 +16,23 @@ Describe 'Base-compatible exact authority registry' {
         $script:Adapters = @{
             old=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/ApprovedA403Adapter.json') -Raw | ConvertFrom-Json)
             new=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/Reviewed8aAdapter.json') -Raw | ConvertFrom-Json)
+            corrected=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/Reviewed513Adapter.json') -Raw | ConvertFrom-Json)
         }
     }
 
-    # Scenario: Either complete immutable tuple is presented to the actual proposed driver guard.
-    # Purpose: Preserve the current14-member baseline while verifying the exact26-member future binding.
-    It 'UnitT10_AcceptsOnlyTheCompleteTuple_<Version>' -TestCases @(@{Version='old';Count=14},@{Version='new';Count=26}) {
+    # Scenario: A complete baseline, original runner, or merged corrected tuple reaches the actual driver guard.
+    # Purpose: Preserve the 14-member baseline and admit only the two exact reviewed 26-member closures.
+    It 'UnitT10_AcceptsOnlyTheCompleteTuple_<Version>' -TestCases @(@{Version='old';Count=14},@{Version='new';Count=26},@{Version='corrected';Count=26}) {
         param($Version,$Count)
         $selected = Assert-PredecessorApprovedSnapshot -Adapter $script:Adapters[$Version]
         $selected.files.Count | Should -Be $Count
         $selected.commit | Should -BeExactly $script:Adapters[$Version].authority.commit
     }
 
-    # Scenario: One of the identity, archive or closure fields is substituted for either admitted version.
+    # Scenario: One of the identity, archive or closure fields is substituted for any admitted version.
     # Purpose: Keep the reviewed set closed and reject omissions, forged members and duplicates.
     It 'UnitT20_RejectsTheSubstitution_<Version>_<Kind>' -TestCases @(
-        foreach ($version in @('old','new')) {
+        foreach ($version in @('old','new','corrected')) {
             foreach ($kind in @('commit','url','archive','member','missing','duplicate')) { @{Version=$version;Kind=$kind} }
         }
     ) {
@@ -49,9 +50,10 @@ Describe 'Base-compatible exact authority registry' {
     }
 
     # Scenario: The actual proposed dispatch chooses legacy or current resolver arguments.
-    # Purpose: Avoid passing a new unsupported argument to legacy code and forward900/37 only for8a.
+    # Purpose: Avoid passing an unsupported argument to legacy code and forward900/37 for both exact current resolver versions.
     It 'UnitT30_UsesTheCompatibleResolverCall_<Version>_<Budget>' -TestCases @(
         @{Version='old';Budget=37;Expected=$null},@{Version='new';Budget=900;Expected=900},@{Version='new';Budget=37;Expected=37}
+        @{Version='corrected';Budget=900;Expected=900},@{Version='corrected';Budget=37;Expected=37}
     ) {
         param($Version,$Budget,$Expected)
         function Test-ResolverProbe {
