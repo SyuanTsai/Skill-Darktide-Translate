@@ -14,6 +14,7 @@ param(
     [string] $TrustedTestCommit,
     [string] $ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION,
     [string] $OutputPath,
+    [ValidateRange(1, 3600)][int] $AcquisitionTimeoutSeconds = 900,
     [switch] $BootstrapTransition,
     [switch] $EnableSemanticScan,
     [string[]] $SemanticCredentialNames = @(),
@@ -84,6 +85,205 @@ function Assert-NoDuplicateJsonProperties {
             $index++
         }
     }
+}
+function Assert-PredecessorApprovedSnapshot {
+    param([Parameter(Mandatory = $true)]$Adapter)
+    # Base-owned compatibility binds the two verified immutable closures.
+    $snapshots = @'
+[
+  {
+    "repository": "https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git",
+    "commit": "a403abdf038a3346d775431a6908a71cc3d35a5b",
+    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/a403abdf038a3346d775431a6908a71cc3d35a5b",
+    "archiveSha256": "17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3",
+    "files": [
+      {
+        "path": "docs/standards/README.md",
+        "sha256": "5e1ddd737d26a5ec1ff1ebd08e158376ddaf1ea21008bb987fc7f51376923f7c"
+      },
+      {
+        "path": "docs/standards/managed-skill-lifecycle.md",
+        "sha256": "70950cf8bdd02819efae6f6e06ac5be1da3e70f809c23e3c6f8d3b217797416c"
+      },
+      {
+        "path": "docs/standards/schemas/managed-skill-lifecycle-v1.schema.json",
+        "sha256": "9a7f4c02588d2b88194e953a41766a72a9426fa89d4c3781c5750dcc22d35863"
+      },
+      {
+        "path": "docs/standards/schemas/openai-agent-metadata.schema.json",
+        "sha256": "23c1aaee28a54fea1946a61d6122a2097906ffa5bdd66c8014fc6b1625c9062a"
+      },
+      {
+        "path": "docs/standards/schemas/source-inventory-v2.schema.json",
+        "sha256": "084550944b4141ab5535f58fb6e99730a5c34b56103f6b59fd5a352679caa98e"
+      },
+      {
+        "path": "docs/standards/schemas/validation-security-gate-v1.schema.json",
+        "sha256": "56979baa08f3ec5534e3a17f925d53e69accd4cdc500872e92ca56b694044ea6"
+      },
+      {
+        "path": "docs/standards/skill-repository-review-matrix.md",
+        "sha256": "c345ad3ec32d1941df5c5757ce96b4430c0223b3f8ed99f2a4de7dc9923410f2"
+      },
+      {
+        "path": "docs/standards/skill-repository-standard.md",
+        "sha256": "78a72aa8214acd5a5e202df34bbb20f8cfd841ab3d181de10645a777267cfd5d"
+      },
+      {
+        "path": "docs/standards/upstream-interoperability.md",
+        "sha256": "9c544fbfb6b77a589514f1926aa1488882e932786a303a42ce6c6c9b2ba80c7e"
+      },
+      {
+        "path": "docs/standards/validation-security-gate.json",
+        "sha256": "e303e8c3d484012022f5c4da694c3fe21ff02395b0b9b7e973a4234d4182f485"
+      },
+      {
+        "path": "docs/standards/validation-toolchain.json",
+        "sha256": "5925dcb1aea1e545b9787a29825e7a0cc03a04c777cd68ab44c9bdd7482ff579"
+      },
+      {
+        "path": "scripts/Invoke-StandardAuthorityGate.ps1",
+        "sha256": "c98d3f1b181ba0e7d3894729a8f1636984407c20454a27e0e383799c2f90425f"
+      },
+      {
+        "path": "scripts/Resolve-PythonWheelClosure.py",
+        "sha256": "7fa1511a3e3ba257c6d9e37f929f68e5684184a3a2756a3f9e765ccc6e69d208"
+      },
+      {
+        "path": "scripts/Resolve-StandardValidationTool.ps1",
+        "sha256": "3744bc4549612e5997361315a8fd5e1ea803ade26052cf4eaf2ccdc1776fcf6e"
+      }
+    ]
+  },
+  {
+    "repository": "https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git",
+    "commit": "8aabd22694a05771f98639f6d726cc9a620eb94b",
+    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/8aabd22694a05771f98639f6d726cc9a620eb94b",
+    "archiveSha256": "d92df1a8f0aa342970dc9c66a77b6211955b4708de12119cb7f9a360fd265311",
+    "files": [
+      {
+        "path": "docs/standards/README.md",
+        "sha256": "5e1ddd737d26a5ec1ff1ebd08e158376ddaf1ea21008bb987fc7f51376923f7c"
+      },
+      {
+        "path": "docs/standards/managed-skill-lifecycle.md",
+        "sha256": "70950cf8bdd02819efae6f6e06ac5be1da3e70f809c23e3c6f8d3b217797416c"
+      },
+      {
+        "path": "docs/standards/schemas/managed-skill-lifecycle-v1.schema.json",
+        "sha256": "9a7f4c02588d2b88194e953a41766a72a9426fa89d4c3781c5750dcc22d35863"
+      },
+      {
+        "path": "docs/standards/schemas/openai-agent-metadata.schema.json",
+        "sha256": "23c1aaee28a54fea1946a61d6122a2097906ffa5bdd66c8014fc6b1625c9062a"
+      },
+      {
+        "path": "docs/standards/schemas/source-inventory-v2.schema.json",
+        "sha256": "084550944b4141ab5535f58fb6e99730a5c34b56103f6b59fd5a352679caa98e"
+      },
+      {
+        "path": "docs/standards/schemas/validation-security-gate-v1.schema.json",
+        "sha256": "32aee32858cdb0f8fa7b01462af05ad2300cb247cd2e3ca769fa36ed1ac205a9"
+      },
+      {
+        "path": "docs/standards/skill-repository-review-matrix.md",
+        "sha256": "315204afe428bb51cab5e815b2c40f6d0cbd55c81a3532ad59b686ae5e4c166c"
+      },
+      {
+        "path": "docs/standards/skill-repository-standard.md",
+        "sha256": "c85562f017a09b4f4daa8dd3a1fcbd1d34714eb711ed9c011642247c8d3be61e"
+      },
+      {
+        "path": "docs/standards/upstream-interoperability.md",
+        "sha256": "9c544fbfb6b77a589514f1926aa1488882e932786a303a42ce6c6c9b2ba80c7e"
+      },
+      {
+        "path": "docs/standards/validation-security-gate.json",
+        "sha256": "2d4ac30449981083d3f3eab850789e7115684f9dfecad48234bc91ffb678e674"
+      },
+      {
+        "path": "docs/standards/validation-toolchain.json",
+        "sha256": "1dddbf4c5736e22e56f6ecb298542f41d39e116ab00ca24ad18beb7a3eab40ed"
+      },
+      {
+        "path": "scripts/Invoke-StandardAuthorityGate.ps1",
+        "sha256": "e5e8050df56dd60af7d9eec04fda2e05e331fded18bc69257431c2a11f39a9e9"
+      },
+      {
+        "path": "scripts/Resolve-PythonWheelClosure.py",
+        "sha256": "d209c973f331fdbb82a4d546bda18b1d485bcd1e446dd446b6d8bc4360b5ce35"
+      },
+      {
+        "path": "scripts/Resolve-StandardValidationTool.ps1",
+        "sha256": "86540ff07e1b73177d179ae6a9ee2f0fef8029e27286604d68a9a98d0d205ec2"
+      },
+      {
+        "path": "docs/standards/schemas/standard-validation-adapter-v1.schema.json",
+        "sha256": "11aa88fc25716d748bd4f514f1a44f02390ad1745dd5a5c5beee07f642fd5639"
+      },
+      {
+        "path": "docs/standards/schemas/standard-validation-evidence-v1.schema.json",
+        "sha256": "8ed4a9d7158273d7a1e9d898acf07f57e9170822cb7cbb70f1e2eec7195867ee"
+      },
+      {
+        "path": "docs/standards/standard-validation-contract-v1.json",
+        "sha256": "6fa3233e86ec7918aebf1413d41a6d1712f55eb2d1b09262fe18e53ddfbcb8cf"
+      },
+      {
+        "path": "docs/standards/pr12-source-merge-adoption.json",
+        "sha256": "4c5262f2a11d228195230c15fa4faaf9614af6b59f110e5d9c08f242ce809175"
+      },
+      {
+        "path": "docs/standards/trust-anchors/human-approval-public-key.xml",
+        "sha256": "1e46153b72d02f3ce2fb26becd449df4f1590d8e5cb441b1954006a5602bbd9b"
+      },
+      {
+        "path": "docs/standards/trust-anchors/trusted-supervisor-public-key.xml",
+        "sha256": "4d550851f43405920156f40c9fc648d99a69dd73efc200f6968d8a837e7fbf27"
+      },
+      {
+        "path": "scripts/Invoke-StandardValidation.ps1",
+        "sha256": "c127309958226417291b512d633caa2120bbd12a663c98fff1d63106cf5a2677"
+      },
+      {
+        "path": "docs/standards/schemas/standard-semantic-consent-evidence-v2.schema.json",
+        "sha256": "109091979d0a47e2035d3d8b20963fcdb85680e5da737bf1f27121608115d430"
+      },
+      {
+        "path": "scripts/StandardSemanticBridge.psm1",
+        "sha256": "daf90f703898cc56fc3310e1eec462bafa6552edcac0de4f08a3cd4b9f63a429"
+      },
+      {
+        "path": "docs/standards/schemas/upstream-adapter-v1.schema.json",
+        "sha256": "3cff6246463188a91cc54c6a46315a949314767a759c6214e5b28e4db95ac8d7"
+      },
+      {
+        "path": "docs/standards/upstream-adapter.json",
+        "sha256": "c4f5133b24841bb9c66182dc3d5a027596f864ec28e410d47249a67b3b97ad31"
+      },
+      {
+        "path": "scripts/Validate-UpstreamAdapter.ps1",
+        "sha256": "3b6e6474690b1ae9f9486544b68f50ca29b96f5dbe6aa8d6c6cd8570afad500b"
+      }
+    ]
+  }
+]
+'@ | ConvertFrom-Json
+    if ($Adapter.schemaVersion -ne 1 -or $Adapter.standardVersion -cne 'v1' -or $Adapter.deviations -cne 'None') { throw 'Invalid adapter identity.' }
+    $selected = @($snapshots | Where-Object { $_.commit -ceq $Adapter.authority.commit })
+    if ($selected.Count -ne 1) { throw 'Authority revision is not explicitly admitted.' }
+    $expected = $selected[0]
+    foreach ($field in @('repository','commit','archiveUrl','archiveSha256')) {
+        if ($Adapter.authority.$field -cne $expected.$field) { throw "Immutable authority $field differs." }
+    }
+    if ($Adapter.authority.files -isnot [array] -or $Adapter.authority.files.Count -ne $expected.files.Count) { throw 'Closure count differs.' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $Adapter.authority.files) {
+        if (-not $seen.Add([string]$entry.path)) { throw 'Duplicate closure member.' }
+        $member = @($expected.files | Where-Object { $_.path -ceq $entry.path })
+        if ($member.Count -ne 1 -or $member[0].sha256 -cne $entry.sha256) { throw 'Closure member differs.' }
+    }
+    return $expected
 }
 function Read-JsonFile {
     param(
@@ -5359,7 +5559,7 @@ function Get-RequiredPesterTests {
         'SourcePin.Tests.ps1'
     )
     if ($IncludeTrustedPostPromotionTests) {
-        $tests += 'InstalledClosureOrdering.Tests.ps1'
+        $tests += @('InstalledClosureOrdering.Tests.ps1', 'BaseAuthorityCompatibility.Tests.ps1', 'BaseRepositoryAuthorityInventory.Tests.ps1')
     }
     return @($tests)
 }
@@ -6340,8 +6540,9 @@ if ($BootstrapTransition) {
 $adapterPath = Join-Path $repoRoot 'config/standard-v1.json'
 $adapter = Read-JsonFile -Path $adapterPath -Context 'Standard v1 repository adapter'
 $approvedAuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
-$approvedAuthorityCommit = 'a403abdf038a3346d775431a6908a71cc3d35a5b'
-$approvedAuthorityArchiveSha256 = '17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3'
+$approvedAuthoritySnapshot = Assert-PredecessorApprovedSnapshot -Adapter $adapter
+$approvedAuthorityCommit = [string]$approvedAuthoritySnapshot.commit
+$approvedAuthorityArchiveSha256 = [string]$approvedAuthoritySnapshot.archiveSha256
 if ($adapter.schemaVersion -ne 1 -or $adapter.standardVersion -cne 'v1' -or $adapter.deviations -cne 'None') {
     throw 'Standard v1 repository adapter identity or deviation contract is invalid.'
 }
@@ -6438,22 +6639,7 @@ foreach ($entry in @($adapter.authority.files)) {
     if ($fileHash -cne [string]$entry.sha256) { throw "Authority file identity mismatch: $($entry.path)" }
     $authorityFiles += [pscustomobject][ordered]@{ path = [string]$entry.path; sha256 = $fileHash }
 }
-$requiredAuthorityFiles = @(
-    'docs/standards/README.md',
-    'docs/standards/managed-skill-lifecycle.md',
-    'docs/standards/schemas/managed-skill-lifecycle-v1.schema.json',
-    'docs/standards/skill-repository-standard.md',
-    'docs/standards/skill-repository-review-matrix.md',
-    'docs/standards/upstream-interoperability.md',
-    'docs/standards/validation-security-gate.json',
-    'docs/standards/validation-toolchain.json',
-    'docs/standards/schemas/validation-security-gate-v1.schema.json',
-    'docs/standards/schemas/source-inventory-v2.schema.json',
-    'docs/standards/schemas/openai-agent-metadata.schema.json',
-    'scripts/Invoke-StandardAuthorityGate.ps1',
-    'scripts/Resolve-StandardValidationTool.ps1',
-    'scripts/Resolve-PythonWheelClosure.py'
-)
+$requiredAuthorityFiles = @($approvedAuthoritySnapshot.files | ForEach-Object { [string]$_.path })
 foreach ($required in $requiredAuthorityFiles) {
     if (-not $seenAuthorityPaths.Contains($required)) { throw "Authority inventory does not bind required file '$required'." }
 }
@@ -6490,7 +6676,12 @@ $expectedSources = [ordered]@{
 $receipts = [ordered]@{}
 foreach ($toolName in $expectedSources.Keys) {
     $receiptPath = Join-Path $runRoot "receipt-$toolName.json"
-    & $resolverPath -PolicyPath $policyPath -ToolName $toolName -Install -InstallRoot $installRoot -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion -OutputPath $receiptPath | Out-Host
+    if ($approvedAuthorityCommit -ceq '8aabd22694a05771f98639f6d726cc9a620eb94b') {
+        & $resolverPath -PolicyPath $policyPath -ToolName $toolName -Install -InstallRoot $installRoot -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion -AcquisitionTimeoutSeconds $AcquisitionTimeoutSeconds -OutputPath $receiptPath | Out-Host
+    }
+    else {
+        & $resolverPath -PolicyPath $policyPath -ToolName $toolName -Install -InstallRoot $installRoot -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion -OutputPath $receiptPath | Out-Host
+    }
     $receipt = Read-JsonFile -Path $receiptPath -Context "$toolName resolver receipt"
     if ($receipt.toolName -cne $toolName -or $receipt.source -cne $expectedSources[$toolName] -or
         $receipt.channel -cne 'latest-stable' -or $receipt.frozenForRun -ne $true -or

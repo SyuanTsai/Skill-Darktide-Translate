@@ -347,9 +347,11 @@ Describe 'Darktide bootstrap transition' {
         )
         $requiredTests.Count | Should -Be 9
         ($requiredTests -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
-        $postPromotionTests.Count | Should -Be 10
+        $postPromotionTests.Count | Should -Be 12
         ($postPromotionTests[0..8] -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
         $postPromotionTests[9] | Should -BeExactly 'InstalledClosureOrdering.Tests.ps1'
+        $postPromotionTests[10] | Should -BeExactly 'BaseAuthorityCompatibility.Tests.ps1'
+        $postPromotionTests[11] | Should -BeExactly 'BaseRepositoryAuthorityInventory.Tests.ps1'
         $supervisor | Should -Not -Match '(?s)\$requiredPesterTests\s*=\s*@\(\s*''BootstrapTransition\.Tests\.ps1'''
         foreach ($testName in $requiredTests) {
             $actualTimeout = & $timeoutModule {

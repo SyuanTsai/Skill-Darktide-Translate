@@ -145,7 +145,9 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $repositoryValidator | Should -Not -Match '\[IO\.File\]::WriteAllText\(\$outputFullPath'
     }
 
-    It 'keeps one exact protected Pester inventory across supervisor, parent, and worker execution' {
+    # Scenario: Both version compatibility files join the exact post-promotion protected list.
+    # Purpose: Preserve bootstrap9 and share the same immutable inventory across all protected entrypoints.
+    It 'UnitT80_KeepsOneExactProtectedPesterInventoryAcrossSupervisorParentAndWorkerExecution' {
         $tokens = $null; $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile(
             $script:CanonicalValidatorPath, [ref]$tokens, [ref]$errors)
@@ -172,6 +174,8 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests) | Should -Be @(
             $expected
             'InstalledClosureOrdering.Tests.ps1'
+            'BaseAuthorityCompatibility.Tests.ps1'
+            'BaseRepositoryAuthorityInventory.Tests.ps1'
         )
 
         $canonicalValidator = $ast.Extent.Text
