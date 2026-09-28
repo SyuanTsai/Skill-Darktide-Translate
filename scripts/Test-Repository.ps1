@@ -1100,7 +1100,19 @@ $requiredAuthorityPaths = @(
     'docs/standards/validation-toolchain.json',
     'scripts/Invoke-StandardAuthorityGate.ps1',
     'scripts/Resolve-PythonWheelClosure.py',
-    'scripts/Resolve-StandardValidationTool.ps1'
+    'scripts/Resolve-StandardValidationTool.ps1',
+    'docs/standards/schemas/standard-validation-adapter-v1.schema.json',
+    'docs/standards/schemas/standard-validation-evidence-v1.schema.json',
+    'docs/standards/standard-validation-contract-v1.json',
+    'docs/standards/pr12-source-merge-adoption.json',
+    'docs/standards/trust-anchors/human-approval-public-key.xml',
+    'docs/standards/trust-anchors/trusted-supervisor-public-key.xml',
+    'scripts/Invoke-StandardValidation.ps1',
+    'docs/standards/schemas/standard-semantic-consent-evidence-v2.schema.json',
+    'scripts/StandardSemanticBridge.psm1',
+    'docs/standards/schemas/upstream-adapter-v1.schema.json',
+    'docs/standards/upstream-adapter.json',
+    'scripts/Validate-UpstreamAdapter.ps1'
 )
 if ($adapter.authority.files -isnot [array] -or @($adapter.authority.files).Count -ne $requiredAuthorityPaths.Count) {
     throw 'config/standard-v1.json authority file inventory is incomplete.'

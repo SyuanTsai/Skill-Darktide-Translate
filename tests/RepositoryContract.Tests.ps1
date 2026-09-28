@@ -315,8 +315,8 @@ Describe 'Darktide Translate repository contract' {
         if ($layout.Name -ceq 'legacy') {
             $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
 
-            $validator | Should -Match ([regex]::Escape("`$approvedAuthorityCommit = 'a403abdf038a3346d775431a6908a71cc3d35a5b'"))
-            $validator | Should -Match ([regex]::Escape("`$approvedAuthorityArchiveSha256 = '17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3'"))
+            $validator | Should -Match ([regex]::Escape("`$approvedAuthorityCommit = '8aabd22694a05771f98639f6d726cc9a620eb94b'"))
+            $validator | Should -Match ([regex]::Escape("`$approvedAuthorityArchiveSha256 = 'd92df1a8f0aa342970dc9c66a77b6211955b4708de12119cb7f9a360fd265311'"))
             $validator | Should -Not -Match ([regex]::Escape('d38eba3faf967504751aba759f38102e7538a519'))
         }
     }

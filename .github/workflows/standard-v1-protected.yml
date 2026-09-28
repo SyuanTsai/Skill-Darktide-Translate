@@ -460,6 +460,7 @@ jobs:
             BaseCommit = $baseCommit
             TrustedTestCommit = $trustedTestCommit
             ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION
+            AcquisitionTimeoutSeconds = 900
             OutputPath = $outputPath
           }
           $isBootstrapTransition =
