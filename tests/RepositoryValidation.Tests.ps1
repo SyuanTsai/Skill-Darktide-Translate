@@ -81,18 +81,21 @@ Describe 'Repository pre-push validation' {
         $workflow | Should -Not -Match 'run: \./tests/Invoke-Tests\.ps1'
     }
 
-    # Scenario: The bootstrap is PR-only; the promoted Standard v1 adapter adds main-push validation.
-    # Purpose: Verify the actual event contract without requiring retired legacy workflow files.
-    It 'UnitT50_UsesTheProtectedEventsForTheCurrentLifecycle' {
+    # Scenario: A migrated source separates read-only PR validation from main-push validation.
+    # Purpose: Verify the active event contracts without re-enabling the privileged legacy PR workflow.
+    It 'UnitT50_UsesTheCurrentValidationEvents' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
-        $workflow | Should -Match '(?m)^  pull_request_target:'
         if ($script:layout.Name -ceq 'legacy') {
+            $workflow | Should -Match '(?m)^  pull_request_target:'
             $workflow | Should -Not -Match '(?m)^  (push|pull_request|workflow_dispatch):'
         }
         else {
             $workflow | Should -Match '(?m)^  push:\r?$'
             $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
-            $workflow | Should -Match '(?m)^  pull_request_target:'
+            $workflow | Should -Not -Match '(?m)^  pull_request_target:'
+            $candidate = Get-Content -LiteralPath (Join-Path $script:repoRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
+            $candidate | Should -Match '(?m)^  pull_request:\s*$'
+            $candidate | Should -Not -Match 'pull_request_target|checks: write'
         }
     }
 }

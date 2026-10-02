@@ -58,27 +58,22 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $validator | Should -Not -Match 'postPesterRepositoryValidatorPath'
     }
 
-    It 'routes CI through the same canonical validator without a second policy workflow' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
-        $workflow | Should -Match 'scripts/Validate\.ps1'
-        $workflow | Should -Match 'pull_request_target:'
-        $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.sha \}\}'
-        $workflow | Should -Match '\$validatorArguments = @\{'
-        $workflow | Should -Match '& \$trustedValidator @validatorArguments'
-        $workflow | Should -Match 'persist-credentials:\s*false'
-        $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
-        $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
-        $workflow | Should -Match 'Export canonical evidence for clean upload'
-        $workflow | Should -Match 'upload-canonical-validation-evidence'
-        $workflow | Should -Match 'evidence_base64'
-        $workflow | Should -Not -Match '(?m)^\s*(Install-Module|npm install|go install|pip install)\b'
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/skill-validator.yml') | Should -BeFalse
-
-        foreach ($context in @('repository-contract', 'skill-validator', 'skill-tools')) {
-            $pattern = "(?ms)^\s+{0}:\s+name:\s+{0}.*?needs:\s+- canonical-validation.*?{1}" -f `
-                [regex]::Escape($context),
-                [regex]::Escape("needs['canonical-validation'].result")
-            $workflow | Should -Match $pattern
+    It 'routes PR and main CI through the same canonical validator on Windows' {
+        $candidate = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
+        $main = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+        foreach ($workflow in @($candidate, $main)) {
+            $workflow | Should -Match 'scripts/Validate\.ps1'
+            $workflow | Should -Match 'runs-on: windows-latest'
+            $workflow | Should -Match 'shell: pwsh'
+            $workflow | Should -Match 'persist-credentials: false'
+            $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
+            $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
+            $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
+            $workflow | Should -Not -Match 'pull_request_target|checks: write|ubuntu-latest'
         }
+        $candidate | Should -Match '(?m)^  pull_request:\s*$'
+        $main | Should -Match '(?ms)^  push:\s*\r?\n\s+branches:\s*\r?\n\s+- main'
+        $main | Should -Not -Match 'publish-head-required-checks|canonical-validation|repository-contract-windows-powershell'
+        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/skill-validator.yml') | Should -BeFalse
     }
 }

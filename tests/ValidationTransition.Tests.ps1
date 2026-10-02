@@ -135,27 +135,29 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         }
     }
 
-    # Scenario: A pull request must execute the workflow definition owned by its trusted base.
-    # Purpose: Preserve base-owned pull-request validation and exclude ref-selected manual dispatch.
-    It 'UnitT40_MapsProtectedAndTrustedEventsToOneCanonicalValidator' {
+    # Scenario: A main-branch push follows a previously checked pull request.
+    # Purpose: Keep one exact-commit Windows validation after merge without re-running the retired PR supervisor.
+    It 'UnitT40_ValidatesMainPushWithExactCommitOnWindows' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:WorkflowRoot 'standard-v1-protected.yml') -Raw
-        $workflow | Should -Match '(?m)^\s{2}pull_request_target:\s*$'
-        $workflow | Should -Match '(?ms)^\s{2}push:\s*\r?\n\s{4}branches:\s*\r?\n\s{6}- main'
-        $workflow | Should -Not -Match '(?m)^\s{2}workflow_dispatch:\s*$'
-        $workflow | Should -Not -Match '(?m)^\s{2}pull_request:\s*$'
-        $workflow | Should -Match 'trustedValidator = Join-Path \$env:TRUSTED_SUPERVISOR_ROOT .+scripts/Validate\.ps1'
-        ([regex]::Matches($workflow, 'id: canonical-validation')).Count | Should -Be 1
-        ([regex]::Matches($workflow, 'scripts/Validate\.ps1')).Count | Should -BeGreaterThan 0
+        $workflow | Should -Match '(?ms)^  push:\s*\r?\n\s+branches:\s*\r?\n\s+- main'
+        $workflow | Should -Not -Match '(?m)^  pull_request_target:\s*$'
+        $workflow | Should -Not -Match '(?m)^  pull_request:\s*$'
+        $workflow | Should -Not -Match '(?m)^  workflow_dispatch:\s*$'
+        $workflow | Should -Match 'runs-on: windows-latest'
+        $workflow | Should -Match 'EXPECTED_HEAD_SHA: \$\{\{ github\.sha \}\}'
+        $workflow | Should -Match 'checkoutHead -cne \$env:EXPECTED_HEAD_SHA'
+        $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
+        $workflow | Should -Match 'scripts/Validate\.ps1'
     }
 
-    # Scenario: Compatibility check names are retained for existing required-status consumers.
-    # Purpose: Make every retained status a direct mirror of canonical-validation result, never an always-success policy.
-    It 'UnitT50_MakesCompatibilityStatusesMirrorCanonicalResult' {
+    # Scenario: The old protected workflow remains in the repository for main-push validation.
+    # Purpose: Retire Linux, PowerShell 5.1, mirror jobs, and write-token check publication from the PR path.
+    It 'UnitT50_RetiresLegacyJobsAndHeadBoundCheckPublisher' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:WorkflowRoot 'standard-v1-protected.yml') -Raw
-        foreach ($name in @('repository-contract', 'skill-validator', 'skill-tools')) {
-            $workflow | Should -Match ("(?sm)^\s+{0}:.*?needs:\s*\r?\n\s+- canonical-validation.*?CANONICAL_RESULT.*?needs\['canonical-validation'\]\.result" -f [regex]::Escape($name))
-            $workflow | Should -Match ("(?sm)^\s+{0}:.*?CANONICAL_RESULT.*?!= 'success'.*?exit 1" -f [regex]::Escape($name))
-        }
+        @([regex]::Matches($workflow, '(?m)^  [a-z][a-z0-9-]+:\s*$')).Count | Should -Be 2
+        $workflow | Should -Not -Match 'ubuntu-latest|shell: powershell|pull_request_target|checks: write'
+        $workflow | Should -Not -Match 'repository-contract-windows-powershell|canonical-validation|publish-head-required-checks'
+        $workflow | Should -Not -Match 'cgroup|unshare|/proc|sudo'
     }
 
     # Scenario: Documentation describes validation entry points after the migration.
