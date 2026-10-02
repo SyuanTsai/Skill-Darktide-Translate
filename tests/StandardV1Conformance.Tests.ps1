@@ -58,6 +58,34 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $validator | Should -Not -Match 'postPesterRepositoryValidatorPath'
     }
 
+    # Scenario: The canonical validator is invoked directly on a non-Windows host.
+    # Purpose: Stop before legacy Linux isolation setup, which is outside the supported R4 execution path.
+    It 'UnitT50_RejectsUnsupportedHostsBeforeLegacyLinuxSetup' {
+        $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
+        $hostDetection = $validator.IndexOf('$script:IsWindowsHost =', [StringComparison]::Ordinal)
+        $linuxSetup = $validator.IndexOf('$script:IsLinuxHost =', [StringComparison]::Ordinal)
+        $guard = [regex]::Match($validator,
+            "(?s)if \(-not \`$script:IsWindowsHost\) \{\s*throw 'Standard v1 validation requires Windows with PowerShell 7\.'\s*\}")
+
+        $hostDetection | Should -BeGreaterOrEqual 0
+        $guard.Success | Should -BeTrue
+        $guard.Index | Should -BeGreaterThan $hostDetection
+        $guard.Index | Should -BeLessThan $linuxSetup
+
+        $guardBlock = [scriptblock]::Create($guard.Value)
+        $previousHostFlag = Get-Variable -Name IsWindowsHost -Scope Script -ErrorAction SilentlyContinue
+        try {
+            $script:IsWindowsHost = $false
+            { & $guardBlock } | Should -Throw -ExpectedMessage 'Standard v1 validation requires Windows with PowerShell 7.'
+            $script:IsWindowsHost = $true
+            { & $guardBlock } | Should -Not -Throw
+        }
+        finally {
+            if ($null -ne $previousHostFlag) { $script:IsWindowsHost = $previousHostFlag.Value }
+            else { Remove-Variable -Name IsWindowsHost -Scope Script -ErrorAction SilentlyContinue }
+        }
+    }
+
     It 'routes PR and main CI through the same canonical validator on Windows' {
         $candidate = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $main = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw

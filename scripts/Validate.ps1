@@ -41,6 +41,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:IsWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+if (-not $script:IsWindowsHost) {
+    throw 'Standard v1 validation requires Windows with PowerShell 7.'
+}
 $script:IsLinuxHost = $false
 $isLinuxVariable = Get-Variable -Name IsLinux -ErrorAction SilentlyContinue
 if ($null -ne $isLinuxVariable) { $script:IsLinuxHost = [bool]$isLinuxVariable.Value }
