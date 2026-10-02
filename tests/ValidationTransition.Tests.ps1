@@ -105,6 +105,13 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflow | Should -Not -Match 'pull_request_target|checks: write|CODEX_PESTER_CGROUP_ROOT'
     }
 
+    # Scenario: the central authority script is dot-sourced to define validation functions.
+    # Purpose: preserve the run-resolved Go version across its same-named script parameter binding.
+    It 'UnitT32_PreservesGoVersionWhenLoadingAuthorityFunctions' {
+        $validator = Get-Content -LiteralPath $script:CanonicalValidatorPath -Raw
+        $validator | Should -Match '(?m)^\. \$authorityGatePath -DefineFunctionsOnly -ExpectedGoRuntimeVersion \$ExpectedGoRuntimeVersion$'
+    }
+
     # Scenario: A multi-commit branch is validated locally before it is pushed.
     # Purpose: Compare the complete branch against the remote default branch instead of only HEAD's parent.
     It 'UnitT35_UsesTheRemoteDefaultBranchMergeBaseForImplicitComparison' {

@@ -6471,7 +6471,7 @@ $resolverPath = Join-Path $authorityRoot 'scripts/Resolve-StandardValidationTool
 $policyPath = Join-Path $authorityRoot 'docs/standards/validation-toolchain.json'
 $authorityGatePath = Join-Path $authorityRoot 'scripts/Invoke-StandardAuthorityGate.ps1'
 $validationSecurityGatePath = Join-Path $authorityRoot 'docs/standards/validation-security-gate.json'
-. $authorityGatePath -DefineFunctionsOnly
+. $authorityGatePath -DefineFunctionsOnly -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion
 $validationSecurityGate = Assert-AuthorityValidationSecurityGate `
     -Policy (Read-JsonFile -Path $validationSecurityGatePath -Context 'Validation/security gate policy')
 $validationSecurityGatePolicySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $validationSecurityGatePath).Hash.ToLowerInvariant()
