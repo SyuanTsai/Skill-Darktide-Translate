@@ -98,6 +98,9 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflow | Should -Match 'checkoutHead -cne \$env:EXPECTED_HEAD_SHA'
         $workflow | Should -Match 'scripts/Validate\.ps1'
         $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
+        $workflow | Should -Match '\[regex\]::Match\('
+        $workflow | Should -Match "Groups\['version'\]\.Value"
+        $workflow | Should -Match 'ExpectedGoRuntimeVersion \$expectedGoRuntimeVersion'
         $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
         $workflow | Should -Not -Match 'pull_request_target|checks: write|CODEX_PESTER_CGROUP_ROOT'
     }

@@ -56,15 +56,20 @@ jobs:
             }
           }
           $goVersion = @(& go version)
-          if ($LASTEXITCODE -ne 0 -or $goVersion.Count -ne 1 -or
-              [string]$goVersion[0] -notmatch '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+) [^\s]+/[^\s]+$') {
+          if ($LASTEXITCODE -ne 0 -or $goVersion.Count -ne 1) {
             throw 'The approved stable Go runtime could not be identified.'
           }
+          $goRuntimeMatch = [regex]::Match([string]$goVersion[0],
+              '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+) [^\s]+/[^\s]+$')
+          if (-not $goRuntimeMatch.Success) {
+            throw 'The approved stable Go runtime could not be identified.'
+          }
+          $expectedGoRuntimeVersion = $goRuntimeMatch.Groups['version'].Value
           $reportPath = Join-Path $env:RUNNER_TEMP 'darktide-windows-candidate-report.json'
           & pwsh -NoProfile -NonInteractive -File (Join-Path $repositoryRoot 'scripts/Validate.ps1') `
               -RepositoryRoot $repositoryRoot -ArtifactsRoot $env:RUNNER_TEMP `
               -BaseCommit $baseCommit -TrustedTestCommit $checkoutHead `
-              -ExpectedGoRuntimeVersion $Matches.version -OutputPath $reportPath
+              -ExpectedGoRuntimeVersion $expectedGoRuntimeVersion -OutputPath $reportPath
           if ($LASTEXITCODE -ne 0) { throw "Candidate validator exited $LASTEXITCODE." }
           if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             throw 'Candidate validator did not produce a report.'
