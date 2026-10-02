@@ -93,6 +93,11 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflow | Should -Match '(?m)^  pull_request:\s*$'
         $workflow | Should -Match '(?m)^permissions:\s*\r?\n  contents: read\s*$'
         $workflow | Should -Match 'runs-on: windows-latest'
+        $workflow | Should -Match 'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020'
+        $workflow | Should -Match "node-version: '24'"
+        $workflow | Should -Match 'Require npm 11 lockfile semantics'
+        $workflow | Should -Match ([regex]::Escape('^11\.[0-9]+\.[0-9]+$'))
+        $workflow.IndexOf('Require npm 11 lockfile semantics') | Should -BeLessThan $workflow.IndexOf('Validate candidate head with PowerShell 7')
         $workflow | Should -Match "runnerNpmPrefix -ceq 'C:\\npm\\prefix'"
         $workflow | Should -Match 'SetEnvironmentVariable\(''NPM_CONFIG_PREFIX'', \$null, ''Process''\)'
         $workflow | Should -Match 'Unexpected npm prefix in the candidate runner environment'

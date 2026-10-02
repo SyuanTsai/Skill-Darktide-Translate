@@ -29,6 +29,20 @@ jobs:
           check-latest: true
           cache: false
 
+      - name: Set up Node for central npm lock resolution
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          check-latest: true
+
+      - name: Require npm 11 lockfile semantics
+        shell: pwsh
+        run: |
+          $npmVersion = ([string](& npm --version)).Trim()
+          if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^11\.[0-9]+\.[0-9]+$') {
+            throw "The central resolver requires npm 11 lockfile semantics; found '$npmVersion'."
+          }
+
       - name: Validate candidate head with PowerShell 7
         shell: pwsh
         env:
