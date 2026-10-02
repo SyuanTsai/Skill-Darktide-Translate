@@ -139,6 +139,38 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Not -Match 'Get-CimInstance\s+-ClassName\s+Win32_Process'
     }
 
+    It 'InterT45_BoundsRealTrustedPesterChildOutputAndPreservesExitStatus' {
+        # Scenario: The trusted Pester transport receives a verbose or failing real child.
+        # Purpose: Keep each captured stream bounded while preserving the child's exit.
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$errors)
+        @($errors).Count | Should -Be 0
+        $definitions = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -in @('Get-WindowsSuspendedProcessBoundaryType', 'Invoke-TrustedPowerShellProcess')
+        }, $false))
+        $definitions.Count | Should -Be 2
+        $transport = @($definitions | Where-Object Name -eq 'Invoke-TrustedPowerShellProcess')[0]
+        $transport.Extent.Text | Should -Match 'ReadBoundedAsync'
+        $transport.Extent.Text | Should -Not -Match 'ReadToEndAsync'
+        foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
+
+        $powerShellPath = [string](Join-Path $PSHOME 'pwsh.exe')
+        $normal = Invoke-TrustedPowerShellProcess -Command $powerShellPath `
+            -Arguments @('-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write("normal")') `
+            -WorkingDirectory $TestDrive -Context 'bounded child'
+        $normal | Should -Be 'normal'
+        { Invoke-TrustedPowerShellProcess -Command $powerShellPath `
+            -Arguments @('-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write(''x'' * 4194305)') `
+            -WorkingDirectory $TestDrive -Context 'oversized child' } |
+            Should -Throw '*bounded trusted-process output limit*'
+        { Invoke-TrustedPowerShellProcess -Command $powerShellPath `
+            -Arguments @('-NoProfile', '-NonInteractive', '-Command', 'exit 7') `
+            -WorkingDirectory $TestDrive -Context 'failed child' } |
+            Should -Throw '*exited with code 7*'
+    }
+
     It 'UnitT50_BindsBootstrapToTheExpectedChangedPathSetAndBaseCommit' {
         # Scenario: A bootstrap candidate could otherwise select the legacy path while changing arbitrary repository content.
         # Purpose: Require an immutable base comparison and a narrow transition-only changed-path contract.

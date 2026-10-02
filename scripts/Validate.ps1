@@ -5428,8 +5428,10 @@ function Invoke-TrustedPowerShellProcess {
             $process.StandardInput.Write([string]$StandardInput)
         }
         $process.StandardInput.Close()
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $maxOutputCharacters = 4194304
+        $outputBoundaryType = Get-WindowsSuspendedProcessBoundaryType
+        $stdoutTask = $outputBoundaryType::ReadBoundedAsync($process.StandardOutput, $maxOutputCharacters)
+        $stderrTask = $outputBoundaryType::ReadBoundedAsync($process.StandardError, $maxOutputCharacters)
         if (-not $process.WaitForExit($TimeoutMilliseconds)) {
             try {
                 $process.Kill($true)
@@ -5440,11 +5442,13 @@ function Invoke-TrustedPowerShellProcess {
             }
             throw "$Context exceeded its timeout of $TimeoutMilliseconds milliseconds."
         }
-        $stdoutText = $stdoutTask.GetAwaiter().GetResult()
-        $stderrText = $stderrTask.GetAwaiter().GetResult()
-        if ($stdoutText.Length -gt 4194304 -or $stderrText.Length -gt 4194304) {
+        $stdoutResult = $stdoutTask.GetAwaiter().GetResult()
+        $stderrResult = $stderrTask.GetAwaiter().GetResult()
+        if ($stdoutResult.Truncated -or $stderrResult.Truncated) {
             throw "$Context exceeded the bounded trusted-process output limit."
         }
+        $stdoutText = $stdoutResult.Text
+        $stderrText = $stderrResult.Text
         if ($process.ExitCode -ne 0) {
             throw "$Context exited with code $($process.ExitCode).`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText"
         }
