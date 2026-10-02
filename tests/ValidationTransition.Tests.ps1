@@ -93,6 +93,9 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflow | Should -Match '(?m)^  pull_request:\s*$'
         $workflow | Should -Match '(?m)^permissions:\s*\r?\n  contents: read\s*$'
         $workflow | Should -Match 'runs-on: windows-latest'
+        $workflow | Should -Match "runnerNpmPrefix -ceq 'C:\\npm\\prefix'"
+        $workflow | Should -Match 'SetEnvironmentVariable\(''NPM_CONFIG_PREFIX'', \$null, ''Process''\)'
+        $workflow | Should -Match 'Unexpected npm prefix in the candidate runner environment'
         $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
         $workflow | Should -Match 'persist-credentials: false'
         $workflow | Should -Match 'checkoutHead -cne \$env:EXPECTED_HEAD_SHA'

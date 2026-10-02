@@ -39,6 +39,13 @@ jobs:
           if ($PSVersionTable.PSVersion.Major -lt 7 -or -not $IsWindows) {
             throw 'Candidate validation requires Windows with PowerShell 7.'
           }
+          $runnerNpmPrefix = [Environment]::GetEnvironmentVariable('NPM_CONFIG_PREFIX', 'Process')
+          if ($runnerNpmPrefix -ceq 'C:\npm\prefix') {
+            [Environment]::SetEnvironmentVariable('NPM_CONFIG_PREFIX', $null, 'Process')
+          }
+          elseif (-not [string]::IsNullOrWhiteSpace($runnerNpmPrefix)) {
+            throw 'Unexpected npm prefix in the candidate runner environment.'
+          }
           $repositoryRoot = [IO.Path]::GetFullPath((Get-Location).Path)
           $gitPath = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path
           $gitArguments = @('-c', "safe.directory=$repositoryRoot", '-C', $repositoryRoot)
