@@ -45,8 +45,6 @@ if (-not $script:IsWindowsHost) {
     throw 'Standard v1 validation requires Windows with PowerShell 7.'
 }
 $script:IsLinuxHost = $false
-$isLinuxVariable = Get-Variable -Name IsLinux -ErrorAction SilentlyContinue
-if ($null -ne $isLinuxVariable) { $script:IsLinuxHost = [bool]$isLinuxVariable.Value }
 $script:IsSupportedProcessBoundaryHost = $script:IsWindowsHost -or $script:IsLinuxHost
 $env:GIT_NO_REPLACE_OBJECTS = '1'
 $script:TrustedStatPath = $null
@@ -4375,21 +4373,6 @@ function Assert-RegularFileForHash {
     }
 }
 
-function Assert-LinuxGlibcRuntime {
-    if (-not $script:IsLinuxHost) { return }
-    $lddCommand = Get-Command ldd -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    $lddPath = [IO.Path]::GetFullPath([string]$lddCommand.Path)
-    if (-not (Test-Path -LiteralPath $lddPath -PathType Leaf)) {
-        throw 'Linux libc compatibility preflight could not locate ldd.'
-    }
-    Assert-NoReparseAncestors -Path $lddPath -Context 'Linux libc compatibility utility'
-    $lddOutput = @(& $lddPath --version 2>&1 | ForEach-Object { [string]$_ })
-    $lddExitCode = $LASTEXITCODE
-    if ($lddExitCode -ne 0 -or ($lddOutput -join [Environment]::NewLine) -notmatch '(?i)(GNU libc|GLIBC)') {
-        throw 'This Linux runtime is not glibc-compatible; the canonical native process boundary requires glibc.'
-    }
-}
-
 function Resolve-GitCommonDirectoryFromMetadata {
     param(
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
@@ -6236,7 +6219,6 @@ $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
     [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 }
 else { [IO.Path]::GetFullPath($RepositoryRoot) }
-Assert-LinuxGlibcRuntime
 $supervisorRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $repositoryValidatorPath = Join-Path $supervisorRoot 'scripts/Test-Repository.ps1'
 if (-not (Test-Path -LiteralPath $repositoryValidatorPath -PathType Leaf)) {
