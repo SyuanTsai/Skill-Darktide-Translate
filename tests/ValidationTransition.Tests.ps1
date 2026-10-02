@@ -66,7 +66,9 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflowFiles.Count | Should -BeGreaterThan 0
         foreach ($workflowFile in $workflowFiles) {
             $workflow = Get-Content -LiteralPath $workflowFile.FullName -Raw
-            $workflow | Should -Not -Match '(?m)^\s*pull_request:\s*$'
+            if ($workflowFile.Name -cne 'standard-v1-candidate-windows.yml') {
+                $workflow | Should -Not -Match '(?m)^\s*pull_request:\s*$'
+            }
             $workflow | Should -Not -Match 'skill-validator@latest|skill-tools@latest'
             if ($workflow -match '(?i)skill-validator|skill-tools|SkillSpector|Invoke-Pester|Test-Repository|validation') {
                 $workflow | Should -Match 'scripts/Validate\.ps1'
@@ -80,6 +82,24 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $prePush = Get-Content -LiteralPath $script:PrePushPath -Raw
         $prePush | Should -Match 'scripts/Validate\.ps1'
         $prePush | Should -Not -Match 'Test-CleanRepositoryHead|Test-Repository|Test-ReferenceIntegrity|Invoke-Pester|skill-validator|skill-tools|SkillSpector|security'
+    }
+
+    # Scenario: A normal pull request tests its own immutable head on Windows.
+    # Purpose: Keep candidate tests and evidence bound to that head with read-only permissions.
+    It 'UnitT31_BindsReadOnlyWindowsCandidateWorkflowToExactHead' {
+        $path = Join-Path $script:WorkflowRoot 'standard-v1-candidate-windows.yml'
+        Test-Path -LiteralPath $path -PathType Leaf | Should -BeTrue
+        $workflow = Get-Content -LiteralPath $path -Raw
+        $workflow | Should -Match '(?m)^  pull_request:\s*$'
+        $workflow | Should -Match '(?m)^permissions:\s*\r?\n  contents: read\s*$'
+        $workflow | Should -Match 'runs-on: windows-latest'
+        $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
+        $workflow | Should -Match 'persist-credentials: false'
+        $workflow | Should -Match 'checkoutHead -cne \$env:EXPECTED_HEAD_SHA'
+        $workflow | Should -Match 'scripts/Validate\.ps1'
+        $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
+        $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
+        $workflow | Should -Not -Match 'pull_request_target|checks: write|CODEX_PESTER_CGROUP_ROOT'
     }
 
     # Scenario: A multi-commit branch is validated locally before it is pushed.

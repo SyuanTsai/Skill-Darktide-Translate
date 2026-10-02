@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
+name: Darktide Translate Windows Candidate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-candidate:
+    name: Darktide Translate Windows Candidate
+    runs-on: windows-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout immutable pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up approved Go runtime
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+          check-latest: true
+          cache: false
+
+      - name: Validate candidate head with PowerShell 7
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSVersion.Major -lt 7 -or -not $IsWindows) {
+            throw 'Candidate validation requires Windows with PowerShell 7.'
+          }
+          $repositoryRoot = [IO.Path]::GetFullPath((Get-Location).Path)
+          $gitPath = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path
+          $gitArguments = @('-c', "safe.directory=$repositoryRoot", '-C', $repositoryRoot)
+          $checkoutHead = ([string]((& $gitPath @gitArguments rev-parse HEAD) | Select-Object -First 1)).Trim()
+          if ($LASTEXITCODE -ne 0 -or $checkoutHead -cnotmatch '^[0-9a-f]{40}$' -or
+              $checkoutHead -cne $env:EXPECTED_HEAD_SHA) {
+            throw 'Checked-out candidate does not match the pull request head SHA.'
+          }
+          $baseCommit = ''
+          if ([string]$env:BASE_SHA -cmatch '^[0-9a-f]{40}$') {
+            $mergeBase = ([string]((& $gitPath @gitArguments merge-base $env:BASE_SHA $checkoutHead) | Select-Object -First 1)).Trim()
+            if ($LASTEXITCODE -eq 0 -and $mergeBase -cmatch '^[0-9a-f]{40}$' -and
+                $mergeBase -cne $checkoutHead) {
+              $baseCommit = $mergeBase
+            }
+          }
+          $goVersion = @(& go version)
+          if ($LASTEXITCODE -ne 0 -or $goVersion.Count -ne 1 -or
+              [string]$goVersion[0] -notmatch '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+) [^\s]+/[^\s]+$') {
+            throw 'The approved stable Go runtime could not be identified.'
+          }
+          $reportPath = Join-Path $env:RUNNER_TEMP 'darktide-windows-candidate-report.json'
+          & pwsh -NoProfile -NonInteractive -File (Join-Path $repositoryRoot 'scripts/Validate.ps1') `
+              -RepositoryRoot $repositoryRoot -ArtifactsRoot $env:RUNNER_TEMP `
+              -BaseCommit $baseCommit -TrustedTestCommit $checkoutHead `
+              -ExpectedGoRuntimeVersion $Matches.version -OutputPath $reportPath
+          if ($LASTEXITCODE -ne 0) { throw "Candidate validator exited $LASTEXITCODE." }
+          if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+            throw 'Candidate validator did not produce a report.'
+          }
+          $report = Get-Content -LiteralPath $reportPath -Raw -Encoding utf8 | ConvertFrom-Json -Depth 100
+          if ([string]$report.candidate.commit -cne $checkoutHead -or
+              [string]$report.stages.repositoryTests.pester.trustedCommit -cne $checkoutHead -or
+              [string]$report.result -cne 'passed' -or
+              [string]$report.executionBoundary.platform -cne 'windows-restricted-primary-token-job-object') {
+            throw 'Candidate report does not prove a successful exact-head Windows validation.'
+          }
+          Write-Host "Validated immutable candidate head $checkoutHead."
