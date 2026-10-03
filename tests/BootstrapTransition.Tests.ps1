@@ -116,16 +116,16 @@ Describe 'Darktide bootstrap transition' {
         }
     }
 
-    It 'UnitT30_RetiresBootstrapSelectionFromMainValidation' {
-        # Scenario: The repository has completed its Standard v1 migration.
-        # Purpose: Keep main validation on the current canonical path without reviving the old bootstrap supervisor.
+    It 'UnitT30_SelectsBootstrapOnlyWhenTheCandidateHasNotMigratedToStandardV1' {
+        # Scenario: The protected workflow sees either the current bootstrap layout or the migrated layout.
+        # Purpose: Keep transition success explicit and prevent a mixed or post-migration tree from taking the legacy path.
         $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
         $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
 
         $supervisor | Should -Match '\[switch\] \$BootstrapTransition'
-        $workflow | Should -Not -Match 'BootstrapTransition|pull_request_target|catalog/skills-catalog\.json'
-        $workflow | Should -Match 'scripts/Validate\.ps1'
-        $workflow | Should -Match 'runs-on: windows-latest'
+        $workflow | Should -Match 'BootstrapTransition'
+        $workflow | Should -Match 'config/standard-v1\.json'
+        $workflow | Should -Match 'catalog/skills-catalog\.json'
     }
 
     It 'UnitT40_UsesAnOSNativeWindowsProcessSnapshotForCleanup' {
@@ -306,9 +306,17 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'linuxPesterCgroupCleanupException'
         $supervisor | Should -Match 'PesterProxyCgroupPath'
         $supervisor | Should -Match '\[IO\.File\]::WriteAllText\([\s\S]*?cgroup\.procs'
-        $workflow | Should -Not -Match 'CODEX_PESTER_CGROUP_ROOT|CODEX_PESTER_VALIDATOR_CGROUP|sudo -n|ubuntu-latest'
-        $workflow | Should -Match 'runs-on: windows-latest'
-        $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
+        $workflow | Should -Match 'Delegate Linux cgroup v2 subtree'
+        $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
+        $workflow | Should -Match 'CODEX_PESTER_VALIDATOR_CGROUP'
+        $workflow | Should -Match 'root_subtree_control'
+        $workflow | Should -Match '\+cpu \+memory'
+        $workflow | Should -Match 'cgroup\.subtree_control'
+        $workflow | Should -Match 'cgroup\.threads'
+        $workflow | Should -Match 'cgroup_delegated/cgroup\.procs'
+        $workflow | Should -Match 'sudo -n chown'
+        $workflow | Should -Match 'trusted-validator'
+        $workflow | Should -Match 'Remove delegated Linux cgroup subtree'
         $supervisor | Should -Match 'Start-WindowsSuspendedProcess'
         $supervisor | Should -Match '\.CopyToAsync\('
         $supervisor | Should -Match '--kill-child'
@@ -392,13 +400,21 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'per-candidate 300-second CPU'
     }
 
-    It 'UnitT95_RetiresTheLinuxAggregateCgroupFromMainCI' {
-        # Scenario: The source retains historical Linux helpers while current CI is Windows-only.
-        # Purpose: Prevent the old root-owned cgroup admission and cleanup jobs from reappearing in the active workflow.
+    It 'UnitT95_KeepsProtectedPesterBelowARootOwnedAggregateCgroup' {
+        # Scenario: Candidate code runs under the delegated runner identity and can write migration controls in that delegated subtree.
+        # Purpose: Keep that whole subtree below a root-owned aggregate boundary and prove every descendant is dead before later steps.
         $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
 
-        $workflow | Should -Not -Match 'cgroup|unshare|sudo|/proc|ubuntu-latest'
-        $workflow | Should -Match 'runs-on: windows-latest'
+        $workflow | Should -Match 'cgroup_delegated="\$cgroup_parent/delegated"'
+        $workflow | Should -Match 'cgroup_supervisor="\$cgroup_delegated/trusted-validator"'
+        $workflow | Should -Match '(?s)''2147483648''.*?"\$cgroup_parent/memory\.max"'
+        $workflow | Should -Match '(?s)''256''.*?"\$cgroup_parent/pids\.max"'
+        $workflow | Should -Not -Match 'chown[^\r\n]*"\$cgroup_parent(?:/cgroup\.(?:procs|threads))?"'
+        $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT=%s[\s\S]*?"\$cgroup_delegated"'
+        $workflow | Should -Match 'cgroup\.kill'
+        $workflow | Should -Match 'cgroup\.events'
+        $workflow | Should -Match '/usr/bin/find "\$cgroup_parent" -mindepth 1 -depth -type d'
+        $workflow | Should -Match 'shell:\s*/usr/bin/sudo -n /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -e -o pipefail \{0\}'
     }
 
     It 'UnitT100_BindsReplacementObjectDiscoveryToTheCandidateWorktree' {
@@ -408,7 +424,7 @@ Describe 'Darktide bootstrap transition' {
         $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
 
         $supervisor | Should -Match '(?s)function Assert-NoGitReplacementObjects.*?safe\.directory=\$RepositoryRoot.*?core\.worktree=\$RepositoryRoot.*?rev-parse --git-path refs/replace'
-        $workflow | Should -Match '(?s)\$gitPath\s*=.*?\$gitArguments\s*=\s*@\(.*?safe\.directory=\$repositoryRoot.*?rev-parse HEAD.*?merge-base \$env:BASE_SHA \$checkoutHead'
+        $workflow | Should -Match '(?s)\$gitPath\s*=.*?\$gitArguments\s*=\s*@\(.*?safe\.directory=\$repositoryRoot.*?core\.worktree=\$repositoryRoot.*?rev-parse HEAD.*?merge-base --is-ancestor'
 
         $tokens = $null
         $parseErrors = $null
@@ -463,12 +479,14 @@ Describe 'Darktide bootstrap transition' {
     }
 
     It 'UnitT110_RejectsNonUtf8PowerShellSourceBytes' {
-        # Scenario: A retired compatibility diagnostic parses strict UTF-8 source fixtures.
-        # Purpose: Preserve byte-level source rejection evidence while current CI uses PowerShell 7.
+        # Scenario: Windows PowerShell 5.1 parses trusted local source fixtures encoded as UTF-8 with or without a BOM, while UTF-16 and UTF-32 source is rejected.
+        # Purpose: Prevent host ANSI source interpretation from accepting malformed candidate PowerShell while preserving non-ASCII UTF-8 code.
         $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
 
-        $workflow | Should -Not -Match 'shell: powershell|repository-contract-windows-powershell'
-        $workflow | Should -Match 'shell: pwsh'
+        $workflow | Should -Match '\[IO\.File\]::ReadAllBytes\(\$candidatePath\)'
+        $workflow | Should -Not -Match '\$candidateSource\s*=\s*\[IO\.File\]::ReadAllText\('
+        $workflow | Should -Match '(?s)\$candidateBytes\[0\] -eq 0xEF.*?\$candidateBytes\[1\] -eq 0xBB.*?\$candidateBytes\[2\] -eq 0xBF'
+        $workflow | Should -Match '(?s)\[Text\.UTF8Encoding\]::new\(\$false, \$true\)\.GetString\(.*?\$candidateBytes.*?\$candidateOffset.*?\$candidateBytes\.Length - \$candidateOffset'
 
         $compatibilityTokens = $null
         $compatibilityParseErrors = $null

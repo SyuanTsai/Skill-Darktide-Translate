@@ -613,6 +613,88 @@ Describe 'Trusted filesystem contract' {
         Write-Host "Ordinal ordering: 15279 entries in $($timer.Elapsed.TotalMilliseconds) ms; canonical bytes equal."
     }
 }
+Describe 'Protected workflow trust binding' {
+    BeforeAll {
+        $script:TrustRepositoryRoot = Split-Path -Parent $PSScriptRoot
+        $script:TrustWorkflow = Get-Content -LiteralPath (Join-Path $script:TrustRepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+        $script:TrustValidator = Get-Content -LiteralPath (Join-Path $script:TrustRepositoryRoot 'scripts/Validate.ps1') -Raw
+
+        function Get-TestWorkflowStep {
+            param([string] $Name)
+            $pattern = '(?ms)^      - name: ' + [regex]::Escape($Name) + '\r?\n(?:(?!^      - name: ).)*?        run: \|\r?\n(?<body>(?:          [^\r\n]*\r?\n|\r?\n)+)'
+            $match = [regex]::Match($script:TrustWorkflow, $pattern)
+            if (-not $match.Success) { throw "Workflow step not found: $Name" }
+            return [regex]::Replace($match.Groups['body'].Value, '(?m)^          ', '')
+        }
+
+    }
+
+    # Scenario: An existing summary is rewritten or removed after the trusted preflight emitted its evidence.
+    # Purpose: Exercise the real exporter against a tampered regular file, not a regex approximation.
+    It 'InterT60_AuthenticatesDiagnosticsBeforeExport_<mode>' -ForEach @(
+        @{ mode = 'valid' }, @{ mode = 'tampered' }, @{ mode = 'missing-proof' },
+        @{ mode = 'deleted' }, @{ mode = 'pre-summary-failure' }
+    ) {
+        $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $run = Join-Path $root 'sgv1-fixture'
+        [void](New-Item -ItemType Directory -Path $run -Force)
+        $names = @('RUNNER_TEMP', 'GITHUB_OUTPUT', 'EVIDENCE_BASE64_LENGTH', 'EXPECTED_DIAGNOSTICS_SHA256')
+        $saved = @{}
+        foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+        try {
+            $env:RUNNER_TEMP = $root
+            $env:GITHUB_OUTPUT = Join-Path $root 'trusted-output'
+            $env:EVIDENCE_BASE64_LENGTH = '0'
+            $env:EXPECTED_DIAGNOSTICS_SHA256 = ''
+            $securityPreflightSummaryPath = Join-Path $run 'security-preflight-summary.json'
+            $securityBlockers = @()
+            $sanitizedSecurityFindings = @()
+            $runId = 'fixture'
+            $start = $script:TrustValidator.IndexOf('$securityPreflightSummary =', [StringComparison]::Ordinal)
+            $end = $script:TrustValidator.IndexOf('if ($securityBlockers.Count -gt 0)', $start, [StringComparison]::Ordinal)
+            & ([scriptblock]::Create($script:TrustValidator.Substring($start, $end - $start)))
+            if (Test-Path -LiteralPath $env:GITHUB_OUTPUT) {
+                $line = Get-Content -LiteralPath $env:GITHUB_OUTPUT | Where-Object { $_ -like 'standard_v1_diagnostics_sha256=*' }
+                $env:EXPECTED_DIAGNOSTICS_SHA256 = ([string]$line).Split('=', 2)[1]
+            }
+            if ($mode -eq 'tampered') {
+                $code = "[IO.File]::WriteAllText('" + $securityPreflightSummaryPath.Replace("'", "''") + "', 'forged summary'); exit 1"
+                $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+                & (Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })) -NoProfile -EncodedCommand $encoded
+                $LASTEXITCODE | Should -Be 1
+            }
+            if ($mode -in @('deleted', 'pre-summary-failure')) {
+                [IO.File]::Delete($securityPreflightSummaryPath)
+            }
+            if ($mode -in @('missing-proof', 'pre-summary-failure')) { $env:EXPECTED_DIAGNOSTICS_SHA256 = '' }
+            $env:GITHUB_OUTPUT = Join-Path $root 'export-output'
+            $exportPath = Join-Path $root 'export.ps1'
+            [IO.File]::WriteAllText($exportPath, '$ErrorActionPreference = ''Stop''' + [Environment]::NewLine +
+                (Get-TestWorkflowStep 'Export bounded validation diagnostics for clean upload'), [Text.UTF8Encoding]::new($false))
+            # Run the real workflow step in a separate pwsh so its exit 0 cannot
+            # terminate the test harness or bypass subsequent assertions.
+            $exportOutput = @(& (Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })) -NoProfile -NonInteractive -File $exportPath 2>&1)
+            $exportExitCode = $LASTEXITCODE
+            if ($mode -in @('valid', 'pre-summary-failure')) {
+                $exportExitCode | Should -Be 0
+                if ($mode -eq 'valid') { $env:EXPECTED_DIAGNOSTICS_SHA256 | Should -Match '^[0-9a-f]{64}$' }
+                $lines = Get-Content -LiteralPath $env:GITHUB_OUTPUT
+                ($lines | Where-Object { $_ -like 'diagnostics_sha256=*' }) | Should -BeExactly "diagnostics_sha256=$env:EXPECTED_DIAGNOSTICS_SHA256"
+                if ($mode -eq 'pre-summary-failure') {
+                    ($lines | Where-Object { $_ -like 'diagnostics_base64=*' }) | Should -BeExactly 'diagnostics_base64='
+                }
+            }
+            else {
+                $exportExitCode | Should -Not -Be 0
+                ($exportOutput -join [Environment]::NewLine) | Should -Match 'diagnostics'
+                Test-Path -LiteralPath $env:GITHUB_OUTPUT | Should -BeFalse
+            }
+        }
+        finally {
+            foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+        }
+    }
+}
 Describe 'Optional Linux read-only path binding' {
     BeforeAll {
         $tokens = $null; $errors = $null

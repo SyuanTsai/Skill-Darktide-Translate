@@ -81,8 +81,8 @@ Describe 'Repository pre-push validation' {
         $workflow | Should -Not -Match 'run: \./tests/Invoke-Tests\.ps1'
     }
 
-    # Scenario: A migrated source separates read-only PR validation from main-push validation.
-    # Purpose: Verify the active event contracts without re-enabling the privileged legacy PR workflow.
+    # Scenario: The protected workflow retains base-owned PR validation while the read-only candidate gate is additive.
+    # Purpose: Verify both event contracts without treating candidate CI as a required protected context.
     It 'UnitT50_UsesTheCurrentValidationEvents' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
         if ($script:layout.Name -ceq 'legacy') {
@@ -92,7 +92,7 @@ Describe 'Repository pre-push validation' {
         else {
             $workflow | Should -Match '(?m)^  push:\r?$'
             $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
-            $workflow | Should -Not -Match '(?m)^  pull_request_target:'
+            $workflow | Should -Match '(?m)^  pull_request_target:'
             $candidate = Get-Content -LiteralPath (Join-Path $script:repoRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
             $candidate | Should -Match '(?m)^  pull_request:\s*$'
             $candidate | Should -Not -Match 'pull_request_target|checks: write'
