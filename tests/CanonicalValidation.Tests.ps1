@@ -275,6 +275,168 @@ Describe 'Canonical Standard v1 validation adapter' {
         finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
     }
 
+    # Scenario: An exact candidate's scanner reports known parse limits for two inventory files.
+    # Purpose: Preserve a bounded, candidate-bound ledger clue in the failing CI log without exposing raw report text.
+    It 'UnitT34_ReportsOnlyBoundedInventoryIndicesForIncompleteStaticAnalysis' {
+        $report = [pscustomobject]@{
+            execution_successful = $true
+            analysis_completeness = [pscustomobject]@{
+                execution_successful = $true
+                is_complete = $false
+                status = 'partial'
+                coverage_percent = 36
+                ledger_exceptions = @(
+                    [pscustomobject]@{ path = 'SKILL.md'; reason_code = 'static_parse_limit'; message = 'SECRET_MARKER' },
+                    [pscustomobject]@{ path = 'scripts/tool.ps1'; reason_code = 'static_parse_limit'; message = 'SECRET_MARKER' }
+                )
+                scope_exclusions = @()
+                limitations = @()
+            }
+        }
+        $probeModule = New-Module -Name "SkillSpectorProbe_$([guid]::NewGuid().ToString('N'))" `
+            -ScriptBlock ([scriptblock]::Create($script:SkillSpectorProbeSource))
+        try {
+            $failure = $null
+            try {
+                & $probeModule {
+                    param($probeReport)
+                    Assert-SkillSpectorReport -Report $probeReport -SkillRoot 'C:\candidate\skills\sample' `
+                        -SkillId 'sample-skill' -ExpectedInventoryPaths @('SKILL.md', 'scripts/tool.ps1') `
+                        -CandidateCommit ('a' * 40) -ScannerVersion '2.12.0' -InventorySha256 ('b' * 64)
+                } $report
+            }
+            catch { $failure = $_.Exception }
+            $failure | Should -Not -BeNullOrEmpty
+            $failure.Message | Should -Match 'did not prove complete static analysis'
+            $failure.Message | Should -Match 'candidateCommit=a{40}'
+            $failure.Message | Should -Match 'scannerVersion=2\.12\.0'
+            $failure.Message | Should -Match 'inventorySha256=b{64}'
+            $failure.Message | Should -Match 'inventoryCount=2'
+            $failure.Message | Should -Match 'ledgerTotal=2'
+            $failure.Message | Should -Match 'sampledLedgerEntries=2'
+            $failure.Message | Should -Match 'staticParseLimitInSample=2'
+            $failure.Message | Should -Match 'inventoryIndicesInSample=0,1'
+            $failure.Message | Should -Not -Match 'SECRET_MARKER|SKILL\.md|tool\.ps1|[\r\n]'
+        }
+        finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Scenario: An untrusted scanner report contains many hostile ledger values outside the candidate inventory.
+    # Purpose: Keep failure diagnostics finite and refuse to echo attacker-controlled path, reason, or message text.
+    It 'UnitT35_BoundsAndRedactsHostileStaticLedgerValues' {
+        $entries = @(1..40 | ForEach-Object {
+            [pscustomobject]@{ path = "SECRET_MARKER`n$_"; reason_code = 'SECRET_MARKER'; message = 'SECRET_MARKER' }
+        })
+        $report = [pscustomobject]@{
+            execution_successful = $true
+            analysis_completeness = [pscustomobject]@{
+                execution_successful = $true
+                is_complete = $false
+                status = 'partial'
+                coverage_percent = 36
+                ledger_exceptions = $entries
+                scope_exclusions = @()
+                limitations = @()
+            }
+        }
+        $probeModule = New-Module -Name "SkillSpectorProbe_$([guid]::NewGuid().ToString('N'))" `
+            -ScriptBlock ([scriptblock]::Create($script:SkillSpectorProbeSource))
+        try {
+            $failure = $null
+            try {
+                & $probeModule {
+                    param($probeReport)
+                    Assert-SkillSpectorReport -Report $probeReport -SkillRoot 'C:\candidate\skills\sample' `
+                        -SkillId 'sample-skill' -ExpectedInventoryPaths @('SKILL.md')
+                } $report
+            }
+            catch { $failure = $_.Exception }
+            $failure | Should -Not -BeNullOrEmpty
+            $failure.Message | Should -Match 'ledgerTotal=40'
+            $failure.Message | Should -Match 'sampledLedgerEntries=32'
+            $failure.Message | Should -Match 'truncated=true'
+            $failure.Message.Length | Should -BeLessThan 600
+            $failure.Message | Should -Not -Match 'SECRET_MARKER|[\r\n]'
+        }
+        finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'UnitT36_LabelsTheFirst32LedgerEntriesAsASampleWhenParseLimitsFollow' {
+        $entries = @((1..32 | ForEach-Object {
+            [pscustomobject]@{ path = 'SECRET_MARKER'; reason_code = 'other_reason'; message = 'SECRET_MARKER' }
+        })) + @([pscustomobject]@{ path = 'SKILL.md'; reason_code = 'static_parse_limit'; message = 'SECRET_MARKER' })
+        $report = [pscustomobject]@{
+            execution_successful = $true
+            analysis_completeness = [pscustomobject]@{
+                execution_successful = $true
+                is_complete = $false
+                status = 'partial'
+                coverage_percent = 36
+                ledger_exceptions = $entries
+                scope_exclusions = @()
+                limitations = @()
+            }
+        }
+        $probeModule = New-Module -Name "SkillSpectorProbe_$([guid]::NewGuid().ToString('N'))" `
+            -ScriptBlock ([scriptblock]::Create($script:SkillSpectorProbeSource))
+        try {
+            $failure = $null
+            try {
+                & $probeModule {
+                    param($probeReport)
+                    Assert-SkillSpectorReport -Report $probeReport -SkillRoot 'C:\candidate\skills\sample' `
+                        -SkillId 'sample-skill' -ExpectedInventoryPaths @('SKILL.md')
+                } $report
+            }
+            catch { $failure = $_.Exception }
+            $failure | Should -Not -BeNullOrEmpty
+            $failure.Message | Should -Match 'ledgerTotal=33'
+            $failure.Message | Should -Match 'sampledLedgerEntries=32'
+            $failure.Message | Should -Match 'staticParseLimitInSample=0'
+            $failure.Message | Should -Match 'inventoryIndicesInSample=none'
+            $failure.Message | Should -Match 'truncated=true'
+            $failure.Message | Should -Not -Match 'SECRET_MARKER|SKILL\.md|[\r\n]'
+        }
+        finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'UnitT37_RedactsUnexpectedLedgerDespiteNominalCompleteness' {
+        foreach ($fieldName in @('ledger_exceptions', 'scope_exclusions', 'limitations')) {
+            $completeness = [pscustomobject]@{
+                execution_successful = $true
+                is_complete = $true
+                status = 'complete'
+                coverage_percent = 100
+                ledger_exceptions = @()
+                scope_exclusions = @()
+                limitations = @()
+            }
+            $completeness.$fieldName = @([pscustomobject]@{
+                path = "SECRET_MARKER`npath"
+                reason_code = 'SECRET_MARKER'
+                message = 'SECRET_MARKER'
+            })
+            $report = [pscustomobject]@{ execution_successful = $true; analysis_completeness = $completeness }
+            $probeModule = New-Module -Name "SkillSpectorProbe_$([guid]::NewGuid().ToString('N'))" `
+                -ScriptBlock ([scriptblock]::Create($script:SkillSpectorProbeSource))
+            try {
+                $failure = $null
+                try {
+                    & $probeModule {
+                        param($probeReport)
+                        Assert-SkillSpectorReport -Report $probeReport -SkillRoot 'C:\candidate\skills\sample' `
+                            -SkillId 'sample-skill' -ExpectedInventoryPaths @('SKILL.md')
+                    } $report
+                }
+                catch { $failure = $_.Exception }
+                $failure | Should -Not -BeNullOrEmpty
+                $failure.Message | Should -Match "$fieldName.*count=1"
+                $failure.Message | Should -Not -Match 'SECRET_MARKER|[\r\n]'
+            }
+            finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
     It 'accepts a clean skill-tools SARIF report with no findings' {
         $start = $script:Validator.IndexOf('function Assert-SkillToolsReport')
         $end = $script:Validator.IndexOf('function Assert-PathWithinRoot')

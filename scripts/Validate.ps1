@@ -1881,7 +1881,15 @@ function Resolve-ReportedFilePath {
 }
 
 function Assert-SkillSpectorReport {
-    param($Report, [string] $SkillRoot, [string] $SkillId, [string[]] $ExpectedInventoryPaths)
+    param(
+        $Report,
+        [string] $SkillRoot,
+        [string] $SkillId,
+        [string[]] $ExpectedInventoryPaths,
+        [string] $CandidateCommit,
+        [string] $ScannerVersion,
+        [string] $InventorySha256
+    )
     $numericTypes = @([byte], [sbyte], [int16], [uint16], [int], [uint32], [long], [uint64], [single], [double], [decimal])
     $readDiagnosticField = {
         param($Object, [string] $Name)
@@ -1937,6 +1945,8 @@ function Assert-SkillSpectorReport {
     $coverage = $coverageField.Value
     $coverageIsNumeric = $false
     foreach ($type in $numericTypes) { if ($coverage -is $type) { $coverageIsNumeric = $true; break } }
+    $safeSkillId = '[redacted]'
+    if ($SkillId -cmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$' -and $SkillId.Length -le 64) { $safeSkillId = $SkillId }
     if (-not $reportExecutionField.Present -or $executionSuccessful -isnot [bool] -or -not $executionSuccessful -or
         -not $completenessObjectField.Present -or $completeness -isnot [pscustomobject] -or
         -not $completenessExecutionField.Present -or $completenessExecutionField.Value -isnot [bool] -or
@@ -1944,8 +1954,6 @@ function Assert-SkillSpectorReport {
         -not $isCompleteField.Present -or $isCompleteField.Value -isnot [bool] -or -not $isCompleteField.Value -or
         -not $statusField.Present -or $statusField.Value -isnot [string] -or $statusField.Value -cne 'complete' -or
         -not $coverageField.Present -or -not $coverageIsNumeric -or $coverage -ne 100) {
-        $safeSkillId = '[redacted]'
-        if ($SkillId -cmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$' -and $SkillId.Length -le 64) { $safeSkillId = $SkillId }
         $diagnosticFields = @(
             (& $formatDiagnosticField 'execution_successful' $reportExecutionField)
             (& $formatDiagnosticField 'analysis_completeness.execution_successful' $completenessExecutionField)
@@ -1953,14 +1961,56 @@ function Assert-SkillSpectorReport {
             (& $formatDiagnosticField 'analysis_completeness.status' $statusField)
             (& $formatDiagnosticField 'analysis_completeness.coverage_percent' $coverageField)
         )
+        $ledgerField = & $readDiagnosticField $completeness 'ledger_exceptions'
+        if ($ledgerField.Present -and $ledgerField.Value -is [array] -and $ledgerField.Value.Count -gt 0) {
+            # The report is untrusted. Log only fixed labels, bounded counts, and
+            # indices into the candidate's ordinal-sorted integrity inventory.
+            $ledgerItems = @($ledgerField.Value)
+            $limit = [Math]::Min($ledgerItems.Count, 32)
+            $staticParseLimitCount = 0
+            $otherCount = 0
+            $inventoryIndices = [Collections.Generic.List[int]]::new()
+            for ($i = 0; $i -lt $limit; $i++) {
+                $entry = $ledgerItems[$i]
+                $reasonField = & $readDiagnosticField $entry 'reason_code'
+                $pathField = & $readDiagnosticField $entry 'path'
+                if ($reasonField.Present -and $reasonField.Value -is [string] -and
+                    $reasonField.Value -ceq 'static_parse_limit') {
+                    $staticParseLimitCount++
+                    if ($pathField.Present -and $pathField.Value -is [string]) {
+                        for ($index = 0; $index -lt $ExpectedInventoryPaths.Count; $index++) {
+                            if ([string]::Equals($ExpectedInventoryPaths[$index], $pathField.Value, [StringComparison]::Ordinal)) {
+                                $inventoryIndices.Add($index)
+                                break
+                            }
+                        }
+                    }
+                }
+                else { $otherCount++ }
+            }
+            if ($CandidateCommit -cmatch '^[0-9a-f]{40}$') { $diagnosticFields += "candidateCommit=$CandidateCommit" }
+            if ($ScannerVersion -cmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -and $ScannerVersion.Length -le 32) {
+                $diagnosticFields += "scannerVersion=$ScannerVersion"
+            }
+            if ($InventorySha256 -cmatch '^[0-9a-f]{64}$') { $diagnosticFields += "inventorySha256=$InventorySha256" }
+            $indices = if ($inventoryIndices.Count -gt 0) { $inventoryIndices.ToArray() -join ',' } else { 'none' }
+            $truncated = if ($ledgerItems.Count -gt $limit) { 'true' } else { 'false' }
+            $diagnosticFields += "inventoryCount=$($ExpectedInventoryPaths.Count)"
+            $diagnosticFields += "ledgerTotal=$($ledgerItems.Count)"
+            $diagnosticFields += "sampledLedgerEntries=$limit"
+            $diagnosticFields += "staticParseLimitInSample=$staticParseLimitCount"
+            $diagnosticFields += "otherInSample=$otherCount"
+            $diagnosticFields += "inventoryIndicesInSample=$indices"
+            $diagnosticFields += "truncated=$truncated"
+        }
         $diagnostic = "SkillSpector completeness rejected: skillId=$safeSkillId; $($diagnosticFields -join '; ')"
         throw "SkillSpector did not prove complete static analysis for '$safeSkillId'. $diagnostic"
     }
     foreach ($name in @('ledger_exceptions', 'scope_exclusions', 'limitations')) {
         $items = Get-RequiredProperty -Object $completeness -Name $name -Context 'SkillSpector completeness'
         if ($items -isnot [array] -or @($items).Count -ne 0) {
-            $detail = ConvertTo-Json -InputObject $items -Depth 12 -Compress
-            throw "SkillSpector reported incomplete '$name' evidence for '$SkillId': $detail"
+            $count = if ($items -is [array]) { @($items).Count } else { 'invalid-type' }
+            throw "SkillSpector reported incomplete '$name' evidence for '$safeSkillId': count=$count"
         }
     }
     $skill = Get-RequiredProperty -Object $Report -Name 'skill' -Context 'SkillSpector report'
@@ -4264,7 +4314,10 @@ foreach ($skillId in $skillIds) {
     $reportPath = Join-Path $childOutputRoot "skillspector-static-$skillId.json"
     [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $skillSpectorRuntimeEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
     $report = Read-JsonFile -Path $reportPath -Context "SkillSpector static report for $skillId"
-    $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
+    $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId `
+        -ExpectedInventoryPaths $expectedInventoryPaths -CandidateCommit $candidateCommit `
+        -ScannerVersion ([string]$receipts.skillspector.resolvedVersion) `
+        -InventorySha256 ([string]$skillIntegrity[0].contentSha256))
     foreach ($issue in $issues) {
         $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector issue'
         if ($reportedSeverity -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedSeverity)) {
