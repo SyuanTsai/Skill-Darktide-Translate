@@ -58,19 +58,19 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $validator | Should -Not -Match 'postPesterRepositoryValidatorPath'
     }
 
-    # Scenario: The canonical validator is invoked directly on a non-Windows host.
-    # Purpose: Stop before legacy Linux isolation setup, which is outside the supported R4 execution path.
-    It 'UnitT50_RejectsUnsupportedHostsBeforeLegacyLinuxSetup' {
+    # Scenario: The canonical validator is invoked on a host outside the supported Windows CI runtime.
+    # Purpose: Fail before validation setup so an unsupported host cannot produce a misleading report.
+    It 'UnitT50_RejectsUnsupportedHostsBeforeValidationSetup' {
         $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
         $hostDetection = $validator.IndexOf('$script:IsWindowsHost =', [StringComparison]::Ordinal)
-        $linuxSetup = $validator.IndexOf('$script:IsLinuxHost =', [StringComparison]::Ordinal)
+        $validationSetup = $validator.IndexOf('function Read-StrictUtf8File', [StringComparison]::Ordinal)
         $guard = [regex]::Match($validator,
             "(?s)if \(-not \`$script:IsWindowsHost\) \{\s*throw 'Standard v1 validation requires Windows with PowerShell 7\.'\s*\}")
 
         $hostDetection | Should -BeGreaterOrEqual 0
         $guard.Success | Should -BeTrue
         $guard.Index | Should -BeGreaterThan $hostDetection
-        $guard.Index | Should -BeLessThan $linuxSetup
+        $guard.Index | Should -BeLessThan $validationSetup
 
         $guardBlock = [scriptblock]::Create($guard.Value)
         $previousHostFlag = Get-Variable -Name IsWindowsHost -Scope Script -ErrorAction SilentlyContinue
@@ -86,33 +86,26 @@ Describe 'Darktide Translate Standard v1 conformance' {
         }
     }
 
-    It 'routes pull requests through the base-owned protected validator and additive candidate gate' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+    # Scenario: A pull request or main push enters the single Windows validation workflow.
+    # Purpose: Require exact-head validation with a digest-verified Microsoft stable PowerShell release.
+    It 'UnitT60_UsesTheLatestStableWindowsWorkflow' {
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $workflow | Should -Match 'scripts/Validate\.ps1'
-        $workflow | Should -Match 'pull_request_target:'
-        $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.sha \}\}'
-        $workflow | Should -Match '\$validatorArguments = @\{'
-        $workflow | Should -Match '& \$trustedValidator @validatorArguments'
+        $workflow | Should -Match 'pull_request:'
+        $workflow | Should -Match 'push:'
+        $workflow | Should -Match 'branches:\s*\r?\n\s+- main'
         $workflow | Should -Match 'persist-credentials:\s*false'
         $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
         $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
-        $workflow | Should -Match 'Export canonical evidence for clean upload'
-        $workflow | Should -Match 'upload-canonical-validation-evidence'
-        $workflow | Should -Match 'evidence_base64'
-        $workflow | Should -Not -Match '(?m)^\s*(Install-Module|npm install|go install|pip install)\b'
-
-        foreach ($context in @('repository-contract', 'skill-validator', 'skill-tools')) {
-            $pattern = "(?ms)^\s+{0}:\s+name:\s+{0}.*?needs:\s+- canonical-validation.*?{1}" -f `
-                [regex]::Escape($context),
-                [regex]::Escape("needs['canonical-validation'].result")
-            $workflow | Should -Match $pattern
-        }
-
-        $candidate = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
-        $candidate | Should -Match '(?m)^  pull_request:\s*$'
-        $candidate | Should -Match 'github\.event\.pull_request\.head\.sha'
-        $candidate | Should -Match 'persist-credentials: false'
-        $candidate | Should -Not -Match 'pull_request_target|checks: write'
+        $workflow | Should -Match 'Install-LatestPowerShell\.ps1'
+        $workflow | Should -Match 'PowerShellRelease\.psm1'
+        $workflow | Should -Match 'sha256:'
+        $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
+        $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
+        $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
+        $workflow | Should -Not -Match 'pull_request_target|checks: write|ubuntu-latest|repository-contract \(Windows PowerShell 5\.1\)'
+        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/skill-validator.yml') | Should -BeFalse
     }
 }

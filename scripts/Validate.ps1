@@ -4099,7 +4099,9 @@ function Assert-BootstrapTransitionChangedPaths {
 
     $allowedPathList = @(
         '.github/workflows/skill-validator.yml'
-        '.github/workflows/standard-v1-protected.yml'
+        '.github/workflows/standard-v1-candidate-windows.yml'
+        'scripts/Install-LatestPowerShell.ps1'
+        'scripts/PowerShellRelease.psm1'
         'scripts/Test-Repository.ps1'
         'scripts/Validate.ps1'
         'tests/BootstrapTransition.Tests.ps1'
@@ -4115,10 +4117,16 @@ function Assert-BootstrapTransitionChangedPaths {
         'tests/StandardV1Conformance.Tests.ps1'
         'tests/Test-Repository.Tests.ps1'
         'tests/TestSupport.ps1'
-        'tests/validate-windows-powershell.ps1'
+        'tests/ValidationTransition.Tests.ps1'
     )
     $allowedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($path in $allowedPathList) { [void]$allowedPaths.Add($path) }
+    $retiredPathList = @(
+        '.github/workflows/standard-v1-protected.yml'
+        'tests/validate-windows-powershell.ps1'
+    )
+    $retiredPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($path in $retiredPathList) { [void]$retiredPaths.Add($path) }
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
     $gitOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot diff --find-renames=100% --name-status -z "$BaseCommit...$CandidateCommit") -join '')
     if ($LASTEXITCODE -ne 0) {
@@ -4135,14 +4143,16 @@ function Assert-BootstrapTransitionChangedPaths {
         if ($status -cmatch '^[RC][0-9]{3}$') {
             throw "Bootstrap transition changed-path allowlist rejects rename/copy status '$status'."
         }
-        if ($status -cnotmatch '^[AM]$') {
-            throw "Bootstrap transition changed-path allowlist rejects Git status '$status'."
-        }
         if ($index + 1 -ge $tokens.Count) {
             throw 'Git returned an incomplete bootstrap transition status record.'
         }
         $path = [string]$tokens[$index + 1]
-        if (-not $allowedPaths.Contains($path)) {
+        if ($status -ceq 'D') {
+            if (-not $retiredPaths.Contains($path)) {
+                throw "Bootstrap transition changed-path allowlist rejects deletion '$path'."
+            }
+        }
+        elseif ($status -cnotmatch '^[AM]$' -or -not $allowedPaths.Contains($path)) {
             throw "Bootstrap transition changed-path allowlist rejects '$path'."
         }
         if (-not $changedPathSet.Add($path)) {
@@ -4153,10 +4163,8 @@ function Assert-BootstrapTransitionChangedPaths {
     }
 
     $requiredPathList = @(
-        '.github/workflows/standard-v1-protected.yml'
         'scripts/Test-Repository.ps1'
         'scripts/Validate.ps1'
-        'tests/validate-windows-powershell.ps1'
     )
     # A maintenance update need not rewrite every established trust anchor.
     # Both immutable revisions must still contain every anchor as a regular blob.
@@ -4172,6 +4180,41 @@ function Assert-BootstrapTransitionChangedPaths {
                 $Matches.path -cne $requiredPath) {
                 throw "Bootstrap transition requires tracked regular trust anchor '$requiredPath' at '$revision'."
             }
+        }
+    }
+    foreach ($requiredPath in @(
+            '.github/workflows/standard-v1-candidate-windows.yml'
+            'scripts/Install-LatestPowerShell.ps1'
+            'scripts/PowerShellRelease.psm1'
+        )) {
+        $anchorOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $CandidateCommit -- $requiredPath) -join '')
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect latest-only Windows validation anchor '$requiredPath' at '$CandidateCommit'."
+        }
+        $anchorRecords = @($anchorOutput.Split([char]0) | Where-Object { $_ -ne '' })
+        if ($anchorRecords.Count -ne 1 -or
+            $anchorRecords[0] -cnotmatch '^(?<mode>100644|100755) blob [0-9a-f]{40}\t(?<path>[^\x00\r\n]+)$' -or
+            $Matches.path -cne $requiredPath) {
+            throw "Latest-only Windows validation requires tracked regular anchor '$requiredPath' at '$CandidateCommit'."
+        }
+    }
+    foreach ($retiredPath in $retiredPathList) {
+        $baseOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $BaseCommit -- $retiredPath) -join '')
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect retired validation anchor '$retiredPath' at '$BaseCommit'."
+        }
+        $baseRecords = @($baseOutput.Split([char]0) | Where-Object { $_ -ne '' })
+        if ($baseRecords.Count -ne 1 -or
+            $baseRecords[0] -cnotmatch '^(?<mode>100644|100755) blob [0-9a-f]{40}\t(?<path>[^\x00\r\n]+)$' -or
+            $Matches.path -cne $retiredPath) {
+            throw "Bootstrap retirement requires the old validation anchor '$retiredPath' at '$BaseCommit'."
+        }
+        $candidateOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $CandidateCommit -- $retiredPath) -join '')
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect retired validation anchor '$retiredPath' at '$CandidateCommit'."
+        }
+        if (@($candidateOutput.Split([char]0) | Where-Object { $_ -ne '' }).Count -ne 0) {
+            throw "Bootstrap retirement requires '$retiredPath' to be absent from '$CandidateCommit'."
         }
     }
     return [pscustomobject][ordered]@{

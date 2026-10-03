@@ -81,72 +81,21 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'symbolicLinkTarget='
     }
 
-    It 'fails closed for explicitly supplied blank Linux read-only paths' {
-        $script:Validator | Should -Match '\[IO\.Path\]::GetFullPath\(\[string\]\$readOnlyPath\)'
-        $script:Validator | Should -Not -Match 'IsNullOrWhiteSpace\(\$readOnlyPathText\)\) \{ continue \}'
-    }
 
-    It 'keeps reparse accounting explicit in the descriptor-relative writable-root scan' {
-        $script:Validator | Should -Match '\[switch\] \$AllowReparseEntries'
-        $script:Validator | Should -Match 'S_IFLNK'
-        $script:Validator | Should -Match 'Writable root contains a reparse entry'
-    }
 
-    It 'counts but never traverses explicitly allowed writable-root reparse entries' {
-        $usageStart = $script:Validator.IndexOf('function Get-LinuxWritableRootUsage', [StringComparison]::Ordinal)
-        $usageEnd = $script:Validator.IndexOf('function Assert-LinuxWritableRootUsage', $usageStart, [StringComparison]::Ordinal)
-        $usageFunction = $script:Validator.Substring($usageStart, $usageEnd - $usageStart)
 
-        $usageFunction | Should -Match '\[switch\] \$AllowReparseEntries'
-        $usageFunction | Should -Match '-MaximumEntries\s+100000'
-        $usageFunction | Should -Match '-AllowReparseEntries\s+\(\[bool\]\$AllowReparseEntries\)'
-        $script:Validator | Should -Match 'if \(fileType == S_IFLNK\) \{[\s\S]*?if \(allowReparseEntries\) \{ continue; \}'
-    }
 
-    # Scenario: A hostile tree swaps or inserts a symlink while writable-root inspection is running.
-    # Purpose: Keep traversal descriptor-relative and reject reparse entries before following them.
-    It 'UnitT90_UsesDescriptorRelativeNoFollowWritableRootTraversal' {
-        $usageStart = $script:Validator.IndexOf('function Get-LinuxWritableRootUsage', [StringComparison]::Ordinal)
-        $usageEnd = $script:Validator.IndexOf('function Assert-LinuxWritableRootUsage', $usageStart, [StringComparison]::Ordinal)
-        $usageFunction = $script:Validator.Substring($usageStart, $usageEnd - $usageStart)
 
-        $script:Validator | Should -Match 'openat'
-        $script:Validator | Should -Match 'O_NOFOLLOW'
-        $script:Validator | Should -Match 'AT_SYMLINK_NOFOLLOW'
-        $usageFunction | Should -Not -Match 'EnumerateFileSystemInfos|Get-ChildItem'
-    }
 
-    It 'enforces writable-root growth during every protected Pester shard' {
-        $runspaceStart = $script:Validator.IndexOf('function Invoke-ProtectedPesterRunspace', [StringComparison]::Ordinal)
-        $runspaceEnd = $script:Validator.IndexOf('if ($ProtectedPesterServerProxy)', $runspaceStart, [StringComparison]::Ordinal)
-        $runspaceFunction = $script:Validator.Substring($runspaceStart, $runspaceEnd - $runspaceStart)
 
-        $runspaceFunction | Should -Match '\[int64\] \$WritableRootBaselineBytes'
-        $runspaceFunction | Should -Match '(?s)Assert-LinuxAggregateResourceUsage.*?Assert-LinuxWritableRootUsage'
-        $runspaceFunction | Should -Match '-BaselineBytes \$WritableRootBaselineBytes'
-        $runspaceFunction | Should -Match '(?s)\$output = @\(\$powerShell\.EndInvoke\(\$asyncResult\)\).*?Assert-LinuxWritableRootUsage'
 
-        $supervisorStart = $script:Validator.IndexOf('function Invoke-ProtectedPesterSupervisor', [StringComparison]::Ordinal)
-        $supervisorEnd = $script:Validator.IndexOf('if ($ProtectedPesterSupervisor)', $supervisorStart, [StringComparison]::Ordinal)
-        $supervisorFunction = $script:Validator.Substring($supervisorStart, $supervisorEnd - $supervisorStart)
-        $supervisorFunction | Should -Match '(?s)\$linuxWritableRootBaselineBytes = \[int64\]0.*?foreach \(\$requiredPesterTest'
-        $supervisorFunction | Should -Match '-WritableRootBaselineBytes \$linuxWritableRootBaselineBytes'
-    }
 
-    It 'sizes the private Linux etc projection for hosted runner images' {
-        $script:Validator | Should -Match 'size=268435456,nodev,nosuid,noexec tmpfs "\$target"'
-    }
 
-    It 'uses the portable setpriv syntax for clearing ambient capabilities' {
-        $script:Validator | Should -Match ([regex]::Escape('--ambient-caps=-all'))
-        $script:Validator | Should -Not -Match ([regex]::Escape('--ambient-clear'))
-    }
 
-    It 'skips unreadable optional Linux module search paths without weakening required paths' {
-        $script:Validator | Should -Match 'modulePathExists = Test-Path -LiteralPath \$modulePath -PathType Container -ErrorAction Stop'
-        $script:Validator | Should -Match 'catch \[UnauthorizedAccessException\]'
-        $script:Validator | Should -Match 'Inherited PSModulePath entries are optional'
-    }
+
+
+
+
 
     It 'verifies host runtimes by absolute path and hash while keeping package files run-owned' {
         $script:Validator | Should -Match 'function Assert-ExternalReceiptFile'
@@ -424,42 +373,29 @@ Describe 'Canonical Standard v1 validation adapter' {
         $pesterIndex = $script:Validator.IndexOf('$pesterRunnerPath')
         $semanticIndex | Should -BeGreaterThan -1
         $pesterIndex | Should -BeGreaterThan $semanticIndex
-        $candidate = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
-        $candidate | Should -Match '(?m)^  pull_request:\s*$'
-        $candidate | Should -Match 'github\.event\.pull_request\.head\.sha'
-        $workflow | Should -Match 'github\.run_attempt'
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
+        $workflow | Should -Match '(?m)^  pull_request:\s*$'
+        $workflow | Should -Match '(?ms)^  push:\s*\r?\n\s{4}branches:\s*\r?\n\s{6}- main'
         $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
-        $workflow | Should -Match 'pull_request_target:'
-        $workflow | Should -Match 'ref: \$\{\{ github\.event_name == .pull_request_target. && github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}'
-        $workflow | Should -Match 'Materialize protected validation supervisor'
-        $workflow | Should -Match 'Materialize protected Windows compatibility contract'
-        $workflow | Should -Match 'TRUSTED_WINDOWS_CONTRACT'
-        $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.sha \}\}'
-        $workflow | Should -Match 'TRUSTED_DEFAULT_BRANCH: \$\{\{ github\.event\.repository\.default_branch \}\}'
-        $workflow | Should -Match "GITHUB_EVENT_NAME -eq 'workflow_dispatch'"
-        $workflow | Should -Match 'refs/remotes/origin'
-        $workflow | Should -Match 'Enable unprivileged Linux user namespaces'
-        $workflow | Should -Match 'kernel\.unprivileged_userns_clone=1'
-        $workflow | Should -Match 'kernel\.apparmor_restrict_unprivileged_userns=0'
-        $workflow | Should -Match 'unshare --user --map-root-user --pid --fork --kill-child=SIGKILL -- true'
-        $workflow | Should -Match 'publish-head-required-checks'
-        $workflow | Should -Match "github\.event_name != 'workflow_dispatch'"
-        $workflow | Should -Match 'HEAD_SHA'
-        $workflow | Should -Match 'Darktide Translate Standard v1'
-        $workflow | Should -Not -Match "github\.event_name == 'pull_request'"
-        $workflow | Should -Not -Match 'TRUSTED_VALIDATE_BLOB|TRUSTED_REPOSITORY_VALIDATOR_BLOB'
-        $workflow | Should -Match '\$actualBlob = .*rev-parse \$revision'
-        $workflow | Should -Match 'TRUSTED_SUPERVISOR_ROOT'
-        $workflow | Should -Match '\$trustedValidator = Join-Path \$env:TRUSTED_SUPERVISOR_ROOT'
-        $workflow | Should -Match 'id: canonical-validation'
-        $workflow | Should -Match 'Verify canonical validation evidence'
-        $workflow | Should -Match 'standard_v1_evidence_sha256'
-        $workflow | Should -Not -Match '(?m)^\s*& \.\/scripts\/Validate\.ps1'
+        $workflow | Should -Match 'persist-credentials:\s*false'
+        $workflow | Should -Match 'Install-LatestPowerShell\.ps1'
+        $workflow | Should -Match 'PowerShellRelease\.psm1'
+        $installer = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Install-LatestPowerShell.ps1') -Raw
+        $installer | Should -Match 'https://aka\.ms/powershell-release\?tag=stable'
+        $installer | Should -Match 'BaseResponse\.RequestMessage\.RequestUri'
+        $installer | Should -Match 'Get-VerifiedPowerShellStableTagFromUri'
+        $installer | Should -Match 'Assert-PowerShellReleaseTagMatchesStableChannel'
+        $installer | Should -Match 'releases/tags/\$stableTag'
+        $workflow | Should -Match 'publishedDigest'
+        $workflow | Should -Match 'executableVersion'
+        $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
+        $workflow | Should -Not -Match 'pull_request_target|checks: write|ubuntu-latest|CODEX_PESTER_CGROUP_ROOT|CANONICAL_RESULT|repository-contract \(Windows PowerShell 5\.1\)|actions/upload-artifact|GITHUB_STEP_SUMMARY'
+        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1') | Should -BeFalse
     }
 
     It 'keeps required CI free of implicit LLM credentials and skipped tests' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $workflow | Should -Not -Match 'EnableSemanticScan'
         $script:Validator | Should -Match 'credential-free and deterministic'
         $script:Validator | Should -Match 'SkippedCount -ne 0'
@@ -474,157 +410,37 @@ Describe 'Canonical Standard v1 validation adapter' {
         $repositoryValidator | Should -Match 'NoFilters:\$NoFilters'
     }
 
-    # Scenario: A collaborator can choose a branch when manually dispatching a workflow.
-    # Purpose: A branch-owned definition must never gain this publisher's checks permission.
-    It 'does not expose ref-selectable dispatch on the privileged workflow' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
-        $workflow | Should -Not -Match '(?m)^\s+workflow_dispatch:'
-        $workflow | Should -Match '(?m)^  pull_request_target:'
-        $workflow | Should -Match 'baseCandidate.*not.*distinct ancestor'
-        $workflow | Should -Match "github\.event_name == 'push'.*github\.sha"
+    # Scenario: A collaborator can trigger pull request or main-push validation only.
+    # Purpose: Keep the route read-only, exact-head-bound, and free of status publishers.
+    It 'UnitT90_UsesOnlyTheReadOnlyLatestStableWindowsRoute' {
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
+        $workflow | Should -Not -Match '(?m)^\s+workflow_dispatch:|pull_request_target|checks: write|status: write|actions/upload-artifact|GITHUB_STEP_SUMMARY'
+        $workflow | Should -Match '(?m)^permissions:\s*\r?\n  contents: read\s*$'
+        $workflow | Should -Match 'timeout-minutes:'
+        $workflow | Should -Match 'if:\s*always\(\)'
+        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
     }
 }
 
 Describe 'Protected workflow trust binding' {
     BeforeAll {
         $script:TrustRepositoryRoot = Split-Path -Parent $PSScriptRoot
-        $script:TrustWorkflow = Get-Content -LiteralPath (Join-Path $script:TrustRepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
         $script:TrustValidator = Get-Content -LiteralPath (Join-Path $script:TrustRepositoryRoot 'scripts/Validate.ps1') -Raw
 
-        function Get-TestWorkflowStep {
-            param([string] $Name)
-            $pattern = '(?ms)^      - name: ' + [regex]::Escape($Name) + '\r?\n(?:(?!^      - name: ).)*?        run: \|\r?\n(?<body>(?:          [^\r\n]*\r?\n|\r?\n)+)'
-            $match = [regex]::Match($script:TrustWorkflow, $pattern)
-            if (-not $match.Success) { throw "Workflow step not found: $Name" }
-            return [regex]::Replace($match.Groups['body'].Value, '(?m)^          ', '')
-        }
 
-        function Invoke-TestManualTrust {
-            param([string] $BaseMode = 'blank', [string] $EventName = 'workflow_dispatch', [switch] $RemoveProof)
-            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
-            $repo = Join-Path $root 'repo'
-            $temp = Join-Path $root 'runner'
-            [void](New-Item -ItemType Directory -Path $repo, $temp, (Join-Path $repo 'scripts'), (Join-Path $repo 'tests') -Force)
-            $git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path
-            function Invoke-FixtureGit {
-                param([string[]] $GitArgs)
-                $output = @(& $git -C $repo -c user.name=Example -c user.email=example@example.test -c commit.gpgsign=false @GitArgs 2>&1)
-                if ($LASTEXITCODE -ne 0) { throw "Git fixture failed: $output" }
-                return ($output -join "`n").Trim()
-            }
-            $start = $script:TrustValidator.IndexOf('$trustedPesterCommit =', [StringComparison]::Ordinal)
-            $end = $script:TrustValidator.IndexOf('$pesterMirrorRoot =', $start, [StringComparison]::Ordinal)
-            if ($start -lt 0 -or $end -le $start) { throw 'Production Pester trust-selection block not found.' }
-            $selection = $script:TrustValidator.Substring($start, $end - $start)
-            $spy = @'
-param($RepositoryRoot, $ArtifactsRoot, $BaseCommit, $TrustedTestCommit, $ExpectedGoRuntimeVersion, $OutputPath)
-$isGitHubActions = $true
-$candidateCommit = (& git -C $RepositoryRoot rev-parse HEAD) -join ''
-'@ + "`n" + $selection + @'
 
-$marker = (& git -C $RepositoryRoot show "${trustedPesterCommit}:tests/marker.txt") -join ''
-if ($LASTEXITCODE -ne 0) { throw 'Selected trusted test commit is not readable.' }
-[pscustomobject]@{ base = $BaseCommit; trusted = $trustedPesterCommit; marker = $marker } |
-    ConvertTo-Json | Set-Content -LiteralPath $OutputPath -Encoding utf8
-'@
-            [IO.File]::WriteAllText((Join-Path $repo 'scripts/Validate.ps1'), $spy)
-            [IO.File]::WriteAllText((Join-Path $repo 'scripts/Test-Repository.ps1'), '# trusted fixture')
-            [IO.File]::WriteAllText((Join-Path $repo 'tests/marker.txt'), 'common')
-            [void](Invoke-FixtureGit @('init', '-q', '-b', 'main'))
-            [void](Invoke-FixtureGit @('add', '.'))
-            [void](Invoke-FixtureGit @('commit', '-qm', 'common'))
-            $common = Invoke-FixtureGit @('rev-parse', 'HEAD')
-            [void](Invoke-FixtureGit @('checkout', '-qb', 'candidate'))
-            [IO.File]::WriteAllText((Join-Path $repo 'tests/marker.txt'), 'candidate-untrusted')
-            [void](Invoke-FixtureGit @('commit', '-qam', 'candidate'))
-            $candidate = Invoke-FixtureGit @('rev-parse', 'HEAD')
-            [void](Invoke-FixtureGit @('checkout', '-q', 'main'))
-            [IO.File]::WriteAllText((Join-Path $repo 'tests/marker.txt'), 'default-trusted')
-            [void](Invoke-FixtureGit @('commit', '-qam', 'trusted'))
-            $trusted = Invoke-FixtureGit @('rev-parse', 'HEAD')
-            [void](Invoke-FixtureGit @('update-ref', 'refs/remotes/origin/main', $trusted))
-            [void](Invoke-FixtureGit @('checkout', '-q', 'candidate'))
-            $names = @('RUNNER_TEMP', 'GITHUB_ENV', 'GITHUB_EVENT_NAME', 'GITHUB_SHA', 'TRUSTED_SUPERVISOR_COMMIT', 'TRUSTED_DEFAULT_BRANCH', 'TRUSTED_SUPERVISOR_ROOT', 'TRUSTED_SUPERVISOR_SHA', 'PULL_REQUEST_BASE_SHA', 'PUSH_BEFORE_SHA', 'STANDARD_GO_RUNTIME_VERSION')
-            $saved = @{}
-            foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
-            $savedNativeDirectory = [Environment]::CurrentDirectory
-            Push-Location $repo
-            try {
-                # GitHub launches pwsh with its native cwd equal to the checkout.
-                # Match that for the real ProcessStartInfo cat-file invocation.
-                [Environment]::CurrentDirectory = $repo
-                $env:RUNNER_TEMP = $temp
-                $env:GITHUB_ENV = Join-Path $temp 'github-env'
-                $env:GITHUB_EVENT_NAME = $EventName
-                $env:GITHUB_SHA = if ($EventName -eq 'workflow_dispatch') { $candidate } else { $common }
-                $env:TRUSTED_SUPERVISOR_COMMIT = if ($EventName -eq 'workflow_dispatch') { $candidate } else { $common }
-                $env:TRUSTED_DEFAULT_BRANCH = 'main'
-                $env:TRUSTED_SUPERVISOR_SHA = ''
-                $env:PUSH_BEFORE_SHA = ''
-                $env:STANDARD_GO_RUNTIME_VERSION = '1.2.3'
-                $env:PULL_REQUEST_BASE_SHA = switch ($BaseMode) {
-                    'matching' { $trusted }; 'candidate' { $candidate }; 'malformed' { 'not-a-sha' }; 'common' { $common }; default { '' }
-                }
-                & ([scriptblock]::Create((Get-TestWorkflowStep 'Materialize protected validation supervisor')))
-                foreach ($line in (Get-Content -LiteralPath $env:GITHUB_ENV)) {
-                    $parts = $line.Split('=', 2)
-                    [Environment]::SetEnvironmentVariable($parts[0], $parts[1])
-                }
-                if ($RemoveProof) { $env:TRUSTED_SUPERVISOR_SHA = '' }
-                $canonical = Get-TestWorkflowStep 'Run canonical Standard v1 validation'
-                $selectionStart = $canonical.IndexOf('$repositoryRoot =', [StringComparison]::Ordinal)
-                if ($selectionStart -lt 0) { throw 'Canonical parameter-selection boundary not found.' }
-                # This portable regression executes the real Git/parameter path;
-                # Linux cgroup admission is validated by the protected Linux job.
-                & ([scriptblock]::Create($canonical.Substring($selectionStart)))
-                $result = Get-Content -LiteralPath (Join-Path $temp 'darktide-translate-conformance-report.json') -Raw | ConvertFrom-Json
-                return [pscustomobject]@{ Result = $result; Trusted = $trusted; Common = $common }
-            }
-            finally {
-                [Environment]::CurrentDirectory = $savedNativeDirectory
-                Pop-Location
-                foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-            }
-        }
+
     }
 
-    # Scenario: A manual candidate diverges from the current default branch and omits the optional base.
-    # Purpose: Candidate-owned tests cannot replace the supervisor's trusted regression archive.
-    It 'InterT10_BindsBlankManualBaseToResolvedDefaultTests' {
-        $probe = Invoke-TestManualTrust
-        $probe.Result.trusted | Should -BeExactly $probe.Trusted
-        $probe.Result.marker | Should -BeExactly 'default-trusted'
-        $probe.Result.base | Should -BeNullOrEmpty
-    }
 
-    # Scenario: A caller supplies the same resolved default SHA despite divergent candidate history.
-    # Purpose: Keep trusted-test identity separate from optional ancestor-only diff comparison.
-    It 'InterT20_AcceptsMatchingManualBaseWithoutCandidateFallback' {
-        $probe = Invoke-TestManualTrust -BaseMode matching
-        $probe.Result.trusted | Should -BeExactly $probe.Trusted
-        $probe.Result.base | Should -BeNullOrEmpty
-    }
 
-    # Scenario: A manual caller names a candidate or malformed SHA instead of the trusted default.
-    # Purpose: Reject arbitrary test provenance instead of silently falling back to candidate tests.
-    It 'InterT30_RejectsConflictingManualBase_<mode>' -ForEach @(@{ mode = 'candidate' }, @{ mode = 'malformed' }) {
-        { Invoke-TestManualTrust -BaseMode $mode } | Should -Throw '*manual base*trusted supervisor*'
-    }
 
-    # Scenario: Materializer proof is missing before canonical invocation.
-    # Purpose: An absent trust identity must fail closed before expensive validation.
-    It 'InterT40_RejectsMissingSupervisorIdentity' {
-        { Invoke-TestManualTrust -RemoveProof } | Should -Throw '*supervisor*SHA*'
-    }
 
-    # Scenario: A PR event supplies its immutable common ancestor as the supervisor and comparison base.
-    # Purpose: Preserve the established PR archive and changed-path binding.
-    It 'InterT50_PreservesPullRequestTrustedBase' {
-        $probe = Invoke-TestManualTrust -BaseMode common -EventName pull_request_target
-        $probe.Result.trusted | Should -BeExactly $probe.Common
-        $probe.Result.base | Should -BeExactly $probe.Common
-        $probe.Result.marker | Should -BeExactly 'common'
-    }
+
+
+
+
+
 
     # Scenario: Two installed paths share an ordinal, NFC or ASCII-folded identity.
     # Purpose: Fail closed using actual production helpers, including canonically equivalent Unicode.
@@ -654,151 +470,5 @@ if ($LASTEXITCODE -ne 0) { throw 'Selected trusted test commit is not readable.'
         } $first $second } | Should -Throw $message
     }
 
-    # Scenario: An existing summary is rewritten or removed after the trusted preflight emitted its evidence.
-    # Purpose: Exercise the real exporter against a tampered regular file, not a regex approximation.
-    It 'InterT60_AuthenticatesDiagnosticsBeforeExport_<mode>' -ForEach @(
-        @{ mode = 'valid' }, @{ mode = 'tampered' }, @{ mode = 'missing-proof' },
-        @{ mode = 'deleted' }, @{ mode = 'pre-summary-failure' }
-    ) {
-        $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
-        $run = Join-Path $root 'sgv1-fixture'
-        [void](New-Item -ItemType Directory -Path $run -Force)
-        $names = @('RUNNER_TEMP', 'GITHUB_OUTPUT', 'EVIDENCE_BASE64_LENGTH', 'EXPECTED_DIAGNOSTICS_SHA256')
-        $saved = @{}
-        foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
-        try {
-            $env:RUNNER_TEMP = $root
-            $env:GITHUB_OUTPUT = Join-Path $root 'trusted-output'
-            $env:EVIDENCE_BASE64_LENGTH = '0'
-            $env:EXPECTED_DIAGNOSTICS_SHA256 = ''
-            $securityPreflightSummaryPath = Join-Path $run 'security-preflight-summary.json'
-            $securityBlockers = @()
-            $sanitizedSecurityFindings = @()
-            $runId = 'fixture'
-            $start = $script:TrustValidator.IndexOf('$securityPreflightSummary =', [StringComparison]::Ordinal)
-            $end = $script:TrustValidator.IndexOf('if ($securityBlockers.Count -gt 0)', $start, [StringComparison]::Ordinal)
-            & ([scriptblock]::Create($script:TrustValidator.Substring($start, $end - $start)))
-            if (Test-Path -LiteralPath $env:GITHUB_OUTPUT) {
-                $line = Get-Content -LiteralPath $env:GITHUB_OUTPUT | Where-Object { $_ -like 'standard_v1_diagnostics_sha256=*' }
-                $env:EXPECTED_DIAGNOSTICS_SHA256 = ([string]$line).Split('=', 2)[1]
-            }
-            if ($mode -eq 'tampered') {
-                $code = "[IO.File]::WriteAllText('" + $securityPreflightSummaryPath.Replace("'", "''") + "', 'forged summary'); exit 1"
-                $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
-                & (Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })) -NoProfile -EncodedCommand $encoded
-                $LASTEXITCODE | Should -Be 1
-            }
-            if ($mode -in @('deleted', 'pre-summary-failure')) {
-                [IO.File]::Delete($securityPreflightSummaryPath)
-            }
-            if ($mode -in @('missing-proof', 'pre-summary-failure')) { $env:EXPECTED_DIAGNOSTICS_SHA256 = '' }
-            $env:GITHUB_OUTPUT = Join-Path $root 'export-output'
-            $exportPath = Join-Path $root 'export.ps1'
-            [IO.File]::WriteAllText($exportPath, '$ErrorActionPreference = ''Stop''' + [Environment]::NewLine +
-                (Get-TestWorkflowStep 'Export bounded validation diagnostics for clean upload'), [Text.UTF8Encoding]::new($false))
-            # Run the real workflow step in a separate pwsh so its exit 0 cannot
-            # terminate the test harness or bypass subsequent assertions.
-            $exportOutput = @(& (Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })) -NoProfile -NonInteractive -File $exportPath 2>&1)
-            $exportExitCode = $LASTEXITCODE
-            if ($mode -in @('valid', 'pre-summary-failure')) {
-                $exportExitCode | Should -Be 0
-                if ($mode -eq 'valid') { $env:EXPECTED_DIAGNOSTICS_SHA256 | Should -Match '^[0-9a-f]{64}$' }
-                $lines = Get-Content -LiteralPath $env:GITHUB_OUTPUT
-                ($lines | Where-Object { $_ -like 'diagnostics_sha256=*' }) | Should -BeExactly "diagnostics_sha256=$env:EXPECTED_DIAGNOSTICS_SHA256"
-                if ($mode -eq 'pre-summary-failure') {
-                    ($lines | Where-Object { $_ -like 'diagnostics_base64=*' }) | Should -BeExactly 'diagnostics_base64='
-                }
-            }
-            else {
-                $exportExitCode | Should -Not -Be 0
-                ($exportOutput -join [Environment]::NewLine) | Should -Match 'diagnostics'
-                Test-Path -LiteralPath $env:GITHUB_OUTPUT | Should -BeFalse
-            }
-        }
-        finally {
-            foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-        }
-    }
-}
 
-Describe 'Bounded writable-root enumeration behavior' {
-    BeforeAll {
-        $tokens = $null; $errors = $null
-        $ast = [Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1'), [ref]$tokens, [ref]$errors)
-        if (@($errors).Count -ne 0) { throw 'Validator must parse before behavioral testing.' }
-        $script:HostIsLinux = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
-        foreach ($name in @(
-            'Enable-LinuxWritableRootInspector',
-            'Invoke-LinuxWritableRootInspection',
-            'Get-LinuxWritableRootUsage'
-        )) {
-            $definition = $ast.Find({ param($node)
-                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
-            }, $true)
-            if ($null -ne $definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
-            else { throw "Missing production writable-root function: $name" }
-        }
-    }
-
-    BeforeEach {
-        $script:PreviousLinuxHost = $script:IsLinuxHost
-        # Cross-platform function test only: this is not namespace/cgroup acceptance.
-        $script:IsLinuxHost = $true
-        $script:UsageRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
-        [void](New-Item -ItemType Directory -Path $script:UsageRoot)
-        $file = Join-Path $script:UsageRoot 'entry'
-        [IO.File]::WriteAllText($file, '')
-    }
-    AfterEach { $script:IsLinuxHost = $script:PreviousLinuxHost }
-
-    # Scenario: A hostile tree exceeds the bounded entry inventory.
-    # Purpose: Keep the exact 100000 ceiling inside the descriptor-relative native traversal.
-    It 'UnitT10_StopsEnumerationAtTheFirstExcessEntry' {
-        $source = $ast.Extent.Text
-        $source | Should -Match 'entryCount\+\+;\s+if \(entryCount > maximumEntries\)'
-        $source | Should -Match 'Writable root exceeded the aggregate writable-entry-count limit'
-        $usage = $ast.Find({ param($node)
-            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-LinuxWritableRootUsage'
-        }, $true)
-        $usage.Extent.Text | Should -Match '-MaximumEntries\s+100000'
-    }
-
-    # Scenario: The native inspector accepts a result at the inclusive limit.
-    # Purpose: Preserve the PowerShell return contract without executing libc on a non-Linux unit host.
-    It 'UnitT20_AcceptsTheExactEntryLimit' {
-        Mock Invoke-LinuxWritableRootInspection {
-            [pscustomobject]@{ Bytes = [int64]17; EntryCount = 100000 }
-        }
-        $usage = Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Exact fixture'
-        $usage.fileCount | Should -Be 100000
-        $usage.bytes | Should -Be 17
-        Should -Invoke Invoke-LinuxWritableRootInspection -Times 1 -Exactly -ParameterFilter {
-            $MaximumEntries -eq 100000 -and -not $AllowReparseEntries
-        }
-    }
-
-    # Scenario: A real directory contains an ordinary file, hidden-name file and nested directory/file.
-    # Purpose: Exercise native enumeration and verify that directories count while file bytes remain exact.
-    It 'InterT30_CountsRealFilesDirectoriesAndHiddenEntries' {
-        if (-not $script:HostIsLinux) {
-            Set-ItResult -Skipped -Because 'native descriptor traversal is Linux-only'
-            return
-        }
-        [IO.File]::WriteAllText((Join-Path $script:UsageRoot '.hidden'), 'ab')
-        $subdir = Join-Path $script:UsageRoot 'nested'
-        [void](New-Item -ItemType Directory -Path $subdir)
-        [IO.File]::WriteAllText((Join-Path $subdir 'payload'), 'xyz')
-        $usage = Get-LinuxWritableRootUsage -Root $script:UsageRoot -Context 'Real fixture'
-        $usage.fileCount | Should -Be 4
-        $usage.bytes | Should -Be 5
-    }
-
-    # Scenario: Traversal fails while directory descriptors remain stacked.
-    # Purpose: Keep fail-closed cleanup on every native traversal exit.
-    It 'UnitT40_DisposesEnumeratorWhenMoveNextFails' {
-        $source = $ast.Extent.Text
-        $source | Should -Match '(?s)finally\s*\{\s*while \(pending\.Count > 0\).*?CloseFrame\(frame\)'
-        $source | Should -Match 'CloseDirectory\(directory\)'
-    }
 }
