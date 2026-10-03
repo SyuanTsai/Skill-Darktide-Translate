@@ -84,15 +84,15 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $prePush | Should -Not -Match 'Test-CleanRepositoryHead|Test-Repository|Test-ReferenceIntegrity|Invoke-Pester|skill-validator|skill-tools|SkillSpector|security'
     }
 
-    # Scenario: A normal pull request tests its own immutable head on Windows.
-    # Purpose: Keep candidate tests and evidence bound to that head with read-only permissions.
-    It 'UnitT31_BindsReadOnlyWindowsCandidateWorkflowToExactHead' {
+    # Scenario: A pull request or main push enters the read-only Windows route for its event commit.
+    # Purpose: Keep candidate tests and evidence bound to the exact event SHA without granting write access.
+    It 'UnitT31_BindsPullRequestAndMainPushToTheExactReadOnlyHead' {
         $path = Join-Path $script:WorkflowRoot 'standard-v1-candidate-windows.yml'
         Test-Path -LiteralPath $path -PathType Leaf | Should -BeTrue
         $workflow = Get-Content -LiteralPath $path -Raw
-        $workflow | Should -Match '(?m)^  pull_request:\s*$'
+        $workflow | Should -Match '(?ms)^on:\s*\r?\n  pull_request:\s*\r?\n  push:\s*\r?\n    branches:\s*\r?\n      - main(?:\r?\n|$)'
         $workflow | Should -Match '(?m)^permissions:\s*\r?\n  contents: read\s*$'
-        $workflow | Should -Match 'runs-on: windows-latest'
+        $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
         $workflow | Should -Match 'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020'
         $workflow | Should -Match "node-version: '24'"
         $workflow | Should -Match 'Require npm 11 lockfile semantics'
@@ -102,15 +102,15 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflow | Should -Match 'SetEnvironmentVariable\(''NPM_CONFIG_PREFIX'', \$null, ''Process''\)'
         $workflow | Should -Match 'Unexpected npm prefix in the candidate runner environment'
         $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
+        $workflow | Should -Match 'github\.event\.pull_request\.head\.sha \|\| github\.sha'
+        $workflow | Should -Match 'ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}'
         $workflow | Should -Match 'persist-credentials: false'
         $workflow | Should -Match 'checkoutHead -cne \$env:EXPECTED_HEAD_SHA'
         $workflow | Should -Match 'scripts/Validate\.ps1'
         $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
-        $workflow | Should -Match '\[regex\]::Match\('
-        $workflow | Should -Match "Groups\['version'\]\.Value"
-        $workflow | Should -Match 'ExpectedGoRuntimeVersion \$expectedGoRuntimeVersion'
         $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
-        $workflow | Should -Not -Match 'pull_request_target|checks: write|CODEX_PESTER_CGROUP_ROOT'
+        ([regex]::Matches($workflow, 'scripts/Validate\.ps1')).Count | Should -Be 1
+        $workflow | Should -Not -Match 'pull_request_target|workflow_dispatch|checks: write|status: write|CODEX_PESTER_CGROUP_ROOT'
     }
 
     # Scenario: the central authority script is dot-sourced to define validation functions.
@@ -135,28 +135,35 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         }
     }
 
-    # Scenario: A pull request or push to main enters the single latest-stable Windows route.
-    # Purpose: Bind one canonical validation run to the immutable event SHA and verified runtime.
-    It 'UnitT40_MapsPullRequestAndMainPushToOneCanonicalValidator' {
+    # Scenario: The validation job selects current stable Go and the Microsoft stable PowerShell release.
+    # Purpose: Bind tool execution to verified stable versions, archive digest, and executable receipt evidence.
+    It 'UnitT40_UsesVerifiedLatestStableToolchains' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:WorkflowRoot 'standard-v1-candidate-windows.yml') -Raw
-        $workflow | Should -Match '(?m)^  pull_request:\s*$'
-        $workflow | Should -Match '(?ms)^  push:\s*\r?\n\s{4}branches:\s*\r?\n\s{6}- main'
-        $workflow | Should -Not -Match 'pull_request_target|workflow_dispatch|checks: write'
-        $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
-        $workflow | Should -Match 'persist-credentials:\s*false'
+        $workflow | Should -Match 'runs-on: windows-latest'
+        $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
+        $workflow | Should -Match "go-version: 'stable'"
+        $workflow | Should -Match 'check-latest: true'
+        $workflow | Should -Not -Match "go-version: '[0-9]+\.[0-9]+\.[0-9]+'"
         $workflow | Should -Match 'Install-LatestPowerShell\.ps1'
         $workflow | Should -Match 'PowerShellRelease\.psm1'
+        $workflow | Should -Match 'sha256:'
+        $workflow | Should -Match '\$powerShellReceipt\.publishedDigest'
+        $workflow | Should -Match '\$powerShellReceipt\.observedSha256'
+        $workflow | Should -Match '\$powerShellReceipt\.executableVersion'
+        $workflow | Should -Match '\$powerShellReceipt\.executablePath'
+        $workflow | Should -Match '\$powerShellPath\.StartsWith\(\$installRootFullPath'
+        $workflow | Should -Match '& \$powerShellPath -NoLogo -NoProfile -NonInteractive'
+        $workflow | Should -Match '\$powerShellReceipt\.version'
+        $workflow | Should -Match '\[regex\]::Match\('
+        $workflow | Should -Match "Groups\['version'\]\.Value"
+        $workflow | Should -Match 'ExpectedGoRuntimeVersion \$expectedGoRuntimeVersion'
+        $workflow | Should -Not -Match 'PSVersionTable\.PSVersion\.Major -lt 7|& pwsh\s'
         $installer = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Install-LatestPowerShell.ps1') -Raw
         $installer | Should -Match 'https://aka\.ms/powershell-release\?tag=stable'
         $installer | Should -Match 'BaseResponse\.RequestMessage\.RequestUri'
         $installer | Should -Match 'Get-VerifiedPowerShellStableTagFromUri'
         $installer | Should -Match 'Assert-PowerShellReleaseTagMatchesStableChannel'
         $installer | Should -Match 'releases/tags/\$stableTag'
-        $workflow | Should -Not -Match 'actions/upload-artifact|GITHUB_STEP_SUMMARY'
-        $workflow | Should -Match 'scripts/Validate\.ps1'
-        $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
-        $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
-        ([regex]::Matches($workflow, 'scripts/Validate\.ps1')).Count | Should -Be 1
     }
 
     # Scenario: The latest-only route finishes under a finite job deadline and removes its run-owned files.
@@ -168,7 +175,7 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflow | Should -Match 'if:\s*always\(\)'
         $workflow | Should -Match 'SGV1_RUN_DIRECTORY'
         $workflow | Should -Match 'Remove run-owned validation directory'
-        $workflow | Should -Not -Match 'repository-contract|skill-validator|skill-tools|publish-head-required-checks|ubuntu-latest|CODEX_PESTER_CGROUP_ROOT'
+        $workflow | Should -Not -Match 'repository-contract|skill-validator|skill-tools|publish-head-required-checks|CANONICAL_RESULT|ubuntu-latest|CODEX_PESTER_CGROUP_ROOT|actions/upload-artifact|GITHUB_STEP_SUMMARY'
         Test-Path -LiteralPath (Join-Path $script:WorkflowRoot 'standard-v1-protected.yml') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1') | Should -BeFalse
     }

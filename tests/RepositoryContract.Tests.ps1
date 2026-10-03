@@ -294,34 +294,6 @@ Describe 'Darktide Translate repository contract' {
         $userAgentMatches[0].Groups['version'].Value | Should -Be $version
     }
 
-    # Scenario: GitHub validates a branch or pull request using the shared tool policy.
-    # Purpose: Prevent the repository from silently pinning stale quality tools or weakening the required gates.
-    It 'UnitT40_PreservesTheSharedLatestAtRunTimeQualityGate' {
-        # Source layout remains legacy during bootstrap, but its old CI was retired.
-        $workflow = Get-Content -LiteralPath (Join-Path $repoRoot $layout.WorkflowPath) -Raw
-        foreach ($retiredWorkflow in @('validate.yml', 'skill-validator.yml')) {
-            Test-Path -LiteralPath (Join-Path $repoRoot ".github/workflows/$retiredWorkflow") | Should -BeFalse
-        }
-        $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
-        $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
-        $workflow | Should -Match 'persist-credentials:\s*false'
-        $workflow | Should -Match "go-version: 'stable'"
-        $workflow | Should -Match 'check-latest: true'
-        $workflow | Should -Not -Match "go-version: '[0-9]+\.[0-9]+\.[0-9]+'"
-        $workflow | Should -Match 'runs-on: windows-latest'
-        $workflow | Should -Match 'Install-LatestPowerShell\.ps1'
-        $installer = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Install-LatestPowerShell.ps1') -Raw
-        $installer | Should -Match 'https://aka\.ms/powershell-release\?tag=stable'
-        $installer | Should -Match 'BaseResponse\.RequestMessage\.RequestUri'
-        $installer | Should -Match 'Get-VerifiedPowerShellStableTagFromUri'
-        $installer | Should -Match 'Assert-PowerShellReleaseTagMatchesStableChannel'
-        $installer | Should -Match 'releases/tags/\$stableTag'
-        $workflow | Should -Match 'sha256:'
-        $workflow | Should -Not -Match 'pull_request_target|ubuntu-latest|checks: write'
-        $workflow | Should -Not -Match 'actions/upload-artifact|GITHUB_STEP_SUMMARY'
-        $workflow | Should -Match 'scripts/Validate\.ps1'
-    }
-
     # Scenario: A legacy bootstrap snapshot validates the migration against its pinned central authority.
     # Purpose: Prevent a migration from retaining a stale authority pin that rejects the candidate before validation.
     It 'UnitT44_BindsTheBootstrapSupervisorToTheCurrentAuthoritySnapshot' {
@@ -357,9 +329,7 @@ Describe 'Trusted filesystem contract' {
             if (@($errors).Count -ne 0) { throw 'The production filesystem source must parse.' }
             $names = @(
                 'Assert-RegularFileForHash', 'Assert-NoReparseAncestors', 'Test-PathEqual',
-                'Assert-InstalledClosureSafeRelativePath', 'Get-InstalledClosureSymlinkTarget',
-                'Get-InstalledClosureSymlinkIdentitySha256', 'Get-InstalledSafeUnixSymlinkEntry',
-                'Get-InstalledClosureAsciiCaseFold', 'Add-InstalledClosureEntry',
+                'Assert-InstalledClosureSafeRelativePath', 'Get-InstalledClosureAsciiCaseFold', 'Add-InstalledClosureEntry',
                 'Sort-InstalledClosureEntriesByOrdinalPath', 'Get-InstalledDirectoryClosureSha256'
             )
             $functions = @($ast.FindAll({
@@ -370,11 +340,6 @@ Describe 'Trusted filesystem contract' {
                 $_.Extent.Text
             }) -join "`n"
             $module = New-Module -ScriptBlock ([scriptblock]::Create($source))
-            & $module {
-                # Execute only the supported Windows regular-file branch in this Windows CI contract.
-                $script:IsLinuxHost = $false
-                $script:TrustedStatPath = $null
-            }
             return $module
         }
 
@@ -449,30 +414,19 @@ Describe 'Trusted filesystem contract' {
         $after | Should -Not -Be $before
     }
 
-    # Scenario: An installed closure contains an in-root link on the current OS.
-    # Purpose: Reject Windows reparse points and accept only identity-bound, in-root Unix symbolic links.
-    It 'InterT80_EnforcesHostSpecificReparsePolicy' {
+    # Scenario: A Windows installed closure contains a junction.
+    # Purpose: Reject reparse points before their contents can enter a trusted closure digest.
+    It 'InterT80_RejectsWindowsReparsePointsInInstalledClosures' {
         $root = Join-Path $TestDrive 'linked-closure'
         $target = Join-Path $root 'target'
         [void](New-Item -ItemType Directory -Path $target -Force)
         [IO.File]::WriteAllText((Join-Path $target 'payload'), 'fixture')
         $link = Join-Path $root 'link'
-        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
-            [void](New-Item -ItemType SymbolicLink -Path $link -Target 'target')
-            $entry = & $script:FilesystemModules['scripts/Validate.ps1'] {
-                param($link, $root)
-                Get-InstalledSafeUnixSymlinkEntry -Item (Get-Item -LiteralPath $link -Force) -Root $root -Context 'Unix link fixture'
-            } $link $root
-            $entry.path | Should -BeExactly 'link'
-            $entry.sha256 | Should -Match '^[0-9a-f]{64}$'
-        }
-        else {
-            [void](New-Item -ItemType Junction -Path $link -Target $target)
-            { & $script:FilesystemModules['scripts/Validate.ps1'] {
-                param($root)
-                Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Windows reparse fixture'
-            } $root } | Should -Throw '*not a safe Unix symbolic link*'
-        }
+        [void](New-Item -ItemType Junction -Path $link -Target $target)
+        { & $script:FilesystemModules['scripts/Validate.ps1'] {
+            param($root)
+            Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Windows reparse fixture'
+        } $root } | Should -Throw '*reparse*'
     }
 
     # Scenario: A large closure must be sorted while preserving its independently computed canonical bytes.

@@ -235,19 +235,17 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$trustedPesterCommit'
         $supervisor | Should -Match '(?s)Expand-TrustedGitArchive.*?-Revision \$trustedPesterCommit.*?-PathSpec @\(''tests''\).*?-Context ''Trusted base Pester tests'''
         $supervisor | Should -Match '(?s)\$candidateMirrorTestsRoot.*?Remove-Item'
-        $supervisor | Should -Match 'function global:New-Item'
-        $supervisor | Should -Match "'Junction'"
-        $supervisor | Should -Match "'SymbolicLink'"
-        $supervisor | Should -Match 'function global:Get-ChildItem'
-        $supervisor | Should -Match '\.retained-partial-\*'
-        $supervisor | Should -Match 'Set-StrictMode -Version 1\.0'
-        $supervisor | Should -Match '\$readOnlyPaths = @\('
+        $supervisor | Should -Match 'function Invoke-ProtectedPesterServerProxy'
+        $supervisor | Should -Match 'New-ContainedProcessEnvironment -DiagnosticRoot \$childWritableRootPath'
+        $supervisor | Should -Match 'New-WindowsKillOnCloseJob -Context ''Protected Pester server proxy'''
+        $supervisor | Should -Match 'Assign-WindowsProcessToJob -JobHandle \$jobHandle -Process \$child'
+        $supervisor | Should -Match '-UseRestrictedToken \$true'
+        $supervisor | Should -Match '''-ProtectedPesterServerProxy'''
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
         $supervisor | Should -Match '\[string\[\]\] \$TestNames'
         $supervisor | Should -Match "AddParameter\('TestNames'"
         $supervisor | Should -Match '\[string\] \$PesterTrustedTestCommit'
         $supervisor | Should -Match "AddParameter\('TrustedTestCommit'"
-        $supervisor | Should -Match "Set-Variable -Name 'trustedTestCommit' -Scope Global"
         $supervisor | Should -Match "BootstrapTransition\.Tests\.ps1"
         $supervisor | Should -Match 'foreach \(\$requiredPesterTest in \$requiredPesterTests\)'
         $supervisor | Should -Match '\$requiredPesterTestsFunction = \(Get-Command Get-RequiredPesterTests'
@@ -263,7 +261,6 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$runspace\.Close\(\)'
         $supervisor | Should -Match 'serverProcessInstance\.Process\.WaitForExit\(5000\)'
         $supervisor | Should -Match 'Start-WindowsSuspendedProcess'
-        $supervisor | Should -Match '\.CopyToAsync\('
         $supervisor | Should -Match 'SGV1-Pester-Result:'
         $supervisor | Should -Match 'Invoke-TrustedPowerShellProcess'
         $supervisor | Should -Match 'Invoke-ProtectedPesterSupervisor'

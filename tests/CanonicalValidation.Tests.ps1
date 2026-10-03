@@ -73,14 +73,6 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'is backed by a reparse point'
     }
 
-    It 'binds safe Unix virtual-environment symlinks without allowing traversal' {
-        $script:Validator | Should -Match 'function Get-InstalledSafeUnixSymlinkEntry'
-        $script:Validator | Should -Match 'function Get-InstalledClosureSymlinkIdentitySha256'
-        $script:Validator | Should -Match 'symbolic-link target escapes the install root'
-        $script:Validator | Should -Match 'Get-InstalledSafeUnixSymlinkEntry -Item \$item'
-        $script:Validator | Should -Match 'symbolicLinkTarget='
-    }
-
 
 
 
@@ -356,7 +348,7 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'Assert-ReceiptFile -Receipt \$receipts\.skillspector'
         $script:Validator | Should -Match 'Assert-ReceiptInstalledClosure'
         $script:Validator | Should -Match 'installedClosureSha256'
-        $script:Validator | Should -Match 'installed closure contains a reparse-backed entry'
+        $script:Validator | Should -Match 'installed closure contains a reparse point'
         $script:Validator | Should -Match 'Get-ChildItem -LiteralPath \$root -Recurse -Force'
         $script:Validator | Should -Match 'GIT_CONFIG_NOSYSTEM'
         $script:Validator | Should -Match 'core\.hooksPath'
@@ -373,25 +365,6 @@ Describe 'Canonical Standard v1 validation adapter' {
         $pesterIndex = $script:Validator.IndexOf('$pesterRunnerPath')
         $semanticIndex | Should -BeGreaterThan -1
         $pesterIndex | Should -BeGreaterThan $semanticIndex
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
-        $workflow | Should -Match '(?m)^  pull_request:\s*$'
-        $workflow | Should -Match '(?ms)^  push:\s*\r?\n\s{4}branches:\s*\r?\n\s{6}- main'
-        $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
-        $workflow | Should -Match 'persist-credentials:\s*false'
-        $workflow | Should -Match 'Install-LatestPowerShell\.ps1'
-        $workflow | Should -Match 'PowerShellRelease\.psm1'
-        $installer = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Install-LatestPowerShell.ps1') -Raw
-        $installer | Should -Match 'https://aka\.ms/powershell-release\?tag=stable'
-        $installer | Should -Match 'BaseResponse\.RequestMessage\.RequestUri'
-        $installer | Should -Match 'Get-VerifiedPowerShellStableTagFromUri'
-        $installer | Should -Match 'Assert-PowerShellReleaseTagMatchesStableChannel'
-        $installer | Should -Match 'releases/tags/\$stableTag'
-        $workflow | Should -Match 'publishedDigest'
-        $workflow | Should -Match 'executableVersion'
-        $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
-        $workflow | Should -Not -Match 'pull_request_target|checks: write|ubuntu-latest|CODEX_PESTER_CGROUP_ROOT|CANONICAL_RESULT|repository-contract \(Windows PowerShell 5\.1\)|actions/upload-artifact|GITHUB_STEP_SUMMARY'
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1') | Should -BeFalse
     }
 
     It 'keeps required CI free of implicit LLM credentials and skipped tests' {
@@ -405,21 +378,10 @@ Describe 'Canonical Standard v1 validation adapter' {
         $repositoryValidator = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Test-Repository.ps1') -Raw
         $repositoryValidator | Should -Match 'rawSha256'
         $repositoryValidator | Should -Match '\[string\] \$TrustedGitPath'
-        $repositoryValidator | Should -Match '\[string\] \$TrustedStatPath'
         $repositoryValidator | Should -Match '\[switch\] \$NoFilters'
         $repositoryValidator | Should -Match 'NoFilters:\$NoFilters'
     }
 
-    # Scenario: A collaborator can trigger pull request or main-push validation only.
-    # Purpose: Keep the route read-only, exact-head-bound, and free of status publishers.
-    It 'UnitT90_UsesOnlyTheReadOnlyLatestStableWindowsRoute' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
-        $workflow | Should -Not -Match '(?m)^\s+workflow_dispatch:|pull_request_target|checks: write|status: write|actions/upload-artifact|GITHUB_STEP_SUMMARY'
-        $workflow | Should -Match '(?m)^permissions:\s*\r?\n  contents: read\s*$'
-        $workflow | Should -Match 'timeout-minutes:'
-        $workflow | Should -Match 'if:\s*always\(\)'
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
-    }
 }
 
 Describe 'Protected workflow trust binding' {

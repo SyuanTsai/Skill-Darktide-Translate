@@ -86,26 +86,4 @@ Describe 'Darktide Translate Standard v1 conformance' {
         }
     }
 
-    # Scenario: A pull request or main push enters the single Windows validation workflow.
-    # Purpose: Require exact-head validation with a digest-verified Microsoft stable PowerShell release.
-    It 'UnitT60_UsesTheLatestStableWindowsWorkflow' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
-        $workflow | Should -Match 'scripts/Validate\.ps1'
-        $workflow | Should -Match 'pull_request:'
-        $workflow | Should -Match 'push:'
-        $workflow | Should -Match 'branches:\s*\r?\n\s+- main'
-        $workflow | Should -Match 'persist-credentials:\s*false'
-        $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
-        $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
-        $workflow | Should -Match 'Install-LatestPowerShell\.ps1'
-        $workflow | Should -Match 'PowerShellRelease\.psm1'
-        $workflow | Should -Match 'sha256:'
-        $workflow | Should -Match 'github\.event\.pull_request\.head\.sha'
-        $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
-        $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
-        $workflow | Should -Not -Match 'pull_request_target|checks: write|ubuntu-latest|repository-contract \(Windows PowerShell 5\.1\)'
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1') | Should -BeFalse
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/skill-validator.yml') | Should -BeFalse
-    }
 }

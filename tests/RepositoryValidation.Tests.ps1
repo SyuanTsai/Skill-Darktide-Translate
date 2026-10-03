@@ -58,10 +58,8 @@ Describe 'Repository pre-push validation' {
     }
 
     # Scenario: The Standard v1 source tree is validated through its documented entry points.
-    # Purpose: Keep the normal CI route and local pre-push wrapper bound to the canonical validator.
-    It 'UnitT40_UsesTheValidationEntrypointForTheCurrentLifecycle' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
-
+    # Purpose: Keep the local pre-push wrapper bound to the canonical validator and its comparison inputs.
+    It 'UnitT40_UsesTheValidationEntrypointForThePrePushWrapper' {
         Test-Path -LiteralPath $script:prePushPath | Should -BeTrue
         $prePush = Get-Content -LiteralPath $script:prePushPath -Raw
         $prePush | Should -Match 'scripts/Validate\.ps1'
@@ -69,58 +67,6 @@ Describe 'Repository pre-push validation' {
         $prePush | Should -Match 'BaseCommit'
         $prePush | Should -Not -Match 'tests/Invoke-Tests\.ps1'
         $prePush | Should -Not -Match 'Test-ReferenceIntegrity\.ps1'
-        $workflow | Should -Match 'scripts/Validate\.ps1'
-        $workflow | Should -Not -Match 'run: \./tests/Invoke-Tests\.ps1'
-    }
-
-    # Scenario: A pull request or main push enters the one ordinary Windows validation route.
-    # Purpose: Prevent the retired protected publisher and parallel compatibility graph from remaining live.
-    It 'UnitT50_UsesOnlyPullRequestAndMainPushEvents' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:repoRoot $script:layout.WorkflowPath) -Raw
-        $workflow | Should -Match '(?m)^  push:\r?$'
-        $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
-        $workflow | Should -Match '(?m)^  pull_request:\s*$'
-        $workflow | Should -Not -Match 'pull_request_target|workflow_dispatch|checks: write'
-        $workflow | Should -Match 'Install-LatestPowerShell\.ps1'
-        Test-Path -LiteralPath (Join-Path $script:repoRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
-        Test-Path -LiteralPath (Join-Path $script:repoRoot 'tests/validate-windows-powershell.ps1') | Should -BeFalse
-    }
-
-    # Scenario: A normal pull request or main push needs one Windows validator running the resolved stable PowerShell release.
-    # Purpose: Reject the current PATH-selected major-only candidate job and prevent the retired protected publisher from staying live.
-    It 'UnitT60_UsesOneWindowsLatestStablePowerShellWorkflow' {
-        $workflowPath = Join-Path $script:repoRoot '.github/workflows/standard-v1-candidate-windows.yml'
-        $workflow = Get-Content -LiteralPath $workflowPath -Raw
-        $workflow | Should -Match '(?m)^  pull_request:\s*$'
-        $workflow | Should -Match '(?ms)^  push:\r?\n    branches:\r?\n      - main(?:\r?\n|$)'
-        $workflow | Should -Match '(?m)^\s+timeout-minutes:\s*[1-9][0-9]*\s*$'
-        $workflow | Should -Match 'runs-on: windows-latest'
-        $workflow | Should -Match 'contents: read'
-        $workflow | Should -Match 'persist-credentials: false'
-        $workflow | Should -Match 'Install-LatestPowerShell\.ps1'
-        $workflow | Should -Match 'PowerShellRelease\.psm1'
-        $installer = Get-Content -LiteralPath (Join-Path $script:repoRoot 'scripts/Install-LatestPowerShell.ps1') -Raw
-        $installer | Should -Match 'https://aka\.ms/powershell-release\?tag=stable'
-        $installer | Should -Match 'BaseResponse\.RequestMessage\.RequestUri'
-        $installer | Should -Match 'Get-VerifiedPowerShellStableTagFromUri'
-        $installer | Should -Match 'Assert-PowerShellReleaseTagMatchesStableChannel'
-        $installer | Should -Match 'releases/tags/\$stableTag'
-        $workflow | Should -Match 'sha256:'
-        $workflow | Should -Match '\$powerShellReceipt\.executablePath'
-        $workflow | Should -Match '\$powerShellReceipt\.version'
-        $workflow | Should -Not -Match 'actions/upload-artifact|GITHUB_STEP_SUMMARY'
-        $workflow | Should -Match 'if:\s*always\(\)'
-        $workflow | Should -Match 'TrustedTestCommit \$checkoutHead'
-        $workflow | Should -Match 'report\.candidate\.commit -cne \$checkoutHead'
-        $workflow | Should -Not -Match 'PSVersionTable\.PSVersion\.Major -lt 7|& pwsh\s'
-        $workflow | Should -Not -Match 'pull_request_target|checks: write|ubuntu-latest|CODEX_PESTER_CGROUP_ROOT|CANONICAL_RESULT|repository-contract \(Windows PowerShell 5\.1\)'
-        Test-Path -LiteralPath (Join-Path $script:repoRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
-        Test-Path -LiteralPath (Join-Path $script:repoRoot 'tests/validate-windows-powershell.ps1') | Should -BeFalse
-
-        $workflowFiles = @(Get-ChildItem -LiteralPath (Join-Path $script:repoRoot '.github/workflows') -File |
-            Where-Object { $_.Extension -in @('.yml', '.yaml') })
-        @($workflowFiles | Where-Object Name -eq 'standard-v1-candidate-windows.yml').Count | Should -Be 1
-        @($workflowFiles | Where-Object Name -eq 'standard-v1-protected.yml').Count | Should -Be 0
     }
 }
 
