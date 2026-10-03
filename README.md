@@ -72,7 +72,7 @@ pwsh -NoLogo -NoProfile -File ./scripts/Invoke-PrePushValidation.ps1
 
 The wrapper binds the central Standard v1 authority, controlled tool acquisition, package integrity, SkillSpector, repository/domain tests, and the reproducible source pin to one unchanged HEAD by using an explicit base commit or the local clone's immutable merge-base with its remote default branch. `scripts/Validate.ps1` is the canonical validator invoked by the wrapper; `scripts/Test-Repository.ps1`, domain tests, and other component commands are diagnostic components, not alternate release gates. This repository validates only its own `skills/auto-update-darktide-mod/` package; external consumer projections and instruction manifests are outside this repository's inventory.
 
-GitHub Actions calls the same `scripts/Validate.ps1` entry point and records the resolved formal tools and security-gate evidence in the run artifacts.
+GitHub Actions runs one read-only Windows workflow for pull requests and pushes to `main`. It follows Microsoft's official stable PowerShell channel to its canonical release tag, retrieves metadata for that exact tag, verifies the x64 archive against its published SHA-256 digest, and invokes `scripts/Validate.ps1` through that exact executable. The report and release receipt stay in a unique `RUNNER_TEMP` directory while the exact event SHA is checked; the workflow removes that directory on every job outcome.
 
 ## Versioning and rollback
 

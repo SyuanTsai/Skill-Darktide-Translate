@@ -6,7 +6,7 @@ Describe 'Darktide bootstrap transition' {
         $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
         $script:RepositoryValidator = Join-Path $script:RepositoryRoot 'scripts/Test-Repository.ps1'
         $script:Supervisor = Join-Path $script:RepositoryRoot 'scripts/Validate.ps1'
-        $script:ProtectedWorkflow = Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml'
+        $script:ValidationWorkflow = Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml'
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:Layout = Get-TestRepositoryLayout -RepositoryRoot $script:RepositoryRoot
 
@@ -116,16 +116,17 @@ Describe 'Darktide bootstrap transition' {
         }
     }
 
-    It 'UnitT30_SelectsBootstrapOnlyWhenTheCandidateHasNotMigratedToStandardV1' {
-        # Scenario: The protected workflow sees either the current bootstrap layout or the migrated layout.
-        # Purpose: Keep transition success explicit and prevent a mixed or post-migration tree from taking the legacy path.
+    It 'UnitT30_KeepsBootstrapModeOutOfTheNormalWindowsWorkflow' {
+        # Scenario: The repository retains a local bootstrap validator while normal CI uses the Standard v1 route.
+        # Purpose: Prevent CI from re-entering the retired protected workflow or legacy validation mode.
         $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
-        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+        $workflow = Get-Content -LiteralPath $script:ValidationWorkflow -Raw
 
         $supervisor | Should -Match '\[switch\] \$BootstrapTransition'
-        $workflow | Should -Match 'BootstrapTransition'
-        $workflow | Should -Match 'config/standard-v1\.json'
-        $workflow | Should -Match 'catalog/skills-catalog\.json'
+        $workflow | Should -Match 'scripts/Validate\.ps1'
+        $workflow | Should -Not -Match 'BootstrapTransition|pull_request_target|ubuntu-latest|checks: write'
+        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1') | Should -BeFalse
     }
 
     It 'UnitT40_UsesAnOSNativeWindowsProcessSnapshotForCleanup' {
@@ -139,6 +140,38 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Not -Match 'Get-CimInstance\s+-ClassName\s+Win32_Process'
     }
 
+    It 'InterT45_BoundsRealTrustedPesterChildOutputAndPreservesExitStatus' {
+        # Scenario: The trusted Pester transport receives a verbose or failing real child.
+        # Purpose: Keep each captured stream bounded while preserving the child's exit.
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:Supervisor, [ref]$tokens, [ref]$errors)
+        @($errors).Count | Should -Be 0
+        $definitions = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -in @('Get-WindowsSuspendedProcessBoundaryType', 'Invoke-TrustedPowerShellProcess')
+        }, $false))
+        $definitions.Count | Should -Be 2
+        $transport = @($definitions | Where-Object Name -eq 'Invoke-TrustedPowerShellProcess')[0]
+        $transport.Extent.Text | Should -Match 'ReadBoundedAsync'
+        $transport.Extent.Text | Should -Not -Match 'ReadToEndAsync'
+        foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
+
+        $powerShellPath = [string](Join-Path $PSHOME 'pwsh.exe')
+        $normal = Invoke-TrustedPowerShellProcess -Command $powerShellPath `
+            -Arguments @('-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write("normal")') `
+            -WorkingDirectory $TestDrive -Context 'bounded child'
+        $normal | Should -Be 'normal'
+        { Invoke-TrustedPowerShellProcess -Command $powerShellPath `
+            -Arguments @('-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write(''x'' * 4194305)') `
+            -WorkingDirectory $TestDrive -Context 'oversized child' } |
+            Should -Throw '*bounded trusted-process output limit*'
+        { Invoke-TrustedPowerShellProcess -Command $powerShellPath `
+            -Arguments @('-NoProfile', '-NonInteractive', '-Command', 'exit 7') `
+            -WorkingDirectory $TestDrive -Context 'failed child' } |
+            Should -Throw '*exited with code 7*'
+    }
+
     It 'UnitT50_BindsBootstrapToTheExpectedChangedPathSetAndBaseCommit' {
         # Scenario: A bootstrap candidate could otherwise select the legacy path while changing arbitrary repository content.
         # Purpose: Require an immutable base comparison and a narrow transition-only changed-path contract.
@@ -146,10 +179,14 @@ Describe 'Darktide bootstrap transition' {
 
         $supervisor | Should -Match 'Bootstrap transition requires a distinct base commit'
         $supervisor | Should -Match 'Bootstrap transition changed-path allowlist'
-        $supervisor | Should -Match '\.github/workflows/standard-v1-protected\.yml'
+        $supervisor | Should -Match '\.github/workflows/standard-v1-candidate-windows\.yml'
+        $supervisor | Should -Match 'scripts/Install-LatestPowerShell\.ps1'
+        $supervisor | Should -Match 'scripts/PowerShellRelease\.psm1'
         $supervisor | Should -Match 'scripts/Test-Repository\.ps1'
         $supervisor | Should -Match 'scripts/Validate\.ps1'
-        $supervisor | Should -Match 'tests/validate-windows-powershell\.ps1'
+        $supervisor | Should -Match '\$retiredPathList'
+        $supervisor | Should -Match 'if \(\$status -ceq ''D''\)'
+        $supervisor | Should -Match 'Bootstrap retirement requires'
         $supervisor | Should -Match 'Bootstrap transition bounded cancellation probe'
     }
 
@@ -186,32 +223,10 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'Join-Path \$testsRoot \$_'
     }
 
-    It 'UnitT80_ProjectsLinuxEtcWithoutArchiveOwnershipCopy' {
-        # Scenario: A user namespace cannot read every host /etc file or preserve host-root ownership.
-        # Purpose: Build a private readable projection without mutating the host bind or aborting on archive metadata.
-        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
-
-        $supervisor | Should -Match 'system_root.*=.*"/etc"'
-        $supervisor | Should -Match '-type f -readable'
-        $supervisor | Should -Match '/bin/cat -- "\$source"'
-        $supervisor | Should -Not -Match '/bin/cp -a'
-    }
-
-    It 'UnitT85_UsesKernelCgroupAccountingWhenAvailable' {
-        $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
-
-        $supervisor | Should -Match 'if \(-not \[string\]::IsNullOrWhiteSpace\(\$CgroupPath\)\)'
-        $supervisor | Should -Match '\$accountingPath = if \(\[string\]::IsNullOrWhiteSpace\(\$CgroupAccountingPath\)\)'
-        $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage -CgroupPath \$accountingPath -Context \$Context'
-        $supervisor | Should -Match 'if \(\$cpuTicks -gt \(\[int64\]\$MaxCpuSeconds \* \$ClockTicksPerSecond\)\)'
-    }
-
     It 'UnitT90SeparatesChildOutputAndTrustedPesterContent' {
         # Scenario: Low-integrity children must write only to a labeled output root, while tests come from trusted Git bytes.
         # Purpose: Keep scanner receipts and Pester content outside candidate-writable paths and out of the worker's authority.
         $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
-        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
-
         $supervisor | Should -Match "'low-integrity-output'"
         $supervisor | Should -Match '''-PesterChildWritableRoot'', \$childOutputRoot'
         $supervisor | Should -Match '-ChildWritableRoot \$ChildWritableRoot'
@@ -220,19 +235,17 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$trustedPesterCommit'
         $supervisor | Should -Match '(?s)Expand-TrustedGitArchive.*?-Revision \$trustedPesterCommit.*?-PathSpec @\(''tests''\).*?-Context ''Trusted base Pester tests'''
         $supervisor | Should -Match '(?s)\$candidateMirrorTestsRoot.*?Remove-Item'
-        $supervisor | Should -Match 'function global:New-Item'
-        $supervisor | Should -Match "'Junction'"
-        $supervisor | Should -Match "'SymbolicLink'"
-        $supervisor | Should -Match 'function global:Get-ChildItem'
-        $supervisor | Should -Match '\.retained-partial-\*'
-        $supervisor | Should -Match 'Set-StrictMode -Version 1\.0'
-        $supervisor | Should -Match '\$readOnlyPaths = @\('
+        $supervisor | Should -Match 'function Invoke-ProtectedPesterServerProxy'
+        $supervisor | Should -Match 'New-ContainedProcessEnvironment -DiagnosticRoot \$childWritableRootPath'
+        $supervisor | Should -Match 'New-WindowsKillOnCloseJob -Context ''Protected Pester server proxy'''
+        $supervisor | Should -Match 'Assign-WindowsProcessToJob -JobHandle \$jobHandle -Process \$child'
+        $supervisor | Should -Match '-UseRestrictedToken \$true'
+        $supervisor | Should -Match '''-ProtectedPesterServerProxy'''
         $supervisor | Should -Match 'Invoke-ProtectedPesterRunspace'
         $supervisor | Should -Match '\[string\[\]\] \$TestNames'
         $supervisor | Should -Match "AddParameter\('TestNames'"
         $supervisor | Should -Match '\[string\] \$PesterTrustedTestCommit'
         $supervisor | Should -Match "AddParameter\('TrustedTestCommit'"
-        $supervisor | Should -Match "Set-Variable -Name 'trustedTestCommit' -Scope Global"
         $supervisor | Should -Match "BootstrapTransition\.Tests\.ps1"
         $supervisor | Should -Match 'foreach \(\$requiredPesterTest in \$requiredPesterTests\)'
         $supervisor | Should -Match '\$requiredPesterTestsFunction = \(Get-Command Get-RequiredPesterTests'
@@ -247,55 +260,7 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match '\$powerShell\.Stop\(\)'
         $supervisor | Should -Match '\$runspace\.Close\(\)'
         $supervisor | Should -Match 'serverProcessInstance\.Process\.WaitForExit\(5000\)'
-        $supervisor | Should -Match 'Stop-LinuxCandidateCgroup -CgroupPath \$CgroupPath'
-        $supervisor | Should -Match '\[IO\.Directory\]::Delete\(\$CgroupPath\)'
-        $supervisor | Should -Match ': > "\$sandbox_root/dev/console"'
-        $supervisor | Should -Match 'protected-pester-proxy\.log'
-        $supervisor | Should -Match 'Proxy startup diagnostics:'
-        $supervisor | Should -Match 'ConvertFrom-LinuxProcessResourceUsageMetadata'
-        $supervisor | Should -Match "@\('Z', 'X'\)"
-        $supervisor | Should -Match 'statmPath = Join-Path ''/proc'''
-        $supervisor | Should -Match '-Statm \$statm'
-        $supervisor | Should -Match 'Assert-LinuxAggregateResourceUsage'
-        $supervisor | Should -Match 'Get-LinuxAggregateClockTicksPerSecond'
-        $supervisor | Should -Match 'Get-LinuxCgroupCpuUsage'
-        $supervisor | Should -Match '\$fields\[13\].*\$fields\[14\]'
-        $supervisor | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
-        $supervisor | Should -Match 'Get-LinuxPesterCgroupRoot'
-        $supervisor | Should -Match '/proc/\$PID/cgroup'
-        $supervisor | Should -Match 'New-LinuxCandidateCgroup'
-        $supervisor | Should -Match 'memory\.max'
-        $supervisor | Should -Match 'cpu\.stat'
-        $supervisor | Should -Match 'usage_usec'
-        $supervisor | Should -Match 'cgroup\.procs'
-        $supervisor | Should -Match 'cgroup\.events'
-        $supervisor | Should -Match 'populated'
-        $supervisor | Should -Match 'Start-Sleep -Milliseconds 25'
-        $supervisor | Should -Match 'linuxPesterCgroupCleanupException'
-        $supervisor | Should -Match 'PesterProxyCgroupPath'
-        $supervisor | Should -Match '\[IO\.File\]::WriteAllText\([\s\S]*?cgroup\.procs'
-        $workflow | Should -Match 'Delegate Linux cgroup v2 subtree'
-        $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT'
-        $workflow | Should -Match 'CODEX_PESTER_VALIDATOR_CGROUP'
-        $workflow | Should -Match 'root_subtree_control'
-        $workflow | Should -Match '\+cpu \+memory'
-        $workflow | Should -Match 'cgroup\.subtree_control'
-        $workflow | Should -Match 'cgroup\.threads'
-        $workflow | Should -Match 'cgroup_delegated/cgroup\.procs'
-        $workflow | Should -Match 'sudo -n chown'
-        $workflow | Should -Match 'trusted-validator'
-        $workflow | Should -Match 'Remove delegated Linux cgroup subtree'
         $supervisor | Should -Match 'Start-WindowsSuspendedProcess'
-        $supervisor | Should -Match '\.CopyToAsync\('
-        $supervisor | Should -Match '--kill-child'
-        $supervisor | Should -Match '--as=2147483648'
-        $supervisor | Should -Match '--cpu=300'
-        $supervisor | Should -Match '\[switch\] \$ProtectedPesterServerProxy'
-        $supervisor | Should -Match '\$PesterProxyReadOnlyPathsJson'
-        $supervisor | Should -Match 'EnvironmentVariables\.Remove\(\$gateEnvironmentName\)'
-        $supervisor | Should -Match '\[ ! -e "\$target" \]'
-        ([regex]::Matches($supervisor, [regex]::Escape('"$unshare_path" --mount --pid --fork --kill-child --mount-proc="$sandbox_root/proc"'))).Count | Should -Be 2
-        ([regex]::Matches($supervisor, [regex]::Escape('"$chroot_path" "$sandbox_root"'))).Count | Should -Be 2
         $supervisor | Should -Match 'SGV1-Pester-Result:'
         $supervisor | Should -Match 'Invoke-TrustedPowerShellProcess'
         $supervisor | Should -Match 'Invoke-ProtectedPesterSupervisor'
@@ -368,31 +333,14 @@ Describe 'Darktide bootstrap transition' {
         $supervisor | Should -Match 'per-candidate 300-second CPU'
     }
 
-    It 'UnitT95_KeepsProtectedPesterBelowARootOwnedAggregateCgroup' {
-        # Scenario: Candidate code runs under the delegated runner identity and can write migration controls in that delegated subtree.
-        # Purpose: Keep that whole subtree below a root-owned aggregate boundary and prove every descendant is dead before later steps.
-        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
-
-        $workflow | Should -Match 'cgroup_delegated="\$cgroup_parent/delegated"'
-        $workflow | Should -Match 'cgroup_supervisor="\$cgroup_delegated/trusted-validator"'
-        $workflow | Should -Match '(?s)''2147483648''.*?"\$cgroup_parent/memory\.max"'
-        $workflow | Should -Match '(?s)''256''.*?"\$cgroup_parent/pids\.max"'
-        $workflow | Should -Not -Match 'chown[^\r\n]*"\$cgroup_parent(?:/cgroup\.(?:procs|threads))?"'
-        $workflow | Should -Match 'CODEX_PESTER_CGROUP_ROOT=%s[\s\S]*?"\$cgroup_delegated"'
-        $workflow | Should -Match 'cgroup\.kill'
-        $workflow | Should -Match 'cgroup\.events'
-        $workflow | Should -Match '/usr/bin/find "\$cgroup_parent" -mindepth 1 -depth -type d'
-        $workflow | Should -Match 'shell:\s*/usr/bin/sudo -n /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -e -o pipefail \{0\}'
-    }
-
     It 'UnitT100_BindsReplacementObjectDiscoveryToTheCandidateWorktree' {
         # Scenario: Git does not trust the runner checkout through ambient global configuration.
         # Purpose: Make the replacement-object preflight use the same explicit repository trust boundary as every later Git read.
         $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
-        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
+        $workflow = Get-Content -LiteralPath $script:ValidationWorkflow -Raw
 
         $supervisor | Should -Match '(?s)function Assert-NoGitReplacementObjects.*?safe\.directory=\$RepositoryRoot.*?core\.worktree=\$RepositoryRoot.*?rev-parse --git-path refs/replace'
-        $workflow | Should -Match '(?s)\$gitPath\s*=.*?\$gitArguments\s*=\s*@\(.*?safe\.directory=\$repositoryRoot.*?core\.worktree=\$repositoryRoot.*?rev-parse HEAD.*?merge-base --is-ancestor'
+        $workflow | Should -Match '(?s)\$gitArguments\s*=\s*@\(.*?safe\.directory=\$repositoryRoot.*?rev-parse HEAD.*?checkoutHead -cne \$env:EXPECTED_HEAD_SHA.*?merge-base \$env:BASE_SHA \$checkoutHead'
 
         $tokens = $null
         $parseErrors = $null
@@ -446,147 +394,6 @@ Describe 'Darktide bootstrap transition' {
         }
     }
 
-    It 'UnitT110_RejectsNonUtf8PowerShellSourceBytes' {
-        # Scenario: Windows PowerShell 5.1 parses trusted local source fixtures encoded as UTF-8 with or without a BOM, while UTF-16 and UTF-32 source is rejected.
-        # Purpose: Prevent host ANSI source interpretation from accepting malformed candidate PowerShell while preserving non-ASCII UTF-8 code.
-        $workflow = Get-Content -LiteralPath $script:ProtectedWorkflow -Raw
 
-        $workflow | Should -Match '\[IO\.File\]::ReadAllBytes\(\$candidatePath\)'
-        $workflow | Should -Not -Match '\$candidateSource\s*=\s*\[IO\.File\]::ReadAllText\('
-        $workflow | Should -Match '(?s)\$candidateBytes\[0\] -eq 0xEF.*?\$candidateBytes\[1\] -eq 0xBB.*?\$candidateBytes\[2\] -eq 0xBF'
-        $workflow | Should -Match '(?s)\[Text\.UTF8Encoding\]::new\(\$false, \$true\)\.GetString\(.*?\$candidateBytes.*?\$candidateOffset.*?\$candidateBytes\.Length - \$candidateOffset'
-
-        $compatibilityTokens = $null
-        $compatibilityParseErrors = $null
-        $compatibilityAst = [Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $script:RepositoryRoot 'tests/validate-windows-powershell.ps1'),
-            [ref]$compatibilityTokens,
-            [ref]$compatibilityParseErrors
-        )
-        @($compatibilityParseErrors).Count | Should -Be 0
-        $sourceParserAst = $compatibilityAst.Find({
-                param($node)
-                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-                    $node.Name -eq 'Assert-StrictUtf8PowerShellFile'
-            }, $true)
-        $sourceParserAst | Should -Not -BeNullOrEmpty
-
-        $fixtureRoot = Join-Path $TestDrive 'windows-powershell-utf8-fixtures'
-        New-Item -ItemType Directory -Path $fixtureRoot -Force | Out-Null
-        $plainPath = Join-Path $fixtureRoot 'plain-utf8.ps1'
-        $bomPath = Join-Path $fixtureRoot 'bom-utf8.ps1'
-        $utf16Path = Join-Path $fixtureRoot 'utf16.ps1'
-        $utf32Path = Join-Path $fixtureRoot 'utf32.ps1'
-        $malformedPath = Join-Path $fixtureRoot 'malformed-utf8.ps1'
-        $fixtureSource = "`$message = '" + [string][char]0x6E2C + [char]0x8A66 + "'"
-        $utf8 = [Text.UTF8Encoding]::new($false, $true)
-        $utf16 = [Text.Encoding]::Unicode
-        $utf32 = [Text.UTF32Encoding]::new($false, $true)
-        [IO.File]::WriteAllBytes($plainPath, $utf8.GetBytes($fixtureSource))
-        [IO.File]::WriteAllBytes($bomPath, ([byte[]]@(0xEF, 0xBB, 0xBF) + $utf8.GetBytes($fixtureSource)))
-        [IO.File]::WriteAllBytes($utf16Path, ($utf16.GetPreamble() + $utf16.GetBytes($fixtureSource)))
-        [IO.File]::WriteAllBytes($utf32Path, ($utf32.GetPreamble() + $utf32.GetBytes($fixtureSource)))
-        [IO.File]::WriteAllBytes($malformedPath, $utf8.GetBytes('if ('))
-
-        $sourceParserModule = New-Module -ScriptBlock ([scriptblock]::Create($sourceParserAst.Extent.Text))
-        try {
-            foreach ($validPath in @($plainPath, $bomPath)) {
-                {
-                    & $sourceParserModule {
-                        param($Path)
-                        Assert-StrictUtf8PowerShellFile -Path $Path
-                    } $validPath
-                } | Should -Not -Throw
-            }
-            foreach ($invalidPath in @($utf16Path, $utf32Path, $malformedPath)) {
-                {
-                    & $sourceParserModule {
-                        param($Path)
-                        Assert-StrictUtf8PowerShellFile -Path $Path
-                    } $invalidPath
-                } | Should -Throw
-            }
-        }
-        finally {
-            Remove-Module $sourceParserModule -Force
-        }
-
-        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-            $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
-            $systemRoot | Should -Not -BeNullOrEmpty
-            $windowsPowerShellPath = [IO.Path]::GetFullPath((Join-Path $systemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
-            Test-Path -LiteralPath $windowsPowerShellPath -PathType Leaf | Should -BeTrue
-            $runnerPath = Join-Path $fixtureRoot 'parse-fixtures.ps1'
-            $runnerSource = @(
-                'param([string] $PlainPath, [string] $BomPath, [string] $Utf16Path, [string] $Utf32Path, [string] $MalformedPath)'
-                '$ErrorActionPreference = ''Stop'''
-                $sourceParserAst.Extent.Text
-                'Assert-StrictUtf8PowerShellFile -Path $PlainPath'
-                'Assert-StrictUtf8PowerShellFile -Path $BomPath'
-                'foreach ($invalidPath in @($Utf16Path, $Utf32Path, $MalformedPath)) { try { Assert-StrictUtf8PowerShellFile -Path $invalidPath; throw "Expected strict UTF-8 parsing to reject $invalidPath." } catch { if ($_.Exception.Message -like "Expected strict UTF-8 parsing*") { throw } } }'
-            ) -join [Environment]::NewLine
-            [IO.File]::WriteAllText($runnerPath, $runnerSource, [Text.UTF8Encoding]::new($false))
-            & $windowsPowerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runnerPath $plainPath $bomPath $utf16Path $utf32Path $malformedPath
-            $LASTEXITCODE | Should -Be 0
-        }
-
-        foreach ($validatorPath in @($script:Supervisor, $script:RepositoryValidator)) {
-            $validatorSource = Get-Content -LiteralPath $validatorPath -Raw
-            $validatorSource | Should -Match 'Read-StrictUtf8File -Path'
-            $validatorSource | Should -Not -Match '\[IO\.File\]::ReadAllText\([^\r\n]+\[Text\.UTF8Encoding\]::new\(\$false,\s*\$true\)\)'
-            $tokens = $null
-            $parseErrors = $null
-            $validatorAst = [Management.Automation.Language.Parser]::ParseFile(
-                $validatorPath,
-                [ref]$tokens,
-                [ref]$parseErrors
-            )
-            @($parseErrors).Count | Should -Be 0
-            $readerAst = $validatorAst.Find({
-                    param($node)
-                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-                        $node.Name -eq 'Read-StrictUtf8File'
-                }, $true)
-            $readerAst | Should -Not -BeNullOrEmpty
-            $readerAst.Extent.Text | Should -Match '\[IO\.File\]::ReadAllBytes\(\$Path\)'
-            $readerAst.Extent.Text | Should -Match '(?s)\$bytes\[0\] -eq 0xEF.*?\$bytes\[1\] -eq 0xBB.*?\$bytes\[2\] -eq 0xBF'
-            $readerAst.Extent.Text | Should -Match '\[Text\.UTF8Encoding\]::new\(\$false, \$true\)\.GetString\('
-
-            $readerModule = New-Module -ScriptBlock ([scriptblock]::Create($readerAst.Extent.Text))
-            try {
-                $validatorName = [IO.Path]::GetFileNameWithoutExtension($validatorPath)
-                $invalidPath = Join-Path $TestDrive "$validatorName-utf16.txt"
-                $plainPath = Join-Path $TestDrive "$validatorName-utf8.txt"
-                $bomPath = Join-Path $TestDrive "$validatorName-utf8-bom.txt"
-                [IO.File]::WriteAllBytes($invalidPath, [byte[]]@(0xFF, 0xFE, 0x23, 0x00))
-                [IO.File]::WriteAllBytes($plainPath, [byte[]]@(0x23, 0x20, 0x6F, 0x6B))
-                [IO.File]::WriteAllBytes($bomPath, [byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B))
-
-                { & $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $invalidPath } |
-                    Should -Throw
-                (& $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $plainPath) |
-                    Should -Be '# ok'
-                (& $readerModule { param($Path) Read-StrictUtf8File -Path $Path } $bomPath) |
-                    Should -Be '# ok'
-            }
-            finally {
-                Remove-Module $readerModule -Force
-            }
-        }
-
-        $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
-        { $strictUtf8.GetString([byte[]]@(0xFF, 0xFE, 0x23, 0x00), 0, 4) } |
-            Should -Throw
-        { $strictUtf8.GetString([byte[]]@(0xFE, 0xFF, 0x00, 0x23), 0, 4) } |
-            Should -Throw
-        { $strictUtf8.GetString([byte[]]@(0xFF, 0xFE, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00), 0, 8) } |
-            Should -Throw
-        { $strictUtf8.GetString([byte[]]@(0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x23), 0, 8) } |
-            Should -Throw
-        $strictUtf8.GetString([byte[]]@(0x23, 0x20, 0x6F, 0x6B), 0, 4) |
-            Should -Be '# ok'
-        $strictUtf8.GetString([byte[]]@(0xEF, 0xBB, 0xBF, 0x23, 0x20, 0x6F, 0x6B), 3, 4) |
-            Should -Be '# ok'
-    }
 
 }

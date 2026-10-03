@@ -1,0 +1,187 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
+name: Darktide Translate Windows Latest Stable PowerShell
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  windows-latest-stable:
+    name: Darktide Translate Windows Latest Stable PowerShell
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: local
+      EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - name: Checkout immutable candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up approved Go runtime
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+          check-latest: true
+          cache: false
+
+      - name: Set up Node for central npm lock resolution
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          check-latest: true
+
+      - name: Require npm 11 lockfile semantics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmVersion = ([string](& npm --version)).Trim()
+          if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^11\.[0-9]+\.[0-9]+$') {
+            throw "The central resolver requires npm 11 lockfile semantics; found '$npmVersion'."
+          }
+
+      - name: Create run-owned validation directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $IsWindows) {
+            throw 'Standard v1 CI requires a Windows runner.'
+          }
+          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          $directoryName = 'sgv1-{0}-{1}-{2}' -f $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT, [guid]::NewGuid().ToString('N')
+          if ($directoryName -notmatch '^sgv1-[0-9]+-[0-9]+-[0-9a-f]{32}$') {
+            throw 'The run-owned validation directory name is malformed.'
+          }
+          $runDirectory = [IO.Path]::GetFullPath((Join-Path $runnerTemp $directoryName))
+          if ([IO.Path]::GetDirectoryName($runDirectory) -cne $runnerTemp -or (Test-Path -LiteralPath $runDirectory)) {
+            throw 'The run-owned validation directory is outside RUNNER_TEMP or already exists.'
+          }
+          [void](New-Item -ItemType Directory -Path $runDirectory -ErrorAction Stop)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "SGV1_RUN_DIRECTORY=$runDirectory$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+
+      - name: Resolve and verify Microsoft latest stable PowerShell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtimeModule = Join-Path $env:GITHUB_WORKSPACE 'scripts/PowerShellRelease.psm1'
+          $installer = Join-Path $env:GITHUB_WORKSPACE 'scripts/Install-LatestPowerShell.ps1'
+          if (-not (Test-Path -LiteralPath $runtimeModule -PathType Leaf) -or
+              -not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw 'The latest PowerShell release verifier is missing.'
+          }
+          $installRoot = Join-Path $env:SGV1_RUN_DIRECTORY 'powershell'
+          $powerShellReceipt = & $installer -InstallRoot $installRoot
+          if ($null -eq $powerShellReceipt -or
+              [string]$powerShellReceipt.tag -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$' -or
+              [string]$powerShellReceipt.version -cne ([string]$powerShellReceipt.tag).Substring(1) -or
+              [string]$powerShellReceipt.publishedDigest -cnotmatch '^sha256:[0-9a-f]{64}$' -or
+              [string]$powerShellReceipt.observedSha256 -cne ([string]$powerShellReceipt.publishedDigest).Substring(7) -or
+              [string]$powerShellReceipt.executableVersion -cne [string]$powerShellReceipt.version) {
+            throw 'The PowerShell release receipt does not prove the selected tag, archive digest, and executable version.'
+          }
+          $powerShellPath = [IO.Path]::GetFullPath([string]$powerShellReceipt.executablePath)
+          $installRootFullPath = [IO.Path]::GetFullPath($installRoot)
+          if (-not $powerShellPath.StartsWith($installRootFullPath + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+              -not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+            throw 'The verified PowerShell executable is outside its run-owned installation directory.'
+          }
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "SGV1_POWERSHELL_EXE=$powerShellPath$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+
+      - name: Validate exact commit with verified PowerShell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runnerNpmPrefix = [Environment]::GetEnvironmentVariable('NPM_CONFIG_PREFIX', 'Process')
+          if ($runnerNpmPrefix -ceq 'C:\npm\prefix') {
+            [Environment]::SetEnvironmentVariable('NPM_CONFIG_PREFIX', $null, 'Process')
+          }
+          elseif (-not [string]::IsNullOrWhiteSpace($runnerNpmPrefix)) {
+            throw 'Unexpected npm prefix in the candidate runner environment.'
+          }
+          $repositoryRoot = [IO.Path]::GetFullPath((Get-Location).Path)
+          $gitPath = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path
+          $gitArguments = @('-c', "safe.directory=$repositoryRoot", '-C', $repositoryRoot)
+          $checkoutHead = ([string]((& $gitPath @gitArguments rev-parse HEAD) | Select-Object -First 1)).Trim()
+          if ($LASTEXITCODE -ne 0 -or $checkoutHead -cnotmatch '^[0-9a-f]{40}$' -or
+              $checkoutHead -cne $env:EXPECTED_HEAD_SHA) {
+            throw 'Checked-out commit does not match the event SHA.'
+          }
+          $baseCommit = ''
+          if ([string]$env:BASE_SHA -cmatch '^[0-9a-f]{40}$' -and
+              [string]$env:BASE_SHA -cne ('0' * 40)) {
+            $mergeBase = ([string]((& $gitPath @gitArguments merge-base $env:BASE_SHA $checkoutHead) | Select-Object -First 1)).Trim()
+            if ($LASTEXITCODE -ne 0 -or $mergeBase -cnotmatch '^[0-9a-f]{40}$') {
+              throw 'Could not resolve the immutable comparison base for this event.'
+            }
+            if ($mergeBase -cne $checkoutHead) { $baseCommit = $mergeBase }
+          }
+          $goVersion = @(& go version)
+          if ($LASTEXITCODE -ne 0 -or $goVersion.Count -ne 1) {
+            throw 'The approved stable Go runtime could not be identified.'
+          }
+          $goRuntimeMatch = [regex]::Match([string]$goVersion[0],
+              '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+) [^\s]+/[^\s]+$')
+          if (-not $goRuntimeMatch.Success) {
+            throw 'The approved stable Go runtime could not be identified.'
+          }
+          $expectedGoRuntimeVersion = $goRuntimeMatch.Groups['version'].Value
+          $powerShellPath = [IO.Path]::GetFullPath($env:SGV1_POWERSHELL_EXE)
+          if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
+            throw 'The verified PowerShell executable is missing.'
+          }
+          $runDirectory = [IO.Path]::GetFullPath($env:SGV1_RUN_DIRECTORY)
+          $reportPath = Join-Path $runDirectory 'darktide-standard-v1-report.json'
+          if (Test-Path -LiteralPath $reportPath) { throw 'The run-owned validation report path already exists.' }
+          & $powerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+              -File (Join-Path $repositoryRoot 'scripts/Validate.ps1') `
+              -RepositoryRoot $repositoryRoot -ArtifactsRoot $runDirectory `
+              -BaseCommit $baseCommit -TrustedTestCommit $checkoutHead `
+              -ExpectedGoRuntimeVersion $expectedGoRuntimeVersion -OutputPath $reportPath
+          if ($LASTEXITCODE -ne 0) { throw "Canonical validator exited $LASTEXITCODE." }
+          if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+            throw 'Canonical validator did not produce a report.'
+          }
+          $report = Get-Content -LiteralPath $reportPath -Raw -Encoding utf8 | ConvertFrom-Json -Depth 100
+          if ([string]$report.candidate.commit -cne $checkoutHead -or
+              [string]$report.stages.repositoryTests.pester.trustedCommit -cne $checkoutHead -or
+              [string]$report.result -cne 'passed' -or
+              [string]$report.executionBoundary.platform -cne 'windows-restricted-primary-token-job-object') {
+            throw 'Validation report does not prove successful exact-commit Windows validation.'
+          }
+          Write-Host "Validated immutable commit $checkoutHead using $($report.stages.repositoryTests.pester.pesterVersion)."
+
+      - name: Remove run-owned validation directory
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:SGV1_RUN_DIRECTORY)) {
+            Write-Host 'No run-owned validation directory was created.'
+          }
+          else {
+            $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+            $runDirectory = [IO.Path]::GetFullPath($env:SGV1_RUN_DIRECTORY)
+            $directoryName = [IO.Path]::GetFileName($runDirectory)
+            $expectedName = '^sgv1-{0}-{1}-[0-9a-f]{{32}}$' -f [regex]::Escape($env:GITHUB_RUN_ID), [regex]::Escape($env:GITHUB_RUN_ATTEMPT)
+            if ([IO.Path]::GetDirectoryName($runDirectory) -cne $runnerTemp -or $directoryName -cnotmatch $expectedName) {
+              throw 'Refusing to remove a path outside the exact run-owned RUNNER_TEMP directory.'
+            }
+            if (Test-Path -LiteralPath $runDirectory) {
+              $directory = Get-Item -LiteralPath $runDirectory -Force -ErrorAction Stop
+              if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Refusing to remove a non-directory or reparse run path.'
+              }
+              [IO.Directory]::Delete($runDirectory, $true)
+              if (Test-Path -LiteralPath $runDirectory) { throw 'Run-owned validation directory cleanup did not complete.' }
+            }
+          }

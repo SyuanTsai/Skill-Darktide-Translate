@@ -7,16 +7,13 @@ param(
     [string] $RepositoryRoot,
     [string] $OutputPath,
     [string] $TrustedGitPath,
-    [string] $TrustedStatPath,
     [switch] $BootstrapTransition,
     [switch] $NoFilters
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$resolvedTrustedStatPath = if ([string]::IsNullOrWhiteSpace($TrustedStatPath)) { $null } else { [IO.Path]::GetFullPath($TrustedStatPath) }
 $resolvedTrustedGitPath = if ([string]::IsNullOrWhiteSpace($TrustedGitPath)) { $null } else { [IO.Path]::GetFullPath($TrustedGitPath) }
-$script:TrustedStatPath = $resolvedTrustedStatPath
 $script:TrustedGitPath = $resolvedTrustedGitPath
 
 function Assert-ExactPropertySet {
@@ -330,27 +327,6 @@ function Assert-RegularFileForHash {
     )
     if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Context is not a regular non-reparse file: $($Item.FullName)"
-    }
-    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
-        if ([string]::IsNullOrWhiteSpace($script:TrustedStatPath)) {
-            $statCommand = Get-Command stat -CommandType Application -ErrorAction Stop | Select-Object -First 1
-            $script:TrustedStatPath = [IO.Path]::GetFullPath([string]$statCommand.Path)
-            if (-not (Test-Path -LiteralPath $script:TrustedStatPath -PathType Leaf)) {
-                throw "Trusted Linux stat utility is missing: $($script:TrustedStatPath)"
-            }
-        }
-        $previousLcAll = [Environment]::GetEnvironmentVariable('LC_ALL', [EnvironmentVariableTarget]::Process)
-        try {
-            [Environment]::SetEnvironmentVariable('LC_ALL', 'C', [EnvironmentVariableTarget]::Process)
-            $fileType = @(& $script:TrustedStatPath -c '%F' -- $Item.FullName 2>$null)
-            $statExitCode = $LASTEXITCODE
-        }
-        finally {
-            [Environment]::SetEnvironmentVariable('LC_ALL', $previousLcAll, [EnvironmentVariableTarget]::Process)
-        }
-        if ($statExitCode -ne 0 -or $fileType.Count -ne 1 -or [string]$fileType[0].Trim() -cnotin @('regular file', 'regular empty file')) {
-            throw "$Context is not a regular file according to the trusted filesystem type check: $($Item.FullName)"
-        }
     }
 }
 
@@ -956,16 +932,6 @@ if ([string]::IsNullOrWhiteSpace($script:TrustedGitPath)) {
 if (-not (Test-Path -LiteralPath $script:TrustedGitPath -PathType Leaf)) {
     throw "Trusted Git executable is missing: $($script:TrustedGitPath)"
 }
-if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
-    if ([string]::IsNullOrWhiteSpace($script:TrustedStatPath)) {
-        $statCommand = Get-Command stat -CommandType Application -ErrorAction Stop | Select-Object -First 1
-        $script:TrustedStatPath = [IO.Path]::GetFullPath([string]$statCommand.Path)
-    }
-    if (-not (Test-Path -LiteralPath $script:TrustedStatPath -PathType Leaf)) {
-        throw "Trusted Linux stat utility is missing: $($script:TrustedStatPath)"
-    }
-}
-
 $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
     [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 }
