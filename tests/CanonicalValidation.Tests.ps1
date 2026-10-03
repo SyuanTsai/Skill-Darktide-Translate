@@ -7,6 +7,22 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
         $script:Adapter = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'config/standard-v1.json') -Raw |
             ConvertFrom-Json -Depth 20
+
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [System.Management.Automation.Language.Parser]::ParseInput(
+            $script:Validator, [ref]$tokens, [ref]$parseErrors)
+        if ($parseErrors.Count -gt 0) { throw 'Validate.ps1 must parse before the SkillSpector probe is built.' }
+        $probeFunctions = $validatorAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                @('Get-RequiredProperty', 'Assert-SkillSpectorReport') -contains $node.Name
+        }, $true)
+        if ($probeFunctions.Count -ne 2) { throw 'The SkillSpector completeness probe could not find its validator functions.' }
+        $probeSource = ($probeFunctions | Sort-Object { $_.Extent.StartOffset } |
+            ForEach-Object { $_.Extent.Text }) -join "`n"
+        $probeSource += "`nExport-ModuleMember -Function Assert-SkillSpectorReport"
+        $script:SkillSpectorProbeSource = $probeSource
     }
 
     It 'binds the immutable candidate before any external authority or tool acquisition' {
@@ -169,6 +185,153 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match "validate', 'structure', '--allow-dirs=agents'"
         $script:Validator | Should -Match "'check', '--strict', '--allow-dirs=agents'"
         $script:Validator | Should -Match ([regex]::Escape("'check', `$skillRoot, '--format', 'sarif'"))
+    }
+
+    # Scenario: A SkillSpector report fails one completeness gate or contains hostile status text.
+    # Purpose: Emit one bounded, sanitized diagnostic while preserving fail-closed rejection.
+    It 'UnitT30_ReportsSanitizedSkillSpectorCompletenessFailures' {
+        $completeness = [pscustomobject]@{
+            execution_successful = $true
+            is_complete = $true
+            status = 'complete'
+            coverage_percent = 100
+            ledger_exceptions = @()
+            scope_exclusions = @()
+            limitations = @()
+        }
+        $report = [pscustomobject]@{
+            execution_successful = $false
+            analysis_completeness = $completeness
+        }
+        $probeModule = New-Module -Name "SkillSpectorProbe_$([guid]::NewGuid().ToString('N'))" `
+            -ScriptBlock ([scriptblock]::Create($script:SkillSpectorProbeSource))
+        try {
+            $failure = $null
+            try {
+                & $probeModule {
+                    param($probeReport)
+                    Assert-SkillSpectorReport -Report $probeReport -SkillRoot 'C:\candidate\skills\sample' `
+                        -SkillId 'sample-skill' -ExpectedInventoryPaths @()
+                } $report
+            }
+            catch { $failure = $_.Exception }
+
+            $failure | Should -Not -BeNullOrEmpty
+            $failure.Message | Should -Match 'execution_successful'
+            $failure.Message | Should -Match 'did not prove complete static analysis'
+        }
+        finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Scenario: The report status contains an attacker-controlled long value and marker.
+    # Purpose: Keep diagnostics bounded and prevent untrusted report strings from reaching output.
+    It 'UnitT31_RedactsAndBoundsHostileCompletenessStrings' {
+        $hostileStatus = 'partial;SECRET_MARKER=' + ('x' * 4096)
+        $report = [pscustomobject]@{
+            execution_successful = $true
+            analysis_completeness = [pscustomobject]@{
+                execution_successful = $true
+                is_complete = $true
+                status = $hostileStatus
+                coverage_percent = 100
+                ledger_exceptions = @()
+                scope_exclusions = @()
+                limitations = @()
+            }
+        }
+        $probeModule = New-Module -Name "SkillSpectorProbe_$([guid]::NewGuid().ToString('N'))" `
+            -ScriptBlock ([scriptblock]::Create($script:SkillSpectorProbeSource))
+        try {
+            $failure = $null
+            try {
+                & $probeModule {
+                    param($probeReport)
+                    Assert-SkillSpectorReport -Report $probeReport -SkillRoot 'C:\candidate\skills\sample' `
+                        -SkillId 'sample-skill' -ExpectedInventoryPaths @()
+                } $report
+            }
+            catch { $failure = $_.Exception }
+
+            $failure | Should -Not -BeNullOrEmpty
+            $diagnostic = $failure.Message
+            $diagnostic | Should -Match 'analysis_completeness.status'
+            $diagnostic.Length | Should -BeLessThan 500
+            $diagnostic | Should -Not -Match 'SECRET_MARKER'
+            $failure.Message | Should -Match 'did not prove complete static analysis'
+        }
+        finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Scenario: A required completeness gate field is absent from the report.
+    # Purpose: Identify missing gate evidence safely and continue to reject the report.
+    It 'UnitT32_ReportsMissingCompletenessGateFieldsAndRejects' {
+        $report = [pscustomobject]@{
+            execution_successful = $true
+            analysis_completeness = [pscustomobject]@{
+                execution_successful = $true
+                status = 'complete'
+                coverage_percent = 100
+                ledger_exceptions = @()
+                scope_exclusions = @()
+                limitations = @()
+            }
+        }
+        $probeModule = New-Module -Name "SkillSpectorProbe_$([guid]::NewGuid().ToString('N'))" `
+            -ScriptBlock ([scriptblock]::Create($script:SkillSpectorProbeSource))
+        try {
+            $failure = $null
+            try {
+                & $probeModule {
+                    param($probeReport)
+                    Assert-SkillSpectorReport -Report $probeReport -SkillRoot 'C:\candidate\skills\sample' `
+                        -SkillId 'sample-skill' -ExpectedInventoryPaths @()
+                } $report
+            }
+            catch { $failure = $_.Exception }
+
+            $failure | Should -Not -BeNullOrEmpty
+            $failure.Message | Should -Match 'analysis_completeness.is_complete=missing'
+            $failure.Message | Should -Match 'did not prove complete static analysis'
+        }
+        finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Scenario: SkillId contains a newline and attacker-controlled marker text.
+    # Purpose: Keep both the generic rejection and diagnostic free of raw SkillId content.
+    It 'UnitT33_RedactsHostileSkillIdInCompletenessFailure' {
+        $hostileSkillId = "bad`nSECRET_SKILL_ID" + ('x' * 4096)
+        $report = [pscustomobject]@{
+            execution_successful = $false
+            analysis_completeness = [pscustomobject]@{
+                execution_successful = $true
+                is_complete = $true
+                status = 'complete'
+                coverage_percent = 100
+                ledger_exceptions = @()
+                scope_exclusions = @()
+                limitations = @()
+            }
+        }
+        $probeModule = New-Module -Name "SkillSpectorProbe_$([guid]::NewGuid().ToString('N'))" `
+            -ScriptBlock ([scriptblock]::Create($script:SkillSpectorProbeSource))
+        try {
+            $failure = $null
+            try {
+                & $probeModule {
+                    param($probeReport, $probeSkillId)
+                    Assert-SkillSpectorReport -Report $probeReport -SkillRoot 'C:\candidate\skills\sample' `
+                        -SkillId $probeSkillId -ExpectedInventoryPaths @()
+                } $report $hostileSkillId
+            }
+            catch { $failure = $_.Exception }
+
+            $failure | Should -Not -BeNullOrEmpty
+            $failure.Message | Should -Match 'did not prove complete static analysis'
+            $failure.Message | Should -Match 'skillId=\[redacted\]'
+            $failure.Message | Should -Not -Match 'SECRET_SKILL_ID'
+            $failure.Message | Should -Not -Match '[\r\n]'
+        }
+        finally { Remove-Module -Name $probeModule.Name -Force -ErrorAction SilentlyContinue }
     }
 
     It 'accepts a clean skill-tools SARIF report with no findings' {

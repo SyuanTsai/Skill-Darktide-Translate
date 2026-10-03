@@ -3382,21 +3382,79 @@ function Resolve-ReportedFilePath {
 
 function Assert-SkillSpectorReport {
     param($Report, [string] $SkillRoot, [string] $SkillId, [string[]] $ExpectedInventoryPaths)
-    $executionSuccessful = Get-RequiredProperty -Object $Report -Name 'execution_successful' -Context 'SkillSpector report'
-    $completeness = Get-RequiredProperty -Object $Report -Name 'analysis_completeness' -Context 'SkillSpector report'
-    $coverage = Get-RequiredProperty -Object $completeness -Name 'coverage_percent' -Context 'SkillSpector completeness'
     $numericTypes = @([byte], [sbyte], [int16], [uint16], [int], [uint32], [long], [uint64], [single], [double], [decimal])
+    $readDiagnosticField = {
+        param($Object, [string] $Name)
+        if ($Object -is [pscustomobject]) {
+            $property = $Object.PSObject.Properties[$Name]
+            if ($null -ne $property) { return [pscustomobject]@{ Present = $true; Value = $property.Value } }
+        }
+        return [pscustomobject]@{ Present = $false; Value = $null }
+    }
+    $formatDiagnosticField = {
+        param([string] $Name, $Field)
+        if (-not $Field.Present) { return "$Name=missing" }
+        $value = $Field.Value
+        if ($null -eq $value) { return "$Name<null>=null" }
+
+        $typeName = $value.GetType().Name
+        if ($typeName.Length -gt 32) { $typeName = $typeName.Substring(0, 32) }
+        if ($value -is [bool]) {
+            $valueSummary = if ($value) { 'true' } else { 'false' }
+        }
+        elseif ($Name -ceq 'analysis_completeness.status' -and $value -is [string]) {
+            if (@('complete', 'incomplete', 'partial', 'unknown', 'error', 'cancelled') -ccontains $value) {
+                $valueSummary = $value
+            }
+            else { $valueSummary = "redacted-string-length:$($value.Length)" }
+        }
+        elseif ($Name -ceq 'analysis_completeness.coverage_percent') {
+            $isDiagnosticNumeric = $false
+            foreach ($numericType in $numericTypes) {
+                if ($value -is $numericType) { $isDiagnosticNumeric = $true; break }
+            }
+            if ($isDiagnosticNumeric) {
+                $valueSummary = [Convert]::ToString($value, [Globalization.CultureInfo]::InvariantCulture)
+                if ($valueSummary.Length -gt 32) { $valueSummary = $valueSummary.Substring(0, 32) + '...' }
+            }
+            elseif ($value -is [string]) { $valueSummary = "redacted-string-length:$($value.Length)" }
+            else { $valueSummary = 'redacted' }
+        }
+        elseif ($value -is [string]) { $valueSummary = "redacted-string-length:$($value.Length)" }
+        else { $valueSummary = 'redacted' }
+
+        return "$Name<$typeName>=$valueSummary"
+    }
+
+    $reportExecutionField = & $readDiagnosticField $Report 'execution_successful'
+    $completenessObjectField = & $readDiagnosticField $Report 'analysis_completeness'
+    $completeness = if ($completenessObjectField.Present) { $completenessObjectField.Value } else { $null }
+    $completenessExecutionField = & $readDiagnosticField $completeness 'execution_successful'
+    $isCompleteField = & $readDiagnosticField $completeness 'is_complete'
+    $statusField = & $readDiagnosticField $completeness 'status'
+    $coverageField = & $readDiagnosticField $completeness 'coverage_percent'
+    $executionSuccessful = $reportExecutionField.Value
+    $coverage = $coverageField.Value
     $coverageIsNumeric = $false
     foreach ($type in $numericTypes) { if ($coverage -is $type) { $coverageIsNumeric = $true; break } }
-    if ($executionSuccessful -isnot [bool] -or -not $executionSuccessful -or
-        (Get-RequiredProperty -Object $completeness -Name 'execution_successful' -Context 'SkillSpector completeness') -isnot [bool] -or
-        -not (Get-RequiredProperty -Object $completeness -Name 'execution_successful' -Context 'SkillSpector completeness') -or
-        (Get-RequiredProperty -Object $completeness -Name 'is_complete' -Context 'SkillSpector completeness') -isnot [bool] -or
-        -not (Get-RequiredProperty -Object $completeness -Name 'is_complete' -Context 'SkillSpector completeness') -or
-        (Get-RequiredProperty -Object $completeness -Name 'status' -Context 'SkillSpector completeness') -isnot [string] -or
-        (Get-RequiredProperty -Object $completeness -Name 'status' -Context 'SkillSpector completeness') -cne 'complete' -or
-        -not $coverageIsNumeric -or $coverage -ne 100) {
-        throw "SkillSpector did not prove complete static analysis for '$SkillId'."
+    if (-not $reportExecutionField.Present -or $executionSuccessful -isnot [bool] -or -not $executionSuccessful -or
+        -not $completenessObjectField.Present -or $completeness -isnot [pscustomobject] -or
+        -not $completenessExecutionField.Present -or $completenessExecutionField.Value -isnot [bool] -or
+        -not $completenessExecutionField.Value -or
+        -not $isCompleteField.Present -or $isCompleteField.Value -isnot [bool] -or -not $isCompleteField.Value -or
+        -not $statusField.Present -or $statusField.Value -isnot [string] -or $statusField.Value -cne 'complete' -or
+        -not $coverageField.Present -or -not $coverageIsNumeric -or $coverage -ne 100) {
+        $safeSkillId = '[redacted]'
+        if ($SkillId -cmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$' -and $SkillId.Length -le 64) { $safeSkillId = $SkillId }
+        $diagnosticFields = @(
+            (& $formatDiagnosticField 'execution_successful' $reportExecutionField)
+            (& $formatDiagnosticField 'analysis_completeness.execution_successful' $completenessExecutionField)
+            (& $formatDiagnosticField 'analysis_completeness.is_complete' $isCompleteField)
+            (& $formatDiagnosticField 'analysis_completeness.status' $statusField)
+            (& $formatDiagnosticField 'analysis_completeness.coverage_percent' $coverageField)
+        )
+        $diagnostic = "SkillSpector completeness rejected: skillId=$safeSkillId; $($diagnosticFields -join '; ')"
+        throw "SkillSpector did not prove complete static analysis for '$safeSkillId'. $diagnostic"
     }
     foreach ($name in @('ledger_exceptions', 'scope_exclusions', 'limitations')) {
         $items = Get-RequiredProperty -Object $completeness -Name $name -Context 'SkillSpector completeness'
