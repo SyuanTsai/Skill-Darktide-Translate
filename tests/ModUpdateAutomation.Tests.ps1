@@ -2787,6 +2787,7 @@ function Get-SourceTupleContractSha256 {
         $rawEvidenceStart = [Diagnostics.ProcessStartInfo]::new()
         $rawEvidenceStart.FileName = 'git'
         $rawEvidenceStart.UseShellExecute = $false
+        $rawEvidenceStart.RedirectStandardInput = $true
         $rawEvidenceStart.RedirectStandardOutput = $true
         $rawEvidenceStart.RedirectStandardError = $true
         foreach ($argument in @(
@@ -2798,6 +2799,7 @@ function Get-SourceTupleContractSha256 {
         $rawEvidenceMemory = [IO.MemoryStream]::new()
         try {
             $rawEvidenceProcess.Start() | Should -BeTrue
+            $rawEvidenceProcess.StandardInput.Close()
             $rawEvidenceCopy = $rawEvidenceProcess.StandardOutput.BaseStream.CopyToAsync($rawEvidenceMemory)
             $rawEvidenceError = $rawEvidenceProcess.StandardError.ReadToEndAsync()
             $rawEvidenceProcess.WaitForExit()

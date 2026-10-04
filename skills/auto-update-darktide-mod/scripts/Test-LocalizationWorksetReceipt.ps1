@@ -165,11 +165,13 @@ function Get-GitBlobBytes {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'git'
     $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     foreach ($argument in @('-C', $WorkingDirectory, 'cat-file', 'blob', $Object)) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git for independent OLD localization verification.' }
+    $process.StandardInput.Close()
     $memory = [IO.MemoryStream]::new()
     try {
         $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)

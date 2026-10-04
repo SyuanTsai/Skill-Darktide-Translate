@@ -213,6 +213,7 @@ function Get-ModUpdateGitOutputBytes {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'git'
     $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     foreach ($argument in @('-C', $WorkingDirectory) + $Arguments) { $start.ArgumentList.Add($argument) }
@@ -221,6 +222,7 @@ function Get-ModUpdateGitOutputBytes {
     $memory = [IO.MemoryStream]::new()
     try {
         if (-not $process.Start()) { throw 'Unable to start Git evidence capture.' }
+        $process.StandardInput.Close()
         $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
         $errorTask = $process.StandardError.ReadToEndAsync()
         while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {

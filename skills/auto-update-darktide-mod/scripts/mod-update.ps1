@@ -927,12 +927,14 @@ function Invoke-Git {
         $start = [Diagnostics.ProcessStartInfo]::new()
         $start.FileName = 'git'
         $start.UseShellExecute = $false
+        $start.RedirectStandardInput = $true
         $start.RedirectStandardOutput = $true
         $start.RedirectStandardError = $true
         foreach ($argument in @('-C', $WorkingDirectory) + $Arguments) { $start.ArgumentList.Add($argument) }
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $start
         if (-not $process.Start()) { throw 'Unable to start Git.' }
+        $process.StandardInput.Close()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         while (-not $process.WaitForExit(1000)) {
@@ -1028,6 +1030,7 @@ function Get-GitBlobBytes {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'git'
     $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     foreach ($argument in @('-C', $WorkingDirectory, 'cat-file', 'blob', $Object)) {
@@ -1036,6 +1039,7 @@ function Get-GitBlobBytes {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start git cat-file.' }
+    $process.StandardInput.Close()
     $memory = [IO.MemoryStream]::new()
     try {
         $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
@@ -3819,6 +3823,7 @@ function New-GitEvidenceBatch {
                 $start = [Diagnostics.ProcessStartInfo]::new()
                 $start.FileName = 'git'
                 $start.UseShellExecute = $false
+                $start.RedirectStandardInput = $true
                 $start.RedirectStandardOutput = $true
                 $start.RedirectStandardError = $true
                 foreach ($argument in @('-C', [string]$State.worktreePath) + @($specification.arguments)) { $start.ArgumentList.Add([string]$argument) }
@@ -3828,6 +3833,7 @@ function New-GitEvidenceBatch {
                 try {
                     $startedAt = Get-UtcTimestamp
                     if (-not $process.Start()) { throw ('Unable to start Git evidence task {0}.' -f ([string]($specification.name))) }
+                    $process.StandardInput.Close()
                     $active.Add([ordered]@{
                         specification = $specification
                         process = $process
