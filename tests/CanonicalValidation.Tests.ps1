@@ -1,5 +1,302 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
+Describe 'Trusted resolver API credential lifetime' {
+    BeforeAll {
+        $source = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1') -Raw
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+        if ($errors.Count) { throw 'The actual validator must parse before its credential lifetime is exercised.' }
+        $names = @('Protect-ProcessCredentialEnvironment', 'Assert-SemanticCredentialHostSupport',
+            'Read-StrictUtf8File', 'Assert-NoDuplicateJsonProperties', 'Read-JsonFile')
+        $functions = $ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
+        }, $true)
+        if ($functions.Count -ne $names.Count) { throw 'Missing actual credential or receipt helpers.' }
+        $assignments = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst]
+        }, $true))
+        $protect = @($assignments | Where-Object { $_.Left.Extent.Text -ceq '$semanticCredentialEnvironment' })
+        $capture = @($assignments | Where-Object {
+            $_.Left.Extent.Text -ceq '$toolResolutionGitHubToken' -and
+            $_.Extent.StartOffset -lt $protect[0].Extent.StartOffset
+        })
+        $sources = @($assignments | Where-Object { $_.Left.Extent.Text -ceq '$expectedSources' })
+        $loop = @($ast.Find({ param($node)
+            $node -is [Management.Automation.Language.ForEachStatementAst] -and
+            $node.Variable.Extent.Text -ceq '$toolName' -and
+            $node.Condition.Extent.Text -ceq '$expectedSources.Keys'
+        }, $true))
+        if ($protect.Count -ne 1 -or $sources.Count -ne 1 -or $loop.Count -ne 1 -or $capture.Count -gt 1) {
+            throw 'The actual credential capture, sanitizer and resolver loop must be unambiguous.'
+        }
+        $firstFunction = @($ast.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst]
+        })[0]
+        $earlyStatements = @($ast.EndBlock.Statements | Where-Object {
+            $_.Extent.StartOffset -lt $firstFunction.Extent.StartOffset
+        })
+        $script:CredentialEarlyBody = ($earlyStatements.Extent.Text -join "`n")
+        $lateCapture = @($capture | Where-Object { $_.Extent.StartOffset -ge $firstFunction.Extent.StartOffset })
+        $script:CredentialFunctions = ($functions.Extent.Text -join "`n")
+        $script:CredentialSetup = (@($lateCapture + $protect) | Sort-Object { $_.Extent.StartOffset } |
+            ForEach-Object { $_.Extent.Text }) -join "`n"
+        $script:CredentialSources = $sources[0].Extent.Text
+        $script:CredentialLoop = $loop[0].Extent.Text
+
+        function Invoke-CredentialLifetimeFixture {
+            param([string] $Root, [string] $FailTool, [bool] $WithToken)
+            $module = New-Module -ScriptBlock ([scriptblock]::Create($script:CredentialFunctions))
+            return & $module {
+                param($root, $failTool, $withToken, $earlyBody, $setup, $sources, $loop)
+                $before = [Environment]::GetEnvironmentVariables('Process')
+                try {
+                    $script:IsWindowsHost = $true
+                    $script:Calls = [Collections.Generic.List[object]]::new()
+                    $script:FailTool = $failTool
+                    [Environment]::SetEnvironmentVariable('GITHUB_TOKEN',
+                        $(if ($withToken) { 'fixture-read-only-api-token' } else { $null }), 'Process')
+                    [Environment]::SetEnvironmentVariable('GH_TOKEN', 'fixture-unrelated-token', 'Process')
+                    $toolResolutionGitHubToken = $null
+                    . ([scriptblock]::Create($earlyBody))
+                    $child = [Diagnostics.Process]::new()
+                    try {
+                        $child.StartInfo = [Diagnostics.ProcessStartInfo]::new()
+                        $child.StartInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+                        $child.StartInfo.UseShellExecute = $false
+                        $child.StartInfo.CreateNoWindow = $true
+                        $child.StartInfo.RedirectStandardOutput = $true
+                        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+                            "[string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('GITHUB_TOKEN','Process')) -and [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('GH_TOKEN','Process'))")) {
+                            [void]$child.StartInfo.ArgumentList.Add($argument)
+                        }
+                        if (-not $child.Start()) { throw 'Could not start the credential inheritance probe.' }
+                        $childOutput = $child.StandardOutput.ReadToEndAsync()
+                        if (-not $child.WaitForExit(10000)) { $child.Kill($true); throw 'Credential inheritance probe timed out.' }
+                        if ($child.ExitCode -ne 0) { throw 'Credential inheritance probe failed.' }
+                        $preflightChildCredentialFree = ($childOutput.GetAwaiter().GetResult().Trim() -ceq 'True')
+                    }
+                    finally { $child.Dispose() }
+                    $SemanticCredentialNames = @()
+                    . ([scriptblock]::Create($setup))
+                    $cleanAfterSanitizer = [string]::IsNullOrEmpty($env:GITHUB_TOKEN) -and
+                        [string]::IsNullOrEmpty($env:GH_TOKEN)
+                    . ([scriptblock]::Create($sources))
+                    $runRoot = $root; $installRoot = $root; $policyPath = 'fixture-policy.json'
+                    $ExpectedGoRuntimeVersion = 'fixture-runtime'; $receipts = [ordered]@{}
+                    $resolverPath = {
+                        param($PolicyPath, $ToolName, [switch] $Install, $InstallRoot,
+                            $ExpectedGoRuntimeVersion, $OutputPath)
+                        $script:Calls.Add([pscustomobject]@{
+                            tool = $ToolName
+                            hasGitHubToken = ($env:GITHUB_TOKEN -ceq 'fixture-read-only-api-token')
+                            hasGhToken = -not [string]::IsNullOrEmpty($env:GH_TOKEN)
+                        })
+                        if ($ToolName -ceq $script:FailTool) { throw 'fixture resolver failure before its own cleanup' }
+                        # Deliberately leave the token intact: the actual parent must clean it.
+                        $receipt = [ordered]@{ toolName = $ToolName; source = $expectedSources[$ToolName]
+                            channel = 'latest-stable'; frozenForRun = $true
+                            resolvedVersion = 'fixture-version'; resolvedIdentity = 'fixture-identity' }
+                        [IO.File]::WriteAllText($OutputPath, ($receipt | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+                    }
+                    $failure = $null
+                    try { . ([scriptblock]::Create($loop)) } catch { $failure = $_.Exception.Message }
+                    [pscustomobject]@{
+                        calls = @($script:Calls.ToArray()); failure = $failure
+                        cleanAfterSanitizer = $cleanAfterSanitizer
+                        cleanAfterResolution = [string]::IsNullOrEmpty($env:GITHUB_TOKEN) -and
+                            [string]::IsNullOrEmpty($env:GH_TOKEN)
+                        capturedTokenCleared = [string]::IsNullOrEmpty($toolResolutionGitHubToken)
+                        semanticCredentialCount = $semanticCredentialEnvironment.Count
+                        preflightChildCredentialFree = $preflightChildCredentialFree
+                    }
+                }
+                finally {
+                    foreach ($name in @([Environment]::GetEnvironmentVariables('Process').Keys)) {
+                        if (-not $before.Contains($name)) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+                    }
+                    foreach ($entry in $before.GetEnumerator()) {
+                        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+                    }
+                }
+            } $Root $FailTool $WithToken $script:CredentialEarlyBody $script:CredentialSetup $script:CredentialSources $script:CredentialLoop
+        }
+    }
+
+    # Scenario: Preflight Git or transition validation starts a native child before the full credential sanitizer.
+    # Purpose: Exercise actual process inheritance after the validator's early body, exposing no credential value.
+    It 'UnitT05_RemovesApiCredentialsBeforePreflightNativeChildren' {
+        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true
+        $result.preflightChildCredentialFree | Should -BeTrue
+        $result.calls[0].hasGitHubToken | Should -BeTrue
+        $result.cleanAfterResolution | Should -BeTrue
+    }
+
+    # Scenario: The trusted SkillSpector resolver succeeds but leaves the API token in its parent environment.
+    # Purpose: Authenticate that API only, while retaining sanitization and excluding subsequent tool acquisitions.
+    It 'UnitT10_AuthenticatesOnlyTheTrustedSkillSpectorResolver' {
+        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true
+        $result.failure | Should -BeNullOrEmpty
+        $result.cleanAfterSanitizer | Should -BeTrue
+        $result.calls.Count | Should -Be 4
+        $result.calls[0].tool | Should -BeExactly 'skillspector'
+        $result.calls[0].hasGitHubToken | Should -BeTrue
+        @($result.calls | Select-Object -Skip 1 | Where-Object hasGitHubToken).Count | Should -Be 0
+        @($result.calls | Where-Object hasGhToken).Count | Should -Be 0
+        $result.cleanAfterResolution | Should -BeTrue
+        $result.capturedTokenCleared | Should -BeTrue
+        $result.semanticCredentialCount | Should -Be 0
+    }
+
+    # Scenario: The trusted API resolver throws before performing its own credential removal.
+    # Purpose: Require the parent finally path to remove both environment and captured credentials.
+    It 'UnitT20_CleansCredentialsAfterAnEarlySkillSpectorResolverFailure' {
+        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true -FailTool 'skillspector'
+        $result.failure | Should -BeExactly 'fixture resolver failure before its own cleanup'
+        $result.calls.Count | Should -Be 1
+        $result.calls[0].hasGitHubToken | Should -BeTrue
+        $result.cleanAfterSanitizer | Should -BeTrue
+        $result.cleanAfterResolution | Should -BeTrue
+        $result.capturedTokenCleared | Should -BeTrue
+    }
+
+    # Scenario: A later tool acquisition fails after the trusted API resolver returned.
+    # Purpose: Prevent a successful API request from leaking credentials into another installer or failure path.
+    It 'UnitT30_KeepsLaterResolverFailuresCredentialFree' {
+        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true -FailTool 'skill-validator'
+        $result.failure | Should -BeExactly 'fixture resolver failure before its own cleanup'
+        $result.calls.Count | Should -Be 2
+        $result.calls[0].hasGitHubToken | Should -BeTrue
+        $result.calls[1].hasGitHubToken | Should -BeFalse
+        $result.cleanAfterResolution | Should -BeTrue
+        $result.capturedTokenCleared | Should -BeTrue
+    }
+
+    # Scenario: A fork or local validation has no read-only GitHub token.
+    # Purpose: Preserve anonymous resolution without introducing a secret or new authorization prerequisite.
+    It 'UnitT40_PreservesAnonymousResolutionWhenTheTokenIsAbsent' {
+        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $false
+        $result.failure | Should -BeNullOrEmpty
+        $result.calls.Count | Should -Be 4
+        @($result.calls | Where-Object hasGitHubToken).Count | Should -Be 0
+        @($result.calls | Where-Object hasGhToken).Count | Should -Be 0
+        $result.cleanAfterSanitizer | Should -BeTrue
+        $result.cleanAfterResolution | Should -BeTrue
+        $result.capturedTokenCleared | Should -BeTrue
+    }
+}
+
+Describe 'Workflow resolver credential handoff' {
+    BeforeAll {
+        $workflow = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/standard-v1-candidate-windows.yml') -Raw
+        $block = [regex]::Match($workflow,
+            '(?ms)^      - name: Validate exact commit with verified PowerShell\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:)')
+        if (-not $block.Success) { throw 'The actual validation workflow step is missing.' }
+        $code = [regex]::Replace($block.Groups['code'].Value, '(?m)^          ', '')
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors)
+        if ($errors.Count) { throw 'The actual workflow PowerShell must parse.' }
+        $statements = @($ast.EndBlock.Statements)
+        $firstNative = @($statements | Where-Object {
+            $null -ne $_.Find({ param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                $node.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Ampersand
+            }, $true)
+        })[0]
+        $script:WorkflowEarlyBody = (@($statements | Where-Object {
+            $_.Extent.StartOffset -lt $firstNative.Extent.StartOffset
+        }).Extent.Text -join "`n")
+        $invocation = @($statements | Where-Object {
+            $null -ne $_.Find({ param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                $node.CommandElements[0].Extent.Text -ceq '$powerShellPath'
+            }, $true)
+        })
+        if ($invocation.Count -ne 1) { throw 'The actual verified-validator invocation is ambiguous.' }
+        $script:WorkflowInvocation = $invocation[0].Extent.Text
+
+        function Invoke-WorkflowCredentialFixture {
+            param([string] $Root, [int] $ValidatorExit)
+            $module = New-Module -ScriptBlock {}
+            return & $module {
+                param($root, $validatorExit, $earlyBody, $invocation)
+                $before = [Environment]::GetEnvironmentVariables('Process')
+                try {
+                    [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', 'fixture-read-only-api-token', 'Process')
+                    [Environment]::SetEnvironmentVariable('GH_TOKEN', 'fixture-unrelated-token', 'Process')
+                    [Environment]::SetEnvironmentVariable('NPM_CONFIG_PREFIX', $null, 'Process')
+                    $resolverGitHubToken = $null
+                    . ([scriptblock]::Create($earlyBody))
+                    $child = [Diagnostics.Process]::new()
+                    try {
+                        $child.StartInfo = [Diagnostics.ProcessStartInfo]::new()
+                        $child.StartInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+                        $child.StartInfo.UseShellExecute = $false
+                        $child.StartInfo.CreateNoWindow = $true
+                        $child.StartInfo.RedirectStandardOutput = $true
+                        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+                            "[string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('GITHUB_TOKEN','Process')) -and [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('GH_TOKEN','Process'))")) {
+                            [void]$child.StartInfo.ArgumentList.Add($argument)
+                        }
+                        if (-not $child.Start()) { throw 'Could not start the workflow preflight probe.' }
+                        $output = $child.StandardOutput.ReadToEndAsync()
+                        if (-not $child.WaitForExit(10000)) { $child.Kill($true); throw 'Workflow preflight probe timed out.' }
+                        if ($child.ExitCode -ne 0) { throw 'Workflow preflight probe failed.' }
+                        $preflightCredentialFree = ($output.GetAwaiter().GetResult().Trim() -ceq 'True')
+                    }
+                    finally { $child.Dispose() }
+                    $repositoryRoot = Join-Path $root 'workflow-fixture'
+                    [void][IO.Directory]::CreateDirectory((Join-Path $repositoryRoot 'scripts'))
+                    $fixture = @'
+param($RepositoryRoot, $ArtifactsRoot, $BaseCommit, $TrustedTestCommit, $ExpectedGoRuntimeVersion, $OutputPath)
+$result = @{ hasGitHubToken = ($env:GITHUB_TOKEN -ceq 'fixture-read-only-api-token'); hasGhToken = -not [string]::IsNullOrEmpty($env:GH_TOKEN) }
+[IO.File]::WriteAllText($OutputPath, ($result | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+exit ([int]$env:WORKFLOW_FIXTURE_EXIT)
+'@
+                    [IO.File]::WriteAllText((Join-Path $repositoryRoot 'scripts/Validate.ps1'), $fixture,
+                        [Text.UTF8Encoding]::new($false))
+                    [Environment]::SetEnvironmentVariable('WORKFLOW_FIXTURE_EXIT', [string]$validatorExit, 'Process')
+                    $powerShellPath = Join-Path $PSHOME 'pwsh.exe'
+                    $runDirectory = $root; $reportPath = Join-Path $root 'credential-booleans.json'
+                    $baseCommit = ('a' * 40); $checkoutHead = ('b' * 40); $expectedGoRuntimeVersion = 'fixture-runtime'
+                    . ([scriptblock]::Create($invocation))
+                    $nativeExit = $LASTEXITCODE
+                    $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+                    [pscustomobject]@{
+                        preflightCredentialFree = $preflightCredentialFree
+                        validatorHasGitHubToken = $report.hasGitHubToken
+                        validatorHasGhToken = $report.hasGhToken
+                        validatorExit = $nativeExit
+                        parentCredentialFree = [string]::IsNullOrEmpty($env:GITHUB_TOKEN) -and [string]::IsNullOrEmpty($env:GH_TOKEN)
+                        capturedTokenCleared = [string]::IsNullOrEmpty($resolverGitHubToken)
+                    }
+                }
+                finally {
+                    foreach ($name in @([Environment]::GetEnvironmentVariables('Process').Keys)) {
+                        if (-not $before.Contains($name)) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+                    }
+                    foreach ($entry in $before.GetEnumerator()) {
+                        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+                    }
+                }
+            } $Root $ValidatorExit $script:WorkflowEarlyBody $script:WorkflowInvocation
+        }
+    }
+
+    # Scenario: The workflow preflight launches children, then the verified validator succeeds or exits early.
+    # Purpose: Exercise real process inheritance and the actual workflow handoff/finally without exposing a token.
+    It 'UnitT10_ConfinesWorkflowCredentialsToTheTrustedValidator_Exit<exitCode>' -ForEach @(
+        @{ exitCode = 0 }, @{ exitCode = 23 }
+    ) {
+        $result = Invoke-WorkflowCredentialFixture -Root $TestDrive -ValidatorExit $exitCode
+        $result.preflightCredentialFree | Should -BeTrue
+        $result.validatorHasGitHubToken | Should -BeTrue
+        $result.validatorHasGhToken | Should -BeFalse
+        $result.validatorExit | Should -Be $exitCode
+        $result.parentCredentialFree | Should -BeTrue
+        $result.capturedTokenCleared | Should -BeTrue
+    }
+}
+
 Describe 'Canonical Standard v1 validation adapter' {
     BeforeAll {
         $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot

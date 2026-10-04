@@ -99,8 +99,13 @@ jobs:
 
       - name: Validate exact commit with verified PowerShell
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $resolverGitHubToken = [Environment]::GetEnvironmentVariable('GITHUB_TOKEN', 'Process')
+          Remove-Item -LiteralPath 'Env:GITHUB_TOKEN' -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath 'Env:GH_TOKEN' -Force -ErrorAction SilentlyContinue
           $runnerNpmPrefix = [Environment]::GetEnvironmentVariable('NPM_CONFIG_PREFIX', 'Process')
           if ($runnerNpmPrefix -ceq 'C:\npm\prefix') {
             [Environment]::SetEnvironmentVariable('NPM_CONFIG_PREFIX', $null, 'Process')
@@ -142,11 +147,19 @@ jobs:
           $runDirectory = [IO.Path]::GetFullPath($env:SGV1_RUN_DIRECTORY)
           $reportPath = Join-Path $runDirectory 'darktide-standard-v1-report.json'
           if (Test-Path -LiteralPath $reportPath) { throw 'The run-owned validation report path already exists.' }
-          & $powerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-              -File (Join-Path $repositoryRoot 'scripts/Validate.ps1') `
-              -RepositoryRoot $repositoryRoot -ArtifactsRoot $runDirectory `
-              -BaseCommit $baseCommit -TrustedTestCommit $checkoutHead `
-              -ExpectedGoRuntimeVersion $expectedGoRuntimeVersion -OutputPath $reportPath
+          try {
+            [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $resolverGitHubToken, 'Process')
+            & $powerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File (Join-Path $repositoryRoot 'scripts/Validate.ps1') `
+                -RepositoryRoot $repositoryRoot -ArtifactsRoot $runDirectory `
+                -BaseCommit $baseCommit -TrustedTestCommit $checkoutHead `
+                -ExpectedGoRuntimeVersion $expectedGoRuntimeVersion -OutputPath $reportPath
+          }
+          finally {
+            Remove-Item -LiteralPath 'Env:GITHUB_TOKEN' -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath 'Env:GH_TOKEN' -Force -ErrorAction SilentlyContinue
+            $resolverGitHubToken = $null
+          }
           if ($LASTEXITCODE -ne 0) { throw "Canonical validator exited $LASTEXITCODE." }
           if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             throw 'Canonical validator did not produce a report.'

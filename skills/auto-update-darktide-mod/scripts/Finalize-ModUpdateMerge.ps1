@@ -664,19 +664,19 @@ function Invoke-ModUpdateReviewedHeadFinalization {
         if (Test-Path -LiteralPath $worktree) { throw 'Exact run worktree remains after standard removal.' }
     }
     elseif ($worktreeRegistered) { throw 'Git still registers the missing exact run worktree.' }
-    $localRef = ('refs/heads/{0}' -f ([string]($State.branch)))
+    $localRef = ('refs/heads/{0}' -f [string]$State.branch)
     $localRefResult = Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', '--quiet', $localRef) -AllowFailure
     if ($localRefResult.exitCode -eq 0) {
         $localOid = $localRefResult.output.Trim()
         if ($localOid -cne $reviewedOid) { throw 'Local run branch changed before atomic deletion.' }
         $null = Invoke-Git -WorkingDirectory $repository -Arguments @('update-ref', '-d', $localRef, $reviewedOid)
     }
-    $remoteRef = ('refs/heads/{0}' -f ([string]($State.branch)))
+    $remoteRef = ('refs/heads/{0}' -f [string]$State.branch)
     $remoteListing = Invoke-Git -WorkingDirectory $repository -Arguments @('ls-remote', '--heads', [string]$State.remote, $remoteRef)
     if (-not [string]::IsNullOrWhiteSpace($remoteListing.output)) {
         $remoteOid = $remoteListing.output.Split([string][char]9)[0]
         if ($remoteOid -cne $reviewedOid) { throw 'Remote run branch changed before deletion.' }
-        $remoteLease = ('--force-with-lease={0}:{1}' -f ([string]$remoteRef), ([string]$reviewedOid))
+        $remoteLease = ('--force-with-lease={0}:{1}' -f [string]$remoteRef, [string]$reviewedOid)
         $null = Invoke-Git -WorkingDirectory $repository -Arguments @('push', [string]$State.remote, $remoteLease, ":$remoteRef")
     }
     $remoteAfter = Invoke-Git -WorkingDirectory $repository -Arguments @('ls-remote', '--heads', [string]$State.remote, $remoteRef)

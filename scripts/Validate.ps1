@@ -43,6 +43,9 @@ $script:IsWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win3
 if (-not $script:IsWindowsHost) {
     throw 'Standard v1 validation requires Windows with PowerShell 7.'
 }
+$toolResolutionGitHubToken = [Environment]::GetEnvironmentVariable('GITHUB_TOKEN', [EnvironmentVariableTarget]::Process)
+Remove-Item -LiteralPath 'Env:GITHUB_TOKEN' -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath 'Env:GH_TOKEN' -Force -ErrorAction SilentlyContinue
 $env:GIT_NO_REPLACE_OBJECTS = '1'
 
 function Read-StrictUtf8File {
@@ -4245,7 +4248,17 @@ $expectedSources = [ordered]@{
 $receipts = [ordered]@{}
 foreach ($toolName in $expectedSources.Keys) {
     $receiptPath = Join-Path $runRoot "receipt-$toolName.json"
-    & $resolverPath -PolicyPath $policyPath -ToolName $toolName -Install -InstallRoot $installRoot -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion -OutputPath $receiptPath | Out-Host
+    try {
+        if ($toolName -ceq 'skillspector' -and -not [string]::IsNullOrWhiteSpace($toolResolutionGitHubToken)) {
+            [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $toolResolutionGitHubToken, [EnvironmentVariableTarget]::Process)
+        }
+        & $resolverPath -PolicyPath $policyPath -ToolName $toolName -Install -InstallRoot $installRoot -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion -OutputPath $receiptPath | Out-Host
+    }
+    finally {
+        Remove-Item -LiteralPath 'Env:GITHUB_TOKEN' -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'Env:GH_TOKEN' -Force -ErrorAction SilentlyContinue
+        $toolResolutionGitHubToken = $null
+    }
     $receipt = Read-JsonFile -Path $receiptPath -Context "$toolName resolver receipt"
     if ($receipt.toolName -cne $toolName -or $receipt.source -cne $expectedSources[$toolName] -or
         $receipt.channel -cne 'latest-stable' -or $receipt.frozenForRun -ne $true -or
@@ -4254,10 +4267,6 @@ foreach ($toolName in $expectedSources.Keys) {
         throw "$toolName receipt does not bind the approved frozen latest-stable identity."
     }
     $receipts[$toolName] = $receipt
-    if ($toolName -ceq 'skillspector') {
-        Remove-Item -LiteralPath 'Env:GITHUB_TOKEN' -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath 'Env:GH_TOKEN' -Force -ErrorAction SilentlyContinue
-    }
 }
 
 $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector'
