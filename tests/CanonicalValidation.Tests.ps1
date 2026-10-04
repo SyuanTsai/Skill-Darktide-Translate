@@ -1,5 +1,103 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
+Describe 'Run-owned workflow cleanup filesystem boundary' {
+    BeforeAll {
+        $workflow = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/standard-v1-candidate-windows.yml') -Raw
+        $block = [regex]::Match($workflow,
+            '(?ms)^      - name: Remove run-owned validation directory\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:|\z)')
+        if (-not $block.Success) { throw 'The actual run-owned cleanup step is missing.' }
+        $code = [regex]::Replace($block.Groups['code'].Value, '(?m)^          ', '')
+        $tokens = $null; $errors = $null
+        [void][Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors)
+        if ($errors.Count) { throw 'The actual cleanup workflow PowerShell must parse.' }
+        $script:RunCleanupBody = [scriptblock]::Create($code)
+        function Invoke-RunCleanupFixture {
+            param([string] $RunnerTemp, [string] $RunDirectory)
+            $module = New-Module -ScriptBlock {}
+            & $module {
+                param($runnerTemp, $runDirectory, $body)
+                $names = @('RUNNER_TEMP', 'SGV1_RUN_DIRECTORY', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT')
+                $before = @{}
+                foreach ($name in $names) { $before[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+                try {
+                    [Environment]::SetEnvironmentVariable('RUNNER_TEMP', $runnerTemp, 'Process')
+                    [Environment]::SetEnvironmentVariable('SGV1_RUN_DIRECTORY', $runDirectory, 'Process')
+                    [Environment]::SetEnvironmentVariable('GITHUB_RUN_ID', '123', 'Process')
+                    [Environment]::SetEnvironmentVariable('GITHUB_RUN_ATTEMPT', '1', 'Process')
+                    & $body
+                }
+                finally {
+                    foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $before[$name], 'Process') }
+                }
+            } $RunnerTemp $RunDirectory $script:RunCleanupBody
+        }
+        function New-RunCleanupFixture {
+            param([string] $Root)
+            $parent = Join-Path $Root ([guid]::NewGuid().ToString('N'))
+            $owned = Join-Path $parent ('sgv1-123-1-' + [guid]::NewGuid().ToString('N'))
+            [void][IO.Directory]::CreateDirectory($owned)
+            return @{ parent = $parent; owned = $owned }
+        }
+    }
+
+    # Scenario: A disposable Git-style object and its ordinary directory are read-only.
+    # Purpose: Delete owned validation data without changing ACLs or swallowing deletion errors.
+    It 'InterT10_RemovesReadOnlyFilesAndDirectoriesUnderTheValidatedRunRoot' {
+        $fixture = New-RunCleanupFixture -Root $TestDrive
+        $objects = Join-Path $fixture.owned '.git/objects/81'
+        [void][IO.Directory]::CreateDirectory($objects)
+        $objectPath = Join-Path $objects 'b65ec5593125829b263a61a9b99efea873d2'
+        [IO.File]::WriteAllText($objectPath, 'fixture object')
+        [IO.File]::SetAttributes($objectPath, [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Archive)
+        [IO.File]::SetAttributes($objects, [IO.File]::GetAttributes($objects) -bor [IO.FileAttributes]::ReadOnly)
+        Invoke-RunCleanupFixture -RunnerTemp $fixture.parent -RunDirectory $fixture.owned
+        Test-Path -LiteralPath $fixture.owned | Should -BeFalse
+        Test-Path -LiteralPath $fixture.parent | Should -BeTrue
+    }
+
+    # Scenario: An owned run contains a junction to a separate read-only sentinel.
+    # Purpose: Cleanup removes the link entry while preserving the target's bytes and attributes.
+    It 'InterT20_DoesNotTraverseNestedReparseTargetsWhileClearingReadOnly' {
+        $fixture = New-RunCleanupFixture -Root $TestDrive
+        $outside = Join-Path $fixture.parent 'outside'
+        [void][IO.Directory]::CreateDirectory($outside)
+        $sentinel = Join-Path $outside 'sentinel.txt'
+        [IO.File]::WriteAllText($sentinel, 'outside must survive')
+        [IO.File]::SetAttributes($sentinel, [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Archive)
+        $attributes = [IO.File]::GetAttributes($sentinel)
+        [void](New-Item -ItemType Junction -Path (Join-Path $fixture.owned 'linked') -Value $outside)
+        Invoke-RunCleanupFixture -RunnerTemp $fixture.parent -RunDirectory $fixture.owned
+        Test-Path -LiteralPath $fixture.owned | Should -BeFalse
+        [IO.File]::ReadAllText($sentinel) | Should -BeExactly 'outside must survive'
+        [IO.File]::GetAttributes($sentinel) | Should -Be $attributes
+    }
+
+    # Scenario: The requested path has the wrong name, parent, or is itself a junction.
+    # Purpose: Preserve the original ownership guards before any filesystem mutation.
+    It 'InterT30_RejectsUnsafeRunRoots_<kind>' -ForEach @(
+        @{ kind = 'name' }, @{ kind = 'parent' }, @{ kind = 'rootReparse' }
+    ) {
+        $fixture = New-RunCleanupFixture -Root $TestDrive
+        $outside = Join-Path $fixture.parent 'outside'
+        [void][IO.Directory]::CreateDirectory($outside)
+        $sentinel = Join-Path $outside 'sentinel.txt'
+        [IO.File]::WriteAllText($sentinel, 'outside must survive')
+        $run = $fixture.owned
+        if ($kind -eq 'name') { $run = $outside }
+        elseif ($kind -eq 'parent') {
+            $run = Join-Path $outside ([IO.Path]::GetFileName($fixture.owned))
+            [void][IO.Directory]::CreateDirectory($run)
+        }
+        else {
+            [IO.Directory]::Delete($fixture.owned)
+            [void](New-Item -ItemType Junction -Path $fixture.owned -Value $outside)
+        }
+        { Invoke-RunCleanupFixture -RunnerTemp $fixture.parent -RunDirectory $run } | Should -Throw '*Refusing to remove*'
+        Test-Path -LiteralPath $run | Should -BeTrue
+        [IO.File]::ReadAllText($sentinel) | Should -BeExactly 'outside must survive'
+    }
+}
+
 Describe 'Trusted resolver API credential lifetime' {
     BeforeAll {
         $source = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1') -Raw
