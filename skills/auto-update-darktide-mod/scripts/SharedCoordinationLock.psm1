@@ -223,7 +223,7 @@ function Write-CoordinationReceipt {
     if ([string]::IsNullOrWhiteSpace([string]$Lease.receiptRoot)) { return $null }
     $receiptDirectory = Join-Path ([string]$Lease.receiptRoot) 'coordination-locks'
     New-Item -ItemType Directory -Path $receiptDirectory -Force | Out-Null
-    $receiptPath = Join-Path $receiptDirectory ("$($Lease.resourceKey)-$($Lease.receiptId).json")
+    $receiptPath = Join-Path $receiptDirectory ('{0}-{1}.json' -f ([string]$Lease.resourceKey), ([string]$Lease.receiptId))
     $receipt = [ordered]@{
         schemaVersion = 1
         runId = $Lease.runId
@@ -303,7 +303,7 @@ function Enter-SharedCoordinationLease {
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
         if ($WaitHeartbeatAction) { $null = & $WaitHeartbeatAction }
-        $prepared = Join-Path $lockRoot (".pending-$ResourceKey-$RunId-$([guid]::NewGuid().ToString('N'))")
+        $prepared = Join-Path $lockRoot ('.pending-{0}-{1}-{2}' -f ([string]$ResourceKey), ([string]$RunId), ([string]([guid]::NewGuid().ToString('N'))))
         New-Item -ItemType Directory -Path $prepared -ErrorAction Stop | Out-Null
         $owner = [ordered]@{
             schemaVersion = 1
@@ -325,7 +325,7 @@ function Enter-SharedCoordinationLease {
                 $existingOwnerPath = Join-Path $lockPath 'owner.json'
                 $null = Assert-CoordinationPath -Path $existingOwnerPath -RepositoryRoot $lockRoot
                 try { $existing = Get-Content -LiteralPath $existingOwnerPath -Raw | ConvertFrom-Json -AsHashtable }
-                catch { throw "Existing $ResourceKey coordination lock owner is unreadable; preserve it for explicit recovery." }
+                catch { throw ('Existing {0} coordination lock owner is unreadable; preserve it for explicit recovery.' -f ([string]$ResourceKey)) }
                 Assert-CoordinationOwner -Owner $existing -ResourceKey $ResourceKey
                 $existingHeartbeat = [DateTimeOffset]::ParseExact(
                     [string]$existing.heartbeat, 'o', [Globalization.CultureInfo]::InvariantCulture,
@@ -336,7 +336,7 @@ function Enter-SharedCoordinationLease {
                     $waitForOwner = $true
                 }
                 else {
-                    $stalePath = Join-Path $lockRoot (".stale-$ResourceKey-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))-$([guid]::NewGuid().ToString('N'))")
+                    $stalePath = Join-Path $lockRoot ('.stale-{0}-{1}-{2}' -f ([string]$ResourceKey), ([string]([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))), ([string]([guid]::NewGuid().ToString('N'))))
                     try {
                         [IO.Directory]::Move($lockPath, $stalePath)
                         $staleEvidencePath = [IO.Path]::GetFullPath($stalePath)
@@ -356,9 +356,7 @@ function Enter-SharedCoordinationLease {
                     else {
                         [Math]::Max([int64]0, [Environment]::TickCount64 - $waitStartedMilliseconds)
                     }
-                    return New-CoordinationLeaseRecord -LockPath $lockPath -Token $token -RunId $RunId `
-                        -ResourceKey $ResourceKey -Identity $identity -Owner $owner -ReceiptRoot $receiptRootFull `
-                        -StaleEvidencePath $staleEvidencePath -WaitingMilliseconds $waitingMilliseconds
+                    return New-CoordinationLeaseRecord -LockPath $lockPath -Token $token -RunId $RunId -ResourceKey $ResourceKey -Identity $identity -Owner $owner -ReceiptRoot $receiptRootFull -StaleEvidencePath $staleEvidencePath -WaitingMilliseconds $waitingMilliseconds
                 }
                 catch [IO.IOException] { $waitForOwner = $true }
             }

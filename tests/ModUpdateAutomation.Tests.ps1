@@ -304,7 +304,80 @@ Describe 'Deterministic Darktide MOD update automation' {
     It 'UnitT120_DeletesTheRemoteBranchWithAnExactReviewedHeadLease' {
         $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
 
-        $finalizer | Should -Match '--force-with-lease=\$\{remoteRef\}:\$reviewedOid'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($finalizer, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $finalizationFunctions = @($ast.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $_.Name -ceq 'Invoke-ModUpdateReviewedHeadFinalization'
+        })
+        $finalizationFunctions.Count | Should -Be 1
+        $leaseAssignments = @($finalizationFunctions[0].Body.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -ceq 'remoteLease'
+        }, $true))
+        $leaseAssignments.Count | Should -Be 1
+        $deleteCalls = @($finalizationFunctions[0].Body.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -ceq 'Invoke-Git' -and
+                $null -ne $node.Find({
+                    param($argumentNode)
+                    $argumentNode -is [Management.Automation.Language.VariableExpressionAst] -and
+                        $argumentNode.VariablePath.UserPath -ceq 'remoteLease'
+                }, $true)
+        }, $true))
+        $deleteCalls.Count | Should -Be 1
+        $argumentParameters = @($deleteCalls[0].CommandElements | Where-Object {
+            $_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -ceq 'Arguments'
+        })
+        $argumentParameters.Count | Should -Be 1
+        $argumentIndex = $deleteCalls[0].CommandElements.IndexOf($argumentParameters[0]) + 1
+        $argumentsAst = $deleteCalls[0].CommandElements[$argumentIndex]
+        ($argumentsAst -is [Management.Automation.Language.ArrayExpressionAst]) | Should -BeTrue
+        foreach ($operand in @($leaseAssignments[0].Right, $argumentsAst)) {
+            @($operand.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -or
+                    $node -is [Management.Automation.Language.AssignmentStatementAst] -or
+                    $node -is [Management.Automation.Language.InvokeMemberExpressionAst]
+            }, $true)).Count | Should -Be 0
+            foreach ($variable in @($operand.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.VariableExpressionAst]
+            }, $true))) {
+                $variable.VariablePath.UserPath | Should -BeIn @('remoteRef', 'reviewedOid', 'remoteLease', 'State')
+            }
+            foreach ($member in @($operand.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.MemberExpressionAst]
+            }, $true))) {
+                $member.Static | Should -BeFalse
+                $member.Expression.Extent.Text | Should -BeExactly '$State'
+                $member.Member.Extent.Text | Should -BeExactly 'remote'
+            }
+            foreach ($cast in @($operand.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.ConvertExpressionAst]
+            }, $true))) {
+                $cast.Type.TypeName.FullName | Should -BeExactly 'string'
+            }
+        }
+        $remoteRef = 'refs/heads/Update/lease-boundary'
+        $reviewedOid = '0123456789abcdef0123456789abcdef01234567'
+        $State = [ordered]@{ remote = 'lease-test-remote' }
+        $remoteLease = & ([scriptblock]::Create($leaseAssignments[0].Right.Extent.Text))
+        $deleteArguments = @(& ([scriptblock]::Create($argumentsAst.Extent.Text)))
+        $deleteArguments.Count | Should -Be 4
+        foreach ($argument in $deleteArguments) { ($argument -is [string]) | Should -BeTrue }
+        $deleteArguments[0] | Should -BeExactly 'push'
+        $deleteArguments[1] | Should -BeExactly 'lease-test-remote'
+        $deleteArguments[2] | Should -BeExactly '--force-with-lease=refs/heads/Update/lease-boundary:0123456789abcdef0123456789abcdef01234567'
+        $deleteArguments[3] | Should -BeExactly ':refs/heads/Update/lease-boundary'
+        @($deleteArguments | Where-Object { $_.StartsWith('--force-with-lease=', [StringComparison]::Ordinal) }).Count | Should -Be 1
         $finalizer | Should -Match 'fingerprintArtifactSha256 = \[string\]\$State\.mergeFingerprintSha256'
         $finalizer | Should -Match 'fingerprintBlobSha256 = \[string\]\$Fingerprint\.fingerprintBlobSha256'
         $finalizer | Should -Match 'archiveSha256 = \[string\]\$State\.archive\.sha256'
@@ -873,7 +946,82 @@ function Suspend-Stage {
         $coordination | Should -Match 'function Enter-SharedCoordinationLease'
         $coordination | Should -Match 'Test-CoordinationLeaseMatchesOwner'
         $coordination | Should -Match '\[int64\]::TryParse\(\[string\]\$Owner\.processStartTicks'
-        $coordination | Should -Match '\.stale-\$ResourceKey'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($coordination, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $leaseFunctions = @($ast.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $_.Name -ceq 'Enter-SharedCoordinationLease'
+        })
+        $leaseFunctions.Count | Should -Be 1
+        $staleAssignments = @($leaseFunctions[0].Body.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -ceq 'stalePath'
+        }, $true))
+        $staleAssignments.Count | Should -Be 1
+        $pathCalls = @($staleAssignments[0].Right.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Join-Path'
+        }, $true))
+        $pathCalls.Count | Should -Be 1
+        $pathCalls[0].CommandElements.Count | Should -Be 3
+        $nameAst = $pathCalls[0].CommandElements[-1]
+        @($nameAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -or
+                $node -is [Management.Automation.Language.AssignmentStatementAst]
+        }, $true)).Count | Should -Be 0
+        foreach ($variable in @($nameAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.VariableExpressionAst]
+        }, $true))) { $variable.VariablePath.UserPath | Should -BeExactly 'ResourceKey' }
+        $calls = @($nameAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.InvokeMemberExpressionAst]
+        }, $true))
+        $guidCalls = @($calls | Where-Object { $_.Member.Extent.Text -ceq 'NewGuid' })
+        $guidCalls.Count | Should -Be 1
+        $guidCalls[0].Static | Should -BeTrue
+        $guidCalls[0].Expression.Extent.Text | Should -BeExactly '[guid]'
+        $guidCalls[0].Arguments.Count | Should -Be 0
+        $calls.Count | Should -Be 3
+        foreach ($call in $calls | Where-Object { $_.Member.Extent.Text -cne 'NewGuid' }) {
+            $call.Member.Extent.Text | Should -BeExactly 'ToString'
+            $call.Static | Should -BeFalse
+            $call.Arguments.Count | Should -Be 1
+            ($call.Arguments[0] -is [Management.Automation.Language.StringConstantExpressionAst]) | Should -BeTrue
+            if ($call.Arguments[0].Value -ceq 'N') {
+                $call.Expression.Extent.Text | Should -BeExactly '[guid]::NewGuid()'
+            }
+            else {
+                $call.Arguments[0].Value | Should -BeExactly 'yyyyMMddTHHmmssfffffffZ'
+                $call.Expression.Extent.Text | Should -BeExactly '[DateTimeOffset]::UtcNow'
+            }
+        }
+        foreach ($cast in @($nameAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.ConvertExpressionAst]
+        }, $true))) { $cast.Type.TypeName.FullName | Should -BeExactly 'string' }
+        $ResourceKey = 'source-acquisition'
+        $staleNames = @(& ([scriptblock]::Create($nameAst.Extent.Text)))
+        $staleNames.Count | Should -Be 1
+        ($staleNames[0] -is [string]) | Should -BeTrue
+        $staleName = $staleNames[0]
+        $expectedPrefix = '.stale-source-acquisition-'
+        $staleName.StartsWith($expectedPrefix, [StringComparison]::Ordinal) | Should -BeTrue
+        $staleName.Length | Should -Be ($expectedPrefix.Length + 23 + 1 + 32)
+        $staleName[$expectedPrefix.Length + 23] | Should -Be ([char]'-')
+        $timestamp = $staleName.Substring($expectedPrefix.Length, 23)
+        $parsedTimestamp = [DateTimeOffset]::MinValue
+        [DateTimeOffset]::TryParseExact($timestamp, 'yyyyMMddTHHmmssfffffffZ', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsedTimestamp) | Should -BeTrue
+        $guidText = $staleName.Substring($expectedPrefix.Length + 24)
+        $parsedGuid = [guid]::Empty
+        [guid]::TryParseExact($guidText, 'N', [ref]$parsedGuid) | Should -BeTrue
+        $parsedGuid | Should -Not -Be ([guid]::Empty)
         $coordination | Should -Match '(?s)\$owner\.acquiredAt = Get-CoordinationUtcTimestamp.*?Directory\]::Move\(\$prepared, \$lockPath\)'
         $coordination | Should -Match '\[scriptblock\] \$WaitHeartbeatAction'
         $coordination | Should -Match '\$null = & \$WaitHeartbeatAction'

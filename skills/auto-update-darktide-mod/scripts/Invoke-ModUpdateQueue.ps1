@@ -39,8 +39,7 @@ function Read-QueueTextWithHeartbeat {
 
 $queueRunId = [guid]::NewGuid().ToString()
 $queueReceiptRoot = Join-Path $repository "AI Auto Update/In Progress/.queue-coordination/$queueRunId"
-$sourceInventoryLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' `
-    -RunId $queueRunId -ReceiptRoot $queueReceiptRoot
+$sourceInventoryLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId $queueRunId -ReceiptRoot $queueReceiptRoot
 try {
     $queue = Read-QueueTextWithHeartbeat -Path $queueFull -Lease $sourceInventoryLease | ConvertFrom-Json -AsHashtable
     if ([int]$queue.schemaVersion -ne 1) { throw 'Queue schemaVersion must be 1.' }

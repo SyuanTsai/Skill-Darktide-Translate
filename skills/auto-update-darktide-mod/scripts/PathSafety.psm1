@@ -285,7 +285,7 @@ function Test-PortableReparseItem {
             catch [IO.FileNotFoundException] { }
             catch [IO.DirectoryNotFoundException] { }
             catch {
-                throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+                throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message))
             }
         }
         $parent = [IO.DirectoryInfo]::new($probe).Parent

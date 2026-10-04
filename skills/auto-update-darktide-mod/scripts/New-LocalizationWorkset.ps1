@@ -137,7 +137,7 @@ function Invoke-GitText {
     $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
     while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
     $result = [ordered]@{ exitCode = $process.ExitCode; output = $stdoutTask.Result.TrimEnd(); warning = $stderrTask.Result.TrimEnd() }
-    if ($result.exitCode -ne 0 -and -not $AllowFailure) { throw "Git localization query failed: $($result.warning) $($result.output)" }
+    if ($result.exitCode -ne 0 -and -not $AllowFailure) { throw ('Git localization query failed: {0} {1}' -f ([string]$result.warning), ([string]$result.output)) }
     $result
 }
 
@@ -201,7 +201,7 @@ function Assert-NoReparsePath {
             }
             if (-not $AllowMissing) { throw 'Localization workset path component is missing.' }
         }
-        catch { throw "Unable to inspect Localization workset physical containment component: $($_.Exception.Message)" }
+        catch { throw ('Unable to inspect Localization workset physical containment component: {0}' -f ([string]$_.Exception.Message)) }
         if (Test-PortableReparseItem -Path $current -Item $item -Label 'Localization workset') { throw 'Localization workset path contains a symlink or reparse point.' }
         if ($current.Equals($rootFull, $comparison)) {
             if ($null -eq $item) { throw 'Unable to prove NEW localization containment.' }
@@ -288,7 +288,7 @@ if ($existingWorkset) {
     foreach ($unit in @($existingWorkset.units)) {
         if ([string]$unit.action -cne 'AI_REQUIRED' -and
             ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
-            throw "Localization review fields were edited outside AI_REQUIRED: $($unit.unitId)"
+            throw ('Localization review fields were edited outside AI_REQUIRED: {0}' -f ([string]$unit.unitId))
         }
     }
 }
@@ -348,7 +348,7 @@ if ($newFiles.Count -ne 1) {
 $newPath = Assert-ContainedPath -Candidate $newFiles[0].FullName -Root $stagingRoot
 Assert-NoReparsePath -Path $newPath -Root $stagingRoot
 $oldPath = [string]$oldPaths[0]
-$oldBytes = Get-GitBlobBytes -WorkingDirectory $repository -Object "$resolvedBaseOid`:$oldPath"
+$oldBytes = Get-GitBlobBytes -WorkingDirectory $repository -Object ('{0}:{1}' -f ([string]$resolvedBaseOid), ([string]$oldPath))
 $newBytes = Read-FileBytesWithHeartbeat -Path $newPath
 $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath $oldPath -SourceId $sourceIdentity -HeartbeatAction $HeartbeatAction
 $newDocument = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newPath -SourceId $sourceIdentity -HeartbeatAction $HeartbeatAction

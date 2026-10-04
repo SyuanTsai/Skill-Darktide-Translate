@@ -131,11 +131,16 @@ return {
         }
     }
 
-    # Scenario: A bracketed zh-tw language key uses a Lua long-string literal with either the basic or equals-delimited form.
+    # Scenario: A bracketed zh-tw language key uses basic or equals-delimited Lua long strings, including an opening LF, CRLF, or CR.
     # Purpose: Decode the key to its Lua value so long-string syntax cannot hide an existing semantic zh-tw field.
     It 'UnitT24_DecodesLongStringsInBracketedLanguageKeys' {
         Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
-        foreach ($longKey in @('[[zh-tw]]', '[=[zh-tw]=]')) {
+        $openingNewlines = @([string][char]10, ([string][char]13 + [string][char]10), [string][char]13)
+        $longKeys = @('[[zh-tw]]', '[=[zh-tw]=]') + @($openingNewlines | ForEach-Object {
+            '[[' + $_ + 'zh-tw]]'
+            '[=[' + $_ + 'zh-tw]=]'
+        })
+        foreach ($longKey in $longKeys) {
             $lua = 'return {{ escaped = {{ ["en"] = "Hello", [ {0} ] = "哈囉" }} }}' -f $longKey
             $document = Get-LuaLocalizationDocument `
                 -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($lua)) `
@@ -389,6 +394,19 @@ return {
         $nonAiTampered | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $nonAiTamperedPath -NoNewline
         { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $nonAiTamperedPath -PassThru } |
             Should -Throw '*outside AI_REQUIRED*'
+
+        # Scenario: Untrusted workset JSON supplies an array identity with a matching immutable contract.
+        # Purpose: Preserve the diagnostic for all identity values while rejecting edits outside AI_REQUIRED.
+        $arrayIdentityPath = Join-Path $repository 'AI Auto Update/In Progress/array-identity/review-artifacts/localization-workset.json'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $arrayIdentityPath) -Force | Out-Null
+        $arrayIdentity = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+        $arrayIdentityUnit = @($arrayIdentity.units | Where-Object key -eq 'unchanged')[0]
+        $arrayIdentityUnit.unitId = @('first', 'second')
+        $arrayIdentityUnit.reviewStatus = 'approved'
+        $arrayIdentity.immutableContractSha256 = Get-TestImmutableWorksetContractSha256 -Workset $arrayIdentity
+        $arrayIdentity | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $arrayIdentityPath -NoNewline
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $arrayIdentityPath -PassThru } |
+            Should -Throw '*outside AI_REQUIRED: first second'
 
         $missingTarget = @($workset.units | Where-Object key -eq 'missing_both')[0]
         $missingTarget.reviewStatus = 'approved'

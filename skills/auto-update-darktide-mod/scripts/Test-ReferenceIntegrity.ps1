@@ -78,7 +78,7 @@ function Assert-NoReparsePath {
             throw "$Name path component is missing."
         }
         catch {
-            throw "Unable to inspect $Name physical containment component: $($_.Exception.Message)"
+            throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Name), ([string]($_.Exception.Message)))
         }
         if (Test-PortableReparseItem -Path $current -Item $item -Label $Name) {
             throw "$Name path contains a symlink or reparse point."
@@ -147,7 +147,7 @@ function Get-GitBlobOid {
     }
     $hasher = [Security.Cryptography.IncrementalHash]::CreateHash($algorithm)
     try {
-        $header = [Text.Encoding]::ASCII.GetBytes("blob $($Content.Length)`0")
+        $header = [Text.Encoding]::ASCII.GetBytes((('blob {0}' -f ([string]($Content.Length))) + [char]0))
         $hasher.AppendData($header)
         for ($offset = 0; $offset -lt $Content.Length; $offset += 1MB) {
             $count = [Math]::Min(1MB, $Content.Length - $offset)
@@ -159,9 +159,7 @@ function Get-GitBlobOid {
     finally { $hasher.Dispose() }
 }
 
-$skillRepositoryPath = ConvertTo-NormalizedRepositoryPath `
-    -Path $provenance.skillRepositoryPath `
-    -Name 'Skill repository path'
+$skillRepositoryPath = ConvertTo-NormalizedRepositoryPath -Path $provenance.skillRepositoryPath -Name 'Skill repository path'
 
 $resolvedSkillRoot = [IO.Path]::GetFullPath($skillRoot).TrimEnd(
     [IO.Path]::DirectorySeparatorChar,
@@ -190,10 +188,7 @@ function Test-Document {
         throw "$Name package SHA-256 mismatch."
     }
     $packageBytes = Read-FileBytesWithHeartbeat -Path $candidate
-    $packageGitBlobOid = Get-GitBlobOid `
-        -Content $packageBytes `
-        -ObjectFormat $Document.packagedGitObjectFormat `
-        -Name "$Name package"
+    $packageGitBlobOid = Get-GitBlobOid -Content $packageBytes -ObjectFormat $Document.packagedGitObjectFormat -Name "$Name package"
     if ($packageGitBlobOid -ne $Document.packagedGitBlobOid) {
         throw "$Name package Git blob OID mismatch."
     }
@@ -229,17 +224,12 @@ function Test-Document {
         throw "$Name expanded content SHA-256 mismatch."
     }
 
-    $sourceGitBlobOid = Get-GitBlobOid `
-        -Content $expandedBytes `
-        -ObjectFormat $Document.sourceGitObjectFormat `
-        -Name "$Name source"
+    $sourceGitBlobOid = Get-GitBlobOid -Content $expandedBytes -ObjectFormat $Document.sourceGitObjectFormat -Name "$Name source"
     if ($sourceGitBlobOid -ne $Document.sourceGitBlobOid) {
         throw "$Name source Git blob OID mismatch."
     }
 
-    $packagedPath = ConvertTo-NormalizedRepositoryPath `
-        -Path $Document.packagedPath `
-        -Name "$Name packaged path"
+    $packagedPath = ConvertTo-NormalizedRepositoryPath -Path $Document.packagedPath -Name "$Name packaged path"
 
     [ordered]@{
         path = "$skillRepositoryPath/$packagedPath"

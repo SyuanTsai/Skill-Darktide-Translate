@@ -31,7 +31,7 @@ Existing runs continue with the workflow tuple recorded in their own state. Runs
 From this Skill directory, materialize only the Workflow needed for a claim into a new temporary directory:
 
 ```powershell
-$schema14Temp = Join-Path ([IO.Path]::GetTempPath()) "darktide-schema14-$([guid]::NewGuid())"
+$schema14Temp = Join-Path ([IO.Path]::GetTempPath()) ('darktide-schema14-{0}' -f [guid]::NewGuid())
 New-Item -ItemType Directory -Path $schema14Temp | Out-Null
 ./scripts/Test-ReferenceIntegrity.ps1
 $expanded = ./scripts/Expand-Schema14Reference.ps1 -Document Workflow -OutputDirectory $schema14Temp -PassThru

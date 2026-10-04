@@ -466,7 +466,7 @@ function Test-MetadataSourceFieldMatch {
         }
         if (-not $hashKeys.Contains($FieldName)) { return $false }
         $key = [regex]::Escape([string]$hashKeys[$FieldName])
-        $matchesForKey = @([regex]::Matches($Text, "(?m)^$key=([^`r`n]*)`r?$") )
+        $matchesForKey = @([regex]::Matches($Text, (('(?m)^{0}=([^' + [char]13 + [char]10 + ']*)' + [char]13 + '?$') -f ([string]$key))) )
         return $matchesForKey.Count -eq 1 -and [string]$matchesForKey[0].Groups[1].Value -ceq $FieldValue
     }
     if ($RelativePath -cne 'README.md') { return $false }
@@ -508,7 +508,7 @@ function Test-MetadataSourceFieldMatch {
     }
     if (-not $readmeLabels.Contains($FieldName)) { return $false }
     $label = [regex]::Escape([string]$readmeLabels[$FieldName])
-    $matchesForLabel = @([regex]::Matches($readmeText, "(?m)^\s*-\s+$label\s*:\s*([^`r`n]*)`r?$") )
+    $matchesForLabel = @([regex]::Matches($readmeText, (('(?m)^\s*-\s+{0}\s*:\s*([^' + [char]13 + [char]10 + ']*)' + [char]13 + '?$') -f ([string]$label))) )
     if ($matchesForLabel.Count -ne 1) { return $false }
     $recorded = ([string]$matchesForLabel[0].Groups[1].Value).Trim()
     if ($recorded.Length -ge 2 -and $recorded.StartsWith('`', [StringComparison]::Ordinal) -and
@@ -596,7 +596,7 @@ function Assert-NoReparsePath {
                     if ($info.Exists -and (($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $true }
                 }
                 catch {
-                    throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+                    throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]($_.Exception.Message)))
                 }
             }
             $parent = [IO.DirectoryInfo]::new($probe).Parent
@@ -624,7 +624,7 @@ function Assert-NoReparsePath {
             if (-not $AllowMissing) { throw "$Label path component is missing." }
         }
         catch {
-            throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+            throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]($_.Exception.Message)))
         }
         if (& $testReparse $current $item) {
             throw "$Label path contains a symlink or reparse point."
@@ -840,12 +840,9 @@ function Enter-SharedCoordinationLock {
         [string] $ReceiptRoot,
         [ValidateRange(1, 3600)][int] $TimeoutSeconds = 300
     )
-    $lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey $ResourceKey `
-        -RunId $ActualRunId -ReceiptRoot $ReceiptRoot -WaitHeartbeatAction { Update-ActiveReservationHeartbeat } `
-        -TimeoutSeconds $TimeoutSeconds
+    $lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey $ResourceKey -RunId $ActualRunId -ReceiptRoot $ReceiptRoot -WaitHeartbeatAction { Update-ActiveReservationHeartbeat } -TimeoutSeconds $TimeoutSeconds
     if ($script:activeStageContext -and $lease.Contains('waitingMilliseconds')) {
-        $null = Add-StageWait -Context $script:activeStageContext -Reason 'coordination' `
-            -Milliseconds ([int64]$lease.waitingMilliseconds)
+        $null = Add-StageWait -Context $script:activeStageContext -Reason 'coordination' -Milliseconds ([int64]$lease.waitingMilliseconds)
     }
     $script:activeSharedCoordinationLease = $lease
     $lease
@@ -923,8 +920,7 @@ function Invoke-Git {
                 [string]$script:activeReservationState.artifactsRoot
             }
             else { $null }
-            $coordinationLease = Enter-SharedCoordinationLock -Repository ([IO.Path]::GetFullPath($RepositoryRoot)) `
-                -ResourceKey 'git-coordination' -ActualRunId $coordinationRunId -ReceiptRoot $receiptRoot
+            $coordinationLease = Enter-SharedCoordinationLock -Repository ([IO.Path]::GetFullPath($RepositoryRoot)) -ResourceKey 'git-coordination' -ActualRunId $coordinationRunId -ReceiptRoot $receiptRoot
         }
         Update-ActiveReservationHeartbeat -Force
         Update-ActiveSharedCoordinationHeartbeat -Force
@@ -947,7 +943,7 @@ function Invoke-Git {
         $warning = $stderrTask.Result.TrimEnd()
         $exitCode = $process.ExitCode
         if ($exitCode -ne 0 -and -not $AllowFailure) {
-            throw "git $($Arguments -join ' ') failed ($exitCode): $warning $output"
+            throw ('git {0} failed ({1}): {2} {3}' -f ([string]($Arguments -join ' ')), ([string]$exitCode), ([string]$warning), ([string]$output))
         }
         [pscustomobject]@{
             exitCode = $exitCode
@@ -1019,7 +1015,7 @@ function Invoke-Gh {
         warning = $stderrTask.Result.TrimEnd()
     }
     if ($result.exitCode -ne 0 -and -not $AllowFailure) {
-        throw "gh $($Arguments -join ' ') failed ($($result.exitCode)): $($result.warning) $($result.output)"
+        throw ('gh {0} failed ({1}): {2} {3}' -f ([string]($Arguments -join ' ')), ([string]($result.exitCode)), ([string]($result.warning)), ([string]($result.output)))
     }
     $result
 }
@@ -1194,7 +1190,7 @@ function Assert-ArchivePayloadSecurity {
         }
         $fileSha256 = Get-Sha256Bytes -Bytes $bytes
         $modRelative = $relative.Substring(([string]$State.repoModDirectory).Length).TrimStart('/')
-        $repositoryPath = if ([string]::IsNullOrWhiteSpace($modRelative)) { [string]$State.modRelativePath } else { "$($State.modRelativePath)/$modRelative" }
+        $repositoryPath = if ([string]::IsNullOrWhiteSpace($modRelative)) { [string]$State.modRelativePath } else { ('{0}/{1}' -f ([string]($State.modRelativePath)), ([string]$modRelative)) }
         $oldSha256 = $null
         if (-not [string]::IsNullOrWhiteSpace($c0Oid)) {
             $exists = Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('cat-file', '-e', "${c0Oid}:$repositoryPath") -AllowFailure
@@ -1218,7 +1214,7 @@ function Assert-ArchivePayloadSecurity {
             }
         )
         if ($matchingIndexes.Count -ne 1) {
-            throw "Security approval required for changed risky archive payload: $risk $relative fileSha256=$fileSha256 archiveSha256=$($State.archive.sha256)"
+            throw ('Security approval required for changed risky archive payload: {0} {1} fileSha256={2} archiveSha256={3}' -f ([string]$risk), ([string]$relative), ([string]$fileSha256), ([string]($State.archive.sha256)))
         }
         $null = $usedOverrides.Add([int]$matchingIndexes[0])
         $dispositions[$relative] = [ordered]@{ result = 'approved-exact-tuple'; risk = $risk; fileSha256 = $fileSha256; c0Sha256 = $oldSha256; archiveSha256 = $State.archive.sha256 }
@@ -1271,14 +1267,12 @@ function New-GitTrackedPathIndex {
         [Parameter(Mandatory)][string] $WorkingDirectory,
         [Parameter(Mandatory)][string] $Root
     )
-    $ignoreCaseResult = Invoke-Git -WorkingDirectory $WorkingDirectory `
-        -Arguments @('config', '--bool', 'core.ignorecase') -AllowFailure
+    $ignoreCaseResult = Invoke-Git -WorkingDirectory $WorkingDirectory -Arguments @('config', '--bool', 'core.ignorecase') -AllowFailure
     if ($ignoreCaseResult.exitCode -notin @(0, 1)) {
         throw 'Unable to inspect core.ignorecase before Git normalization.'
     }
     $coreIgnoreCase = $ignoreCaseResult.exitCode -eq 0 -and $ignoreCaseResult.output.Trim() -ceq 'true'
-    $trackedResult = Invoke-Git -WorkingDirectory $WorkingDirectory `
-        -Arguments @('-c', 'core.quotepath=false', 'ls-files', '-z', '--full-name', '--', $Root)
+    $trackedResult = Invoke-Git -WorkingDirectory $WorkingDirectory -Arguments @('-c', 'core.quotepath=false', 'ls-files', '-z', '--full-name', '--', $Root)
     $exact = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $ignoreCase = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
     $ambiguousIgnoreCase = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1321,8 +1315,7 @@ function Get-GitIndexStagePathMap {
         [Parameter(Mandatory)][string] $WorkingDirectory,
         [Parameter(Mandatory)][string] $Checkpoint
     )
-    $indexListing = Invoke-Git -WorkingDirectory $WorkingDirectory `
-        -Arguments @('-c', 'core.quotepath=false', 'ls-files', '--stage', '-z', '--full-name')
+    $indexListing = Invoke-Git -WorkingDirectory $WorkingDirectory -Arguments @('-c', 'core.quotepath=false', 'ls-files', '--stage', '-z', '--full-name')
     $indexPaths = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
     foreach ($entryValue in @($indexListing.output -split ([string][char]0))) {
         if ([string]::IsNullOrEmpty($entryValue)) { continue }
@@ -1380,12 +1373,9 @@ function Normalize-GitCaseVariantWorktreePaths {
         if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualPath, $canonicalPath)) {
             throw "Git index normalization changed a non-case path: $actualPath -> $canonicalPath"
         }
-        $source = Assert-NoReparsePath -Path (Join-Path $worktreeRoot $actualPath) `
-            -Root $worktreeRoot -Label 'Case-variant install source' -AllowMissing
-        $destination = Assert-ContainedPath -Candidate (Join-Path $worktreeRoot $canonicalPath) `
-            -Root $worktreeRoot -Label 'Canonical install destination'
-        $destination = Assert-NoReparsePath -Path $destination -Root $worktreeRoot `
-            -Label 'Canonical install destination' -AllowMissing
+        $source = Assert-NoReparsePath -Path (Join-Path $worktreeRoot $actualPath) -Root $worktreeRoot -Label 'Case-variant install source' -AllowMissing
+        $destination = Assert-ContainedPath -Candidate (Join-Path $worktreeRoot $canonicalPath) -Root $worktreeRoot -Label 'Canonical install destination'
+        $destination = Assert-NoReparsePath -Path $destination -Root $worktreeRoot -Label 'Canonical install destination' -AllowMissing
         $sourceFullPath = [IO.Path]::GetFullPath($source)
         $destinationFullPath = [IO.Path]::GetFullPath($destination)
         $physicalPathComparison = Get-PortablePathComparison -Paths @($sourceFullPath, $destinationFullPath)
@@ -1420,7 +1410,7 @@ function Normalize-GitCaseVariantWorktreePaths {
         }
         $null = Assert-NoReparsePath -Path $parent -Root $worktreeRoot -Label 'Canonical install destination parent'
         if (Test-Path -LiteralPath ([string]$move.destination)) {
-            throw "Canonical install destination appeared during normalization: $($move.destinationPath)"
+            throw ('Canonical install destination appeared during normalization: {0}' -f ([string]($move.destinationPath)))
         }
         [IO.File]::Move([string]$move.source, [string]$move.destination)
         Update-ActiveReservationHeartbeat -Force
@@ -1431,12 +1421,10 @@ function Normalize-GitCaseVariantWorktreePaths {
 function New-GitNormalizationManifest {
     param([Collections.IDictionary] $State)
     $records = [Collections.Generic.List[object]]::new()
-    $trackedPathIndex = New-GitTrackedPathIndex -WorkingDirectory ([string]$State.worktreePath) `
-        -Root ([string]$State.modRelativePath)
+    $trackedPathIndex = New-GitTrackedPathIndex -WorkingDirectory ([string]$State.worktreePath) -Root ([string]$State.modRelativePath)
     foreach ($file in Get-ChildItem -LiteralPath $State.installRoot -File -Recurse | Sort-Object FullName) {
         $relativeToRepository = [IO.Path]::GetRelativePath($State.worktreePath, $file.FullName).Replace('\', '/')
-        $repositoryPath = Resolve-GitNormalizationRepositoryPath -RepositoryPath $relativeToRepository `
-            -TrackedPathIndex $trackedPathIndex
+        $repositoryPath = Resolve-GitNormalizationRepositoryPath -RepositoryPath $relativeToRepository -TrackedPathIndex $trackedPathIndex
         $relativeToMod = [IO.Path]::GetRelativePath($State.installRoot, $file.FullName).Replace('\', '/')
         $rawBytes = Read-FileBytesWithHeartbeat -Path $file.FullName
         $blobOid = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.autocrlf=true', 'hash-object', '-w', "--path=$repositoryPath", '--', $file.FullName)).output.Trim()
@@ -1752,8 +1740,7 @@ function Assert-RunLocalSkillPackage {
         $null = Assert-NoReparsePath -Path $pinPath -Root ([string]$State.repositoryRoot) -Label 'Run-local Skill source pin'
         if (-not (Test-Path -LiteralPath $pinPath -PathType Leaf)) { throw 'Run-local Skill source pin is missing.' }
         $actualPinSha = Get-FileSha256 -Path $pinPath
-        $integrity = & $integrityScript -SkillSourcePinPath $pinPath `
-            -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+        $integrity = & $integrityScript -SkillSourcePinPath $pinPath -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
         if ($integrity.result -cne 'passed' -or -not $integrity.skillSourcePin) {
             throw 'Installed package integrity did not pass.'
         }
@@ -1917,8 +1904,7 @@ function Enter-ModReservationWorker {
     $owner.leaseMode = 'active'
     $owner.reservationState = 'running'
     $owner.heartbeat = Get-UtcTimestamp
-    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) -Value $owner `
-        -ExpectedReservationToken $reservationToken -ExpectedWorkerToken $previousWorkerToken
+    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) -Value $owner -ExpectedReservationToken $reservationToken -ExpectedWorkerToken $previousWorkerToken
     $script:activeReservationLease = [ordered]@{
         modLockPath = [string]$State.modLockPath
         repositoryRoot = [string]$State.repositoryRoot
@@ -1971,8 +1957,7 @@ function Write-ActiveReservationOwner {
         [int64]$Value.workerProcessStartTicks -ne [int64]$lease.workerProcessStartTicks) {
         throw 'Reservation owner update changed the immutable active worker tuple.'
     }
-    Write-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot) -Value $Value `
-        -ExpectedReservationToken ([string]$lease.reservationToken) -ExpectedWorkerToken ([string]$lease.workerToken)
+    Write-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot) -Value $Value -ExpectedReservationToken ([string]$lease.reservationToken) -ExpectedWorkerToken ([string]$lease.workerToken)
 }
 
 function Update-ActiveReservationHeartbeat {
@@ -1987,8 +1972,7 @@ function Update-ActiveReservationHeartbeat {
         throw 'MOD reservation ownership changed after this worker acquired its immutable lease.'
     }
     $owner.heartbeat = Get-UtcTimestamp
-    Write-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot) -Value $owner `
-        -ExpectedReservationToken ([string]$lease.reservationToken) -ExpectedWorkerToken ([string]$lease.workerToken)
+    Write-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot) -Value $owner -ExpectedReservationToken ([string]$lease.reservationToken) -ExpectedWorkerToken ([string]$lease.workerToken)
     $lease.lastHeartbeatUtc = [DateTimeOffset]::UtcNow
 }
 
@@ -2127,7 +2111,7 @@ function Get-ModRunPlan {
         "$slug-$short"
     }
     else {
-        "$slug-$($lockKey.Substring(0, 16))-$short"
+        ('{0}-{1}-{2}' -f ([string]$slug), ([string]($lockKey.Substring(0, 16))), ([string]$short))
     }
     $runRoot = Join-Path (Join-Path $queueRoot 'In Progress') $runName
     [ordered]@{
@@ -2261,8 +2245,7 @@ function Enter-ModReservation {
     $owner.leaseMode = 'active'
     $owner.reservationState = 'claiming'
     $owner.heartbeat = Get-UtcTimestamp
-    Write-ModReservationOwner -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot) -Value $owner `
-        -ExpectedReservationToken $expectedReservationToken -ExpectedWorkerToken $expectedWorkerToken
+    Write-ModReservationOwner -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot) -Value $owner -ExpectedReservationToken $expectedReservationToken -ExpectedWorkerToken $expectedWorkerToken
     $script:activeReservationLease = [ordered]@{
         modLockPath = [string]$Plan.modLockPath
         repositoryRoot = [string]$Plan.repositoryRoot
@@ -2295,7 +2278,7 @@ function Assert-Schema15BaseLocalizationEligibility {
     if ($localizationPaths.Count -ne 1) { throw 'AUTOMATION_BLOCKED: localization_entry_not_unique' }
 
     foreach ($path in $localizationPaths) {
-        $blobOid = (Invoke-Git -WorkingDirectory $Repository -Arguments @('rev-parse', "$BaseOid`:$path")).output.Trim()
+        $blobOid = (Invoke-Git -WorkingDirectory $Repository -Arguments @('rev-parse', ('{0}:{1}' -f ([string]$BaseOid), ([string]$path)))).output.Trim()
         $bytes = Get-GitBlobBytes -WorkingDirectory $Repository -Object $blobOid
         $document = Get-LuaLocalizationDocument -Bytes $bytes -SourceId $path -HeartbeatAction { Update-ActiveReservationHeartbeat }
         if (@($document.units).Count -eq 0 -and [bool]$document.isIoDofileOnlyLoader) {
@@ -2324,7 +2307,7 @@ function Test-SourceRequestPreflight {
         throw 'Source request pageUrl must be a canonical page URL without user-info, query, fragment, or a custom port.'
     }
     $expectedGameDomain = 'warhammer40kdarktide'
-    $expectedPagePath = "/$expectedGameDomain/mods/$([Convert]::ToString($request.modId, [Globalization.CultureInfo]::InvariantCulture))"
+    $expectedPagePath = ('/{0}/mods/{1}' -f ([string]$expectedGameDomain), ([string]([Convert]::ToString($request.modId, [Globalization.CultureInfo]::InvariantCulture))))
     if ([string]$request.gameDomain -cne $expectedGameDomain -or
         $pageUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
         $pageUri.AbsolutePath.TrimEnd('/') -cne $expectedPagePath) {
@@ -2552,9 +2535,7 @@ function Invoke-AcquireSource {
             $requestSha = Get-FileSha256 -Path $boundRequestPath
             $retainedPath = [IO.Path]::GetFullPath((Join-Path $incoming ([string]$preservedReceipt.filename)))
             $receiptVerifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
-            $retainedVerification = & $receiptVerifier -ReceiptPath $receiptPath -SourceRequestPath $boundRequestPath `
-                -RunRoot ([string]$plan.runRoot) -RetainedPath $retainedPath -AllowNonDelivered `
-                -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+            $retainedVerification = & $receiptVerifier -ReceiptPath $receiptPath -SourceRequestPath $boundRequestPath -RunRoot ([string]$plan.runRoot) -RetainedPath $retainedPath -AllowNonDelivered -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
             if ($retainedVerification.result -cne 'passed' -or -not $retainedVerification.recoveryResult) {
                 throw 'Preserved non-delivered source receipt failed independent recovery verification.'
             }
@@ -2613,8 +2594,7 @@ function Invoke-AcquireSource {
             }
         }
         $receiptVerifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
-        $verification = & $receiptVerifier -ReceiptPath $receiptPath -SourceRequestPath $boundRequestPath `
-            -RunRoot ([string]$plan.runRoot) -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+        $verification = & $receiptVerifier -ReceiptPath $receiptPath -SourceRequestPath $boundRequestPath -RunRoot ([string]$plan.runRoot) -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
         if ($verification.result -cne 'passed') { throw 'Preserved source receipt failed same-run acquisition recovery.' }
         $preservedReceipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
         $receiptSha = Get-FileSha256 -Path $receiptPath
@@ -2759,7 +2739,7 @@ function Complete-IncompleteClaim {
         }
     }
     else {
-        $branchExists = (Invoke-Git -WorkingDirectory $repository -Arguments @('show-ref', '--verify', '--quiet', "refs/heads/$($State.branch)") -AllowFailure).exitCode -eq 0
+        $branchExists = (Invoke-Git -WorkingDirectory $repository -Arguments @('show-ref', '--verify', '--quiet', ('refs/heads/{0}' -f ([string]($State.branch)))) -AllowFailure).exitCode -eq 0
         $arguments = if ($branchExists) {
             @('worktree', 'add', $worktree, [string]$State.branch)
         }
@@ -2772,8 +2752,7 @@ function Complete-IncompleteClaim {
     $coordinatorArchive = [string]$State.claimCoordinatorArchivePath
     $claimedArchive = [string]$State.archive.path
     if (-not (Test-Path -LiteralPath $claimedArchive -PathType Leaf)) {
-        $sourceLease = Enter-SharedCoordinationLock -Repository $repository -ResourceKey 'source-acquisition' `
-            -ActualRunId ([string]$State.runId) -ReceiptRoot ([string]$State.artifactsRoot)
+        $sourceLease = Enter-SharedCoordinationLock -Repository $repository -ResourceKey 'source-acquisition' -ActualRunId ([string]$State.runId) -ReceiptRoot ([string]$State.artifactsRoot)
         try {
             if (-not (Test-Path -LiteralPath $coordinatorArchive -PathType Leaf) -and
                 -not (Test-Path -LiteralPath $claimedArchive -PathType Leaf) -and
@@ -2912,8 +2891,7 @@ function Invoke-Claim {
             throw 'Schema 15 acquisition record differs from the MOD reservation owner.'
         }
         $receiptVerifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
-        $receiptVerification = & $receiptVerifier -ReceiptPath $receiptFull -SourceRequestPath $requestFull `
-            -RunRoot $runRoot -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+        $receiptVerification = & $receiptVerifier -ReceiptPath $receiptFull -SourceRequestPath $requestFull -RunRoot $runRoot -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
         if ($receiptVerification.result -ne 'passed') { throw 'Independent source receipt verification failed.' }
         $receipt = Get-Content -LiteralPath $receiptFull -Raw | ConvertFrom-Json -AsHashtable
         $expectedAcquisitionResult = [ordered]@{
@@ -3026,13 +3004,9 @@ function Invoke-Claim {
         else { Write-AtomicBytes -Path $boundSourceRequestPath -Bytes $requestBytes }
     }
     $sourceTuplePath = Join-Path $reviewArtifacts 'source-tuple.json'
-    $sourceTuple = New-SourceTupleEvidence -OutputPath $sourceTuplePath -ActualRunId $actualRunId `
-        -AcquisitionMethod $(if ($sourceReceipt) { "nexus-$($sourceReceipt.provider)" } else { 'manual-queue' }) `
-        -NexusIdentity $sourceIdentity -ArchiveFileName ([IO.Path]::GetFileName($sourceFull)) `
-        -ArchiveSize ([int64]$sampleTwo.Length) -ArchiveSha256 $archiveSha -BoundSourceRequestPath $boundSourceRequestPath `
-        -BoundSourceReceiptPath $(if ($sourceReceipt) { [string]$sourceReceipt.path } else { $null })
+    $sourceTuple = New-SourceTupleEvidence -OutputPath $sourceTuplePath -ActualRunId $actualRunId -AcquisitionMethod $(if ($sourceReceipt) { ('nexus-{0}' -f ([string]($sourceReceipt.provider))) } else { 'manual-queue' }) -NexusIdentity $sourceIdentity -ArchiveFileName ([IO.Path]::GetFileName($sourceFull)) -ArchiveSize ([int64]$sampleTwo.Length) -ArchiveSha256 $archiveSha -BoundSourceRequestPath $boundSourceRequestPath -BoundSourceReceiptPath $(if ($sourceReceipt) { [string]$sourceReceipt.path } else { $null })
 
-    $branch = "Update/$slug/$([DateTimeOffset]::Now.ToString('yyyyMMdd'))-$short"
+    $branch = ('Update/{0}/{1}-{2}' -f ([string]$slug), ([string]([DateTimeOffset]::Now.ToString('yyyyMMdd'))), ([string]$short))
     $worktreeParent = if ([string]::IsNullOrWhiteSpace($WorktreeParent)) {
         Join-Path (Split-Path -Parent $repository) ((Split-Path -Leaf $repository) + '-worktrees')
     }
@@ -3249,8 +3223,7 @@ function Invoke-Claim {
     }
     Ensure-RunWriterLock -State $state
     Write-AtomicJson -Path $state.statePath -Value $state
-    $sourceCoordination = Enter-SharedCoordinationLock -Repository $repository -ResourceKey 'source-acquisition' `
-        -ActualRunId $actualRunId -ReceiptRoot ([string]$state.artifactsRoot)
+    $sourceCoordination = Enter-SharedCoordinationLock -Repository $repository -ResourceKey 'source-acquisition' -ActualRunId $actualRunId -ReceiptRoot ([string]$state.artifactsRoot)
     try {
         if ((Get-FileSha256 -Path $sourceFull) -cne $archiveSha) {
             throw 'Source archive changed before the coordinated claim move.'
@@ -3346,7 +3319,7 @@ function Get-ZipEntries {
                     $probe = $entry.Open()
                     try { $null = $probe.ReadByte() } finally { $probe.Dispose() }
                 }
-                catch { throw "Encrypted or unreadable archive entry rejected: $entryPath. $($_.Exception.Message)" }
+                catch { throw ('Encrypted or unreadable archive entry rejected: {0}. {1}' -f ([string]$entryPath), ([string]($_.Exception.Message))) }
             }
             $entries.Add([ordered]@{
                 path = $entryPath
@@ -3611,10 +3584,9 @@ function Invoke-LocalizationWorkset {
         $State.status = 'automation-excluded'
         $State.waitingReason = [ordered]@{ code = 'localization_entry_is_loader'; message = 'The unique localization entry is a loader and cannot be automated.' }
         $artifactSha = if (Test-Path -LiteralPath $worksetPath -PathType Leaf) { Get-FileSha256 -Path $worksetPath } else { $null }
-        return Suspend-Stage -State $State -Context $stage -Result 'waiting-input' -ArtifactSha256 $artifactSha `
-            -OutputStage 'localization-workset' -Data $State.waitingReason
+        return Suspend-Stage -State $State -Context $stage -Result 'waiting-input' -ArtifactSha256 $artifactSha -OutputStage 'localization-workset' -Data $State.waitingReason
     }
-    if ($generation.status -eq 'blocked') { throw "Localization workset generation is blocked: $($generation.reason)" }
+    if ($generation.status -eq 'blocked') { throw ('Localization workset generation is blocked: {0}' -f ([string]($generation.reason))) }
     $null = Assert-NoReparsePath -Path $worksetPath -Root ([string]$State.repositoryRoot) -Label 'Localization workset'
     $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
     $pending = @($workset.units | Where-Object { $_.action -ceq 'AI_REQUIRED' -and $_.reviewStatus -cne 'approved' })
@@ -3629,8 +3601,7 @@ function Invoke-LocalizationWorkset {
             counts = $workset.counts
         }
         $waitingData = [ordered]@{ worksetPath = $worksetPath; pendingUnitIds = @($pending.unitId); required = 'Review only AI_REQUIRED units, set reviewStatus=approved and suggestedZhTwExpression, then resume localization.' }
-        return Suspend-Stage -State $State -Context $stage -Result 'waiting-input' `
-            -ArtifactSha256 ([string]$State.localizationWorkset.sha256) -OutputStage 'localization-workset' -Data $waitingData
+        return Suspend-Stage -State $State -Context $stage -Result 'waiting-input' -ArtifactSha256 ([string]$State.localizationWorkset.sha256) -OutputStage 'localization-workset' -Data $waitingData
     }
     $applier = Join-Path $PSScriptRoot 'Apply-LocalizationWorkset.ps1'
     $applied = & $applier -WorksetPath $worksetPath -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
@@ -3654,7 +3625,7 @@ function Invoke-LocalizationWorkset {
     $localizationRoot = Join-Path ([string]$State.artifactsRoot) 'localization'
     $safeId = (Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($relative))).Substring(0, 16)
     $artifactDirectory = Join-Path $localizationRoot $safeId
-    $oldObject = "$($State.baseOid):$([string]$workset.old.path)"
+    $oldObject = ('{0}:{1}' -f ([string]($State.baseOid)), ([string]$workset.old.path))
     Write-ByteFile -Path (Join-Path $artifactDirectory 'old.lua') -Bytes (Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $oldObject)
     Write-ByteFile -Path (Join-Path $artifactDirectory 'new.lua') -Bytes $rawBytes
     Write-ByteFile -Path (Join-Path $artifactDirectory 'indexed.lua') -Bytes $indexedBytes
@@ -3722,12 +3693,10 @@ function Invoke-Localization {
     $stage = Start-Stage -Name 'localization'
     Assert-LockOwner -State $State
     $plan = if ([string]::IsNullOrWhiteSpace($LocalizationPlanPath)) {
-        $installRoot = Assert-NoReparseTree -Path ([string]$State.installRoot) `
-            -Root ([string]$State.worktreePath) -Label 'Installed MOD tree before Schema 14 localization plan detection'
+        $installRoot = Assert-NoReparseTree -Path ([string]$State.installRoot) -Root ([string]$State.worktreePath) -Label 'Installed MOD tree before Schema 14 localization plan detection'
         $registeredModFiles = @(
             Get-ChildItem -LiteralPath $installRoot -File -Filter '*.mod' | ForEach-Object {
-                $descriptorPath = Assert-NoReparsePath -Path $_.FullName -Root ([string]$State.worktreePath) `
-                    -Label 'Schema 14 MOD descriptor'
+                $descriptorPath = Assert-NoReparsePath -Path $_.FullName -Root ([string]$State.worktreePath) -Label 'Schema 14 MOD descriptor'
                 $descriptorText = [Text.UTF8Encoding]::new($false, $true).GetString(
                     (Read-FileBytesWithHeartbeat -Path $descriptorPath)
                 )
@@ -3743,9 +3712,7 @@ function Invoke-Localization {
                 message = 'The installed Schema 14 MOD registers mod_localization. Review its active localization and resume with an explicit localization plan.'
                 registeredModFiles = $registeredModFiles
             }
-            return (Suspend-Stage -State $State -Context $stage -Result 'waiting-input' `
-                -ArtifactSha256 ([string]$State.rawInstallManifest.sha256) -OutputStage 'localization-plan' `
-                -Data ([ordered]@{
+            return (Suspend-Stage -State $State -Context $stage -Result 'waiting-input' -ArtifactSha256 ([string]$State.rawInstallManifest.sha256) -OutputStage 'localization-plan' -Data ([ordered]@{
                     code = $State.waitingReason.code
                     required = $State.waitingReason.message
                     registeredModFiles = $registeredModFiles
@@ -3789,11 +3756,11 @@ function Invoke-Localization {
             $null = Get-LuaLocalizationDocument -Bytes $mergedBytes -DisplayPath $relative -SourceId $relative -HeartbeatAction { Update-ActiveReservationHeartbeat }
         }
         catch {
-            throw "Merged Schema 14 localization structure is invalid: $($_.Exception.Message)"
+            throw ('Merged Schema 14 localization structure is invalid: {0}' -f ([string]($_.Exception.Message)))
         }
         $safeId = (Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($relative))).Substring(0, 16)
         $artifactDirectory = Join-Path $localizationRoot $safeId
-        $oldObject = "$($State.evidenceChain.c0Oid):$relative"
+        $oldObject = ('{0}:{1}' -f ([string]($State.evidenceChain.c0Oid)), ([string]$relative))
         $oldExists = Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('cat-file', '-e', $oldObject) -AllowFailure
         if ($oldExists.exitCode -eq 0) {
             Write-ByteFile -Path (Join-Path $artifactDirectory 'old.lua') -Bytes (Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $oldObject)
@@ -3860,7 +3827,7 @@ function New-GitEvidenceBatch {
                 $memory = [IO.MemoryStream]::new()
                 try {
                     $startedAt = Get-UtcTimestamp
-                    if (-not $process.Start()) { throw "Unable to start Git evidence task $($specification.name)." }
+                    if (-not $process.Start()) { throw ('Unable to start Git evidence task {0}.' -f ([string]($specification.name))) }
                     $active.Add([ordered]@{
                         specification = $specification
                         process = $process
@@ -3884,7 +3851,7 @@ function New-GitEvidenceBatch {
                 $null = $item.copyTask.GetAwaiter().GetResult()
                 $errorText = $item.errorTask.GetAwaiter().GetResult()
                 if ($item.process.ExitCode -ne 0) {
-                    throw "Git evidence task $($item.specification.name) failed ($($item.process.ExitCode)): $errorText"
+                    throw ('Git evidence task {0} failed ({1}): {2}' -f ([string]($item.specification.name)), ([string]($item.process.ExitCode)), ([string]$errorText))
                 }
                 $completed.Add([ordered]@{
                     specification = $item.specification
@@ -3913,7 +3880,7 @@ function New-GitEvidenceBatch {
     $tasks = @()
     foreach ($specification in @($TaskSpecifications)) {
         $taskResults = @($completed | Where-Object { [string]$_.specification.name -ceq [string]$specification.name })
-        if ($taskResults.Count -ne 1) { throw "Bounded Git evidence batch produced an ambiguous task result: $($specification.name)" }
+        if ($taskResults.Count -ne 1) { throw ('Bounded Git evidence batch produced an ambiguous task result: {0}' -f ([string]($specification.name))) }
         $result = $taskResults[0]
         $path = Join-Path (Join-Path ([string]$State.artifactsRoot) 'git-evidence') ([string]$specification.artifactName)
         New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
@@ -3964,7 +3931,7 @@ function Assert-EvidenceChangedPathAllowlists {
     $records = @()
     foreach ($range in $ranges) {
         $paths = @(
-            (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.quotePath=false', 'diff', '--name-only', '--no-renames', "$($range.baseOid)..$($range.headOid)")).output -split "`r?`n" |
+            (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.quotePath=false', 'diff', '--name-only', '--no-renames', ('{0}..{1}' -f ([string]($range.baseOid)), ([string]($range.headOid))))).output -split "`r?`n" |
                 Where-Object { $_ } |
                 Sort-Object -Unique
         )
@@ -3977,7 +3944,7 @@ function Assert-EvidenceChangedPathAllowlists {
                 'mod-or-metadata' { $inMod -or $path -cin $metadata }
                 default { $false }
             }
-            if (-not $allowed) { throw "Coordinator changed-path allowlist rejected $($range.name): $path" }
+            if (-not $allowed) { throw ('Coordinator changed-path allowlist rejected {0}: {1}' -f ([string]($range.name)), ([string]$path)) }
         }
         $pathsSha256 = Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject @($paths) -Compress)))
         $records += [ordered]@{
@@ -4005,7 +3972,7 @@ function Assert-BuildMetadataPaths {
         [switch] $AllowMissing
     )
     $worktree = [IO.Path]::GetFullPath([string]$State.worktreePath)
-    $required = @('README.md', ".hash/$($State.modSlug).hash")
+    $required = @('README.md', ('.hash/{0}.hash' -f ([string]($State.modSlug))))
     $actual = @($State.metadataPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
     $matchesRequiredContract = $actual.Count -eq $required.Count
     foreach ($requiredPath in $required) {
@@ -4013,7 +3980,7 @@ function Assert-BuildMetadataPaths {
         if ($pathMatches.Count -ne 1) { $matchesRequiredContract = $false }
     }
     if (-not $matchesRequiredContract) {
-        throw "Metadata preflight requires README.md and .hash/$($State.modSlug).hash before C1."
+        throw ('Metadata preflight requires README.md and .hash/{0}.hash before C1.' -f ([string]($State.modSlug)))
     }
     $records = @()
     foreach ($metadataRelative in $actual) {
@@ -4076,24 +4043,22 @@ function New-BuildMetadataPreview {
         $metadataBytes = Read-FileBytesWithHeartbeat -Path ([string]$metadataPath.fullPath)
         $metadataText = [Text.UTF8Encoding]::new($false, $true).GetString($metadataBytes)
         $metadataBlobOid = (Invoke-Git -WorkingDirectory ([string]$State.worktreePath) -Arguments @(
-            '-c', 'core.autocrlf=true', 'hash-object', '-w', "--path=$([string]$metadataPath.relativePath)", '--', [string]$metadataPath.fullPath
+            '-c', 'core.autocrlf=true', 'hash-object', '-w', ('--path={0}' -f ([string]$metadataPath.relativePath)), '--', [string]$metadataPath.fullPath
         )).output.Trim()
         $metadataIndexedBytes = Get-GitBlobBytes -WorkingDirectory ([string]$State.worktreePath) -Object $metadataBlobOid
         $metadataRawSha256 = Get-Sha256Bytes -Bytes $metadataBytes
         $metadataIndexedSha256 = Get-Sha256Bytes -Bytes $metadataIndexedBytes
         $metadataTransform = if ($metadataRawSha256 -ceq $metadataIndexedSha256) { 'none' }
             elseif (Test-CrlfNormalizationOnly -RawBytes $metadataBytes -IndexedBytes $metadataIndexedBytes) { 'crlf-to-lf' }
-            else { throw "Metadata Git clean processing changed bytes beyond CRLF-to-LF for $($metadataPath.relativePath)." }
+            else { throw ('Metadata Git clean processing changed bytes beyond CRLF-to-LF for {0}.' -f ([string]($metadataPath.relativePath))) }
         $fieldMatches = [ordered]@{}
         foreach ($fieldName in $sourceFields.Keys) {
             $fieldValue = [string]$sourceFields[$fieldName]
-            $fieldMatches[$fieldName] = Test-MetadataSourceFieldMatch -RelativePath ([string]$metadataPath.relativePath) `
-                -Text $metadataText -FieldName $fieldName -FieldValue $fieldValue `
-                -NexusPageUrl ([string]$sourceFields.nexusPageUrl)
+            $fieldMatches[$fieldName] = Test-MetadataSourceFieldMatch -RelativePath ([string]$metadataPath.relativePath) -Text $metadataText -FieldName $fieldName -FieldValue $fieldValue -NexusPageUrl ([string]$sourceFields.nexusPageUrl)
         }
         $mismatchedFields = @($fieldMatches.Keys | Where-Object { -not [bool]$fieldMatches[$_] })
         if ($mismatchedFields.Count -ne 0) {
-            throw "Metadata preflight field mismatch: $($metadataPath.relativePath) $($mismatchedFields -join ', ')."
+            throw ('Metadata preflight field mismatch: {0} {1}.' -f ([string]($metadataPath.relativePath)), ([string]($mismatchedFields -join ', ')))
         }
         $metadataRecords += [ordered]@{
             path = [string]$metadataPath.relativePath
@@ -4122,8 +4087,7 @@ function New-BuildMetadataPreview {
             [IO.Path]::GetFullPath([string]$State.metadataPreview.path) -cne [IO.Path]::GetFullPath($metadataPreviewPath)) {
             throw 'Recorded metadata preview path changed after build-commits preflight.'
         }
-        $previousPreviewPath = Assert-NoReparsePath -Path ([string]$State.metadataPreview.path) `
-            -Root ([string]$State.repositoryRoot) -Label 'Metadata preview'
+        $previousPreviewPath = Assert-NoReparsePath -Path ([string]$State.metadataPreview.path) -Root ([string]$State.repositoryRoot) -Label 'Metadata preview'
         if (-not (Test-Path -LiteralPath $previousPreviewPath -PathType Leaf) -or
             (Get-FileSha256 -Path $previousPreviewPath) -cne [string]$State.metadataPreview.sha256) {
             throw 'Recorded metadata preview bytes changed after build-commits preflight.'
@@ -4177,7 +4141,7 @@ function Get-BuildCommitsResumeCheckpoint {
     foreach ($checkpoint in $recorded) {
         if ([string]::IsNullOrWhiteSpace([string]$checkpoint.oid)) { continue }
         if ([string]::IsNullOrWhiteSpace([string]$checkpoint.tree)) {
-            throw "Recorded build-commits partial checkpoint tree is missing for $($checkpoint.name)."
+            throw ('Recorded build-commits partial checkpoint tree is missing for {0}.' -f ([string]($checkpoint.name)))
         }
         $latest = $checkpoint
     }
@@ -4185,7 +4149,7 @@ function Get-BuildCommitsResumeCheckpoint {
         throw 'Incomplete build-commits recovery requires HEAD to equal the latest recorded same-run checkpoint.'
     }
     if ([string]$latest.tree -cne $HeadTreeOid) {
-        throw "Recorded build-commits partial checkpoint tree no longer matches HEAD at $($latest.name)."
+        throw ('Recorded build-commits partial checkpoint tree no longer matches HEAD at {0}.' -f ([string]($latest.name)))
     }
     [string]$latest.name
 }
@@ -4221,7 +4185,7 @@ function Assert-BuildCommitsRecordedCheckpoints {
         $actualParentOid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', "$oid^" )).output.Trim()
         $actualParentTreeOid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', "$oid^^{tree}" )).output.Trim()
         if ($actualParentOid -cne $parentOid -or $actualParentTreeOid -cne $parentTreeOid) {
-            throw "Recorded $($name.ToUpperInvariant()) partial checkpoint parent tuple changed."
+            throw ('Recorded {0} partial checkpoint parent tuple changed.' -f ([string]($name.ToUpperInvariant())))
         }
     }
 }
@@ -4263,7 +4227,7 @@ function Assert-StagedCheckpointBoundary {
             $upstreamWhitespacePaths.Count -gt 0 -and
             @($upstreamWhitespacePaths | Where-Object { $_ -cnotin $stagedPaths }).Count -eq 0
         if (-not $isExactUpstreamException) {
-            throw "$Checkpoint staged diff failed git diff --cached --check: $($diffCheck.warning) $($diffCheck.output)".Trim()
+            throw ('{0} staged diff failed git diff --cached --check: {1} {2}' -f ([string]$Checkpoint), ([string]($diffCheck.warning)), ([string]($diffCheck.output))).Trim()
         }
     }
     [ordered]@{
@@ -4283,8 +4247,7 @@ function Assert-FileTreeMatchesManifest {
         [switch] $AllowCaseOnlyPathNormalization
     )
     $rootFull = [IO.Path]::GetFullPath($Root)
-    $manifestPath = Assert-NoReparsePath -Path ([string]$ManifestReceipt.path) `
-        -Root $Repository -Label "$Label manifest"
+    $manifestPath = Assert-NoReparsePath -Path ([string]$ManifestReceipt.path) -Root $Repository -Label ('{0} manifest' -f ([string]$Label))
     if ((Get-FileSha256 -Path $manifestPath) -cne [string]$ManifestReceipt.sha256) {
         throw "$Label immutable manifest SHA-256 changed."
     }
@@ -4307,7 +4270,7 @@ function Assert-FileTreeMatchesManifest {
             if ([string]$actual[$index].path -cne [string]$expected[$index].path -or
                 [int64]$actual[$index].size -ne [int64]$expected[$index].size -or
                 [string]$actual[$index].sha256 -cne [string]$expected[$index].sha256) {
-                throw "$Label differs from its immutable manifest at $($actual[$index].path)."
+                throw ('{0} differs from its immutable manifest at {1}.' -f ([string]$Label), ([string]$($actual[$index].path)))
             }
         }
     }
@@ -4316,12 +4279,12 @@ function Assert-FileTreeMatchesManifest {
         $actualByPath = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($file in $expected) {
             if (-not $expectedByPath.TryAdd([string]$file.path, $file)) {
-                throw "$Label contains case-colliding expected paths: $($file.path)."
+                throw ('{0} contains case-colliding expected paths: {1}.' -f ([string]$Label), ([string]$($file.path)))
             }
         }
         foreach ($file in $actual) {
             if (-not $actualByPath.TryAdd([string]$file.path, $file)) {
-                throw "$Label contains case-colliding actual paths: $($file.path)."
+                throw ('{0} contains case-colliding actual paths: {1}.' -f ([string]$Label), ([string]$($file.path)))
             }
         }
         foreach ($path in $expectedByPath.Keys) {
@@ -4358,13 +4321,12 @@ function Assert-CheckpointIndexState {
     $indexPaths = Get-GitIndexStagePathMap -WorkingDirectory $WorkingDirectory -Checkpoint $Checkpoint
 
     foreach ($path in $expected.Keys) {
-        $indexPath = Resolve-GitNormalizationRepositoryPath -RepositoryPath $path `
-            -TrackedPathIndex $trackedPathIndex
+        $indexPath = Resolve-GitNormalizationRepositoryPath -RepositoryPath $path -TrackedPathIndex $trackedPathIndex
         if (-not $indexPaths.ContainsKey($indexPath)) {
             throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
         }
         try {
-            $blobBytes = Get-GitBlobBytes -WorkingDirectory $WorkingDirectory -Object ":$([string]$indexPaths[$indexPath])"
+            $blobBytes = Get-GitBlobBytes -WorkingDirectory $WorkingDirectory -Object (':{0}' -f ([string]$indexPaths[$indexPath]))
         }
         catch {
             throw "$Checkpoint index blob differs from its immutable expected SHA-256: $path"
@@ -4417,8 +4379,7 @@ function Save-BuildCommitsFailure {
         recoveryDisposition = $disposition
         error = $ErrorMessage
     }
-    $null = Fail-Stage -State $State -Context $Context -ErrorMessage $ErrorMessage `
-        -PartialCheckpoint $checkpoint -RecoveryDisposition $disposition
+    $null = Fail-Stage -State $State -Context $Context -ErrorMessage $ErrorMessage -PartialCheckpoint $checkpoint -RecoveryDisposition $disposition
 }
 
 function Invoke-BuildCommits {
@@ -4428,11 +4389,10 @@ function Invoke-BuildCommits {
     $stage = Start-Stage -Name 'build-commits'
     try {
         Assert-LockOwner -State $State
-        $worktree = Assert-NoReparsePath -Path ([string]$State.worktreePath) `
-            -Root ([IO.Path]::GetPathRoot([string]$State.worktreePath)) -Label 'Evidence worktree'
+        $worktree = Assert-NoReparsePath -Path ([string]$State.worktreePath) -Root ([IO.Path]::GetPathRoot([string]$State.worktreePath)) -Label 'Evidence worktree'
         $null = Assert-NoReparseTree -Path ([string]$State.installRoot) -Root $worktree -Label 'Installed MOD tree before evidence commits'
 
-        $remoteTrackingRef = "refs/remotes/$($State.remote)/$($State.branch)"
+        $remoteTrackingRef = ('refs/remotes/{0}/{1}' -f ([string]($State.remote)), ([string]($State.branch)))
         $remoteTracking = Invoke-Git -WorkingDirectory $worktree -Arguments @('show-ref', '--verify', '--quiet', $remoteTrackingRef) -AllowFailure
         if (-not $State.published -and $remoteTracking.exitCode -eq 0) {
             $remoteTrackingOid = Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', '--verify', "$remoteTrackingRef^{commit}")
@@ -4456,9 +4416,7 @@ function Invoke-BuildCommits {
                 message = 'Prepare the missing README/formal-hash metadata from the immutable source tuple, then resume build-commits.'
                 missingPaths = $missingMetadataPaths
             }
-            return Suspend-Stage -State $State -Context $stage -Result 'waiting-input' `
-                -ArtifactSha256 ([string]$State.sourceTuple.sha256) -OutputStage 'metadata-preparation' `
-                -Data ([ordered]@{
+            return Suspend-Stage -State $State -Context $stage -Result 'waiting-input' -ArtifactSha256 ([string]$State.sourceTuple.sha256) -OutputStage 'metadata-preparation' -Data ([ordered]@{
                     required = $State.waitingReason.message
                     missingPaths = $missingMetadataPaths
                     sourceTuplePath = [string]$State.sourceTuple.path
@@ -4468,8 +4426,7 @@ function Invoke-BuildCommits {
 
         $State.waitingReason = $null
         $validator = Join-Path $PSScriptRoot 'Test-ModUpdateCandidate.ps1'
-        $securityValidation = & $validator -StatePath $State.statePath -SecurityPayloadOnly `
-            -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+        $securityValidation = & $validator -StatePath $State.statePath -SecurityPayloadOnly -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
         if ($securityValidation.result -ne 'passed') { throw 'Independent pre-commit payload security validation rejected the run.' }
         $State.securityPrecommitValidation = [ordered]@{
             path = $securityValidation.path; sha256 = $securityValidation.sha256; result = $securityValidation.result
@@ -4487,11 +4444,8 @@ function Invoke-BuildCommits {
         $checkpointRanks = @{ c0 = 0; c1 = 1; c2 = 2; c3 = 3; f = 4 }
         $resumeRank = [int]$checkpointRanks[$resumeCheckpoint]
         if ($resumeRank -lt 3) {
-            $null = Assert-FileTreeMatchesManifest -Root ([string]$State.installRoot) `
-                -Repository ([string]$State.repositoryRoot) -ManifestReceipt $State.rawInstallManifest `
-                -Label 'Pre-C1 raw install tree' -AllowCaseOnlyPathNormalization
-            $normalizationPath = Assert-NoReparsePath -Path ([string]$State.gitIndexNormalization.path) `
-                -Root ([string]$State.repositoryRoot) -Label 'Git index normalization manifest'
+            $null = Assert-FileTreeMatchesManifest -Root ([string]$State.installRoot) -Repository ([string]$State.repositoryRoot) -ManifestReceipt $State.rawInstallManifest -Label 'Pre-C1 raw install tree' -AllowCaseOnlyPathNormalization
+            $normalizationPath = Assert-NoReparsePath -Path ([string]$State.gitIndexNormalization.path) -Root ([string]$State.repositoryRoot) -Label 'Git index normalization manifest'
             if ((Get-FileSha256 -Path $normalizationPath) -cne [string]$State.gitIndexNormalization.sha256) {
                 throw 'Git index normalization manifest SHA-256 changed before checkpoint commits.'
             }
@@ -4513,20 +4467,17 @@ function Invoke-BuildCommits {
         if ($resumeRank -lt 1) {
             $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('reset', '--quiet', 'HEAD', '--', $State.modRelativePath)
             $c1NormalizationRecords = @($normalization.files | Where-Object { [string]$_.repositoryPath -cnotin $targets })
-            Normalize-GitCaseVariantWorktreePaths -WorkingDirectory $worktree `
-                -ModRelativePath ([string]$State.modRelativePath) -Records $c1NormalizationRecords
+            Normalize-GitCaseVariantWorktreePaths -WorkingDirectory $worktree -ModRelativePath ([string]$State.modRelativePath) -Records $c1NormalizationRecords
             $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('-c', 'core.autocrlf=true', 'add', '-A', '--', $State.modRelativePath)
             foreach ($target in $targets) {
                 $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('reset', '--quiet', 'HEAD', '--', $target)
             }
-            $c1Boundary = Assert-StagedCheckpointBoundary -WorkingDirectory $worktree -Checkpoint 'C1' `
-                -AllowedRoot ([string]$State.modRelativePath) -ExcludedPaths $targets
+            $c1Boundary = Assert-StagedCheckpointBoundary -WorkingDirectory $worktree -Checkpoint 'C1' -AllowedRoot ([string]$State.modRelativePath) -ExcludedPaths $targets
             $c1Expected = @($normalization.files | Where-Object { [string]$_.repositoryPath -cnotin $targets } |
                 ForEach-Object { [ordered]@{ path = [string]$_.repositoryPath; sha256 = [string]$_.indexedSha256 } })
             $c1ExpectedPaths = @($c1Expected | ForEach-Object { [string]$_.path })
             $c1Absent = @($c1Boundary.stagedPaths | Where-Object { [string]$_ -cnotin $c1ExpectedPaths })
-            $null = Assert-CheckpointIndexState -WorkingDirectory $worktree -Checkpoint 'C1' `
-                -ExpectedRecords $c1Expected -AbsentPaths $c1Absent
+            $null = Assert-CheckpointIndexState -WorkingDirectory $worktree -Checkpoint 'C1' -ExpectedRecords $c1Expected -AbsentPaths $c1Absent
             $c1Staged = Invoke-Git -WorkingDirectory $worktree -Arguments @('diff', '--cached', '--quiet') -AllowFailure
             if ($c1Staged.exitCode -eq 0 -and $State.localizationMode -eq 'none') { throw 'The archive is already current; an empty non-localization evidence commit is not allowed.' }
             if ($c1Staged.exitCode -notin @(0, 1)) { throw 'Unable to inspect the C1 index.' }
@@ -4562,14 +4513,12 @@ function Invoke-BuildCommits {
                     [ordered]@{ path = [string]$_.relativePath; sha256 = [string]$_.indexedSha256 }
                 })
                 $c2ExpectedPaths = @($c2Expected | ForEach-Object { [string]$_.path })
-                $null = Assert-CheckpointIndexState -WorkingDirectory $worktree -Checkpoint 'C2' `
-                    -ExpectedRecords $c2Expected -AbsentPaths @($targets | Where-Object { [string]$_ -cnotin $c2ExpectedPaths })
+                $null = Assert-CheckpointIndexState -WorkingDirectory $worktree -Checkpoint 'C2' -ExpectedRecords $c2Expected -AbsentPaths @($targets | Where-Object { [string]$_ -cnotin $c2ExpectedPaths })
                 $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('commit', '--allow-empty', '-m', "chore($($State.modSlug)): checkpoint upstream localization [C2]")
                 $State.evidenceChain.c2Oid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD')).output.Trim()
                 $State.evidenceChain.c2TreeOid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD^{tree}')).output.Trim()
                 $State.evidenceChain.c2Status = 'committed'
-                $State.evidenceChain.c2Reason = New-CheckpointReason -State $State -Checkpoint C2 `
-                    -ParentTreeOid ([string]$State.evidenceChain.c2ParentTreeOid) -TreeOid ([string]$State.evidenceChain.c2TreeOid)
+                $State.evidenceChain.c2Reason = New-CheckpointReason -State $State -Checkpoint C2 -ParentTreeOid ([string]$State.evidenceChain.c2ParentTreeOid) -TreeOid ([string]$State.evidenceChain.c2TreeOid)
                 Save-State -State $State
                 $resumeRank = 2
             }
@@ -4592,14 +4541,12 @@ function Invoke-BuildCommits {
                 $c3Expected = @($State.localizationFiles | ForEach-Object {
                     [ordered]@{ path = [string]$_.relativePath; sha256 = [string]$_.mergedSha256 }
                 })
-                $null = Assert-CheckpointIndexState -WorkingDirectory $worktree -Checkpoint 'C3' `
-                    -ExpectedRecords $c3Expected -AbsentPaths @($targets | Where-Object { [string]$_ -cnotin $c3Targets })
+                $null = Assert-CheckpointIndexState -WorkingDirectory $worktree -Checkpoint 'C3' -ExpectedRecords $c3Expected -AbsentPaths @($targets | Where-Object { [string]$_ -cnotin $c3Targets })
                 $null = Invoke-Git -WorkingDirectory $worktree -Arguments @('commit', '--allow-empty', '-m', "feat($($State.modSlug)): restore approved zh-tw localization [C3]")
                 $State.evidenceChain.c3Oid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD')).output.Trim()
                 $State.evidenceChain.c3TreeOid = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', 'HEAD^{tree}')).output.Trim()
                 $State.evidenceChain.c3Status = 'committed'
-                $State.evidenceChain.c3Reason = New-CheckpointReason -State $State -Checkpoint C3 `
-                    -ParentTreeOid ([string]$State.evidenceChain.c3ParentTreeOid) -TreeOid ([string]$State.evidenceChain.c3TreeOid)
+                $State.evidenceChain.c3Reason = New-CheckpointReason -State $State -Checkpoint C3 -ParentTreeOid ([string]$State.evidenceChain.c3ParentTreeOid) -TreeOid ([string]$State.evidenceChain.c3TreeOid)
                 Save-State -State $State
                 $resumeRank = 3
             }
@@ -4642,29 +4589,29 @@ function Invoke-BuildCommits {
             c3FDiff = $notApplicableEvidence; c3FNameStatus = $notApplicableEvidence
         }
         $evidenceTasks = @(
-            [ordered]@{ name = 'c0C1Diff'; artifactName = 'c0-c1.diff'; baseOid = $State.evidenceChain.c0Oid; headOid = $State.evidenceChain.c1Oid; treeOid = $State.evidenceChain.c1TreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', "$($State.evidenceChain.c0Oid)..$($State.evidenceChain.c1Oid)") }
-            [ordered]@{ name = 'c0C1NameStatus'; artifactName = 'c0-c1.name-status.txt'; baseOid = $State.evidenceChain.c0Oid; headOid = $State.evidenceChain.c1Oid; treeOid = $State.evidenceChain.c1TreeOid; arguments = @('diff', '--name-status', '--no-renames', "$($State.evidenceChain.c0Oid)..$($State.evidenceChain.c1Oid)") }
-            [ordered]@{ name = 'c1ParentNameStatus'; artifactName = 'c1-parent.name-status.txt'; baseOid = $State.evidenceChain.c1ParentOid; headOid = $State.evidenceChain.c1Oid; treeOid = $State.evidenceChain.c1TreeOid; arguments = @('diff', '--name-status', '--no-renames', "$($State.evidenceChain.c1ParentOid)..$($State.evidenceChain.c1Oid)") }
+            [ordered]@{ name = 'c0C1Diff'; artifactName = 'c0-c1.diff'; baseOid = $State.evidenceChain.c0Oid; headOid = $State.evidenceChain.c1Oid; treeOid = $State.evidenceChain.c1TreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c0Oid), ([string]$State.evidenceChain.c1Oid))) }
+            [ordered]@{ name = 'c0C1NameStatus'; artifactName = 'c0-c1.name-status.txt'; baseOid = $State.evidenceChain.c0Oid; headOid = $State.evidenceChain.c1Oid; treeOid = $State.evidenceChain.c1TreeOid; arguments = @('diff', '--name-status', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c0Oid), ([string]$State.evidenceChain.c1Oid))) }
+            [ordered]@{ name = 'c1ParentNameStatus'; artifactName = 'c1-parent.name-status.txt'; baseOid = $State.evidenceChain.c1ParentOid; headOid = $State.evidenceChain.c1Oid; treeOid = $State.evidenceChain.c1TreeOid; arguments = @('diff', '--name-status', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c1ParentOid), ([string]$State.evidenceChain.c1Oid))) }
         )
         if ($State.localizationMode -eq 'zh-tw') {
             $evidenceTasks += @(
-                [ordered]@{ name = 'c1C2Diff'; artifactName = 'c1-c2.diff'; baseOid = $State.evidenceChain.c1Oid; headOid = $State.evidenceChain.c2Oid; treeOid = $State.evidenceChain.c2TreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', "$($State.evidenceChain.c1Oid)..$($State.evidenceChain.c2Oid)") }
-                [ordered]@{ name = 'c1C2NameStatus'; artifactName = 'c1-c2.name-status.txt'; baseOid = $State.evidenceChain.c1Oid; headOid = $State.evidenceChain.c2Oid; treeOid = $State.evidenceChain.c2TreeOid; arguments = @('diff', '--name-status', '--no-renames', "$($State.evidenceChain.c1Oid)..$($State.evidenceChain.c2Oid)") }
-                [ordered]@{ name = 'c2C3Diff'; artifactName = 'c2-c3.diff'; baseOid = $State.evidenceChain.c2Oid; headOid = $State.evidenceChain.c3Oid; treeOid = $State.evidenceChain.c3TreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', "$($State.evidenceChain.c2Oid)..$($State.evidenceChain.c3Oid)") }
-                [ordered]@{ name = 'c2C3NameStatus'; artifactName = 'c2-c3.name-status.txt'; baseOid = $State.evidenceChain.c2Oid; headOid = $State.evidenceChain.c3Oid; treeOid = $State.evidenceChain.c3TreeOid; arguments = @('diff', '--name-status', '--no-renames', "$($State.evidenceChain.c2Oid)..$($State.evidenceChain.c3Oid)") }
-                [ordered]@{ name = 'c2ParentNameStatus'; artifactName = 'c2-parent.name-status.txt'; baseOid = $State.evidenceChain.c2ParentOid; headOid = $State.evidenceChain.c2Oid; treeOid = $State.evidenceChain.c2TreeOid; arguments = @('diff', '--name-status', '--no-renames', "$($State.evidenceChain.c2ParentOid)..$($State.evidenceChain.c2Oid)") }
-                [ordered]@{ name = 'c3ParentNameStatus'; artifactName = 'c3-parent.name-status.txt'; baseOid = $State.evidenceChain.c3ParentOid; headOid = $State.evidenceChain.c3Oid; treeOid = $State.evidenceChain.c3TreeOid; arguments = @('diff', '--name-status', '--no-renames', "$($State.evidenceChain.c3ParentOid)..$($State.evidenceChain.c3Oid)") }
+                [ordered]@{ name = 'c1C2Diff'; artifactName = 'c1-c2.diff'; baseOid = $State.evidenceChain.c1Oid; headOid = $State.evidenceChain.c2Oid; treeOid = $State.evidenceChain.c2TreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c1Oid), ([string]$State.evidenceChain.c2Oid))) }
+                [ordered]@{ name = 'c1C2NameStatus'; artifactName = 'c1-c2.name-status.txt'; baseOid = $State.evidenceChain.c1Oid; headOid = $State.evidenceChain.c2Oid; treeOid = $State.evidenceChain.c2TreeOid; arguments = @('diff', '--name-status', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c1Oid), ([string]$State.evidenceChain.c2Oid))) }
+                [ordered]@{ name = 'c2C3Diff'; artifactName = 'c2-c3.diff'; baseOid = $State.evidenceChain.c2Oid; headOid = $State.evidenceChain.c3Oid; treeOid = $State.evidenceChain.c3TreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c2Oid), ([string]$State.evidenceChain.c3Oid))) }
+                [ordered]@{ name = 'c2C3NameStatus'; artifactName = 'c2-c3.name-status.txt'; baseOid = $State.evidenceChain.c2Oid; headOid = $State.evidenceChain.c3Oid; treeOid = $State.evidenceChain.c3TreeOid; arguments = @('diff', '--name-status', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c2Oid), ([string]$State.evidenceChain.c3Oid))) }
+                [ordered]@{ name = 'c2ParentNameStatus'; artifactName = 'c2-parent.name-status.txt'; baseOid = $State.evidenceChain.c2ParentOid; headOid = $State.evidenceChain.c2Oid; treeOid = $State.evidenceChain.c2TreeOid; arguments = @('diff', '--name-status', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c2ParentOid), ([string]$State.evidenceChain.c2Oid))) }
+                [ordered]@{ name = 'c3ParentNameStatus'; artifactName = 'c3-parent.name-status.txt'; baseOid = $State.evidenceChain.c3ParentOid; headOid = $State.evidenceChain.c3Oid; treeOid = $State.evidenceChain.c3TreeOid; arguments = @('diff', '--name-status', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c3ParentOid), ([string]$State.evidenceChain.c3Oid))) }
             )
             if ($State.evidenceChain.fOid -ne $State.evidenceChain.c3Oid) {
                 $evidenceTasks += @(
-                    [ordered]@{ name = 'c3FDiff'; artifactName = 'c3-f.diff'; baseOid = $State.evidenceChain.c3Oid; headOid = $State.evidenceChain.fOid; treeOid = $State.evidenceChain.fTreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', "$($State.evidenceChain.c3Oid)..$($State.evidenceChain.fOid)") }
-                    [ordered]@{ name = 'c3FNameStatus'; artifactName = 'c3-f.name-status.txt'; baseOid = $State.evidenceChain.c3Oid; headOid = $State.evidenceChain.fOid; treeOid = $State.evidenceChain.fTreeOid; arguments = @('diff', '--name-status', '--no-renames', "$($State.evidenceChain.c3Oid)..$($State.evidenceChain.fOid)") }
+                    [ordered]@{ name = 'c3FDiff'; artifactName = 'c3-f.diff'; baseOid = $State.evidenceChain.c3Oid; headOid = $State.evidenceChain.fOid; treeOid = $State.evidenceChain.fTreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c3Oid), ([string]$State.evidenceChain.fOid))) }
+                    [ordered]@{ name = 'c3FNameStatus'; artifactName = 'c3-f.name-status.txt'; baseOid = $State.evidenceChain.c3Oid; headOid = $State.evidenceChain.fOid; treeOid = $State.evidenceChain.fTreeOid; arguments = @('diff', '--name-status', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c3Oid), ([string]$State.evidenceChain.fOid))) }
                 )
             }
         }
         $evidenceTasks += @(
-            [ordered]@{ name = 'c0FDiff'; artifactName = 'c0-f.diff'; baseOid = $State.evidenceChain.c0Oid; headOid = $State.evidenceChain.fOid; treeOid = $State.evidenceChain.fTreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', "$($State.evidenceChain.c0Oid)..$($State.evidenceChain.fOid)") }
-            [ordered]@{ name = 'c0FNameStatus'; artifactName = 'c0-f.name-status.txt'; baseOid = $State.evidenceChain.c0Oid; headOid = $State.evidenceChain.fOid; treeOid = $State.evidenceChain.fTreeOid; arguments = @('diff', '--name-status', '--no-renames', "$($State.evidenceChain.c0Oid)..$($State.evidenceChain.fOid)") }
+            [ordered]@{ name = 'c0FDiff'; artifactName = 'c0-f.diff'; baseOid = $State.evidenceChain.c0Oid; headOid = $State.evidenceChain.fOid; treeOid = $State.evidenceChain.fTreeOid; arguments = @('diff', '--full-index', '--binary', '--no-ext-diff', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c0Oid), ([string]$State.evidenceChain.fOid))) }
+            [ordered]@{ name = 'c0FNameStatus'; artifactName = 'c0-f.name-status.txt'; baseOid = $State.evidenceChain.c0Oid; headOid = $State.evidenceChain.fOid; treeOid = $State.evidenceChain.fTreeOid; arguments = @('diff', '--name-status', '--no-renames', ('{0}..{1}' -f ([string]$State.evidenceChain.c0Oid), ([string]$State.evidenceChain.fOid))) }
         )
         $evidenceBatch = New-GitEvidenceBatch -State $State -TaskSpecifications $evidenceTasks -MaxConcurrency 4
         foreach ($name in $evidenceBatch.artifacts.Keys) { $evidence[$name] = $evidenceBatch.artifacts[$name] }
@@ -4695,11 +4642,11 @@ function Invoke-BuildCommits {
             if (-not (Test-Path -LiteralPath ([string]$task.artifact.path) -PathType Leaf) -or
                 (Get-FileSha256 -Path ([string]$task.artifact.path)) -cne [string]$task.artifact.sha256 -or
                 (Get-Item -LiteralPath ([string]$task.artifact.path)).Length -ne [int64]$task.artifact.size) {
-                throw "Coordinator verification rejected Git evidence task $($task.name)."
+                throw ('Coordinator verification rejected Git evidence task {0}.' -f ([string]$($task.name)))
             }
         }
         $spotCheckTask = @($evidenceBatch.tasks | Sort-Object { [string]$_.name })[0]
-        $spotCheckTree = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', "$($spotCheckTask.headOid)^{tree}")).output.Trim()
+        $spotCheckTree = (Invoke-Git -WorkingDirectory $worktree -Arguments @('rev-parse', ('{0}^{{tree}}' -f ([string]$($spotCheckTask.headOid))))).output.Trim()
         if ($spotCheckTree -cne [string]$spotCheckTask.treeOid) { throw 'Coordinator Git object spot-check rejected the bounded evidence batch.' }
         $changedPathVerification = Assert-EvidenceChangedPathAllowlists -State $State
         $receiptPath = Join-Path $State.artifactsRoot 'evidence-generation-receipt.json'
@@ -4825,12 +4772,12 @@ function Get-PrBody {
     $localizationIds = @($State.localizationFiles | ForEach-Object { $_.safeId }) -join ', '
     if ([string]::IsNullOrWhiteSpace($localizationIds)) { $localizationIds = 'not-applicable' }
     if ([int]$State.schemaVersion -ge 15) {
-        $localizationEvidence = @($State.localizationFiles | ForEach-Object { "$($_.safeId): raw=$($_.rawSha256), indexed=$($_.indexedSha256), merged-raw=$($_.mergedRawSha256), merged-indexed=$($_.mergedSha256), workset-edits=$($_.worksetEditCount)" }) -join '; '
+        $localizationEvidence = @($State.localizationFiles | ForEach-Object { '{0}: raw={1}, indexed={2}, merged-raw={3}, merged-indexed={4}, workset-edits={5}' -f ([string]$($_.safeId)), ([string]$($_.rawSha256)), ([string]$($_.indexedSha256)), ([string]$($_.mergedRawSha256)), ([string]$($_.mergedSha256)), ([string]$($_.worksetEditCount)) }) -join '; '
         $approvedSpanCount = [int]$State.localizationWorkset.editCount
         $unchangedTargetCount = [int]$State.localizationWorkset.counts.unchanged
         $localizationScope = 'only program-selected zh-tw workset edits; BLOCKED=0'
         $rows = foreach ($changeType in @('unchanged', 'localized_source', 'missing_zh_tw', 'zh_tw_only_changed', 'source_changed_translation_unchanged', 'source_and_translation_changed', 'new_key', 'deleted_key', 'blocked')) {
-            "| $changeType | $($State.localizationWorkset.counts[$changeType]) |"
+            '| {0} | {1} |' -f ([string]$changeType), ([string]$($State.localizationWorkset.counts[$changeType]))
         }
         $localizationTable = [string]::Concat(
             [char]10,
@@ -4844,7 +4791,7 @@ function Get-PrBody {
         $worksetDeletionReceiptSha = [string]$State.localizationWorkset.deletionReceiptSha256
     }
     else {
-        $localizationEvidence = @($State.localizationFiles | ForEach-Object { "$($_.safeId): raw=$($_.rawSha256), indexed=$($_.indexedSha256), merged=$($_.mergedSha256), approved-spans=$(@($_.approvedSpans).Count)" }) -join '; '
+        $localizationEvidence = @($State.localizationFiles | ForEach-Object { '{0}: raw={1}, indexed={2}, merged={3}, approved-spans={4}' -f ([string]$($_.safeId)), ([string]$($_.rawSha256)), ([string]$($_.indexedSha256)), ([string]$($_.mergedSha256)), ([string]$(@($_.approvedSpans).Count)) }) -join '; '
         $approvedSpanCount = @($State.localizationFiles | ForEach-Object { @($_.approvedSpans).Count } | Measure-Object -Sum).Sum
         if ($null -eq $approvedSpanCount) { $approvedSpanCount = 0 }
         $unchangedTargetCount = @($State.localizationFiles | Where-Object { @($_.approvedSpans).Count -eq 0 }).Count
@@ -4858,59 +4805,61 @@ function Get-PrBody {
     $securityOverrideSummary = @(
         $State.securityOverrides |
             Sort-Object { [string]$_.relativePath } |
-            ForEach-Object { "archiveSha256=$($_.archiveSha256);relativePath=$($_.relativePath);fileSha256=$($_.fileSha256)" }
+            ForEach-Object { 'archiveSha256={0};relativePath={1};fileSha256={2}' -f ([string]$($_.archiveSha256)), ([string]$($_.relativePath)), ([string]$($_.fileSha256)) }
     ) -join ' | '
     if ([string]::IsNullOrWhiteSpace($securityOverrideSummary)) { $securityOverrideSummary = 'none' }
-    @"
-## Darktide MOD update evidence
-
-- Run: $($State.runId)
-- MOD: $($State.mod)
-- Workflow Schema version: $($State.schemaVersion)
-- HEAD/F: $($State.evidenceChain.fOid)
-- C0: $($State.evidenceChain.c0Oid)
-- C1: $($State.evidenceChain.c1Oid)
-- C2: $($State.evidenceChain.c2Oid) ($($State.evidenceChain.c2Status): $($State.evidenceChain.c2Reason.code), $($State.evidenceChain.c2Reason.disposition))
-- C3: $($State.evidenceChain.c3Oid) ($($State.evidenceChain.c3Status): $($State.evidenceChain.c3Reason.code), $($State.evidenceChain.c3Reason.disposition))
-- Trees C0/C1/C2/C3/F: $($State.evidenceChain.c0TreeOid) / $($State.evidenceChain.c1TreeOid) / $($State.evidenceChain.c2TreeOid) / $($State.evidenceChain.c3TreeOid) / $($State.evidenceChain.fTreeOid)
-- Parent-tree Gate: C1^=$($State.evidenceChain.c1ParentTreeOid); C2^=$($State.evidenceChain.c2ParentTreeOid); C3^=$($State.evidenceChain.c3ParentTreeOid)
-- C0..C1 diff/name-status SHA-256: $($State.evidenceDiffs.c0C1Diff.sha256) / $($State.evidenceDiffs.c0C1NameStatus.sha256)
-- C1..C2 diff/name-status SHA-256: $($State.evidenceDiffs.c1C2Diff.sha256) / $($State.evidenceDiffs.c1C2NameStatus.sha256)
-- C2..C3 diff/name-status SHA-256: $($State.evidenceDiffs.c2C3Diff.sha256) / $($State.evidenceDiffs.c2C3NameStatus.sha256)
-- C0..F diff/name-status SHA-256: $($State.evidenceDiffs.c0FDiff.sha256) / $($State.evidenceDiffs.c0FNameStatus.sha256)
-- C3..F diff/name-status SHA-256: $($State.evidenceDiffs.c3FDiff.sha256) / $($State.evidenceDiffs.c3FNameStatus.sha256)
-- Evidence target paths SHA-256: $($State.evidenceTargetPathsSha256)
-- Evidence target paths: $(@($State.evidenceTargetPaths) -join ', ')
-- Extraction/raw-install/install/candidate-tree manifest SHA-256: $($State.extractionManifest.sha256) / $($State.rawInstallManifest.sha256) / $($State.installManifest.sha256) / $($State.candidateTreeManifest.sha256)
-- Git normalization/metadata/evidence receipt SHA-256: $($State.gitIndexNormalization.sha256) / $($State.metadataPreview.sha256) / $($State.evidenceReceipt.sha256)
-- Diff readability result/SHA-256: $($State.diffReadability.result) / $($State.diffReadability.sha256)
-- Candidate Gate: $($State.candidateGate.status)
-- Validation SHA-256: $($State.candidateGate.validationReportSha256)
-- Workflow commit/SHA-256: $($State.workflowCommitOid) / $($State.workflowSha256)
-- Skill source repository/ref/content/pin SHA-256: $($State.workflowSourceRepository) / $($State.workflowRef) / $($State.workflowSourceContentSha256) / $($State.workflowSourcePinSha256)
-- Review Baseline path/blob/SHA-256: $($State.reviewBaselinePath) / $($State.reviewBaselineBlobOid) / $($State.reviewBaselineSha256)
-- Translation quality path/blob/SHA-256: $($State.translationQualityPath) / $($State.translationQualityBlobOid) / $($State.translationQualitySha256)
-- Localization mode/ids: $($State.localizationMode) / $localizationIds
-- Localization raw/indexed/merged evidence: $localizationEvidence
-- Localization workset SHA-256: $worksetSha
-- Localization workset deletion receipt SHA-256: $worksetDeletionReceiptSha
-- Localization target/approved-span/unchanged/removed/BLOCKED counts: $(@($State.evidenceTargetPaths).Count) / $approvedSpanCount / $unchangedTargetCount / $removedTargetCount / 0
-- Localization scope: $localizationScope
-- Archive filename/SHA-256: $($State.archive.filename) / $($State.archive.sha256)
-- Source tuple contract SHA-256: $($State.sourceTuple.contractSha256)
-- Source receipt SHA-256: $(if ($State.Contains('sourceReceipt') -and $State.sourceReceipt) { $State.sourceReceipt.sha256 } else { 'not-applicable' })
-- Security overrides: $securityOverrideSummary
-- Security override receipt SHA-256: $(if ($State.Contains('securityOverrideReceipt') -and $State.securityOverrideReceipt) { $State.securityOverrideReceipt.sha256 } else { 'not-applicable' })
-- Pre-commit security validation SHA-256: $($State.securityPrecommitValidation.sha256)
-- External review: $($State.externalReview.status)
-$localizationTable
-"@
+    (
+    @(
+        '## Darktide MOD update evidence'
+        ''
+        '- Run: {0}'
+        '- MOD: {1}'
+        '- Workflow Schema version: {2}'
+        '- HEAD/F: {3}'
+        '- C0: {4}'
+        '- C1: {5}'
+        '- C2: {6} ({7}: {8}, {9})'
+        '- C3: {10} ({11}: {12}, {13})'
+        '- Trees C0/C1/C2/C3/F: {14} / {15} / {16} / {17} / {18}'
+        '- Parent-tree Gate: C1^={19}; C2^={20}; C3^={21}'
+        '- C0..C1 diff/name-status SHA-256: {22} / {23}'
+        '- C1..C2 diff/name-status SHA-256: {24} / {25}'
+        '- C2..C3 diff/name-status SHA-256: {26} / {27}'
+        '- C0..F diff/name-status SHA-256: {28} / {29}'
+        '- C3..F diff/name-status SHA-256: {30} / {31}'
+        '- Evidence target paths SHA-256: {32}'
+        '- Evidence target paths: {33}'
+        '- Extraction/raw-install/install/candidate-tree manifest SHA-256: {34} / {35} / {36} / {37}'
+        '- Git normalization/metadata/evidence receipt SHA-256: {38} / {39} / {40}'
+        '- Diff readability result/SHA-256: {41} / {42}'
+        '- Candidate Gate: {43}'
+        '- Validation SHA-256: {44}'
+        '- Workflow commit/SHA-256: {45} / {46}'
+        '- Skill source repository/ref/content/pin SHA-256: {47} / {48} / {49} / {50}'
+        '- Review Baseline path/blob/SHA-256: {51} / {52} / {53}'
+        '- Translation quality path/blob/SHA-256: {54} / {55} / {56}'
+        '- Localization mode/ids: {57} / {58}'
+        '- Localization raw/indexed/merged evidence: {59}'
+        '- Localization workset SHA-256: {60}'
+        '- Localization workset deletion receipt SHA-256: {61}'
+        '- Localization target/approved-span/unchanged/removed/BLOCKED counts: {62} / {63} / {64} / {65} / 0'
+        '- Localization scope: {66}'
+        '- Archive filename/SHA-256: {67} / {68}'
+        '- Source tuple contract SHA-256: {69}'
+        '- Source receipt SHA-256: {70}'
+        '- Security overrides: {71}'
+        '- Security override receipt SHA-256: {72}'
+        '- Pre-commit security validation SHA-256: {73}'
+        '- External review: {74}'
+        '{75}'
+    ) -join [char]10
+) -f ([string]$($State.runId)), ([string]$($State.mod)), ([string]$($State.schemaVersion)), ([string]$($State.evidenceChain.fOid)), ([string]$($State.evidenceChain.c0Oid)), ([string]$($State.evidenceChain.c1Oid)), ([string]$($State.evidenceChain.c2Oid)), ([string]$($State.evidenceChain.c2Status)), ([string]$($State.evidenceChain.c2Reason.code)), ([string]$($State.evidenceChain.c2Reason.disposition)), ([string]$($State.evidenceChain.c3Oid)), ([string]$($State.evidenceChain.c3Status)), ([string]$($State.evidenceChain.c3Reason.code)), ([string]$($State.evidenceChain.c3Reason.disposition)), ([string]$($State.evidenceChain.c0TreeOid)), ([string]$($State.evidenceChain.c1TreeOid)), ([string]$($State.evidenceChain.c2TreeOid)), ([string]$($State.evidenceChain.c3TreeOid)), ([string]$($State.evidenceChain.fTreeOid)), ([string]$($State.evidenceChain.c1ParentTreeOid)), ([string]$($State.evidenceChain.c2ParentTreeOid)), ([string]$($State.evidenceChain.c3ParentTreeOid)), ([string]$($State.evidenceDiffs.c0C1Diff.sha256)), ([string]$($State.evidenceDiffs.c0C1NameStatus.sha256)), ([string]$($State.evidenceDiffs.c1C2Diff.sha256)), ([string]$($State.evidenceDiffs.c1C2NameStatus.sha256)), ([string]$($State.evidenceDiffs.c2C3Diff.sha256)), ([string]$($State.evidenceDiffs.c2C3NameStatus.sha256)), ([string]$($State.evidenceDiffs.c0FDiff.sha256)), ([string]$($State.evidenceDiffs.c0FNameStatus.sha256)), ([string]$($State.evidenceDiffs.c3FDiff.sha256)), ([string]$($State.evidenceDiffs.c3FNameStatus.sha256)), ([string]$($State.evidenceTargetPathsSha256)), ([string]$(@($State.evidenceTargetPaths) -join ', ')), ([string]$($State.extractionManifest.sha256)), ([string]$($State.rawInstallManifest.sha256)), ([string]$($State.installManifest.sha256)), ([string]$($State.candidateTreeManifest.sha256)), ([string]$($State.gitIndexNormalization.sha256)), ([string]$($State.metadataPreview.sha256)), ([string]$($State.evidenceReceipt.sha256)), ([string]$($State.diffReadability.result)), ([string]$($State.diffReadability.sha256)), ([string]$($State.candidateGate.status)), ([string]$($State.candidateGate.validationReportSha256)), ([string]$($State.workflowCommitOid)), ([string]$($State.workflowSha256)), ([string]$($State.workflowSourceRepository)), ([string]$($State.workflowRef)), ([string]$($State.workflowSourceContentSha256)), ([string]$($State.workflowSourcePinSha256)), ([string]$($State.reviewBaselinePath)), ([string]$($State.reviewBaselineBlobOid)), ([string]$($State.reviewBaselineSha256)), ([string]$($State.translationQualityPath)), ([string]$($State.translationQualityBlobOid)), ([string]$($State.translationQualitySha256)), ([string]$($State.localizationMode)), ([string]$localizationIds), ([string]$localizationEvidence), ([string]$worksetSha), ([string]$worksetDeletionReceiptSha), ([string]$(@($State.evidenceTargetPaths).Count)), ([string]$approvedSpanCount), ([string]$unchangedTargetCount), ([string]$removedTargetCount), ([string]$localizationScope), ([string]$($State.archive.filename)), ([string]$($State.archive.sha256)), ([string]$($State.sourceTuple.contractSha256)), ([string]$(if ($State.Contains('sourceReceipt') -and $State.sourceReceipt) { $State.sourceReceipt.sha256 } else { 'not-applicable' })), ([string]$securityOverrideSummary), ([string]$(if ($State.Contains('securityOverrideReceipt') -and $State.securityOverrideReceipt) { $State.securityOverrideReceipt.sha256 } else { 'not-applicable' })), ([string]$($State.securityPrecommitValidation.sha256)), ([string]$($State.externalReview.status)), ([string]$localizationTable)
 }
 
 function Assert-PublishedPrAtF {
     param([Collections.IDictionary] $State)
     $localHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('rev-parse', 'HEAD')).output.Trim()
-    $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $State.remote, "refs/heads/$($State.branch)")).output.Split("`t")[0]
+    $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $State.remote, ('refs/heads/{0}' -f ([string]($State.branch))))).output.Split([string][char]9)[0]
     $pr = (Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'view', [string]$State.prNumber, '--json', 'state,isDraft,baseRefName,headRefName,headRefOid,body')).output | ConvertFrom-Json -AsHashtable
     if ($localHead -ne $State.evidenceChain.fOid -or $remoteHead -ne $localHead -or $pr.headRefOid -ne $localHead) {
         throw 'Local, remote, PR head, and immutable F are not identical.'
@@ -4918,8 +4867,8 @@ function Assert-PublishedPrAtF {
     if ($pr.state -ne 'OPEN' -or $pr.isDraft -or $pr.baseRefName -ne $State.pullRequestBase -or $pr.headRefName -ne $State.branch) {
         throw 'Published PR state, draft flag, base, or head branch changed.'
     }
-    $expectedBody = (Get-PrBody -State $State).Replace("`r`n", "`n")
-    $actualBody = ([string]$pr.body).Replace("`r`n", "`n")
+    $expectedBody = (Get-PrBody -State $State).Replace(([string][char]13 + [string][char]10), [string][char]10)
+    $actualBody = ([string]$pr.body).Replace(([string][char]13 + [string][char]10), [string][char]10)
     if ($actualBody -cne $expectedBody) { throw 'Published PR evidence summary body changed.' }
     [ordered]@{
         localHead = $localHead
@@ -5005,7 +4954,7 @@ function Invoke-Publish {
     $pushArguments = @('push', '--set-upstream', $State.remote, $State.branch)
     Assert-AppendOnlyPushArguments -Arguments $pushArguments -Remote $State.remote -Branch $State.branch
     $null = Invoke-Git -WorkingDirectory $State.worktreePath -Arguments $pushArguments
-    $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $State.remote, "refs/heads/$($State.branch)")).output.Split("`t")[0]
+    $remoteHead = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('ls-remote', '--heads', $State.remote, ('refs/heads/{0}' -f ([string]($State.branch))))).output.Split([string][char]9)[0]
     if ($remoteHead -ne $head) { throw 'Remote branch does not equal F after append-only push.' }
 
     # Reuse an existing PR for this exact branch instead of creating duplicate PRs.
@@ -5024,14 +4973,14 @@ function Invoke-Publish {
         $prUrl = [string]$existing[0].url
     }
     else {
-        $prUrl = (Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'create', '--base', $State.pullRequestBase, '--head', $State.branch, '--title', "Update $($State.mod)", '--body', $body)).output.Trim()
+        $prUrl = (Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'create', '--base', $State.pullRequestBase, '--head', $State.branch, '--title', ('Update {0}' -f ([string]$($State.mod))), '--body', $body)).output.Trim()
         $prNumber = [int]($prUrl.TrimEnd('/').Split('/')[-1])
     }
     $pr = (Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'view', [string]$prNumber, '--json', 'number,url,state,isDraft,baseRefName,headRefName,headRefOid,body')).output | ConvertFrom-Json -AsHashtable
     if ($pr.state -ne 'OPEN' -or $pr.isDraft -or $pr.baseRefName -ne $State.pullRequestBase -or $pr.headRefName -ne $State.branch -or $pr.headRefOid -ne $head) {
         throw 'Created or reused PR does not match the required open non-draft base/head/F tuple.'
     }
-    if (([string]$pr.body).Replace("`r`n", "`n") -cne $currentBody.Replace("`r`n", "`n")) {
+    if (([string]$pr.body).Replace(([string][char]13 + [string][char]10), [string][char]10) -cne $currentBody.Replace(([string][char]13 + [string][char]10), [string][char]10)) {
         throw 'Created or reused PR evidence summary body changed during publication.'
     }
     $prUrl = [string]$pr.url
@@ -5050,8 +4999,7 @@ function Invoke-ReviewSnapshot {
     $completed = Get-CompletedStageResult -State $State -Name 'review-snapshot'
     if ($completed) {
         $validator = Join-Path $PSScriptRoot 'Test-ModUpdateCandidate.ps1'
-        $completion = & $validator -StatePath $State.statePath -ReviewCompletion -CheckOnly `
-            -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+        $completion = & $validator -StatePath $State.statePath -ReviewCompletion -CheckOnly -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
         if ($completion.result -ne 'passed') { throw 'Independent Review completion revalidation rejected the current F.' }
         $null = Assert-PublishedPrAtF -State $State
         if ($State.status -ne 'awaiting-user-merge') {
@@ -5072,7 +5020,7 @@ function Invoke-ReviewSnapshot {
         else {
             $view = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('pr', 'view', [string]$State.prNumber, '--json', 'headRefOid,reviews,reviewRequests,comments') -AllowFailure
             if ($view.exitCode -ne 0) {
-                $external = [ordered]@{ status = 'unavailable'; reason = "$($view.warning) $($view.output)".Trim(); headOid = $State.headOid; verifiedAt = $snapshotAt; snapshotAt = $snapshotAt; pollingWaitSeconds = 0 }
+                $external = [ordered]@{ status = 'unavailable'; reason = ('{0} {1}' -f ([string]$($view.warning)), ([string]$($view.output))).Trim(); headOid = $State.headOid; verifiedAt = $snapshotAt; snapshotAt = $snapshotAt; pollingWaitSeconds = 0 }
                 $snapshot = [ordered]@{}
             }
             else {
@@ -5085,10 +5033,10 @@ function Invoke-ReviewSnapshot {
                 }
                 $threadQuery = 'query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved isOutdated path line comments(first:100){nodes{id body path line createdAt author{login} commit{oid}} pageInfo{hasNextPage}}} pageInfo{hasNextPage}}}}}'
                 $threadView = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @(
-                    'api', 'graphql', '-f', "query=$threadQuery", '-F', "owner=$($repositoryParts[0])", '-F', "name=$($repositoryParts[1])", '-F', "number=$($State.prNumber)"
+                    'api', 'graphql', '-f', ('query={0}' -f ([string]$threadQuery)), '-F', ('owner={0}' -f ([string]$($repositoryParts[0]))), '-F', ('name={0}' -f ([string]$($repositoryParts[1]))), '-F', ('number={0}' -f ([string]$($State.prNumber)))
                 ) -AllowFailure
                 if ($threadView.exitCode -ne 0) {
-                    throw "Unable to capture PR review threads: $($threadView.warning) $($threadView.output)".Trim()
+                    throw ('Unable to capture PR review threads: {0} {1}' -f ([string]$($threadView.warning)), ([string]$($threadView.output))).Trim()
                 }
                 $threadDocument = $threadView.output | ConvertFrom-Json -AsHashtable
                 $threads = $threadDocument.data.repository.pullRequest.reviewThreads
@@ -5110,7 +5058,7 @@ function Invoke-ReviewSnapshot {
                         $requestEvidence = $null
                         $requestFailed = $false
                         if ($requested.Count -eq 0 -and $State.externalReview.status -eq 'not-requested') {
-                            $request = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('api', '--method', 'POST', "repos/$repositoryName/pulls/$($State.prNumber)/requested_reviewers", '-f', 'reviewers[]=copilot-pull-request-reviewer[bot]') -AllowFailure
+                            $request = Invoke-Gh -WorkingDirectory $State.worktreePath -Arguments @('api', '--method', 'POST', ('repos/{0}/pulls/{1}/requested_reviewers' -f ([string]$repositoryName), ([string]$($State.prNumber))), '-f', 'reviewers[]=copilot-pull-request-reviewer[bot]') -AllowFailure
                             $requestEvidence = [ordered]@{ exitCode = $request.exitCode; requestedAt = Get-UtcTimestamp; warning = $request.warning }
                             if ($request.exitCode -ne 0) { $requestFailed = $true }
                         }
@@ -5118,7 +5066,7 @@ function Invoke-ReviewSnapshot {
                             $requestEvidence = [ordered]@{ source = 'existing-review-request'; reviewerLogin = [string]$requested[0].login; observedAt = $snapshotAt }
                         }
                         if ($requestFailed) {
-                            [ordered]@{ status = 'unavailable'; reason = "External Review request failed: $($request.warning) $($request.output)".Trim(); requestEvidence = $requestEvidence; headOid = $State.headOid; verifiedAt = $snapshotAt; snapshotAt = $snapshotAt; pollingWaitSeconds = 0 }
+                            [ordered]@{ status = 'unavailable'; reason = ('External Review request failed: {0} {1}' -f ([string]$($request.warning)), ([string]$($request.output))).Trim(); requestEvidence = $requestEvidence; headOid = $State.headOid; verifiedAt = $snapshotAt; snapshotAt = $snapshotAt; pollingWaitSeconds = 0 }
                         }
                         else {
                             [ordered]@{ status = 'requested-pending'; reason = 'No completed Copilot review existed in the one bounded snapshot; no polling was scheduled.'; requestEvidence = $requestEvidence; headOid = $State.headOid; snapshotAt = $snapshotAt; pollingWaitSeconds = 0 }
@@ -5143,8 +5091,7 @@ function Invoke-ReviewSnapshot {
     }
 
     if ([string]::IsNullOrWhiteSpace($LocalReviewPath) -or -not (Test-Path -LiteralPath $LocalReviewPath -PathType Leaf)) {
-        return (Suspend-Stage -State $State -Context $stage -Result 'waiting-input' -ArtifactSha256 ([string]$State.reviewSnapshot.sha256) `
-            -OutputStage 'local-review' -Data ([ordered]@{
+        return (Suspend-Stage -State $State -Context $stage -Result 'waiting-input' -ArtifactSha256 ([string]$State.reviewSnapshot.sha256) -OutputStage 'local-review' -Data ([ordered]@{
                 required = 'Review the current F and immutable feedback snapshot with the packaged Review Baseline, then resume with -LocalReviewPath.'
                 headOid = $State.evidenceChain.fOid; candidateGateSha256 = $State.candidateGate.validationReportSha256
                 feedbackSnapshotPath = $State.reviewSnapshot.path; feedbackSnapshotSha256 = $State.reviewSnapshot.sha256
@@ -5163,8 +5110,7 @@ function Invoke-ReviewSnapshot {
     $State.reviewedOid = $State.evidenceChain.fOid
     Save-State -State $State
     $validator = Join-Path $PSScriptRoot 'Test-ModUpdateCandidate.ps1'
-    $completion = & $validator -StatePath $State.statePath -ReviewCompletion `
-        -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+    $completion = & $validator -StatePath $State.statePath -ReviewCompletion -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
     if ($completion.result -ne 'passed') { throw 'Independent Review completion validation rejected the current F.' }
     $State.status = 'awaiting-user-merge'
     Complete-Stage -State $State -Context $stage -ArtifactSha256 $completion.sha256 -Data ([ordered]@{ externalReview = $State.externalReview; reviewSnapshot = $State.reviewSnapshot; localReview = $State.localReview; completionValidation = $completion })
@@ -5280,8 +5226,7 @@ catch {
             $failedState = Read-State -Path $activeStatePath
             if ($script:activeStageContext) {
                 try {
-                    $null = Fail-Stage -State $failedState -Context $script:activeStageContext `
-                        -ErrorMessage $failureMessage -RecoveryDisposition 'same-run-stage-retry'
+                    $null = Fail-Stage -State $failedState -Context $script:activeStageContext -ErrorMessage $failureMessage -RecoveryDisposition 'same-run-stage-retry'
                 }
                 catch { }
             }
