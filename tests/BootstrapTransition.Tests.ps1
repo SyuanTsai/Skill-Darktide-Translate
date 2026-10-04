@@ -20,6 +20,9 @@ Describe 'Darktide bootstrap transition' {
             }
             & git -C $Destination init --quiet --initial-branch=main
             if ($LASTEXITCODE -ne 0) { throw 'Failed to initialize the validator Git snapshot.' }
+            # The protected runner's run-owned TEMP can put fixture Git objects beyond MAX_PATH.
+            & git -C $Destination config core.longpaths true
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the validator Git snapshot.' }
             & git -C $Destination config user.name 'Protected Validator Snapshot'
             & git -C $Destination config user.email 'protected-validator@example.invalid'
             & git -C $Destination add --all
