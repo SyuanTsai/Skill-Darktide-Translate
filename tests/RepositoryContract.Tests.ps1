@@ -48,23 +48,23 @@ Describe 'Darktide Translate repository contract' {
                 Copy-Item -LiteralPath $sourcePath -Destination $fixturePath
             }
 
-            & git -C $sourceRepository init --quiet --initial-branch=main
+            & git -c core.longpaths=true -C $sourceRepository init --quiet --initial-branch=main
             if ($LASTEXITCODE -ne 0) { throw 'Could not initialize the checkout evidence source repository.' }
-            & git -C $sourceRepository config user.name 'EOL Contract Test'
-            & git -C $sourceRepository config user.email 'eol-contract@example.invalid'
-            & git -C $sourceRepository config core.autocrlf true
-            & git -C $sourceRepository add --all
-            & git -C $sourceRepository commit --quiet -m 'fixture LF source'
+            & git -c core.longpaths=true -C $sourceRepository config user.name 'EOL Contract Test'
+            & git -c core.longpaths=true -C $sourceRepository config user.email 'eol-contract@example.invalid'
+            & git -c core.longpaths=true -C $sourceRepository config core.autocrlf true
+            & git -c core.longpaths=true -C $sourceRepository add --all
+            & git -c core.longpaths=true -C $sourceRepository commit --quiet -m 'fixture LF source'
             if ($LASTEXITCODE -ne 0) { throw 'Could not commit the checkout evidence source repository.' }
-            & git -c core.autocrlf=true clone --quiet $sourceRepository $freshCheckout
+            & git -c core.longpaths=true -c core.autocrlf=true clone --quiet $sourceRepository $freshCheckout
             if ($LASTEXITCODE -ne 0) { throw 'Could not clone the checkout evidence source repository.' }
 
             $modules = foreach ($modulePath in $normalizedModulePaths) {
-                $attribute = [string]((& git -C $sourceRepository check-attr eol -- $modulePath) -join '')
+                $attribute = [string]((& git -c core.longpaths=true -C $sourceRepository check-attr eol -- $modulePath) -join '')
                 if ($LASTEXITCODE -ne 0) { throw "Could not resolve the effective eol attribute for '$modulePath'." }
-                $sourceBlobOid = [string]((& git -C $sourceRepository rev-parse "HEAD:$modulePath") -join '')
+                $sourceBlobOid = [string]((& git -c core.longpaths=true -C $sourceRepository rev-parse "HEAD:$modulePath") -join '')
                 if ($LASTEXITCODE -ne 0) { throw "Could not resolve the source blob for '$modulePath'." }
-                $checkoutRawOid = [string]((& git -C $freshCheckout hash-object --no-filters -- $modulePath) -join '')
+                $checkoutRawOid = [string]((& git -c core.longpaths=true -C $freshCheckout hash-object --no-filters -- $modulePath) -join '')
                 if ($LASTEXITCODE -ne 0) { throw "Could not hash the checkout bytes for '$modulePath'." }
                 [pscustomobject][ordered]@{
                     path = $modulePath
