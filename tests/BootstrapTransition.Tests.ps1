@@ -278,8 +278,8 @@ Describe 'Darktide bootstrap transition' {
     }
 
     It 'UnitT92_BoundsOnlyTheMeasuredSlowPesterShardWithExtraWallTime' {
-        # Scenario: ModUpdateAutomation is a measured 300-second-plus wall-clock shard while the other immutable files stay below the default.
-        # Purpose: Give only that explicit trusted file enough wall time without widening the 300-second CPU or default shard boundary.
+        # Scenario: ModUpdateAutomation and Schema15SourceAcquisition are measured 300-second-plus wall-clock shards; all other immutable files retain the default.
+        # Purpose: Give only those two explicit trusted files enough wall time without widening the 300-second CPU or default shard boundary.
         $supervisor = Get-Content -LiteralPath $script:Supervisor -Raw
         $tokens = $null
         $errors = $null
@@ -324,7 +324,8 @@ Describe 'Darktide bootstrap transition' {
                 param($name)
                 Get-ProtectedPesterShardTimeoutMilliseconds -TestName $name
             } $testName
-            $expectedTimeout = if ($testName -ceq 'ModUpdateAutomation.Tests.ps1') { 600000 } else { 300000 }
+            $expectedTimeout = if ($testName -ceq 'ModUpdateAutomation.Tests.ps1' -or
+                $testName -ceq 'Schema15SourceAcquisition.Tests.ps1') { 600000 } else { 300000 }
             $actualTimeout | Should -Be $expectedTimeout
         }
         (& $timeoutModule { Get-ProtectedPesterShardTimeoutMilliseconds -TestName 'InstalledClosureOrdering.Tests.ps1' }) |
