@@ -924,6 +924,67 @@ Describe 'Canonical Standard v1 validation adapter' {
         $pesterIndex | Should -BeGreaterThan $semanticIndex
     }
 
+    # Scenario: The measured source-acquisition shard needs wall-time budget only.
+    # Purpose: Preserve the exact inventory, reject unknown shards, and verify the runtime budget mapping.
+    It 'UnitT81_BoundsOnlyTheMeasuredPesterShardsWallTime' {
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [System.Management.Automation.Language.Parser]::ParseInput(
+            $script:Validator, [ref]$tokens, [ref]$parseErrors)
+        $parseErrors | Should -BeNullOrEmpty
+        $functions = @($validatorAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                @('Get-RequiredPesterTests', 'Get-ProtectedPesterShardTimeoutMilliseconds') -ccontains $node.Name
+        }, $true))
+        $functions.Count | Should -Be 2
+        $functionSource = ($functions | Sort-Object { $_.Extent.StartOffset } |
+            ForEach-Object { $_.Extent.Text }) -join [Environment]::NewLine
+        . ([scriptblock]::Create($functionSource))
+
+        $coreInventory = @(
+            'BootstrapTransition.Tests.ps1'
+            'LocalizationWorkset.Tests.ps1'
+            'ModUpdateAutomation.Tests.ps1'
+            'RepositoryContract.Tests.ps1'
+            'RepositoryValidation.Tests.ps1'
+            'Schema15Coordination.Tests.ps1'
+            'Schema15SourceAcquisition.Tests.ps1'
+            'SkillContract.Tests.ps1'
+            'SourcePin.Tests.ps1'
+        )
+        $observedCoreInventory = @(Get-RequiredPesterTests)
+        $observedCoreInventory.Count | Should -Be $coreInventory.Count
+        for ($index = 0; $index -lt $coreInventory.Count; $index++) {
+            [string]::Equals(
+                [string]$observedCoreInventory[$index],
+                [string]$coreInventory[$index],
+                [System.StringComparison]::Ordinal
+            ) | Should -BeTrue
+        }
+
+        $fullInventory = @($coreInventory + 'InstalledClosureOrdering.Tests.ps1')
+        $observedFullInventory = @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests)
+        $observedFullInventory.Count | Should -Be $fullInventory.Count
+        for ($index = 0; $index -lt $fullInventory.Count; $index++) {
+            [string]::Equals(
+                [string]$observedFullInventory[$index],
+                [string]$fullInventory[$index],
+                [System.StringComparison]::Ordinal
+            ) | Should -BeTrue
+        }
+
+        $extendedWallShards = @('ModUpdateAutomation.Tests.ps1', 'Schema15SourceAcquisition.Tests.ps1')
+        foreach ($testName in $fullInventory) {
+            $expectedMilliseconds = if ($extendedWallShards -ccontains $testName) { 600000 } else { 300000 }
+            (Get-ProtectedPesterShardTimeoutMilliseconds -TestName $testName) |
+                Should -Be $expectedMilliseconds
+        }
+        {
+            Get-ProtectedPesterShardTimeoutMilliseconds -TestName 'Unlisted.Tests.ps1'
+        } | Should -Throw '*outside the immutable required inventory*'
+    }
+
     It 'keeps required CI free of implicit LLM credentials and skipped tests' {
         $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $workflow | Should -Not -Match 'EnableSemanticScan'

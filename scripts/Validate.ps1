@@ -3483,10 +3483,11 @@ function Get-ProtectedPesterShardTimeoutMilliseconds {
         throw "Protected Pester shard '$TestName' is outside the immutable required inventory."
     }
 
-    # ModUpdateAutomation is the one measured I/O-heavy shard whose wall time
-    # exceeds five minutes. This does not widen the separate 300-second CPU,
-    # memory, active-process, or output boundaries.
-    if ($TestName -ceq 'ModUpdateAutomation.Tests.ps1') { return 600000 }
+    # These two measured I/O-heavy shards need a longer wall budget than the default.
+    # This does not widen the separate 300-second CPU, memory, active-process,
+    # or output boundaries.
+    if ($TestName -ceq 'ModUpdateAutomation.Tests.ps1' -or
+        $TestName -ceq 'Schema15SourceAcquisition.Tests.ps1') { return 600000 }
     return 300000
 }
 
