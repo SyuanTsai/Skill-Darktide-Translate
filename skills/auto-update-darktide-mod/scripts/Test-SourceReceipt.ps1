@@ -175,7 +175,7 @@ function Assert-NoReparsePath {
             }
             throw "$Label path component is missing."
         }
-        catch { throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)" }
+        catch { throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message)) }
         if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
@@ -293,7 +293,7 @@ if (-not $requestUri.IsAbsoluteUri -or $requestUri.Scheme -cne 'https' -or
     throw 'Source request pageUrl must be a canonical page URL without user-info, query, fragment, or a custom port.'
 }
 $expectedGameDomain = 'warhammer40kdarktide'
-$expectedPagePath = "/$expectedGameDomain/mods/$(ConvertTo-InvariantString $request.modId)"
+$expectedPagePath = ('/{0}/mods/{1}' -f ([string]$expectedGameDomain), ([string](ConvertTo-InvariantString $request.modId)))
 if ((ConvertTo-InvariantString $request.gameDomain) -cne $expectedGameDomain -or
     $requestUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
     $requestUri.AbsolutePath.TrimEnd('/') -cne $expectedPagePath) {
@@ -362,7 +362,7 @@ if ($isRetainedNonDelivered) {
         if ([string]$archiveEvidence.archiveFormat -ceq 'zip') { throw 'Unsupported source receipt contains ZIP bytes.' }
         [ordered]@{
             result = 'waiting'; status = 'waiting-user'
-            waitingReason = [ordered]@{ code = 'unsupported_archive_format'; message = "Detected unsupported $($archiveEvidence.archiveFormat) archive bytes after download." }
+            waitingReason = [ordered]@{ code = 'unsupported_archive_format'; message = ('Detected unsupported {0} archive bytes after download.' -f ([string]$archiveEvidence.archiveFormat)) }
             archiveFormat = [string]$archiveEvidence.archiveFormat; retainedPath = $retainedFull
         }
     }

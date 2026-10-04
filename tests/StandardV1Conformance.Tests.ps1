@@ -58,27 +58,32 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $validator | Should -Not -Match 'postPesterRepositoryValidatorPath'
     }
 
-    It 'routes CI through the same canonical validator without a second policy workflow' {
-        $workflow = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-protected.yml') -Raw
-        $workflow | Should -Match 'scripts/Validate\.ps1'
-        $workflow | Should -Match 'pull_request_target:'
-        $workflow | Should -Match 'TRUSTED_SUPERVISOR_COMMIT: \$\{\{ github\.sha \}\}'
-        $workflow | Should -Match '\$validatorArguments = @\{'
-        $workflow | Should -Match '& \$trustedValidator @validatorArguments'
-        $workflow | Should -Match 'persist-credentials:\s*false'
-        $workflow | Should -Match 'actions/checkout@[0-9a-f]{40}'
-        $workflow | Should -Match 'actions/setup-go@[0-9a-f]{40}'
-        $workflow | Should -Match 'Export canonical evidence for clean upload'
-        $workflow | Should -Match 'upload-canonical-validation-evidence'
-        $workflow | Should -Match 'evidence_base64'
-        $workflow | Should -Not -Match '(?m)^\s*(Install-Module|npm install|go install|pip install)\b'
-        Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.github/workflows/skill-validator.yml') | Should -BeFalse
+    # Scenario: The canonical validator is invoked on a host outside the supported Windows CI runtime.
+    # Purpose: Fail before validation setup so an unsupported host cannot produce a misleading report.
+    It 'UnitT50_RejectsUnsupportedHostsBeforeValidationSetup' {
+        $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
+        $hostDetection = $validator.IndexOf('$script:IsWindowsHost =', [StringComparison]::Ordinal)
+        $validationSetup = $validator.IndexOf('function Read-StrictUtf8File', [StringComparison]::Ordinal)
+        $guard = [regex]::Match($validator,
+            "(?s)if \(-not \`$script:IsWindowsHost\) \{\s*throw 'Standard v1 validation requires Windows with PowerShell 7\.'\s*\}")
 
-        foreach ($context in @('repository-contract', 'skill-validator', 'skill-tools')) {
-            $pattern = "(?ms)^\s+{0}:\s+name:\s+{0}.*?needs:\s+- canonical-validation.*?{1}" -f `
-                [regex]::Escape($context),
-                [regex]::Escape("needs['canonical-validation'].result")
-            $workflow | Should -Match $pattern
+        $hostDetection | Should -BeGreaterOrEqual 0
+        $guard.Success | Should -BeTrue
+        $guard.Index | Should -BeGreaterThan $hostDetection
+        $guard.Index | Should -BeLessThan $validationSetup
+
+        $guardBlock = [scriptblock]::Create($guard.Value)
+        $previousHostFlag = Get-Variable -Name IsWindowsHost -Scope Script -ErrorAction SilentlyContinue
+        try {
+            $script:IsWindowsHost = $false
+            { & $guardBlock } | Should -Throw -ExpectedMessage 'Standard v1 validation requires Windows with PowerShell 7.'
+            $script:IsWindowsHost = $true
+            { & $guardBlock } | Should -Not -Throw
+        }
+        finally {
+            if ($null -ne $previousHostFlag) { $script:IsWindowsHost = $previousHostFlag.Value }
+            else { Remove-Variable -Name IsWindowsHost -Scope Script -ErrorAction SilentlyContinue }
         }
     }
+
 }

@@ -9,6 +9,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and
     $null -eq ('SyuanTsai.PathSafetyNative' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.IO;
 using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 
@@ -93,10 +94,43 @@ namespace SyuanTsai {
             SafeFileHandle fileHandle,
             out ByHandleFileInformationBuffer fileInformation);
 
+        private static string GetNativeOpenPath(string path) {
+            if (path == null || path.Length < 260 || path.IndexOf('/') >= 0 ||
+                path.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+                path.StartsWith(@"\\.\", StringComparison.Ordinal)) {
+                return path;
+            }
+            bool drivePath = path.Length >= 3 &&
+                ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+                path[1] == ':' && path[2] == '\\';
+            bool uncPath = path.StartsWith(@"\\", StringComparison.Ordinal);
+            if ((!drivePath && !uncPath) || path.IndexOf(':', drivePath ? 2 : 0) >= 0) {
+                return path;
+            }
+            // Extended syntax bypasses Win32 normalization. Preserve the old
+            // open semantics for inputs that are not ordinary canonical paths.
+            string[] components = path.Substring(drivePath ? 3 : 2).Split('\\');
+            foreach (string component in components) {
+                if (component.EndsWith(".", StringComparison.Ordinal) ||
+                    component.EndsWith(" ", StringComparison.Ordinal)) {
+                    return path;
+                }
+            }
+            try {
+                if (!String.Equals(Path.GetFullPath(path), path, StringComparison.Ordinal)) {
+                    return path;
+                }
+            }
+            catch (ArgumentException) { return path; }
+            catch (NotSupportedException) { return path; }
+            catch (PathTooLongException) { return path; }
+            return uncPath ? @"\\?\UNC\" + path.Substring(2) : @"\\?\" + path;
+        }
+
         public static bool TryGetDirectoryCaseSensitive(string path, out bool caseSensitive) {
             caseSensitive = false;
             using (SafeFileHandle handle = CreateFile(
-                path,
+                GetNativeOpenPath(path),
                 FileReadAttributes,
                 FileShareRead | FileShareWrite | FileShareDelete,
                 IntPtr.Zero,
@@ -135,7 +169,7 @@ namespace SyuanTsai {
             volumeSerialNumber = 0;
             fileIndex = 0;
             using (SafeFileHandle handle = CreateFile(
-                path,
+                GetNativeOpenPath(path),
                 0,
                 FileShareRead | FileShareWrite | FileShareDelete,
                 IntPtr.Zero,
@@ -285,7 +319,7 @@ function Test-PortableReparseItem {
             catch [IO.FileNotFoundException] { }
             catch [IO.DirectoryNotFoundException] { }
             catch {
-                throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+                throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message))
             }
         }
         $parent = [IO.DirectoryInfo]::new($probe).Parent

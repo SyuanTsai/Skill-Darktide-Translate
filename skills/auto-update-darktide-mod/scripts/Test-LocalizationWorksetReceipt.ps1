@@ -112,7 +112,7 @@ function Assert-NoReparsePath {
             }
             throw "$Label path component is missing."
         }
-        catch { throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)" }
+        catch { throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]($_.Exception.Message))) }
         if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
@@ -165,11 +165,13 @@ function Get-GitBlobBytes {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'git'
     $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     foreach ($argument in @('-C', $WorkingDirectory, 'cat-file', 'blob', $Object)) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git for independent OLD localization verification.' }
+    $process.StandardInput.Close()
     $memory = [IO.MemoryStream]::new()
     try {
         $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
@@ -242,8 +244,8 @@ function Get-ExpectedClassification {
 function ConvertTo-NewlineStyle {
     param([string] $Text, [string] $NewlineStyle)
     if ($NewlineStyle -notin @('lf', 'crlf')) { throw 'Workset NEW localization newline style must be uniformly LF or CRLF.' }
-    $normalized = $Text -replace "`r`n|`r|`n", "`n"
-    if ($NewlineStyle -ceq 'crlf') { return $normalized.Replace("`n", "`r`n") }
+    $normalized = $Text -replace (([string][char]13 + [string][char]10 + '|' + [string][char]13 + '|' + [string][char]10)), ([string][char]10)
+    if ($NewlineStyle -ceq 'crlf') { return $normalized.Replace([string][char]10, ([string][char]13 + [string][char]10)) }
     $normalized
 }
 
@@ -487,13 +489,13 @@ foreach ($unit in @($workset.units)) {
     $action = [string]$unit.action
     if ($action -cne 'AI_REQUIRED' -and
         ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
-        throw "Localization review fields were edited outside AI_REQUIRED: $($unit.unitId)"
+        throw ('Localization review fields were edited outside AI_REQUIRED: {0}' -f ([string]($unit.unitId)))
     }
     if ($action -in @('NONE', 'ACCEPT_REMOVAL')) { continue }
-    if ($action -eq 'BLOCKED') { throw "Blocked localization unit cannot have an apply receipt: $($unit.unitId)" }
-    if ($null -eq $unit.new) { throw "Localization action requires a NEW unit: $($unit.unitId)" }
+    if ($action -eq 'BLOCKED') { throw ('Blocked localization unit cannot have an apply receipt: {0}' -f ([string]($unit.unitId))) }
+    if ($null -eq $unit.new) { throw ('Localization action requires a NEW unit: {0}' -f ([string]($unit.unitId))) }
     $currentUnit = $beforeById[[string]$unit.unitId]
-    if ($null -eq $currentUnit) { throw "Localization unit is missing from raw NEW bytes: $($unit.unitId)" }
+    if ($null -eq $currentUnit) { throw ('Localization unit is missing from raw NEW bytes: {0}' -f ([string]($unit.unitId))) }
     if ($action -ceq 'RESTORE_OLD_ZH_TW') {
         $target = if ($null -ne $unit.old.zhTwExpression) {
             [ordered]@{
@@ -504,7 +506,7 @@ foreach ($unit in @($workset.units)) {
         else { $null }
     }
     elseif ($action -ceq 'AI_REQUIRED') {
-        if ([string]$unit.reviewStatus -cne 'approved') { throw "AI_REQUIRED localization unit is not approved: $($unit.unitId)" }
+        if ([string]$unit.reviewStatus -cne 'approved') { throw ('AI_REQUIRED localization unit is not approved: {0}' -f ([string]($unit.unitId))) }
         $normalized = ConvertTo-NewlineStyle -Text ([string]$unit.suggestedZhTwExpression) -NewlineStyle ([string]$workset.new.newline)
         $target = Test-SafeLuaExpression -Expression $normalized
     }
@@ -518,7 +520,7 @@ foreach ($unit in @($workset.units)) {
         $expectedEdits.Add((New-Edit -Start ([int64]$currentUnit.zhTwExpression.startByte) -Length ([int64]$currentUnit.zhTwExpression.lengthByte) -Replacement $replacement -UnitId ([string]$unit.unitId) -Operation 'REPLACE'))
     }
     elseif ($null -ne $target) {
-        $expectedEdits.Add((Get-InsertionEdit -Unit $currentUnit -Expression ([string]$target.raw) -Bytes $newBytes -Newline $(if ($workset.new.newline -ceq 'crlf') { "`r`n" } else { "`n" })))
+        $expectedEdits.Add((Get-InsertionEdit -Unit $currentUnit -Expression ([string]$target.raw) -Bytes $newBytes -Newline $(if ($workset.new.newline -ceq 'crlf') { ([string][char]13 + [string][char]10) } else { [string][char]10 })))
     }
 }
 

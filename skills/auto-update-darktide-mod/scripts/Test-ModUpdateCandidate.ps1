@@ -183,7 +183,7 @@ function Test-MetadataSourceFieldMatch {
         }
         if (-not $hashKeys.Contains($FieldName)) { return $false }
         $key = [regex]::Escape([string]$hashKeys[$FieldName])
-        $matchesForKey = @([regex]::Matches($Text, "(?m)^$key=([^`r`n]*)`r?$") )
+        $matchesForKey = @([regex]::Matches($Text, ('(?m)^{0}=([^{1}{2}]*){1}?$' -f ([string]$key), [char]13, [char]10)) )
         return $matchesForKey.Count -eq 1 -and [string]$matchesForKey[0].Groups[1].Value -ceq $FieldValue
     }
     if ($RelativePath -cne 'README.md') { return $false }
@@ -225,7 +225,7 @@ function Test-MetadataSourceFieldMatch {
     }
     if (-not $readmeLabels.Contains($FieldName)) { return $false }
     $label = [regex]::Escape([string]$readmeLabels[$FieldName])
-    $matchesForLabel = @([regex]::Matches($readmeText, "(?m)^\s*-\s+$label\s*:\s*([^`r`n]*)`r?$") )
+    $matchesForLabel = @([regex]::Matches($readmeText, ('(?m)^\s*-\s+{0}\s*:\s*([^{1}{2}]*){1}?$' -f ([string]$label), [char]13, [char]10)) )
     if ($matchesForLabel.Count -ne 1) { return $false }
     $recorded = ([string]$matchesForLabel[0].Groups[1].Value).Trim()
     if ($recorded.Length -ge 2 -and $recorded.StartsWith('`', [StringComparison]::Ordinal) -and
@@ -258,7 +258,7 @@ function Assert-NoReparsePath {
             }
             throw "$Label path component is missing."
         }
-        catch { throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)" }
+        catch { throw ("Unable to inspect {0} physical containment component: {1}" -f ([string]$Label), ([string]$_.Exception.Message)) }
         if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
         }
@@ -409,10 +409,10 @@ function Assert-ArchivePayloadSecurityIntegrity {
             [string]$_.archiveSha256 -ceq [string]$State.archive.sha256 -and [string]$_.relativePath -ceq $relative -and [string]$_.fileSha256 -ceq $fileSha256
         })
         if ($matchingApprovals.Count -ne 1) { throw "Changed risky payload approval is missing or ambiguous: $relative" }
-        $null = $usedApprovals.Add("$relative`n$fileSha256")
+        $null = $usedApprovals.Add(("{0}{1}{2}" -f ([string]$relative), [char]10, ([string]$fileSha256)))
     }
     if ($approvalArtifact -and $usedApprovals.Count -ne @($approvalArtifact.approvals).Count) { throw 'Security override receipt contains an unused or stale approval.' }
-    "archive payload security passed; approvals=$($usedApprovals.Count)"
+    ("archive payload security passed; approvals={0}" -f ([string]$usedApprovals.Count))
 }
 
 function Assert-SourceReceiptIntegrity {
@@ -439,8 +439,7 @@ function Assert-SourceReceiptIntegrity {
         throw 'Schema 15 source evidence is outside its fixed run-local paths.'
     }
     $verifier = Join-Path $PSScriptRoot 'Test-SourceReceipt.ps1'
-    $verification = & $verifier -ReceiptPath $receiptFull -SourceRequestPath $requestFull -RunRoot $sourceRunRoot `
-        -HeartbeatAction $HeartbeatAction -PassThru
+    $verification = & $verifier -ReceiptPath $receiptFull -SourceRequestPath $requestFull -RunRoot $sourceRunRoot -HeartbeatAction $HeartbeatAction -PassThru
     if ($verification.result -cne 'passed') { throw 'Independent source receipt verifier rejected Schema 15 evidence.' }
     if ((Get-FileSha256 -Path ([string]$State.sourceReceipt.path)) -cne [string]$State.sourceReceipt.sha256) { throw 'Schema 15 source receipt SHA-256 changed.' }
     if ((Get-FileSha256 -Path ([string]$State.sourceReceipt.sourceRequestPath)) -cne [string]$State.sourceReceipt.sourceRequestSha256) { throw 'Schema 15 source request SHA-256 changed.' }
@@ -540,11 +539,11 @@ function Assert-SourceTupleIntegrity {
     }
     $pageUri = [Uri][string]$contract.nexus.pageUrl
     if (-not $pageUri.IsAbsoluteUri -or $pageUri.Scheme -cne 'https' -or $pageUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
-        $pageUri.AbsolutePath.TrimEnd('/') -cne "/warhammer40kdarktide/mods/$($contract.nexus.modId)" -or $pageUri.Query -or $pageUri.Fragment -or $pageUri.UserInfo) {
+        $pageUri.AbsolutePath.TrimEnd('/') -cne ('/warhammer40kdarktide/mods/{0}' -f ([string]$contract.nexus.modId)) -or $pageUri.Query -or $pageUri.Fragment -or $pageUri.UserInfo) {
         throw 'Source tuple Nexus page URL is not canonical.'
     }
     if ([int]$State.schemaVersion -ge 15) {
-        if ([string]$contract.acquisitionMethod -cne "nexus-$($State.sourceReceipt.provider)" -or
+        if ([string]$contract.acquisitionMethod -cne ('nexus-{0}' -f ([string]$State.sourceReceipt.provider)) -or
             [string]$tuple.sourceReceiptPath -cne [string]$State.sourceReceipt.path -or
             [string]$contract.sourceReceiptSha256 -cne [string]$State.sourceReceipt.sha256) {
             throw 'Schema 15 source tuple acquisition method or receipt binding changed.'
@@ -584,7 +583,7 @@ function Assert-SourceTupleIntegrity {
     )
     $requiredMetadataFields = [ordered]@{
         'README.md' = $completeSourceFieldNames
-        ".hash/$($State.modSlug).hash" = $completeSourceFieldNames
+        (".hash/{0}.hash" -f ([string]$State.modSlug)) = $completeSourceFieldNames
     }
     $actualMetadataPaths = @($previewFiles | ForEach-Object { ([string]$_.path).Replace('\', '/') } | Sort-Object)
     $expectedMetadataPaths = @($requiredMetadataFields.Keys | Sort-Object)
@@ -636,9 +635,7 @@ function Assert-SourceTupleIntegrity {
         }
         $textValue = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
         foreach ($fieldName in $expectedFields.Keys) {
-            $expectedMatch = Test-MetadataSourceFieldMatch -RelativePath $relative -Text $textValue `
-                -FieldName $fieldName -FieldValue ([string]$expectedFields[$fieldName]) `
-                -NexusPageUrl ([string]$expectedFields.nexusPageUrl)
+            $expectedMatch = Test-MetadataSourceFieldMatch -RelativePath $relative -Text $textValue -FieldName $fieldName -FieldValue ([string]$expectedFields[$fieldName]) -NexusPageUrl ([string]$expectedFields.nexusPageUrl)
             if (-not $file.sourceFieldMatches.Contains($fieldName) -or [bool]$file.sourceFieldMatches[$fieldName] -ne $expectedMatch) {
                 throw "Metadata preview field evidence is inconsistent: $relative / $fieldName"
             }
@@ -865,8 +862,7 @@ function Assert-ReferenceIntegrity {
     if ((Get-FileSha256 -Path ([string]$State.workflowSourcePinPath)) -cne [string]$State.workflowSourcePinSha256) {
         throw 'Recorded Skill source pin bytes changed.'
     }
-    $integrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') `
-        -SkillSourcePinPath ([string]$State.workflowSourcePinPath) -HeartbeatAction $HeartbeatAction -PassThru
+    $integrity = & (Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1') -SkillSourcePinPath ([string]$State.workflowSourcePinPath) -HeartbeatAction $HeartbeatAction -PassThru
     if ($integrity.result -cne 'passed' -or -not $integrity.skillSourcePin -or
         [string]$integrity.skillSourcePin.pinSha256 -cne [string]$State.workflowSourcePinSha256 -or
         [string]$integrity.skillSourcePin.repository -cne [string]$State.workflowSourceRepository -or
@@ -934,12 +930,14 @@ function Invoke-GitCheck {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'git'
     $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     foreach ($argument in @('-C', $WorkingDirectory) + $Arguments) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start Git validation.' }
+    $process.StandardInput.Close()
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
     while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
@@ -947,7 +945,7 @@ function Invoke-GitCheck {
     $warning = $stderrTask.Result.TrimEnd()
     $exitCode = $process.ExitCode
     if ($exitCode -ne 0 -and -not $AllowFailure) {
-        throw "git $($Arguments -join ' ') failed: $warning $output"
+        throw ("git {0} failed: {1} {2}" -f (($Arguments -join ' '), ([string]$warning), ([string]$output)))
     }
     [ordered]@{ exitCode = $exitCode; output = $output; warning = $warning }
 }
@@ -968,7 +966,7 @@ function Invoke-GhCheck {
     $stderrTask = $process.StandardError.ReadToEndAsync()
     while (-not $process.WaitForExit(1000)) { Invoke-Heartbeat }
     $result = [ordered]@{ exitCode = $process.ExitCode; output = $stdoutTask.Result.TrimEnd(); warning = $stderrTask.Result.TrimEnd() }
-    if ($result.exitCode -ne 0 -and -not $AllowFailure) { throw "GitHub CLI validation failed: $($result.warning) $($result.output)" }
+    if ($result.exitCode -ne 0 -and -not $AllowFailure) { throw ("GitHub CLI validation failed: {0} {1}" -f ([string]$result.warning), ([string]$result.output)) }
     $result
 }
 
@@ -977,11 +975,13 @@ function Get-GitBlobBytes {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'git'
     $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     foreach ($argument in @('-C', $WorkingDirectory, 'cat-file', 'blob', $Object)) { $start.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Unable to start independent Git blob validation.' }
+    $process.StandardInput.Close()
     $memory = [IO.MemoryStream]::new()
     try {
         $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
@@ -1084,7 +1084,7 @@ function Get-EvidenceChangedPathAllowlistVerification {
                 'mod-or-metadata' { $inMod -or $path -cin $metadata }
                 default { $false }
             }
-            if (-not $allowed) { throw "Independent coordinator allowlist reconstruction rejected $($range.name): $path" }
+            if (-not $allowed) { throw ("Independent coordinator allowlist reconstruction rejected {0}: {1}" -f ([string]$range.name), ([string]$path)) }
         }
         $pathsSha256 = Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject @($paths) -Compress)))
         $records += [ordered]@{
@@ -1121,8 +1121,7 @@ function Test-ApprovedSpanCandidate {
         }
         $mergedCursor += $unchangedLength
         $oldBytes = [byte[]]::new($length)
-        Copy-ByteRangeWithHeartbeat -Source $Indexed -SourceOffset $start `
-            -Destination $oldBytes -DestinationOffset 0 -Count $length
+        Copy-ByteRangeWithHeartbeat -Source $Indexed -SourceOffset $start -Destination $oldBytes -DestinationOffset 0 -Count $length
         if ((Get-Sha256Bytes -Bytes $oldBytes) -ne [string]$span.oldSha256) {
             throw 'Approved localization oldSha256 does not match indexed bytes.'
         }
@@ -1157,7 +1156,7 @@ function Test-LocalizationWorksetCandidate {
         }
     })
     try { $null = Test-ApprovedSpanCandidate -Indexed $NewBytes -Merged $MergedBytes -ApprovedSpans $spans }
-    catch { throw "Candidate changed bytes outside approved localization workset edits. $($_.Exception.Message)" }
+    catch { throw ("Candidate changed bytes outside approved localization workset edits. {0}" -f ([string]$_.Exception.Message)) }
     $true
 }
 
@@ -1190,7 +1189,7 @@ function Assert-PrBodyEvidenceSummary {
         [Parameter(Mandatory)][Collections.IDictionary] $State,
         [Parameter(Mandatory)][AllowEmptyString()][string] $Body
     )
-    $normalized = $Body.Replace("`r`n", "`n")
+    $normalized = $Body.Replace(([string][char]13 + [string][char]10), [string][char]10)
     $chain = $State.evidenceChain
     $requiredFragments = [Collections.Generic.List[string]]::new()
     foreach ($fragment in @(
@@ -1220,7 +1219,7 @@ function Assert-PrBodyEvidenceSummary {
         "- External review: $($State.externalReview.status)"
     )) { $requiredFragments.Add($fragment) }
     foreach ($approval in @($State.securityOverrides)) {
-        $requiredFragments.Add("archiveSha256=$($approval.archiveSha256);relativePath=$($approval.relativePath);fileSha256=$($approval.fileSha256)")
+        $requiredFragments.Add(("archiveSha256={0};relativePath={1};fileSha256={2}" -f ([string]$approval.archiveSha256), ([string]$approval.relativePath), ([string]$approval.fileSha256)))
     }
     foreach ($path in @($State.evidenceTargetPaths)) { $requiredFragments.Add([string]$path) }
     foreach ($record in @($State.localizationFiles)) {
@@ -1255,7 +1254,7 @@ if ($SecurityPayloadOnly) {
         try { $securityChecks[$check.name] = [ordered]@{ result = 'passed'; evidence = (& $check.action) } }
         catch {
             $securityChecks[$check.name] = [ordered]@{ result = 'rejected'; evidence = $_.Exception.Message }
-            $securityErrors.Add("$($check.name): $($_.Exception.Message)")
+            $securityErrors.Add(("{0}: {1}" -f ([string]$check.name), ([string]$_.Exception.Message)))
         }
     }
     $securityResult = if ($securityErrors.Count -eq 0) { 'passed' } else { 'rejected' }
@@ -1274,7 +1273,7 @@ if ($SecurityPayloadOnly) {
     }
     if ($PassThru) {
         $securityOutput
-        if ($securityResult -ne 'passed') { throw "Pre-commit payload security validation rejected the run: $($securityErrors -join '; ')" }
+        if ($securityResult -ne 'passed') { throw ("Pre-commit payload security validation rejected the run: {0}" -f ([string]($securityErrors -join '; '))) }
     }
     else {
         $securityOutput | ConvertTo-Json -Depth 20 -Compress
@@ -1289,7 +1288,7 @@ if ($ReviewCompletion) {
     function Add-ReviewCheck {
         param([string] $Name, [scriptblock] $Action)
         try { $reviewChecks[$Name] = [ordered]@{ result = 'passed'; evidence = (& $Action) } }
-        catch { $reviewChecks[$Name] = [ordered]@{ result = 'rejected'; evidence = $_.Exception.Message }; $reviewErrors.Add("${Name}: $($_.Exception.Message)") }
+        catch { $reviewChecks[$Name] = [ordered]@{ result = 'rejected'; evidence = $_.Exception.Message }; $reviewErrors.Add(("{0}: {1}" -f ([string]$Name), ([string]$_.Exception.Message))) }
     }
     Add-ReviewCheck -Name 'claimed-archive' -Action {
         Assert-ClaimedArchiveIntegrity -State $state
@@ -1329,7 +1328,7 @@ if ($ReviewCompletion) {
         foreach ($artifact in @($state.extractionManifest, $state.rawInstallManifest, $state.installManifest, $state.candidateTreeManifest, $state.gitIndexNormalization, $state.metadataPreview, $state.securityPrecommitValidation)) {
             if (-not (Test-Path -LiteralPath ([string]$artifact.path) -PathType Leaf) -or
                 (Get-FileSha256 -Path ([string]$artifact.path)) -cne [string]$artifact.sha256) {
-                throw "Candidate Gate artifact changed: $($artifact.path)"
+                throw ("Candidate Gate artifact changed: {0}" -f ([string]$artifact.path))
             }
         }
         if (-not $state.diffReadability -or (Get-FileSha256 -Path $state.diffReadability.path) -ne $state.candidateGate.diffReadabilitySha256 -or $state.diffReadability.result -ne 'passed') { throw 'Diff readability evidence is missing, changed, or rejected.' }
@@ -1424,7 +1423,7 @@ if ($ReviewCompletion) {
     }
     Add-ReviewCheck -Name 'local-remote-pr-head' -Action {
         $local = (Invoke-GitCheck -WorkingDirectory $state.worktreePath -Arguments @('rev-parse', 'HEAD')).output.Trim()
-        $remote = (Invoke-GitCheck -WorkingDirectory $state.worktreePath -Arguments @('ls-remote', '--heads', $state.remote, "refs/heads/$($state.branch)")).output.Split("`t")[0]
+        $remote = (Invoke-GitCheck -WorkingDirectory $state.worktreePath -Arguments @('ls-remote', '--heads', $state.remote, ('refs/heads/{0}' -f ([string]$state.branch)))).output.Split([string][char]9)[0]
         $pr = (Invoke-GhCheck -WorkingDirectory $state.worktreePath -Arguments @('pr', 'view', [string]$state.prNumber, '--json', 'number,url,state,isDraft,baseRefName,headRefName,headRefOid')).output | ConvertFrom-Json -AsHashtable
         if ($local -ne $state.evidenceChain.fOid -or $remote -ne $local -or $pr.headRefOid -ne $local) { throw 'local, remote, PR head, and F are not identical.' }
         if ($pr.state -ne 'OPEN' -or $pr.isDraft -or $pr.baseRefName -ne $state.pullRequestBase -or $pr.headRefName -ne $state.branch) { throw 'PR state, draft flag, base, or head is invalid.' }
@@ -1482,7 +1481,7 @@ if ($ReviewCompletion) {
         sha256 = if ($CheckOnly) { Get-ContractSha256 -Contract $reviewReport } else { Get-FileSha256 -Path $reviewValidationPath }
         errors = @($reviewErrors)
     }
-    if ($PassThru) { $reviewOutput; if ($reviewResultName -ne 'passed') { throw "Review completion validation rejected the run: $($reviewErrors -join '; ')" } }
+    if ($PassThru) { $reviewOutput; if ($reviewResultName -ne 'passed') { throw ("Review completion validation rejected the run: {0}" -f ([string]($reviewErrors -join '; '))) } }
     else { $reviewOutput | ConvertTo-Json -Depth 20 -Compress; if ($reviewResultName -ne 'passed') { exit 1 } }
     return
 }
@@ -1499,7 +1498,7 @@ function Add-ValidationCheck {
     }
     catch {
         $checks[$Name] = [ordered]@{ result = 'rejected'; evidence = $_.Exception.Message }
-        $errors.Add("${Name}: $($_.Exception.Message)")
+        $errors.Add(("{0}: {1}" -f ([string]$Name), ([string]$_.Exception.Message)))
     }
 }
 
@@ -1628,7 +1627,7 @@ Add-ValidationCheck -Name 'layered-path-allowlists' -Action {
     if ($state.localizationMode -eq 'zh-tw') {
         foreach ($range in @([ordered]@{ base = $chain.c2ParentOid; head = $chain.c2Oid; name = 'C2' }, [ordered]@{ base = $chain.c3ParentOid; head = $chain.c3Oid; name = 'C3' })) {
             foreach ($path in Get-ChangedPaths -WorkingDirectory $worktree -BaseOid $range.base -HeadOid $range.head) {
-                if ($path -cnotin $targets) { throw "$($range.name) contains a non-target path: $path" }
+                if ($path -cnotin $targets) { throw ("{0} contains a non-target path: {1}" -f ([string]$range.name), ([string]$path)) }
             }
         }
     }
@@ -1640,29 +1639,29 @@ Add-ValidationCheck -Name 'layered-path-allowlists' -Action {
 }
 
 Add-ValidationCheck -Name 'diff-check' -Action {
-    $finalCheck = Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--check', "$($chain.c0Oid)..$($chain.fOid)") -AllowFailure
+    $finalCheck = Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--check', ('{0}..{1}' -f ([string]$chain.c0Oid), ([string]$chain.fOid))) -AllowFailure
     if ($finalCheck.exitCode -eq 0) { return 'standard diff --check passed' }
-    if ($finalCheck.exitCode -ne 2) { throw "Standard Git diff --check failed unexpectedly: $($finalCheck.output)" }
+    if ($finalCheck.exitCode -ne 2) { throw ("Standard Git diff --check failed unexpectedly: {0}" -f ([string]$finalCheck.output)) }
 
     $upstreamRanges = @([ordered]@{ base = $chain.c0Oid; head = $chain.c1Oid })
     if ($state.localizationMode -eq 'zh-tw') { $upstreamRanges += [ordered]@{ base = $chain.c1Oid; head = $chain.c2Oid } }
     $upstreamSignatures = @(
         foreach ($range in $upstreamRanges) {
-            $check = Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--check', "$($range.base)..$($range.head)") -AllowFailure
-            if ($check.exitCode -notin @(0, 2)) { throw "Unable to verify upstream whitespace exceptions: $($check.output)" }
+            $check = Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--check', ('{0}..{1}' -f ([string]$range.base), ([string]$range.head))) -AllowFailure
+            if ($check.exitCode -notin @(0, 2)) { throw ("Unable to verify upstream whitespace exceptions: {0}" -f ([string]$check.output)) }
             Get-DiffCheckSignatures -Output $check.output
         }
     ) | Sort-Object -Unique
     if ($state.localizationMode -eq 'zh-tw') {
-        $localizationCheck = Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--check', "$($chain.c2Oid)..$($chain.c3Oid)") -AllowFailure
-        if ($localizationCheck.exitCode -ne 0) { throw "Localization introduced whitespace errors: $($localizationCheck.output)" }
+        $localizationCheck = Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--check', ('{0}..{1}' -f ([string]$chain.c2Oid), ([string]$chain.c3Oid))) -AllowFailure
+        if ($localizationCheck.exitCode -ne 0) { throw ("Localization introduced whitespace errors: {0}" -f ([string]$localizationCheck.output)) }
     }
     $finalSignatures = @(Get-DiffCheckSignatures -Output $finalCheck.output)
-    if ($finalSignatures.Count -eq 0) { throw "Standard Git diff --check produced an unrecognized rejection: $($finalCheck.output)" }
+    if ($finalSignatures.Count -eq 0) { throw ("Standard Git diff --check produced an unrecognized rejection: {0}" -f ([string]$finalCheck.output)) }
     foreach ($signature in $finalSignatures) {
         if ($signature -cnotin $upstreamSignatures) { throw "Final diff contains a non-upstream whitespace error: $signature" }
     }
-    "standard diff --check accepted $($finalSignatures.Count) exact upstream whitespace exceptions"
+    ('standard diff --check accepted {0} exact upstream whitespace exceptions' -f ([string]$finalSignatures.Count))
 }
 
 Add-ValidationCheck -Name 'diff-readability' -Action {
@@ -1678,8 +1677,8 @@ Add-ValidationCheck -Name 'diff-readability' -Action {
     $records = @()
     $noiseRanges = @()
     foreach ($range in $ranges) {
-        $regular = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--numstat', '--no-renames', "$($range.base)..$($range.head)")).output
-        $diagnostic = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', ('--' + (([char[]](105, 103, 110, 111, 114, 101)) -join '') + '-space-at-eol'), '--numstat', '--no-renames', "$($range.base)..$($range.head)")).output
+        $regular = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', '--numstat', '--no-renames', ('{0}..{1}' -f ([string]$range.base), ([string]$range.head)))).output
+        $diagnostic = (Invoke-GitCheck -WorkingDirectory $worktree -Arguments @('diff', ('--' + (([char[]](105, 103, 110, 111, 114, 101)) -join '') + '-space-at-eol'), '--numstat', '--no-renames', ('{0}..{1}' -f ([string]$range.base), ([string]$range.head)))).output
         $regularTotal = 0; foreach ($line in @($regular -split "`r?`n" | Where-Object { $_ -match '^(\d+)\s+(\d+)\s+' })) { $parts = $line -split '\s+', 3; $regularTotal += [int]$parts[0] + [int]$parts[1] }
         $diagnosticTotal = 0; foreach ($line in @($diagnostic -split "`r?`n" | Where-Object { $_ -match '^(\d+)\s+(\d+)\s+' })) { $parts = $line -split '\s+', 3; $diagnosticTotal += [int]$parts[0] + [int]$parts[1] }
         $lineEndingNoise = $regularTotal -gt 20 -and $regularTotal -gt ([Math]::Max(1, $diagnosticTotal) * 4)
@@ -1690,7 +1689,7 @@ Add-ValidationCheck -Name 'diff-readability' -Action {
     $readabilityResult = if ($noiseRanges.Count -eq 0) { 'passed' } else { 'rejected' }
     Write-AtomicJson -Path $readabilityPath -Value ([ordered]@{ schemaVersion = 1; ranges = $records; result = $readabilityResult; generatedAt = Get-UtcTimestamp })
     $state.diffReadability = [ordered]@{ path = $readabilityPath; sha256 = Get-FileSha256 -Path $readabilityPath; result = $readabilityResult }
-    if ($noiseRanges.Count -ne 0) { throw "Diff readability rejected line-ending noise in $($noiseRanges -join ', ')." }
+    if ($noiseRanges.Count -ne 0) { throw ("Diff readability rejected line-ending noise in {0}." -f ([string]($noiseRanges -join ', '))) }
     $state.diffReadability.sha256
 }
 
@@ -1700,12 +1699,12 @@ Add-ValidationCheck -Name 'evidence-generation-receipt' -Action {
 
 Add-ValidationCheck -Name 'artifact-sha256' -Action {
     foreach ($artifact in @($state.sourceTuple, $state.extractionManifest, $state.rawInstallManifest, $state.installManifest, $state.gitIndexNormalization, $state.metadataPreview, $state.candidateTreeManifest, $state.evidenceReceipt)) {
-        if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf)) { throw "Missing manifest or evidence artifact: $($artifact.path)" }
-        if ((Get-FileSha256 -Path $artifact.path) -ne $artifact.sha256) { throw "Artifact sha256 mismatch: $($artifact.path)" }
+        if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf)) { throw ("Missing manifest or evidence artifact: {0}" -f ([string]$artifact.path)) }
+        if ((Get-FileSha256 -Path $artifact.path) -ne $artifact.sha256) { throw ("Artifact sha256 mismatch: {0}" -f ([string]$artifact.path)) }
     }
     foreach ($artifact in @($state.evidenceDiffs.Values)) {
         if ($artifact.Contains('status') -and $artifact.status -eq 'not-applicable') { continue }
-        if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf) -or (Get-FileSha256 -Path $artifact.path) -ne $artifact.sha256) { throw "Git evidence artifact SHA-256 mismatch: $($artifact.path)" }
+        if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf) -or (Get-FileSha256 -Path $artifact.path) -ne $artifact.sha256) { throw ("Git evidence artifact SHA-256 mismatch: {0}" -f ([string]$artifact.path)) }
     }
     if ((Get-FileSha256 -Path $state.localizationManifestPath) -ne $state.stageTimings.localization.artifactSha256) { throw 'Localization manifest SHA-256 differs from its completed-stage receipt.' }
     'manifest and evidence sha256 values verified'
@@ -1715,7 +1714,7 @@ Add-ValidationCheck -Name 'raw-install-provenance' -Action {
     $extraction = Get-Content -LiteralPath $state.extractionManifest.path -Raw | ConvertFrom-Json -AsHashtable
     $rawInstall = Get-Content -LiteralPath $state.rawInstallManifest.path -Raw | ConvertFrom-Json -AsHashtable
     $prefix = ([string]$state.repoModDirectory).TrimEnd('/') + '/'
-    $sourceFiles = @($extraction.files | ForEach-Object { [ordered]@{ path = if ($_.path.StartsWith($prefix, [StringComparison]::Ordinal)) { $_.path.Substring($prefix.Length) } else { throw "Extraction path is outside the one canonical MOD root: $($_.path)" }; size = $_.size; sha256 = $_.sha256 } } | Sort-Object { $_.path })
+    $sourceFiles = @($extraction.files | ForEach-Object { [ordered]@{ path = if ($_.path.StartsWith($prefix, [StringComparison]::Ordinal)) { $_.path.Substring($prefix.Length) } else { throw ("Extraction path is outside the one canonical MOD root: {0}" -f ([string]$_.path)) }; size = $_.size; sha256 = $_.sha256 } } | Sort-Object { $_.path })
     $installedFiles = @($rawInstall.files | Sort-Object { $_.path })
     if ($sourceFiles.Count -ne $installedFiles.Count) { throw 'Raw install file count differs from extraction.' }
     for ($index = 0; $index -lt $sourceFiles.Count; $index++) {
@@ -1762,7 +1761,7 @@ Add-ValidationCheck -Name 'install-normalization' -Action {
     $normalization = Get-Content -LiteralPath $state.gitIndexNormalization.path -Raw | ConvertFrom-Json -AsHashtable
     $candidateByPath = @{}
     foreach ($file in $candidate.files) {
-        if ($candidateByPath.ContainsKey([string]$file.path)) { throw "Candidate manifest path is duplicated: $($file.path)" }
+        if ($candidateByPath.ContainsKey([string]$file.path)) { throw ("Candidate manifest path is duplicated: {0}" -f ([string]$file.path)) }
         $candidateByPath[[string]$file.path] = $file
     }
     $normalizationByPath = @{}
@@ -1792,13 +1791,13 @@ Add-ValidationCheck -Name 'install-normalization' -Action {
             $normalizationFile = $normalizationByRepositoryPath[$installPath]
         }
         if (-not $normalizationFile) {
-            throw "Install path is missing from Git normalization evidence: $installPath. Normalization paths: $($normalizationByPath.Keys -join ', ')."
+            throw ("Install path is missing from Git normalization evidence: {0}. Normalization paths: {1}." -f ([string]$installPath), ([string]($normalizationByPath.Keys -join ', ')))
         }
         $repositoryPath = [string]$normalizationFile.repositoryPath
         $repositoryRelativePath = $repositoryPath.Substring($modPrefix.Length)
         $candidatePath = if ($candidateByPath.ContainsKey($installPath)) { $installPath } else { $repositoryRelativePath }
         if (-not $candidateByPath.ContainsKey($candidatePath)) {
-            throw "Install path is missing from Git candidate evidence: $installPath -> $candidatePath. Candidate paths: $($candidateByPath.Keys -join ', ')."
+            throw ("Install path is missing from Git candidate evidence: {0} -> {1}. Candidate paths: {2}." -f ([string]$installPath), ([string]$candidatePath), ([string]($candidateByPath.Keys -join ', ')))
         }
         $rawPath = Assert-NoReparsePath -Path (Join-Path $state.installRoot $installPath) -Root $worktree -Label 'Installed candidate file'
         $raw = Read-FileBytesWithHeartbeat -Path $rawPath
@@ -1909,19 +1908,16 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
         if ((Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$workset.apply.outputSha256 -or (Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$record.mergedRawSha256) { throw 'Workset merged bytes differ from apply evidence.' }
         if ((Get-Sha256Bytes -Bytes $mergedIndexedBytes) -cne [string]$record.mergedSha256) { throw 'Workset merged indexed bytes changed.' }
         $receiptVerifier = Join-Path $PSScriptRoot 'Test-LocalizationWorksetReceipt.ps1'
-        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath `
-            -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) `
-            -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) `
-            -HeartbeatAction $HeartbeatAction -PassThru
+        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) -HeartbeatAction $HeartbeatAction -PassThru
         if ($receiptVerification.result -cne 'passed') { throw 'Independent localization apply receipt verification failed.' }
         $null = Test-LocalizationWorksetCandidate -NewBytes $newBytes -MergedBytes $mergedBytes -Edits @($workset.apply.edits)
         $targetPath = Join-Path $worktree ([string]$record.relativePath)
         $targetPath = Assert-NoReparsePath -Path $targetPath -Root $worktree -Label 'Worktree localization target'
         if ((Get-FileSha256 -Path $targetPath) -cne [string]$record.mergedRawSha256) { throw 'Worktree localization target differs from workset merged raw bytes.' }
-        $candidateBlob = Get-GitBlobBytes -WorkingDirectory $worktree -Object "$($chain.fOid):$([string]$record.relativePath)"
+        $candidateBlob = Get-GitBlobBytes -WorkingDirectory $worktree -Object ('{0}:{1}' -f ([string]$chain.fOid), ([string]$record.relativePath))
         if ((Get-Sha256Bytes -Bytes $candidateBlob) -cne [string]$record.mergedSha256) { throw 'F localization blob differs from workset merged indexed bytes.' }
     }
-    "Workset units=$(@($workset.units).Count), edits=$(@($workset.apply.edits).Count), SHA-256=$($state.localizationWorkset.sha256)"
+    ('Workset units={0}, edits={1}, SHA-256={2}' -f ([string](@($workset.units).Count)), ([string](@($workset.apply.edits).Count)), ([string]$state.localizationWorkset.sha256))
 }
 
 Add-ValidationCheck -Name 'localization-byte-boundary' -Action {
@@ -1946,7 +1942,7 @@ Add-ValidationCheck -Name 'localization-byte-boundary' -Action {
             $null = Get-LuaLocalizationDocument -Bytes $merged -DisplayPath ([string]$record.relativePath) -SourceId ([string]$record.relativePath) -HeartbeatAction $HeartbeatAction
         }
         catch {
-            throw "Merged Schema 14 localization structure is invalid: $($_.Exception.Message)"
+            throw ("Merged Schema 14 localization structure is invalid: {0}" -f ([string]$_.Exception.Message))
         }
         $relativeToMod = ([string]$record.relativePath).Substring(([string]$state.modRelativePath).Length).TrimStart('/')
         $rawEntry = @($rawInstall.files | Where-Object { $_.path -ceq $relativeToMod })
@@ -1956,7 +1952,7 @@ Add-ValidationCheck -Name 'localization-byte-boundary' -Action {
         $null = Test-ApprovedSpanCandidate -Indexed $indexed -Merged $merged -ApprovedSpans @($decision.approvedSpans)
         $targetPath = Join-Path $worktree ([string]$record.relativePath)
         if ((Get-FileSha256 -Path $targetPath) -ne $record.mergedSha256) { throw 'Worktree localization target differs from merged artifact.' }
-        $candidateBlob = Get-GitBlobBytes -WorkingDirectory $worktree -Object "$($chain.fOid):$([string]$record.relativePath)"
+        $candidateBlob = Get-GitBlobBytes -WorkingDirectory $worktree -Object ('{0}:{1}' -f ([string]$chain.fOid), ([string]$record.relativePath))
         if ((Get-Sha256Bytes -Bytes $candidateBlob) -ne $record.mergedSha256) { throw 'F localization blob differs from the approved merged artifact.' }
     }
     foreach ($removedPath in @($state.localizationRemovedPaths)) {

@@ -192,7 +192,7 @@ function Assert-NoReparsePath {
             throw "$Label path component is missing."
         }
         catch {
-            throw "Unable to inspect $Label physical containment component: $($_.Exception.Message)"
+            throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message))
         }
         if (Test-PortableReparseItem -Path $paths[$index] -Item $item -Label $Label) {
             throw "$Label path contains a symlink or reparse point."
@@ -250,7 +250,7 @@ function Read-SourceRequest {
         throw 'Source request pageUrl must be a canonical page URL without user-info, query, fragment, or a custom port.'
     }
     $expectedGameDomain = 'warhammer40kdarktide'
-    $expectedPagePath = "/$expectedGameDomain/mods/$(ConvertTo-InvariantString $request.modId)"
+    $expectedPagePath = ('/{0}/mods/{1}' -f ([string]$expectedGameDomain), ([string](ConvertTo-InvariantString $request.modId)))
     if ((ConvertTo-InvariantString $request.gameDomain) -cne $expectedGameDomain -or
         $pageUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
         $pageUri.AbsolutePath.TrimEnd('/') -cne $expectedPagePath) {

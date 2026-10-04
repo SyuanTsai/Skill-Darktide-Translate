@@ -611,13 +611,20 @@ Describe 'Schema 15 source acquisition contract' {
         $modRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/TeamKills'
         New-Item -ItemType Directory -Path $modRoot -Force | Out-Null
         & git -C $repository init --quiet
+        if ($LASTEXITCODE -ne 0) { throw 'Could not initialize the loader-preflight test repository.' }
+        & git -C $repository config --local core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Could not enable long paths in the loader-preflight test repository.' }
         & git -C $repository config user.name 'Loader Preflight Test'
+        if ($LASTEXITCODE -ne 0) { throw 'Could not configure the loader-preflight test author.' }
         & git -C $repository config user.email 'loader-preflight@example.invalid'
+        if ($LASTEXITCODE -ne 0) { throw 'Could not configure the loader-preflight test email.' }
         "mod:io_dofile('TeamKills/scripts/mods/TeamKills/localization/en')`nmod:io_dofile('TeamKills/scripts/mods/TeamKills/localization/zh-tw')" |
             Set-Content -LiteralPath (Join-Path $modRoot 'TeamKills_localization.lua') -NoNewline
         'return { helper = true }' | Set-Content -LiteralPath (Join-Path $modRoot 'localization.lua') -NoNewline
         & git -C $repository add .
+        if ($LASTEXITCODE -ne 0) { throw 'Could not stage the loader-preflight test files.' }
         & git -C $repository commit --quiet -m 'base loader'
+        if ($LASTEXITCODE -ne 0) { throw 'Could not commit the loader-preflight test files.' }
 
         $runId = '22222222-3333-4444-8555-666666666666'
         $runRoot = Join-Path $repository 'AI Auto Update/In Progress/teamkills-22222222'
@@ -657,6 +664,8 @@ Describe 'Schema 15 source acquisition contract' {
         $modRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/AutoMod'
         New-Item -ItemType Directory -Path $modRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config --local core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Could not enable long paths in the Schema15 test repository.' }
         & git -C $repository config user.name 'Automatic Run Test'
         & git -C $repository config user.email 'automatic-run@example.invalid'
         'old bytes' | Set-Content -LiteralPath (Join-Path $modRoot 'file.txt') -NoNewline
@@ -684,7 +693,7 @@ Describe 'Schema 15 source acquisition contract' {
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
 
         $result = & (Join-Path $scriptRoot 'mod-update.ps1') run `
-            -RepositoryRoot $repository -ModDirectory 'AutoMod' -RunId $runId `
+            -RepositoryRoot $repository -ModDirectory 'AutoMod' -RunId $runId -WorktreeParent $TestDrive `
             -SourceRequestPath $requestPath -Provider browser -DownloadedFilePath $downloadPath `
             -SkillSourcePinPath $script:skillSourcePinPath -ObservationIntervalMilliseconds 0 -BaseRef HEAD -Until source-verified -PassThru
 
@@ -701,10 +710,12 @@ Describe 'Schema 15 source acquisition contract' {
     # Scenario: An aggregate Schema 15 run pauses for one AI_REQUIRED localization unit after its source stages completed, then receives the approved expression.
     # Purpose: Resume through verified idempotent stages to the waiting localization stage instead of returning the first completed-stage receipt.
     It 'InterT76_ResumesAggregateRunPastIdempotentStagesAfterLocalizationInput' {
-        $repository = Join-Path $TestDrive 'aggregate-localization-resume'
+        $repository = Join-Path $TestDrive 'aggregate-resume'
         $modRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/AutoMod'
         New-Item -ItemType Directory -Path $modRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config --local core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Could not enable long paths in the Schema15 test repository.' }
         & git -C $repository config user.name 'Aggregate Resume Test'
         & git -C $repository config user.email 'aggregate-resume@example.invalid'
         $oldLocalization = 'return { existing = { en = "Existing", ["zh-tw"] = "既有" } }'
@@ -735,7 +746,7 @@ Describe 'Schema 15 source acquisition contract' {
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
 
         $runner = Join-Path $scriptRoot 'mod-update.ps1'
-        $waiting = & $runner run -RepositoryRoot $repository -ModDirectory 'AutoMod' -RunId $runId `
+        $waiting = & $runner run -RepositoryRoot $repository -ModDirectory 'AutoMod' -RunId $runId -WorktreeParent $TestDrive `
             -SourceRequestPath $requestPath -Provider browser -DownloadedFilePath $downloadPath `
             -SkillSourcePinPath $script:skillSourcePinPath -ObservationIntervalMilliseconds 0 -BaseRef HEAD `
             -Until localized -PassThru
@@ -764,6 +775,8 @@ Describe 'Schema 15 source acquisition contract' {
         $modRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/M'
         New-Item -ItemType Directory -Path $modRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config --local core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Could not enable long paths in the Schema15 test repository.' }
         & git -C $repository config user.name 'Candidate Binding Test'
         & git -C $repository config user.email 'candidate-binding@example.invalid'
         $localizationText = 'return { hello = { en = "Hello", ["zh-tw"] = "哈囉" } }'
@@ -923,10 +936,12 @@ Describe 'Schema 15 source acquisition contract' {
     # Scenario: A browser-provided ZIP is acquired under a fixed run ID and then claimed by the same per-MOD reservation owner.
     # Purpose: Prove download verification occurs before worktree creation and the verified receipt survives in Schema 15 state.
     It 'InterT70_AcquiresThenClaimsTheVerifiedSourceInTheSameRun' {
-        $repository = Join-Path $TestDrive 'runner-acquisition-repository'
+        $repository = Join-Path $TestDrive 'runner-acquisition'
         $modRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
         New-Item -ItemType Directory -Path $modRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config --local core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Could not enable long paths in the Schema15 test repository.' }
         & git -C $repository config user.name 'Source Runner Test'
         & git -C $repository config user.email 'source-runner@example.invalid'
         'old bytes' | Set-Content -LiteralPath (Join-Path $modRoot 'file.txt') -NoNewline
@@ -1017,7 +1032,7 @@ Describe 'Schema 15 source acquisition contract' {
         $claimed = & $runner claim `
             -RepositoryRoot $repository `
             -ModDirectory 'ExampleMod' `
-            -RunId $runId `
+            -RunId $runId -WorktreeParent $TestDrive `
             -ArchivePath $acquired.deliveredPath `
             -SourceRequestPath $acquired.sourceRequestPath `
             -SourceReceiptPath $acquired.receiptPath `

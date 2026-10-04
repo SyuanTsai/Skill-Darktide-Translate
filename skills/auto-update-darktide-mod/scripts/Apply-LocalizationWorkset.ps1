@@ -180,7 +180,7 @@ function Assert-NoReparsePath {
             throw
         }
         catch {
-            throw "Unable to inspect Workset NEW localization physical containment component: $($_.Exception.Message)"
+            throw ('Unable to inspect Workset NEW localization physical containment component: {0}' -f $_.Exception.Message)
         }
         if (Test-PortableReparseItem -Path $currentPath -Item $current -Label 'Workset NEW localization') {
             throw 'Workset NEW localization path contains a symlink or reparse point.'
@@ -196,8 +196,8 @@ function Assert-NoReparsePath {
 function ConvertTo-NewlineStyle {
     param([string] $Text, [string] $NewlineStyle)
     if ($NewlineStyle -notin @('lf', 'crlf')) { throw 'Workset NEW localization newline style must be uniformly LF or CRLF.' }
-    $normalized = $Text -replace "`r`n|`r|`n", "`n"
-    if ($NewlineStyle -ceq 'crlf') { return $normalized.Replace("`n", "`r`n") }
+    $normalized = $Text -replace ([string][char]13 + [string][char]10 + '|' + [string][char]13 + '|' + [string][char]10), [string][char]10
+    if ($NewlineStyle -ceq 'crlf') { return $normalized.Replace([string][char]10, ([string][char]13 + [string][char]10)) }
     $normalized
 }
 
@@ -319,7 +319,7 @@ if ([string]$workset.status -eq 'blocked' -or @($workset.units | Where-Object { 
 foreach ($unit in @($workset.units)) {
     if ([string]$unit.action -cne 'AI_REQUIRED' -and
         ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
-        throw "Localization review fields were edited outside AI_REQUIRED: $($unit.unitId)"
+        throw ('Localization review fields were edited outside AI_REQUIRED: {0}' -f ([string]$unit.unitId))
     }
 }
 $expectedStagingParent = [IO.Path]::GetFullPath((Join-Path $worksetRunRoot 'staging/localization-workset-input'))
@@ -374,13 +374,13 @@ foreach ($unit in @($workset.units)) {
     $action = [string]$unit.action
     if ($action -cne 'AI_REQUIRED' -and
         ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
-        throw "Localization review fields were edited outside AI_REQUIRED: $($unit.unitId)"
+        throw ('Localization review fields were edited outside AI_REQUIRED: {0}' -f ([string]$unit.unitId))
     }
     if ($action -in @('NONE', 'ACCEPT_REMOVAL')) { continue }
-    if ($action -eq 'BLOCKED') { throw "Blocked localization unit cannot be applied: $($unit.unitId)" }
-    if ($null -eq $unit.new) { throw "Localization action requires a NEW unit: $($unit.unitId)" }
+    if ($action -eq 'BLOCKED') { throw ('Blocked localization unit cannot be applied: {0}' -f ([string]$unit.unitId)) }
+    if ($null -eq $unit.new) { throw ('Localization action requires a NEW unit: {0}' -f ([string]$unit.unitId)) }
     $currentUnit = $beforeById[[string]$unit.unitId]
-    if ($null -eq $currentUnit) { throw "Localization unit is missing from NEW bytes: $($unit.unitId)" }
+    if ($null -eq $currentUnit) { throw ('Localization unit is missing from NEW bytes: {0}' -f ([string]$unit.unitId)) }
     $target = $null
     if ($action -eq 'RESTORE_OLD_ZH_TW') {
         $target = if ($null -ne $unit.old.zhTwExpression) {
@@ -389,7 +389,7 @@ foreach ($unit in @($workset.units)) {
         else { $null }
     }
     elseif ($action -eq 'AI_REQUIRED') {
-        if ([string]$unit.reviewStatus -cne 'approved') { throw "AI_REQUIRED localization unit is not approved: $($unit.unitId)" }
+        if ([string]$unit.reviewStatus -cne 'approved') { throw ('AI_REQUIRED localization unit is not approved: {0}' -f ([string]$unit.unitId)) }
         $normalizedExpression = ConvertTo-NewlineStyle -Text ([string]$unit.suggestedZhTwExpression) -NewlineStyle ([string]$workset.new.newline)
         $target = Test-SafeLuaExpression -Expression $normalizedExpression
     }
@@ -405,7 +405,8 @@ foreach ($unit in @($workset.units)) {
         $expectedZhTw[[string]$unit.unitId] = [string]$target.canonical
     }
     elseif ($null -ne $target) {
-        $edits.Add((Get-InsertionEdit -Unit $currentUnit -Expression ([string]$target.raw) -Bytes $originalBytes -Newline $(if ($workset.new.newline -ceq 'crlf') { "`r`n" } else { "`n" })))
+        $insertionNewline = if ($workset.new.newline -ceq 'crlf') { [string][char]13 + [string][char]10 } else { [string][char]10 }
+        $edits.Add((Get-InsertionEdit -Unit $currentUnit -Expression ([string]$target.raw) -Bytes $originalBytes -Newline $insertionNewline))
         $expectedZhTw[[string]$unit.unitId] = [string]$target.canonical
     }
 }
@@ -418,16 +419,16 @@ if ([bool]$after.bom -ne [bool]$workset.new.bom -or [string]$after.newline -cne 
 $afterById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($after.units)) { $afterById[[string]$unit.unitId] = $unit }
 foreach ($beforeUnit in @($before.units)) {
-    if (-not $afterById.ContainsKey([string]$beforeUnit.unitId)) { throw "Localization apply removed a non-deleted unit: $($beforeUnit.unitId)" }
+    if (-not $afterById.ContainsKey([string]$beforeUnit.unitId)) { throw ('Localization apply removed a non-deleted unit: {0}' -f $beforeUnit.unitId) }
     $afterUnit = $afterById[[string]$beforeUnit.unitId]
     if ([string]$beforeUnit.sourceExpression.canonical -cne [string]$afterUnit.sourceExpression.canonical) {
-        throw "Localization apply changed a non-zh-tw source expression: $($beforeUnit.unitId)"
+        throw ('Localization apply changed a non-zh-tw source expression: {0}' -f $beforeUnit.unitId)
     }
 }
 foreach ($entry in $expectedZhTw.GetEnumerator()) {
     $afterUnit = $afterById[[string]$entry.Key]
     $actual = if ($null -ne $afterUnit.zhTwExpression) { [string]$afterUnit.zhTwExpression.canonical } else { $null }
-    if ($actual -cne $entry.Value) { throw "Localization apply produced an unexpected zh-tw expression: $($entry.Key)" }
+    if ($actual -cne $entry.Value) { throw ('Localization apply produced an unexpected zh-tw expression: {0}' -f $entry.Key) }
 }
 
 $serializedEdits = @($edits | ForEach-Object {

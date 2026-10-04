@@ -92,10 +92,10 @@ function Assert-ModUpdateGitIdentities {
     if ($remoteNames -cnotcontains $remote) { throw 'Recorded Git remote does not exist in the target repository.' }
 
     foreach ($refName in @(
-        "refs/heads/$($State.branch)",
-        "refs/heads/$($State.pullRequestBase)",
-        "refs/remotes/$remote/$($State.pullRequestBase)",
-        "refs/darktide-finalization/$($State.runId)/pr-head"
+        ('refs/heads/{0}' -f ([string]($State.branch))),
+        ('refs/heads/{0}' -f ([string]($State.pullRequestBase))),
+        ('refs/remotes/{0}/{1}' -f ([string]$remote), ([string]($State.pullRequestBase))),
+        ('refs/darktide-finalization/{0}/pr-head' -f ([string]($State.runId)))
     )) {
         $check = Invoke-Git -WorkingDirectory $repository -Arguments @('check-ref-format', $refName) -AllowFailure
         if ($check.exitCode -ne 0) { throw "Recorded Git ref is invalid: $refName" }
@@ -111,8 +111,7 @@ function Get-ModUpdateArchiveLocations {
         throw 'Finalization archive filename is not one safe file name.'
     }
     $sourceRoot = Join-Path ([string]$State.runRoot) 'source'
-    $sourcePath = Assert-ContainedPath -Candidate (Join-Path (Join-Path ([string]$State.runRoot) 'source') $filename) `
-        -Root $sourceRoot -Label 'Run-owned archive'
+    $sourcePath = Assert-ContainedPath -Candidate (Join-Path (Join-Path ([string]$State.runRoot) 'source') $filename) -Root $sourceRoot -Label 'Run-owned archive'
     $sourcePath = Assert-NoReparsePath -Path $sourcePath -Root ([string]$State.runRoot) -Label 'Run-owned archive' -AllowMissing
     if (-not ([IO.Path]::GetFullPath([string]$State.archive.path)).Equals($sourcePath, (Get-PortablePathComparison -Paths @([IO.Path]::GetFullPath([string]$State.archive.path), $sourcePath)))) {
         throw 'Run-owned archive path differs from its canonical location.'
@@ -171,15 +170,15 @@ function Get-ModUpdateFingerprintRecord {
     if ($fingerprintBlobOid -cne $mainBlobOid) { throw 'Merged main fingerprint differs from the observed merged PR head.' }
 
     $bytes = Get-GitBlobBytes -WorkingDirectory ([string]$State.repositoryRoot) -Object $fingerprintBlobOid
-    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes).Replace("`r`n", "`n")
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes).Replace(([string][char]13 + [string][char]10), ([string][char]10))
     $expected = [ordered]@{
         filename = [string]$State.archive.filename
         size_bytes = [string][int64]$State.archive.size
         sha256 = [string]$State.archive.sha256
     }
     foreach ($name in $expected.Keys) {
-        $line = "$name=$($expected[$name])"
-        if (@($text -split "`n" | Where-Object { $_ -ceq $line }).Count -ne 1) {
+        $line = ('{0}={1}' -f ([string]$name), ([string]($expected[$name])))
+        if (@($text -split ([string][char]10) | Where-Object { $_ -ceq $line }).Count -ne 1) {
             throw "Merged formal fingerprint does not contain the unique immutable $name value."
         }
     }
@@ -214,6 +213,7 @@ function Get-ModUpdateGitOutputBytes {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'git'
     $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     foreach ($argument in @('-C', $WorkingDirectory) + $Arguments) { $start.ArgumentList.Add($argument) }
@@ -222,6 +222,7 @@ function Get-ModUpdateGitOutputBytes {
     $memory = [IO.MemoryStream]::new()
     try {
         if (-not $process.Start()) { throw 'Unable to start Git evidence capture.' }
+        $process.StandardInput.Close()
         $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
         $errorTask = $process.StandardError.ReadToEndAsync()
         while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
@@ -318,8 +319,7 @@ function Assert-ModUpdateMergeFinalizationState {
     }
     $reviewedOid = [string]$State.reviewedOid
     $isResumingFinalization = [string]$State.status -ceq 'merged' -and @($State.completedStages) -contains 'finalize-merge'
-    if (-not (Test-ModUpdateFinalizationStateStatus -Status ([string]$State.status) `
-            -CompletedStages @($State.completedStages) -WaitingReason $(if ($State.Contains('waitingReason')) { $State.waitingReason } else { $null })) -or
+    if (-not (Test-ModUpdateFinalizationStateStatus -Status ([string]$State.status) -CompletedStages @($State.completedStages) -WaitingReason $(if ($State.Contains('waitingReason')) { $State.waitingReason } else { $null })) -or
         -not [bool]$State.published -or
         $reviewedOid -notmatch '^[0-9a-f]{40}$' -or $reviewedOid -cne [string]$State.evidenceChain.fOid -or
         [string]$State.candidateGate.status -cne 'passed' -or [string]$State.candidateGate.fOid -cne $reviewedOid -or
@@ -330,7 +330,7 @@ function Assert-ModUpdateMergeFinalizationState {
         if (@($State.completedStages) -notcontains $stage) { throw "Merge finalization requires completed stage $stage." }
     }
     foreach ($value in @([string]$State.remote, [string]$State.pullRequestBase, [string]$State.branch)) {
-        if ($value.StartsWith('-', [StringComparison]::Ordinal) -or $value.Contains("`0")) {
+        if ($value.StartsWith('-', [StringComparison]::Ordinal) -or $value.Contains([string][char]0)) {
             throw 'Merge finalization rejected an option-like Git identity.'
         }
     }
@@ -450,11 +450,8 @@ function Invoke-ModUpdateChangedHeadReconciliation {
         files = Get-ModUpdateEvidenceManifest -Root $rejectedRoot
     })
 
-    $null = Set-ModUpdateChangedHeadState -State $State -PullRequest $PullRequest -OriginMainOid $OriginMainOid `
-        -FingerprintSha256 (Get-FileSha256 -Path $fingerprintPath) -ReconciliationPath $reconciliationPath `
-        -ReconciliationSha256 (Get-FileSha256 -Path $reconciliationPath)
-    Suspend-Stage -State $State -Context $Stage -Result 'waiting-user' `
-        -ArtifactSha256 (Get-FileSha256 -Path $reconciliationPath) -OutputStage 'post-merge-reconciliation' -Data $record
+    $null = Set-ModUpdateChangedHeadState -State $State -PullRequest $PullRequest -OriginMainOid $OriginMainOid -FingerprintSha256 (Get-FileSha256 -Path $fingerprintPath) -ReconciliationPath $reconciliationPath -ReconciliationSha256 (Get-FileSha256 -Path $reconciliationPath)
+    Suspend-Stage -State $State -Context $Stage -Result 'waiting-user' -ArtifactSha256 (Get-FileSha256 -Path $reconciliationPath) -OutputStage 'post-merge-reconciliation' -Data $record
 }
 
 function Invoke-ModUpdateMergeTopologyReconciliation {
@@ -509,8 +506,7 @@ function Invoke-ModUpdateMergeTopologyReconciliation {
     $State.completedStages = @($State.completedStages | Where-Object { $_ -notin @('validate', 'publish', 'review-snapshot', 'finalize-merge') })
     $State.candidateGate = [ordered]@{ status = 'not-run' }
 
-    Suspend-Stage -State $State -Context $Stage -Result 'waiting-user' `
-        -ArtifactSha256 (Get-FileSha256 -Path $reconciliationPath) -OutputStage 'merge-topology-reconciliation' -Data $record
+    Suspend-Stage -State $State -Context $Stage -Result 'waiting-user' -ArtifactSha256 (Get-FileSha256 -Path $reconciliationPath) -OutputStage 'merge-topology-reconciliation' -Data $record
 }
 
 function Invoke-ModUpdateReviewedHeadFinalization {
@@ -553,7 +549,7 @@ function Invoke-ModUpdateReviewedHeadFinalization {
     }
     if (-not $finalEvidenceExists) {
     if (Test-Path -LiteralPath $evidencePending) {
-        $retained = Join-Path $evidenceRoot ".retained-$runId-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))-$([guid]::NewGuid().ToString('N'))"
+        $retained = Join-Path $evidenceRoot ('.retained-{0}-{1}-{2}' -f ([string]$runId), ([string]([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))), ([string]([guid]::NewGuid().ToString('N'))))
         [IO.Directory]::Move($evidencePending, $retained)
     }
     New-Item -ItemType Directory -Path $evidencePending | Out-Null
@@ -670,19 +666,19 @@ function Invoke-ModUpdateReviewedHeadFinalization {
         if (Test-Path -LiteralPath $worktree) { throw 'Exact run worktree remains after standard removal.' }
     }
     elseif ($worktreeRegistered) { throw 'Git still registers the missing exact run worktree.' }
-    $localRef = "refs/heads/$($State.branch)"
+    $localRef = ('refs/heads/{0}' -f [string]$State.branch)
     $localRefResult = Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', '--quiet', $localRef) -AllowFailure
     if ($localRefResult.exitCode -eq 0) {
         $localOid = $localRefResult.output.Trim()
         if ($localOid -cne $reviewedOid) { throw 'Local run branch changed before atomic deletion.' }
         $null = Invoke-Git -WorkingDirectory $repository -Arguments @('update-ref', '-d', $localRef, $reviewedOid)
     }
-    $remoteRef = "refs/heads/$($State.branch)"
+    $remoteRef = ('refs/heads/{0}' -f [string]$State.branch)
     $remoteListing = Invoke-Git -WorkingDirectory $repository -Arguments @('ls-remote', '--heads', [string]$State.remote, $remoteRef)
     if (-not [string]::IsNullOrWhiteSpace($remoteListing.output)) {
-        $remoteOid = $remoteListing.output.Split("`t")[0]
+        $remoteOid = $remoteListing.output.Split([string][char]9)[0]
         if ($remoteOid -cne $reviewedOid) { throw 'Remote run branch changed before deletion.' }
-        $remoteLease = "--force-with-lease=${remoteRef}:$reviewedOid"
+        $remoteLease = ('--force-with-lease={0}:{1}' -f [string]$remoteRef, [string]$reviewedOid)
         $null = Invoke-Git -WorkingDirectory $repository -Arguments @('push', [string]$State.remote, $remoteLease, ":$remoteRef")
     }
     $remoteAfter = Invoke-Git -WorkingDirectory $repository -Arguments @('ls-remote', '--heads', [string]$State.remote, $remoteRef)
@@ -702,7 +698,7 @@ function Invoke-ModUpdateReviewedHeadFinalization {
     if (Test-Path -LiteralPath $claimDirectory -PathType Container) {
         Remove-ModUpdateOwnedTree -Path $claimDirectory -Root $claimRoot -Label 'Finalized claim directory'
     }
-    $releasedTombstone = Join-Path $lockRoot ".released-$($State.modLockKey)-$runId"
+    $releasedTombstone = Join-Path $lockRoot ('.released-{0}-{1}' -f ([string]($State.modLockKey)), ([string]$runId))
     if (Test-Path -LiteralPath $releasedTombstone) { throw 'Reservation release tombstone already exists.' }
     [IO.Directory]::Move([string]$State.modLockPath, $releasedTombstone)
     Remove-ModUpdateOwnedTree -Path $releasedTombstone -Root $lockRoot -Label 'Released reservation tombstone'
@@ -819,10 +815,10 @@ function Invoke-ModUpdateMergeFinalization {
     $repository = [string]$State.repositoryRoot
     $remote = [string]$State.remote
     $base = [string]$State.pullRequestBase
-    $temporaryRef = "refs/darktide-finalization/$($State.runId)/pr-head"
+    $temporaryRef = ('refs/darktide-finalization/{0}/pr-head' -f ([string]($State.runId)))
     try {
         $null = Invoke-Git -WorkingDirectory $repository -Arguments @('fetch', $remote, "+refs/heads/${base}:refs/remotes/${remote}/${base}")
-        $null = Invoke-Git -WorkingDirectory $repository -Arguments @('fetch', $remote, "+refs/pull/$($State.prNumber)/head:$temporaryRef")
+        $null = Invoke-Git -WorkingDirectory $repository -Arguments @('fetch', $remote, ('+refs/pull/{0}/head:{1}' -f ([string]($State.prNumber)), ([string]$temporaryRef)))
         $observedHead = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', $temporaryRef)).output.Trim()
         if ($observedHead -cne [string]$pr.headRefOid) { throw 'Fetched PR head differs from the GitHub merge observation.' }
         $originMainOid = (Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', "refs/remotes/$remote/$base")).output.Trim()
@@ -832,15 +828,12 @@ function Invoke-ModUpdateMergeFinalization {
             -OriginMainOid $originMainOid -PullRequest $pr
         $headInMerge = Invoke-Git -WorkingDirectory $repository -Arguments @('merge-base', '--is-ancestor', [string]$pr.headRefOid, [string]$pr.mergeCommit.oid) -AllowFailure
         if ($headInMerge.exitCode -ne 0) {
-            return (Invoke-ModUpdateMergeTopologyReconciliation -State $State -PullRequest $pr -Fingerprint $fingerprint `
-                -OriginMainOid $originMainOid -Stage $stage)
+            return (Invoke-ModUpdateMergeTopologyReconciliation -State $State -PullRequest $pr -Fingerprint $fingerprint -OriginMainOid $originMainOid -Stage $stage)
         }
         if ($disposition -ceq 'reconcile-changed-head') {
-            return (Invoke-ModUpdateChangedHeadReconciliation -State $State -PullRequest $pr -Fingerprint $fingerprint `
-                -OriginMainOid $originMainOid -Stage $stage)
+            return (Invoke-ModUpdateChangedHeadReconciliation -State $State -PullRequest $pr -Fingerprint $fingerprint -OriginMainOid $originMainOid -Stage $stage)
         }
-        Invoke-ModUpdateReviewedHeadFinalization -State $State -PullRequest $pr -Fingerprint $fingerprint `
-            -OriginMainOid $originMainOid -Stage $stage
+        Invoke-ModUpdateReviewedHeadFinalization -State $State -PullRequest $pr -Fingerprint $fingerprint -OriginMainOid $originMainOid -Stage $stage
     }
     finally {
         $resolvedTemporary = Invoke-Git -WorkingDirectory $repository -Arguments @('rev-parse', '--verify', '--quiet', $temporaryRef) -AllowFailure

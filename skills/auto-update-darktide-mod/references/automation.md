@@ -46,14 +46,7 @@ Read `references/schema-15.md` completely before a new automatic-source run. Sup
 For an existing signed-in browser session, download only into the fixed aggregate run path `AI Auto Update/In Progress/<normalized-mod-slug>-<first-eight-run-id-characters>/.incoming-<run-id>`. The runner normalizes the MOD directory to a lowercase safe slug, so compute the path before starting the browser download; a sibling `.incoming-*` directly under `AI Auto Update` is outside the run boundary and is rejected. A single `run` invocation acquires, independently verifies, receipt-binds, claims, and continues the ordered stages:
 
 ```powershell
-./scripts/mod-update.ps1 run `
-  -RepositoryRoot 'D:\Games\Warhammer-40-000-DARKTIDE-Mods' `
-  -ModDirectory 'ExampleMod' `
-  -RunId '11111111-2222-4333-8444-555555555555' `
-  -SourceRequestPath 'D:\...\source-request.json' `
-  -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.1.json' `
-  -Provider browser `
-  -DownloadedFilePath 'D:\Games\Warhammer-40-000-DARKTIDE-Mods\AI Auto Update\In Progress\examplemod-11111111\.incoming-11111111-2222-4333-8444-555555555555\ExampleMod.zip'
+./scripts/mod-update.ps1 run -RepositoryRoot 'D:\Games\Warhammer-40-000-DARKTIDE-Mods' -ModDirectory 'ExampleMod' -RunId '11111111-2222-4333-8444-555555555555' -SourceRequestPath 'D:\...\source-request.json' -SkillSourcePinPath 'D:\Pins\darktide-translate-v0.3.1.json' -Provider browser -DownloadedFilePath 'D:\Games\Warhammer-40-000-DARKTIDE-Mods\AI Auto Update\In Progress\examplemod-11111111\.incoming-11111111-2222-4333-8444-555555555555\ExampleMod.zip'
 ```
 
 `acquire-source` and receipt-bound `claim` remain separately callable for coordinators and diagnosis. New automatic runs preflight immutable base localization before branch creation; a loader-only entry returns `AUTOMATION_EXCLUDED: localization_entry_is_loader` while retaining acquisition evidence and the per-MOD reservation.

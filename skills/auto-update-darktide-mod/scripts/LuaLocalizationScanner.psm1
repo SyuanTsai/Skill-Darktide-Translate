@@ -90,7 +90,7 @@ function Get-LuaTokens {
                 $index = if ($closingIndex -lt 0) { $Text.Length } else { $closingIndex + $closing.Length }
             }
             else {
-                $lineEnd = Find-LuaDelimiterIndex -Text $Text -Delimiter "`n" -StartIndex $index
+                $lineEnd = Find-LuaDelimiterIndex -Text $Text -Delimiter ([string][char]10) -StartIndex $index
                 $index = if ($lineEnd -lt 0) { $Text.Length } else { $lineEnd + 1 }
             }
             continue
@@ -229,9 +229,9 @@ function ConvertFrom-LuaKeyString {
         $longString = [regex]::Match($Literal, '^\[(=*)\[(.*)\]\1\]$', [Text.RegularExpressions.RegexOptions]::Singleline)
         if (-not $longString.Success) { throw 'Lua long-string key literal is malformed.' }
         $content = $longString.Groups[2].Value
-        if ($content.StartsWith("`r`n", [StringComparison]::Ordinal)) { $content = $content.Substring(2) }
-        elseif ($content.StartsWith("`n", [StringComparison]::Ordinal) -or $content.StartsWith("`r", [StringComparison]::Ordinal)) { $content = $content.Substring(1) }
-        return ($content -replace "`r`n|`r|`n", "`n")
+        if ($content.StartsWith(([string][char]13 + [string][char]10), [StringComparison]::Ordinal)) { $content = $content.Substring(2) }
+        elseif ($content.StartsWith([string][char]10, [StringComparison]::Ordinal) -or $content.StartsWith([string][char]13, [StringComparison]::Ordinal)) { $content = $content.Substring(1) }
+        return ($content -replace ([string][char]13 + [string][char]10 + '|' + [string][char]13 + '|' + [string][char]10), [string][char]10)
     }
     $content = $Literal.Substring(1, $Literal.Length - 2)
     $encoding = [Text.UTF8Encoding]::new($false, $true)
@@ -269,9 +269,9 @@ function ConvertFrom-LuaKeyString {
             '\' { $bytes.Add(92) }
             '"' { $bytes.Add(34) }
             "'" { $bytes.Add(39) }
-            "`n" { $bytes.Add(10) }
-            "`r" {
-                if (($index + 1) -lt $content.Length -and $content[$index + 1] -eq "`n") { $index++ }
+            ([string][char]10) { $bytes.Add(10) }
+            ([string][char]13) {
+                if (($index + 1) -lt $content.Length -and $content[$index + 1] -eq [string][char]10) { $index++ }
                 $bytes.Add(10)
             }
             'z' {
@@ -735,7 +735,7 @@ function Get-LuaLocalizationDocument {
         $numbered = foreach ($unit in $units) {
             Invoke-LuaScannerProgressHeartbeat
             $unitIndex++
-            $identityBase = "$($unit.sourceId) :: $($unit.containerPath) :: $($unit.key)"
+            $identityBase = ('{0} :: {1} :: {2}' -f $unit.sourceId, $unit.containerPath, $unit.key)
             if (-not $occurrences.ContainsKey($identityBase)) { $occurrences[$identityBase] = 0 }
             $occurrences[$identityBase]++
             [ordered]@{
@@ -743,7 +743,7 @@ function Get-LuaLocalizationDocument {
                 containerPath = $unit.containerPath
                 key = $unit.key
                 occurrence = $occurrences[$identityBase]
-                unitId = "$identityBase :: $($occurrences[$identityBase])"
+                unitId = ('{0} :: {1}' -f $identityBase, $occurrences[$identityBase])
                 blockedReason = $unit.blockedReason
                 sourceExpression = $unit.sourceExpression
                 zhTwExpression = $unit.zhTwExpression
@@ -756,14 +756,14 @@ function Get-LuaLocalizationDocument {
         $hasBareCr = $false
         for ($newlineIndex = 0; $newlineIndex -lt $text.Length; $newlineIndex++) {
             Invoke-LuaScannerProgressHeartbeat
-            if ($text[$newlineIndex] -eq "`r") {
-                if (($newlineIndex + 1) -lt $text.Length -and $text[$newlineIndex + 1] -eq "`n") {
+            if ($text[$newlineIndex] -eq [string][char]13) {
+                if (($newlineIndex + 1) -lt $text.Length -and $text[$newlineIndex + 1] -eq [string][char]10) {
                     $hasCrlf = $true
                     $newlineIndex++
                 }
                 else { $hasBareCr = $true }
             }
-            elseif ($text[$newlineIndex] -eq "`n") { $hasLf = $true }
+            elseif ($text[$newlineIndex] -eq [string][char]10) { $hasLf = $true }
         }
         $newline = if ($hasCrlf -and ($hasLf -or $hasBareCr)) { 'mixed' }
             elseif ($hasCrlf) { 'crlf' }

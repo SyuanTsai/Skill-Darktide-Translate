@@ -32,6 +32,8 @@ Describe 'Schema 15 multi-process coordination contract' {
         }
     }
 
+    # Scenario: Two mods compete with a duplicate generation in a long run-owned Windows fixture path.
+    # Purpose: Preserve cross-process serialization and competing-generation rejection after verified Git fixture setup.
     It 'InterT180_SerializesTwoModsAndRejectsACompetingGenerationAcrossProcesses' -Tag 'MultiProcess' {
         $repository = Join-Path $TestDrive 'multi-process-repository'
         $modsRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods'
@@ -40,10 +42,18 @@ Describe 'Schema 15 multi-process coordination contract' {
         [IO.File]::WriteAllText((Join-Path $modsRoot 'ModA/a.txt'), 'old-a', [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $modsRoot 'ModB/b.txt'), 'old-b', [Text.UTF8Encoding]::new($false))
         & git -C $repository init --quiet
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to initialize the coordination Git fixture.' }
+        # The protected runner's run-owned TEMP can put fixture Git objects beyond MAX_PATH.
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the coordination Git fixture.' }
         & git -C $repository config user.name 'Coordination Test'
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to set the coordination Git fixture name.' }
         & git -C $repository config user.email 'coordination@example.invalid'
-        & git -C $repository add .
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to set the coordination Git fixture email.' }
+        $addOutput = @(& git -C $repository add . 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw ('Coordination fixture Git add failed: ' + ($addOutput -join ' ')) }
         & git -C $repository commit --quiet -m 'coordination fixture base'
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to commit the coordination Git fixture.' }
 
         function New-TestArchive {
             param([string] $Path, [string] $ModName, [string] $Content)
@@ -84,7 +94,8 @@ Describe 'Schema 15 multi-process coordination contract' {
                 '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $runnerPath, 'claim',
                 '-RepositoryRoot', $repository, '-ArchivePath', $ArchivePath, '-ModDirectory', $ModName,
                 '-RunId', $RunId, '-SourceRequestPath', $RequestPath,
-                '-SkillSourcePinPath', $script:skillSourcePinPath, '-BaseRef', 'HEAD'
+                '-SkillSourcePinPath', $script:skillSourcePinPath, '-BaseRef', 'HEAD',
+                '-WorktreeParent', $TestDrive
             )) { $start.ArgumentList.Add($argument) }
             $process = [Diagnostics.Process]::new()
             $process.StartInfo = $start
@@ -129,7 +140,10 @@ Describe 'Schema 15 multi-process coordination contract' {
 
             $successful = @($workers | Where-Object { $_.process.ExitCode -eq 0 })
             $failed = @($workers | Where-Object { $_.process.ExitCode -ne 0 })
-            $successful.Count | Should -Be 2
+            $workerDiagnostics = ($workers | ForEach-Object {
+                "mod=$($_.mod); exit=$($_.process.ExitCode); stderr=$($_.stderrText); stdout=$($_.stdoutText)"
+            }) -join "`n"
+            $successful.Count | Should -Be 2 -Because $workerDiagnostics
             $failed.Count | Should -Be 1
             @($successful.mod | Sort-Object) | Should -Be @('ModA', 'ModB')
             $failed[0].mod | Should -Be 'ModA'

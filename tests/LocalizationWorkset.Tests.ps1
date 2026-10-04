@@ -131,11 +131,16 @@ return {
         }
     }
 
-    # Scenario: A bracketed zh-tw language key uses a Lua long-string literal with either the basic or equals-delimited form.
+    # Scenario: A bracketed zh-tw language key uses basic or equals-delimited Lua long strings, including an opening LF, CRLF, or CR.
     # Purpose: Decode the key to its Lua value so long-string syntax cannot hide an existing semantic zh-tw field.
     It 'UnitT24_DecodesLongStringsInBracketedLanguageKeys' {
         Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
-        foreach ($longKey in @('[[zh-tw]]', '[=[zh-tw]=]')) {
+        $openingNewlines = @([string][char]10, ([string][char]13 + [string][char]10), [string][char]13)
+        $longKeys = @('[[zh-tw]]', '[=[zh-tw]=]') + @($openingNewlines | ForEach-Object {
+            '[[' + $_ + 'zh-tw]]'
+            '[=[' + $_ + 'zh-tw]=]'
+        })
+        foreach ($longKey in $longKeys) {
             $lua = 'return {{ escaped = {{ ["en"] = "Hello", [ {0} ] = "哈囉" }} }}' -f $longKey
             $document = Get-LuaLocalizationDocument `
                 -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($lua)) `
@@ -209,6 +214,8 @@ local side_effect = os.time()
         $oldModRoot = Join-Path $repository 'mods/Foo..Bar'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Double Dot Workset Test'
         & git -C $repository config user.email 'double-dot-workset@example.invalid'
         $localization = 'return { key = { en = "Stable", ["zh-tw"] = "穩定" } }'
@@ -243,6 +250,8 @@ local side_effect = os.time()
         $oldModRoot = Join-Path $repository 'mods/CaseMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Case Distinct Workset Test'
         & git -C $repository config user.email 'case-distinct-workset@example.invalid'
         $oldPath = Join-Path $oldModRoot 'CaseMod_localization.lua'
@@ -305,6 +314,8 @@ return {
         $oldModRoot = Join-Path $repository 'mods/ExampleMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Workset Test'
         & git -C $repository config user.email 'workset@example.invalid'
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
@@ -389,6 +400,19 @@ return {
         $nonAiTampered | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $nonAiTamperedPath -NoNewline
         { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $nonAiTamperedPath -PassThru } |
             Should -Throw '*outside AI_REQUIRED*'
+
+        # Scenario: Untrusted workset JSON supplies an array identity with a matching immutable contract.
+        # Purpose: Preserve the diagnostic for all identity values while rejecting edits outside AI_REQUIRED.
+        $arrayIdentityPath = Join-Path $repository 'AI Auto Update/In Progress/array-identity/review-artifacts/localization-workset.json'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $arrayIdentityPath) -Force | Out-Null
+        $arrayIdentity = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+        $arrayIdentityUnit = @($arrayIdentity.units | Where-Object key -eq 'unchanged')[0]
+        $arrayIdentityUnit.unitId = @('first', 'second')
+        $arrayIdentityUnit.reviewStatus = 'approved'
+        $arrayIdentity.immutableContractSha256 = Get-TestImmutableWorksetContractSha256 -Workset $arrayIdentity
+        $arrayIdentity | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $arrayIdentityPath -NoNewline
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $arrayIdentityPath -PassThru } |
+            Should -Throw '*outside AI_REQUIRED: first second'
 
         $missingTarget = @($workset.units | Where-Object key -eq 'missing_both')[0]
         $missingTarget.reviewStatus = 'approved'
@@ -500,6 +524,8 @@ return {
         $oldModRoot = Join-Path $repository 'mods/ExampleMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Workset Comment Test'
         & git -C $repository config user.email 'workset-comment@example.invalid'
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
@@ -553,6 +579,8 @@ return {
         $oldModRoot = Join-Path $repository 'mods/ExampleMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Workset Newline Test'
         & git -C $repository config user.email 'workset-newline@example.invalid'
         & git -C $repository config core.autocrlf false
@@ -608,6 +636,8 @@ return {
         $oldModRoot = Join-Path $repository 'mods/ExampleMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Workset Path Escape Test'
         & git -C $repository config user.email 'workset-path-escape@example.invalid'
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
@@ -649,6 +679,8 @@ return {
         $oldModRoot = Join-Path $repository 'mods/ExampleMod/nested'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Workset Reparse Test'
         & git -C $repository config user.email 'workset-reparse@example.invalid'
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
@@ -688,10 +720,12 @@ return {
     # Scenario: Entries use direct or composed game Localize calls, with either neutral separators or literal content.
     # Purpose: Skip redundant zh-tw authoring when all visible text is locale-resolved, while translating compositions that add actual text.
     It 'InterT35_SkipsContentlessLocalizeSourcesButStillTranslatesContentfulExpressions' {
-        $repository = Join-Path $TestDrive 'direct-localize-workset-repository'
+        $repository = Join-Path $TestDrive 'direct-localize-repo'
         $oldModRoot = Join-Path $repository 'mods/ExampleMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Direct Localize Workset Test'
         & git -C $repository config user.email 'direct-localize-workset@example.invalid'
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
@@ -770,6 +804,8 @@ return {
         $oldModRoot = Join-Path $repository 'mods/ExampleMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Pending Apply Test'
         & git -C $repository config user.email 'pending-apply@example.invalid'
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
@@ -827,6 +863,8 @@ return {
         $oldModRoot = Join-Path $repository 'mods/TeamKills'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Loader Test'
         & git -C $repository config user.email 'loader@example.invalid'
         $loader = @'
@@ -866,6 +904,8 @@ return localization
         $oldModRoot = Join-Path $repository 'mods/SideEffectMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Non-loader Test'
         & git -C $repository config user.email 'non-loader@example.invalid'
         $content = "mod:io_dofile(`"SideEffectMod/localization/en`")`nlocal side_effect = os.time()"
@@ -895,6 +935,8 @@ return localization
         $oldRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/RenameMod/old'
         New-Item -ItemType Directory -Path $oldRoot -Force | Out-Null
         & git -C $repository init --quiet
+        & git -C $repository config core.longpaths true
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the localization Git fixture.' }
         & git -C $repository config user.name 'Rename Runner Test'
         & git -C $repository config user.email 'rename-runner@example.invalid'
         'return { key = { en = "Stable", ["zh-tw"] = "穩定" } }' |
@@ -923,7 +965,7 @@ return localization
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
         $runner = Join-Path $scriptRoot 'mod-update.ps1'
 
-        $verified = & $runner run -RepositoryRoot $repository -ModDirectory 'RenameMod' -RunId $runId `
+        $verified = & $runner run -RepositoryRoot $repository -ModDirectory 'RenameMod' -RunId $runId -WorktreeParent $TestDrive `
             -SourceRequestPath $requestPath -Provider browser -DownloadedFilePath $downloadPath `
             -SkillSourcePinPath $script:skillSourcePinPath -ObservationIntervalMilliseconds 0 -BaseRef HEAD -Until source-verified -PassThru
         $null = & $runner extract -RepositoryRoot $repository -StatePath $verified.statePath -PassThru
