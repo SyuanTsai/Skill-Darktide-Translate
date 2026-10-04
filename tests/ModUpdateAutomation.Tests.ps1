@@ -74,6 +74,58 @@ Describe 'Deterministic Darktide MOD update automation' {
         $pathSafety | Should -Not -Match '(?s)GetFileInformationByHandleEx\(\s*handle,\s*FileCaseSensitiveInformation\s*,'
     }
 
+    # Scenario: Native metadata opens receive canonical long drive/UNC paths or paths with Win32 normalization semantics.
+    # Purpose: Extend only ordinary canonical long paths, preserving short, relative, device, dot/space, and stream inputs.
+    It 'UnitT109_PreservesNativePathSemanticsWhileExtendingCanonicalLongPaths' {
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $formatter = [SyuanTsai.PathSafetyNative].GetMethod('GetNativeOpenPath', [Reflection.BindingFlags]'NonPublic,Static')
+        $formatter | Should -Not -BeNullOrEmpty
+        $longDrive = 'C:\' + ('a' * 270)
+        $longUnc = '\\server\share\' + ('a' * 270)
+        $formatter.Invoke($null, @($longDrive)) | Should -BeExactly ('\\?\' + $longDrive)
+        $formatter.Invoke($null, @($longUnc)) | Should -BeExactly ('\\?\UNC\' + $longUnc.Substring(2))
+        foreach ($unchanged in @(
+            'C:\short\file.txt',
+            ('relative\' + ('a' * 270)),
+            ('C:relative\' + ('a' * 270)),
+            ('C:/' + ('a' * 270)),
+            ('C:\dot\..\' + ('a' * 270)),
+            ('C:\trailing.\' + ('a' * 270)),
+            ('C:\trailing \'+ ('a' * 270)),
+            ($longDrive + ':stream'),
+            ('\\?\' + $longDrive),
+            ('\\.\' + $longDrive)
+        )) {
+            $formatter.Invoke($null, @($unchanged)) | Should -BeExactly $unchanged
+        }
+    }
+
+    # Scenario: Case aliases and a distinct file exist below a real Windows directory longer than MAX_PATH.
+    # Purpose: Prove native metadata can identify long-path aliases without conflating different files or changing short paths.
+    It 'InterT109_QueriesRealLongPathCaseSemanticsAndPhysicalIdentity' {
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $longRoot = Join-Path $TestDrive ('native-long-' + ('a' * 100))
+        $longRoot = Join-Path $longRoot ('b' * 100)
+        $directory = Join-Path $longRoot 'ui'
+        [void][IO.Directory]::CreateDirectory($directory)
+        $original = Join-Path $directory 'Same.txt'
+        $alias = Join-Path (Join-Path $longRoot 'UI') 'Same.txt'
+        $distinct = Join-Path $directory 'Other.txt'
+        [IO.File]::WriteAllText($original, 'same physical file')
+        [IO.File]::WriteAllText($distinct, 'distinct file')
+        $directory.Length | Should -BeGreaterOrEqual 260
+        Get-PortablePathComparison -Paths @($directory) | Should -Be ([StringComparison]::OrdinalIgnoreCase)
+        Test-PortablePhysicalIdentity -PathA $original -PathB $alias | Should -BeTrue
+        Test-PortablePhysicalIdentity -PathA $original -PathB $distinct | Should -BeFalse
+        $shortDirectory = Join-Path $TestDrive 'native-short'
+        [void][IO.Directory]::CreateDirectory($shortDirectory)
+        $shortFile = Join-Path $shortDirectory 'same.txt'
+        [IO.File]::WriteAllText($shortFile, 'short control')
+        $shortFile.Length | Should -BeLessThan 260
+        Test-PortablePhysicalIdentity -PathA $shortFile -PathB $shortFile | Should -BeTrue
+        Test-PortableReparseItem -Path $directory | Should -BeFalse
+    }
+
     # Scenario: A caller invokes a single stage or resumes the same run.
     # Purpose: Preserve the fixed command surface, structured JSON, timing, state, and idempotency contracts.
     It 'UnitT110_DeclaresTheFixedResumableStageContract' {
@@ -986,7 +1038,7 @@ function Suspend-Stage {
         $guidCalls.Count | Should -Be 1
         $guidCalls[0].Static | Should -BeTrue
         $guidCalls[0].Expression.Extent.Text | Should -BeExactly '[guid]'
-        $guidCalls[0].Arguments.Count | Should -Be 0
+        ($null -eq $guidCalls[0].Arguments) | Should -BeTrue
         $calls.Count | Should -Be 3
         foreach ($call in $calls | Where-Object { $_.Member.Extent.Text -cne 'NewGuid' }) {
             $call.Member.Extent.Text | Should -BeExactly 'ToString'
@@ -1629,14 +1681,19 @@ function Invoke-Git {
         [IO.File]::WriteAllText((Join-Path $repository 'mods/ExampleMod/upstream.txt'), "old`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $repository 'outside.txt'), "old`n", [Text.UTF8Encoding]::new($false))
         & git -C $repository init --quiet --initial-branch=main
+        & git -C $repository config --local core.longpaths true
+        $LASTEXITCODE | Should -Be 0
         & git -C $repository config user.name 'Fixture User'
         & git -C $repository config user.email 'fixture@example.invalid'
         & git -C $repository add --all
+        $LASTEXITCODE | Should -Be 0
         & git -C $repository commit --quiet -m baseline
+        $LASTEXITCODE | Should -Be 0
         try {
             [IO.File]::WriteAllText((Join-Path $repository 'mods/ExampleMod/upstream.txt'), "new`n", [Text.UTF8Encoding]::new($false))
             [IO.File]::WriteAllText((Join-Path $repository 'outside.txt'), "changed`n", [Text.UTF8Encoding]::new($false))
             & git -C $repository add --all
+            $LASTEXITCODE | Should -Be 0
 
             { & $module {
                     param($worktree)
@@ -2389,12 +2446,16 @@ function Get-SourceTupleContractSha256 {
         $fixtureRepo = Join-Path $TestDrive 'git-check-output-repository'
         New-Item -ItemType Directory -Path $fixtureRepo -Force | Out-Null
         & git -C $fixtureRepo init --quiet --initial-branch=main
+        & git -C $fixtureRepo config --local core.longpaths true
+        $LASTEXITCODE | Should -Be 0
         & git -C $fixtureRepo config user.name 'Fixture User'
         & git -C $fixtureRepo config user.email 'fixture@example.invalid'
         $fixturePath = Join-Path $fixtureRepo 'upstream.lua'
         [IO.File]::WriteAllText($fixturePath, "return true`n", [Text.UTF8Encoding]::new($false))
         & git -C $fixtureRepo add upstream.lua
+        $LASTEXITCODE | Should -Be 0
         & git -C $fixtureRepo commit --quiet -m 'fixture baseline'
+        $LASTEXITCODE | Should -Be 0
         [IO.File]::WriteAllText($fixturePath, ('return true' + ' ' + "`n"), [Text.UTF8Encoding]::new($false))
 
         $tokens = $null
@@ -2446,11 +2507,15 @@ function Get-SourceTupleContractSha256 {
         [IO.File]::WriteAllText($trackedCasePath, "old case-preserved content`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $fixtureRepo '.gitattributes'), "*.lua text`n*.txt text`n", [Text.UTF8Encoding]::new($false))
         & git -C $fixtureRepo init --quiet --initial-branch=main
+        & git -C $fixtureRepo config --local core.longpaths true
+        $LASTEXITCODE | Should -Be 0
         & git -C $fixtureRepo config user.name 'Fixture User'
         & git -C $fixtureRepo config user.email 'fixture@example.invalid'
         & git -C $fixtureRepo config core.ignorecase true
         & git -C $fixtureRepo add --all
+        $LASTEXITCODE | Should -Be 0
         & git -C $fixtureRepo commit --quiet -m 'fixture baseline'
+        $LASTEXITCODE | Should -Be 0
 
         $archivePath = Join-Path $queueRoot 'ExampleMod.zip'
         $rawText = "return {`r`n`tkey = `"Hello`",`r`n`tdynamic = `"Dynamic`",`n" + ("`r`n" * 22) + "`t`r`n`ttrail = `"keep`"`t`r`n}"
@@ -2514,10 +2579,12 @@ function Get-SourceTupleContractSha256 {
             'filename=ExampleMod.zip', "size_bytes=$manualArchiveSize", "sha256=$manualArchiveSha", 'acquisition_method=manual-queue'
         ) -join "`n") | Set-Content -LiteralPath (Join-Path $manualHashDirectory 'examplemod.hash') -NoNewline
         & git -C $fixtureRepo add README.md .hash/examplemod.hash
+        $LASTEXITCODE | Should -Be 0
         & git -C $fixtureRepo commit --quiet -m 'fixture source metadata'
+        $LASTEXITCODE | Should -Be 0
         $claimWallClock = [Diagnostics.Stopwatch]::StartNew()
         $claim = & $runnerPath claim -RepositoryRoot $fixtureRepo -ArchivePath $archivePath -ModDirectory 'ExampleMod' `
-            -SourceRequestPath $manualSourceRequestPath -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD `
+            -SourceRequestPath $manualSourceRequestPath -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD -WorktreeParent $TestDrive `
             -PassThru
         $claimWallClock.Stop()
         $claim.result | Should -Be 'passed'
