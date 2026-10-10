@@ -4,7 +4,7 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # Skill package binding
 
-Read this file before the packaged Schema 14 Workflow. It changes only how the Workflow and Review Baseline are located after conversion from the original `AI Prompt` files into an independently versioned Skill source. Every other Workflow and Baseline requirement remains normative.
+Read this file before the packaged Schema 14 Workflow. It maps the Workflow and Review Baseline after conversion from the original `AI Prompt` files into an independently versioned Skill source, and defines a repository-native metadata contract below that explicitly overrides conflicting README acquisition-metadata instructions. Every other Workflow and Baseline requirement remains normative.
 
 ## Stable Skill source
 
@@ -34,6 +34,12 @@ New automatic-source runs also bind `references/schema-15.md`. It is a repositor
 
 A Schema 15 state records `workflowSchemaVersion = 15`, `schema15Path`, `schema15BlobOid`, and `schema15Sha256` in addition to the existing Workflow and Review Baseline tuple. Schema 14 states do not gain these fields and are never migrated implicitly.
 
+## Repository-native metadata contract
+
+For new runs pinned to this Skill source, this repository-native metadata contract overrides conflicting instructions in the byte-exact Schema 14 Workflow or Review Baseline about copying acquisition fields into README. Keep one canonical Nexus-linked heading for the target MOD and its user-facing summary in `README.md`; the heading must identify the tuple's Nexus MOD ID and page URL, but README does not have to repeat the acquisition tuple. Store all 11 tuple fields as unique exact `key=value` entries in `.hash/<normalized-slug>.hash`. The runner and independent Candidate Gate validate those separate requirements; historical README acquisition records do not substitute for the active `.hash` file.
+
+This override applies to new Schema 14 and Schema 15 runs using this source package. Existing runs remain pinned to their recorded Skill source tuple and contract; do not migrate, reinterpret, or rewrite their state, source pin, or installed Skill as part of a resume.
+
 ## Translation-quality extension binding
 
 Schema 14 and Schema 15 translation decisions also bind `references/translation-quality.md` through the complete run-local Skill source pin. Read it after the packaged Workflow and with the packaged Review Baseline. It is a repository-native normative refinement of semantic translation quality: English/in-game meaning authority, independent zh-tw wording, curated existing-translation preservation, and functional rather than word-for-word completeness. It does not alter archive/source identity, deterministic target classification, byte authorization, Lua structure, security, Git evidence, Candidate Gate, publication, or merge-finalization boundaries.
@@ -55,4 +61,4 @@ The `f2912...` commit in `source-provenance.json` belongs to the original Warham
 
 ## Precedence
 
-For package-location questions, this binding overrides the original `AI Prompt` paths and workflow-branch lookup commands. `references/translation-quality.md` controls semantic translation authority, curated unchanged-source preservation, functional completeness, and the corresponding Review Finding threshold for both schemas. `references/schema-15.md` controls automatic acquisition, receipt-bound claim, status distinctions, localization workset, and workset lifecycle for new Schema 15 states. These extensions preserve content scope, safety checks, Git normalization, C0/C1/C2/C3/F evidence, Candidate Gate, append-only refresh, main-advance handling, and finalization requirements.
+For package-location questions, this binding overrides the original `AI Prompt` paths and workflow-branch lookup commands. Its repository-native metadata contract above controls the README/formal-hash split for new runs in both schemas. `references/translation-quality.md` controls semantic translation authority, curated unchanged-source preservation, functional completeness, and the corresponding Review Finding threshold for both schemas. `references/schema-15.md` controls automatic acquisition, receipt-bound claim, status distinctions, localization workset, and workset lifecycle for new Schema 15 states. These extensions preserve content scope, safety checks, Git normalization, C0/C1/C2/C3/F evidence, Candidate Gate, append-only refresh, main-advance handling, and finalization requirements.

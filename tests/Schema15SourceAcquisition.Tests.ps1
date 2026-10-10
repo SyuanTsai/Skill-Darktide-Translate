@@ -805,14 +805,10 @@ Describe 'Schema 15 source acquisition contract' {
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
         $candidateArchiveSha = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
         $candidateArchiveSize = (Get-Item -LiteralPath $downloadPath).Length
-        (@(
-            '- Nexus MOD ID: 434', '- Nexus URL: https://www.nexusmods.com/warhammer40kdarktide/mods/434',
-            '- Nexus page version: 2.0.0', '- Nexus last updated: 2026-01-02T00:00:00.0000000+00:00',
-            '- Main file ID: 545', '- Main file version: 2.0.0',
-            '- Main file uploaded at UTC: 2026-01-01T00:00:00.0000000+00:00',
-            '- Archive filename: M.zip', "- Archive size bytes: $candidateArchiveSize",
-            "- Archive SHA-256: $candidateArchiveSha", '- Acquisition method: nexus-browser'
-        ) -join "`n") | Set-Content -LiteralPath (Join-Path $repository 'README.md') -NoNewline
+@'
+### [M](https://www.nexusmods.com/warhammer40kdarktide/mods/434?tab=description)
+- MOD 版本：Manual summary 2.0.0
+'@ | Set-Content -LiteralPath (Join-Path $repository 'README.md') -NoNewline
         $candidateHashRoot = Join-Path $repository '.hash'
         New-Item -ItemType Directory -Path $candidateHashRoot -Force | Out-Null
         (@(
@@ -841,6 +837,15 @@ Describe 'Schema 15 source acquisition contract' {
         $baselineStateBytes = [IO.File]::ReadAllBytes($statePath)
         $baselineValidation = & (Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1') -StatePath $statePath -PassThru
         $baselineValidation.result | Should -Be 'passed'
+        $metadataState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $metadataPreview = Get-Content -LiteralPath $metadataState.metadataPreview.path -Raw | ConvertFrom-Json -AsHashtable
+        @($metadataPreview.sourceFields.Keys).Count | Should -Be 11
+        $readmePreview = @($metadataPreview.files | Where-Object { [string]$_.path -ceq 'README.md' })[0]
+        $readmeVerifiedFields = @($readmePreview.sourceFieldMatches.Keys | Where-Object { [bool]$readmePreview.sourceFieldMatches[$_] })
+        ($readmeVerifiedFields -join ',') | Should -Be 'nexusModId,nexusPageUrl'
+        $hashPreview = @($metadataPreview.files | Where-Object { [string]$_.path -ceq '.hash/m.hash' })[0]
+        @($hashPreview.sourceFieldMatches.Keys).Count | Should -Be 11
+        @($hashPreview.sourceFieldMatches.Values | Where-Object { -not [bool]$_ }).Count | Should -Be 0
         $reasonState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
         $reasonState.evidenceChain.c2Reason.disposition | Should -Be 'KEEP'
         $reasonState.evidenceChain.c3Reason.disposition | Should -Be 'KEEP'

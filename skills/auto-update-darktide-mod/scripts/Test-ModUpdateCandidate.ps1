@@ -187,52 +187,46 @@ function Test-MetadataSourceFieldMatch {
         return $matchesForKey.Count -eq 1 -and [string]$matchesForKey[0].Groups[1].Value -ceq $FieldValue
     }
     if ($RelativePath -cne 'README.md') { return $false }
-    $readmeText = $Text
-    if (-not [string]::IsNullOrWhiteSpace($NexusPageUrl)) {
-        $targetUri = $null
-        if (-not [Uri]::TryCreate($NexusPageUrl, [UriKind]::Absolute, [ref]$targetUri) -or
-            $targetUri.Scheme -cne 'https' -or $targetUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
-            -not [string]::IsNullOrEmpty($targetUri.UserInfo) -or -not [string]::IsNullOrEmpty($targetUri.Query) -or
-            -not [string]::IsNullOrEmpty($targetUri.Fragment) -or -not $targetUri.IsDefaultPort) {
-            return $false
+    if ($FieldName -cnotin @('nexusModId', 'nexusPageUrl')) { return $false }
+    $sourceUri = $null
+    if ([string]::IsNullOrWhiteSpace($NexusPageUrl) -or
+        -not [Uri]::TryCreate($NexusPageUrl, [UriKind]::Absolute, [ref]$sourceUri) -or
+        $sourceUri.Scheme -cne 'https' -or $sourceUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+        -not [string]::IsNullOrEmpty($sourceUri.UserInfo) -or -not [string]::IsNullOrEmpty($sourceUri.Query) -or
+        -not [string]::IsNullOrEmpty($sourceUri.Fragment) -or -not $sourceUri.IsDefaultPort) {
+        return $false
+    }
+    $sourcePathMatch = [regex]::Match(
+        $sourceUri.AbsolutePath.TrimEnd('/'),
+        '^/warhammer40kdarktide/mods/(?<modId>\d+)$'
+    )
+    if (-not $sourcePathMatch.Success) { return $false }
+    $sourceModId = [string]$sourcePathMatch.Groups['modId'].Value
+    if (($FieldName -ceq 'nexusModId' -and $FieldValue -cne $sourceModId) -or
+        ($FieldName -ceq 'nexusPageUrl' -and $FieldValue -cne $NexusPageUrl)) {
+        return $false
+    }
+    $headingMatches = @([regex]::Matches(
+        $Text,
+        '(?m)^###\s+\[[^\]\r\n]+\]\((?<url>https://[^)\s]+)\)\s*\r?$'
+    ))
+    $matchingHeadingCount = 0
+    foreach ($heading in $headingMatches) {
+        $headingUri = $null
+        if (-not [Uri]::TryCreate([string]$heading.Groups['url'].Value, [UriKind]::Absolute, [ref]$headingUri) -or
+            $headingUri.Scheme -cne 'https' -or $headingUri.Host -notin @('nexusmods.com', 'www.nexusmods.com') -or
+            -not [string]::IsNullOrEmpty($headingUri.UserInfo) -or -not $headingUri.IsDefaultPort) {
+            continue
         }
-        $targetPathMatch = [regex]::Match(
-            $targetUri.AbsolutePath.TrimEnd('/'),
+        $headingPathMatch = [regex]::Match(
+            $headingUri.AbsolutePath.TrimEnd('/'),
             '^/warhammer40kdarktide/mods/(?<modId>\d+)$'
         )
-        if (-not $targetPathMatch.Success) { return $false }
-        $headingMatches = @([regex]::Matches(
-            $Text,
-            '(?m)^###\s+\[[^\]\r\n]+\]\((?i:https://(?:www\.)?nexusmods\.com)/warhammer40kdarktide/mods/(?<modId>\d+)/?(?:\?[^#)\r\n]*)?(?:#[^)\r\n]*)?\)\s*\r?$'
-        ))
-        if ($headingMatches.Count -ne 0) {
-            $targetHeadings = @($headingMatches | Where-Object {
-                [string]$_.Groups['modId'].Value -ceq [string]$targetPathMatch.Groups['modId'].Value
-            })
-            if ($targetHeadings.Count -ne 1) { return $false }
-            $sectionStart = $targetHeadings[0].Index
-            $tailStart = $targetHeadings[0].Index + $targetHeadings[0].Length
-            $nextHeading = [regex]::Match($Text.Substring($tailStart), '(?m)^#{1,3}\s+')
-            $sectionEnd = if ($nextHeading.Success) { $tailStart + $nextHeading.Index } else { $Text.Length }
-            $readmeText = $Text.Substring($sectionStart, $sectionEnd - $sectionStart)
+        if ($headingPathMatch.Success -and [string]$headingPathMatch.Groups['modId'].Value -ceq $sourceModId) {
+            $matchingHeadingCount++
         }
     }
-    $readmeLabels = [ordered]@{
-        nexusModId = 'Nexus MOD ID'; nexusPageUrl = 'Nexus URL'; nexusPageVersion = 'Nexus page version'
-        nexusPageUpdatedAt = 'Nexus last updated'; nexusMainFileId = 'Main file ID'; nexusMainFileVersion = 'Main file version'
-        nexusMainFileUploadedAtUtc = 'Main file uploaded at UTC'; archiveFileName = 'Archive filename'
-        archiveSize = 'Archive size bytes'; archiveSha256 = 'Archive SHA-256'; acquisitionMethod = 'Acquisition method'
-    }
-    if (-not $readmeLabels.Contains($FieldName)) { return $false }
-    $label = [regex]::Escape([string]$readmeLabels[$FieldName])
-    $matchesForLabel = @([regex]::Matches($readmeText, ('(?m)^\s*-\s+{0}\s*:\s*([^{1}{2}]*){1}?$' -f ([string]$label), [char]13, [char]10)) )
-    if ($matchesForLabel.Count -ne 1) { return $false }
-    $recorded = ([string]$matchesForLabel[0].Groups[1].Value).Trim()
-    if ($recorded.Length -ge 2 -and $recorded.StartsWith('`', [StringComparison]::Ordinal) -and
-        $recorded.EndsWith('`', [StringComparison]::Ordinal)) {
-        $recorded = $recorded.Substring(1, $recorded.Length - 2)
-    }
-    $recorded -ceq $FieldValue
+    $matchingHeadingCount -eq 1
 }
 
 function Assert-NoReparsePath {
@@ -582,8 +576,8 @@ function Assert-SourceTupleIntegrity {
         'nexusMainFileUploadedAtUtc', 'archiveFileName', 'archiveSize', 'archiveSha256', 'acquisitionMethod'
     )
     $requiredMetadataFields = [ordered]@{
-        'README.md' = $completeSourceFieldNames
-        (".hash/{0}.hash" -f ([string]$State.modSlug)) = $completeSourceFieldNames
+        'readme.md' = @('nexusModId', 'nexusPageUrl')
+        ((".hash/{0}.hash" -f ([string]$State.modSlug)).ToLowerInvariant()) = $completeSourceFieldNames
     }
     $actualMetadataPaths = @($previewFiles | ForEach-Object { ([string]$_.path).Replace('\', '/') } | Sort-Object)
     $expectedMetadataPaths = @($requiredMetadataFields.Keys | Sort-Object)
@@ -640,7 +634,7 @@ function Assert-SourceTupleIntegrity {
                 throw "Metadata preview field evidence is inconsistent: $relative / $fieldName"
             }
         }
-        foreach ($requiredField in @($requiredMetadataFields[$relative])) {
+        foreach ($requiredField in @($requiredMetadataFields[$relative.ToLowerInvariant()])) {
             if (-not [bool]$file.sourceFieldMatches[$requiredField]) {
                 throw "Metadata file is missing or mixes an immutable source tuple field: $relative / $requiredField"
             }

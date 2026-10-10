@@ -1090,9 +1090,9 @@ function Suspend-Stage {
         $runner | Should -Not -Match '\$gitCommand -in @\([^\)]*''gh'''
     }
 
-    It 'UnitT176_RequiresUniqueExactLabeledSourceMetadataValues' {
-        $candidateSource = Get-Content -LiteralPath $validatorPath -Raw
-        $candidateSource | Should -Match '''README\.md''\s*=\s*\$completeSourceFieldNames'
+    # Scenario: The target MOD is represented by one canonical Nexus heading while complete acquisition facts remain only in its formal hash file.
+    # Purpose: Keep README identity bound to the immutable source tuple without treating human-readable summaries as acquisition metadata.
+    It 'UnitT176_RequiresCanonicalReadmeIdentityAndExactHashTuple' {
         foreach ($path in @($runnerPath, $validatorPath)) {
             $tokens = $null
             $parseErrors = $null
@@ -1110,42 +1110,85 @@ function Suspend-Stage {
                     -FieldValue $fieldValue -NexusPageUrl $nexusPageUrl
             }
 
-            (& $module $invokeMatch 'README.md' '- Archive filename: ExampleMod.zip' 'archiveFileName' 'ExampleMod.zip') |
-                Should -BeTrue
-            (& $module $invokeMatch 'README.md' '- Archive filename: prefix-ExampleMod.zip.bak' 'archiveFileName' 'ExampleMod.zip') |
+            $targetUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/2'
+            $readme = @'
+### [Example MOD](https://www.nexusmods.com/warhammer40kdarktide/mods/2?tab=files)
+- MOD 版本：Manual summary 2.0.0
+'@
+            (& $module $invokeMatch 'README.md' $readme 'nexusModId' '2' $targetUrl) | Should -BeTrue
+            (& $module $invokeMatch 'README.md' $readme 'nexusPageUrl' $targetUrl $targetUrl) | Should -BeTrue
+            (& $module $invokeMatch 'README.md' $readme 'nexusModId' '1' $targetUrl) | Should -BeFalse
+            (& $module $invokeMatch 'README.md' $readme 'nexusPageUrl' 'https://www.nexusmods.com/warhammer40kdarktide/mods/1' $targetUrl) |
                 Should -BeFalse
-            (& $module $invokeMatch 'README.md' ("- Archive filename: ExampleMod.zip`n- Archive filename: ExampleMod.zip") 'archiveFileName' 'ExampleMod.zip') |
+            $legacyReadme = @($readme, '- Nexus page version: 2.0.0', '- Archive filename: ExampleMod.zip') -join [Environment]::NewLine
+            (& $module $invokeMatch 'README.md' $legacyReadme 'archiveFileName' 'ExampleMod.zip' $targetUrl) | Should -BeFalse
+            $duplicateTargetHeading = @($readme, '### [Duplicate](https://www.nexusmods.com/warhammer40kdarktide/mods/2)') -join [Environment]::NewLine
+            (& $module $invokeMatch 'README.md' $duplicateTargetHeading 'nexusModId' '2' $targetUrl) | Should -BeFalse
+            $missingTargetHeading = @'
+### [Other MOD](https://www.nexusmods.com/warhammer40kdarktide/mods/1)
+- Nexus MOD ID: 2
+- Nexus page version: 2.0.0
+- Archive filename: ExampleMod.zip
+'@
+            (& $module $invokeMatch 'README.md' $missingTargetHeading 'nexusModId' '2' $targetUrl) | Should -BeFalse
+            (& $module $invokeMatch 'README.md' $missingTargetHeading 'nexusPageUrl' $targetUrl $targetUrl) | Should -BeFalse
+
+            $completeHash = @'
+nexus_id=2
+nexus_url=https://www.nexusmods.com/warhammer40kdarktide/mods/2
+nexus_page_version=2.0.0
+nexus_last_updated=2026-01-02T00:00:00.0000000+00:00
+main_file_id=456
+version=1.9.0
+main_file_uploaded_at_utc=2026-01-01T00:00:00.0000000+00:00
+filename=ExampleMod.zip
+size_bytes=1234
+sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+acquisition_method=manual-queue
+'@
+            $hashTupleValues = [ordered]@{
+                nexusModId = '2'; nexusPageUrl = $targetUrl; nexusPageVersion = '2.0.0'
+                nexusPageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; nexusMainFileId = '456'
+                nexusMainFileVersion = '1.9.0'; nexusMainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
+                archiveFileName = 'ExampleMod.zip'; archiveSize = '1234'
+                archiveSha256 = ('a' * 64); acquisitionMethod = 'manual-queue'
+            }
+            foreach ($fieldName in $hashTupleValues.Keys) {
+                (& $module $invokeMatch '.hash/examplemod.hash' $completeHash $fieldName ([string]$hashTupleValues[$fieldName]) $targetUrl) |
+                    Should -BeTrue -Because "the formal hash uniquely records $fieldName"
+            }
+            (& $module $invokeMatch '.hash/examplemod.hash' $completeHash 'nexusPageVersion' '1.9.0' $targetUrl) | Should -BeFalse
+            (& $module $invokeMatch '.hash/examplemod.hash' $completeHash 'nexusMainFileVersion' '2.0.0' $targetUrl) | Should -BeFalse
+            $duplicateHash = @($completeHash, 'version=1.9.0') -join [Environment]::NewLine
+            (& $module $invokeMatch '.hash/examplemod.hash' $duplicateHash 'nexusMainFileVersion' '1.9.0' $targetUrl) |
                 Should -BeFalse
-            (& $module $invokeMatch 'README.md' '- Main file ID: 999' 'nexusMainFileId' '456') |
+            $wrongHash = $completeHash.Replace('version=1.9.0', 'version=9.9.9')
+            (& $module $invokeMatch '.hash/examplemod.hash' $wrongHash 'nexusMainFileVersion' '1.9.0' $targetUrl) |
                 Should -BeFalse
-            (& $module $invokeMatch '.hash/examplemod.hash' 'filename=ExampleMod.zip' 'archiveFileName' 'ExampleMod.zip') |
-                Should -BeTrue
-            (& $module $invokeMatch '.hash/examplemod.hash' 'filename=prefix-ExampleMod.zip.bak' 'archiveFileName' 'ExampleMod.zip') |
+            $missingHashField = [regex]::Replace($completeHash, '(?m)^main_file_id=456\r?\n', '')
+            (& $module $invokeMatch '.hash/examplemod.hash' $missingHashField 'nexusMainFileId' '456' $targetUrl) |
+                Should -BeFalse
+            $prefixSuffixHash = $completeHash.Replace('filename=ExampleMod.zip', 'filename=prefix-ExampleMod.zip.bak')
+            (& $module $invokeMatch '.hash/examplemod.hash' $prefixSuffixHash 'archiveFileName' 'ExampleMod.zip' $targetUrl) |
                 Should -BeFalse
 
             $multiModReadme = @'
 ### [First MOD](https://www.nexusmods.com/warhammer40kdarktide/mods/1)
-- Archive filename: FirstMod.zip
 
 ### [Example MOD](https://www.nexusmods.com/warhammer40kdarktide/mods/2?tab=files)
-- Archive filename: ExampleMod.zip
+- MOD 版本：Manual summary 2.0.0
 '@
-            (& $module $invokeMatch 'README.md' $multiModReadme 'archiveFileName' 'ExampleMod.zip' `
-                'https://www.nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeTrue
-            (& $module $invokeMatch 'README.md' $multiModReadme 'archiveFileName' 'FirstMod.zip' `
-                'https://www.nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeFalse
+            (& $module $invokeMatch 'README.md' $multiModReadme 'nexusModId' '2' 'https://www.nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeTrue
+            (& $module $invokeMatch 'README.md' $multiModReadme 'nexusModId' '1' 'https://www.nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeFalse
 
             $nonWwwMultiModReadme = @'
 ### [First MOD](https://nexusmods.com/warhammer40kdarktide/mods/1/)
-- Archive filename: Wrong-Section.zip
 
 ### [Example MOD](https://nexusmods.com/warhammer40kdarktide/mods/2/?tab=files)
-- Archive filename: ExampleMod.zip
+- MOD 版本：Manual summary 2.0.0
 '@
-            (& $module $invokeMatch 'README.md' $nonWwwMultiModReadme 'archiveFileName' 'ExampleMod.zip' `
-                'https://nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeTrue
-            (& $module $invokeMatch 'README.md' $nonWwwMultiModReadme 'archiveFileName' 'Wrong-Section.zip' `
-                'https://nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeFalse
+            (& $module $invokeMatch 'README.md' $nonWwwMultiModReadme 'nexusPageUrl' 'https://nexusmods.com/warhammer40kdarktide/mods/2' 'https://nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeTrue
+            (& $module $invokeMatch 'README.md' $nonWwwMultiModReadme 'nexusModId' '1' 'https://nexusmods.com/warhammer40kdarktide/mods/2') | Should -BeFalse
         }
     }
 
@@ -2557,25 +2600,21 @@ function Get-SourceTupleContractSha256 {
         $manualSourceRequestPath = Join-Path $TestDrive 'manual-source-request.json'
         [ordered]@{
             schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
-            version = '2.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+            version = '1.9.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
             pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
         } | ConvertTo-Json | Set-Content -LiteralPath $manualSourceRequestPath -NoNewline
         $manualArchiveSha = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
         $manualArchiveSize = (Get-Item -LiteralPath $archivePath).Length
-        (@(
-            '- Nexus MOD ID: 123', '- Nexus URL: https://www.nexusmods.com/warhammer40kdarktide/mods/123',
-            '- Nexus page version: 2.0.0', '- Nexus last updated: 2026-01-02T00:00:00.0000000+00:00',
-            '- Main file ID: 456', '- Main file version: 2.0.0',
-            '- Main file uploaded at UTC: 2026-01-01T00:00:00.0000000+00:00',
-            '- Archive filename: ExampleMod.zip', "- Archive size bytes: $manualArchiveSize",
-            "- Archive SHA-256: $manualArchiveSha", '- Acquisition method: manual-queue'
-        ) -join "`n") | Set-Content -LiteralPath (Join-Path $fixtureRepo 'README.md') -NoNewline
+@'
+### [Example MOD](https://www.nexusmods.com/warhammer40kdarktide/mods/123?tab=description)
+- MOD 版本：Manual summary 2.0.0
+'@ | Set-Content -LiteralPath (Join-Path $fixtureRepo 'README.md') -NoNewline
         $manualHashDirectory = Join-Path $fixtureRepo '.hash'
         New-Item -ItemType Directory -Path $manualHashDirectory -Force | Out-Null
         (@(
             'nexus_id=123', 'nexus_url=https://www.nexusmods.com/warhammer40kdarktide/mods/123',
             'nexus_page_version=2.0.0', 'nexus_last_updated=2026-01-02T00:00:00.0000000+00:00',
-            'main_file_id=456', 'version=2.0.0', 'main_file_uploaded_at_utc=2026-01-01T00:00:00.0000000+00:00',
+            'main_file_id=456', 'version=1.9.0', 'main_file_uploaded_at_utc=2026-01-01T00:00:00.0000000+00:00',
             'filename=ExampleMod.zip', "size_bytes=$manualArchiveSize", "sha256=$manualArchiveSha", 'acquisition_method=manual-queue'
         ) -join "`n") | Set-Content -LiteralPath (Join-Path $manualHashDirectory 'examplemod.hash') -NoNewline
         & git -C $fixtureRepo add README.md .hash/examplemod.hash
@@ -2779,23 +2818,33 @@ function Get-SourceTupleContractSha256 {
         $attributeDriftState.evidenceChain.c1Oid | Should -BeNullOrEmpty
         [IO.File]::WriteAllBytes($attributesPath, $attributesBytes)
 
+        $metadataHashPath = Join-Path ([string]$recoveredLocalizationState.worktreePath) '.hash/examplemod.hash'
+        $metadataHashBytes = [IO.File]::ReadAllBytes($metadataHashPath)
+        $metadataHashText = [Text.Encoding]::UTF8.GetString($metadataHashBytes)
+        $metadataHashText = $metadataHashText.Replace('version=1.9.0', 'version=9.9.9')
+        [IO.File]::WriteAllText($metadataHashPath, $metadataHashText, [Text.UTF8Encoding]::new($false))
+        { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
+            Should -Throw '*Metadata preflight field mismatch: .hash/examplemod.hash nexusMainFileVersion*'
+        $hashMismatchState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        (& git -C $hashMismatchState.worktreePath rev-parse HEAD).Trim() | Should -Be $hashMismatchState.evidenceChain.c0Oid
+        $hashMismatchState.evidenceChain.c1Oid | Should -BeNullOrEmpty
+        [IO.File]::WriteAllBytes($metadataHashPath, $metadataHashBytes)
+
         $metadataReadmePath = Join-Path ([string]$recoveredLocalizationState.worktreePath) 'README.md'
         $metadataReadmeBytes = [IO.File]::ReadAllBytes($metadataReadmePath)
         $metadataReadmeText = [Text.Encoding]::UTF8.GetString($metadataReadmeBytes)
         $metadataReadmeText = $metadataReadmeText.Replace(
-            '- Nexus page version: 2.0.0',
-            '- Nexus page version: incorrect-version'
+            '/mods/123?tab=description',
+            '/mods/999?tab=description'
         )
         [IO.File]::WriteAllText($metadataReadmePath, $metadataReadmeText, [Text.UTF8Encoding]::new($false))
         { & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru } |
-            Should -Throw '*Metadata preflight field mismatch: README.md nexusPageVersion*'
+            Should -Throw '*Metadata preflight field mismatch: README.md nexusModId*'
         $metadataMismatchState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
         (& git -C $metadataMismatchState.worktreePath rev-parse HEAD).Trim() | Should -Be $metadataMismatchState.evidenceChain.c0Oid
         $metadataMismatchState.evidenceChain.c1Oid | Should -BeNullOrEmpty
         [IO.File]::WriteAllBytes($metadataReadmePath, $metadataReadmeBytes)
 
-        $metadataHashPath = Join-Path ([string]$recoveredLocalizationState.worktreePath) '.hash/examplemod.hash'
-        $metadataHashBytes = [IO.File]::ReadAllBytes($metadataHashPath)
         [IO.File]::Delete($metadataHashPath)
         $metadataWaiting = & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru
         $metadataWaiting.result | Should -Be 'waiting-input'
@@ -2846,11 +2895,21 @@ function Get-SourceTupleContractSha256 {
 
         $resumedBuild = & $runnerPath build-commits -RepositoryRoot $fixtureRepo -StatePath $statePath -PassThru
         $resumedBuild.result | Should -Be 'passed'
-        $resumedBuild.stageTimings.attempts.Count | Should -Be 8
-        @($resumedBuild.stageTimings.attempts | Where-Object result -eq 'failed').Count | Should -Be 6
+        $resumedBuild.stageTimings.attempts.Count | Should -Be 9
+        @($resumedBuild.stageTimings.attempts | Where-Object result -eq 'failed').Count | Should -Be 7
         @($resumedBuild.stageTimings.attempts | Where-Object result -eq 'waiting-input').Count | Should -Be 1
         $resumedBuild.stageTimings.attempts[-1].result | Should -Be 'passed'
         $preGateState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $metadataPreview = Get-Content -LiteralPath $preGateState.metadataPreview.path -Raw | ConvertFrom-TestJson -AsHashtable
+        @($metadataPreview.sourceFields.Keys).Count | Should -Be 11
+        $metadataPreview.sourceFields.nexusPageVersion | Should -Be '2.0.0'
+        $metadataPreview.sourceFields.nexusMainFileVersion | Should -Be '1.9.0'
+        $readmePreview = @($metadataPreview.files | Where-Object { [string]$_.path -ceq 'README.md' })[0]
+        $readmeVerifiedFields = @($readmePreview.sourceFieldMatches.Keys | Where-Object { [bool]$readmePreview.sourceFieldMatches[$_] })
+        ($readmeVerifiedFields -join ',') | Should -Be 'nexusModId,nexusPageUrl'
+        $hashPreview = @($metadataPreview.files | Where-Object { [string]$_.path -ceq '.hash/examplemod.hash' })[0]
+        @($hashPreview.sourceFieldMatches.Keys).Count | Should -Be 11
+        @($hashPreview.sourceFieldMatches.Values | Where-Object { -not [bool]$_ }).Count | Should -Be 0
         $rawEvidenceStart = [Diagnostics.ProcessStartInfo]::new()
         $rawEvidenceStart.FileName = 'git'
         $rawEvidenceStart.UseShellExecute = $false
