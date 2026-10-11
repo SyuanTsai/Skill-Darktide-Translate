@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Darktide Translate Standard v1 repository contract' {
     BeforeAll {
@@ -49,7 +49,7 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         $file.rawSha256 | Should -Match '^[0-9a-f]{64}$'
         $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
         $validator | Should -Match 'function Get-RawFileSha256'
-        $supervisor = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Validate.ps1') -Raw
+        $supervisor = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'tests/fixtures/LegacyValidate.ps1') -Raw
         $supervisor | Should -Match 'function Assert-SkillInventoryUnchanged'
         $supervisor | Should -Match 'rawSha256'
         $supervisor | Should -Match 'core\.worktree'

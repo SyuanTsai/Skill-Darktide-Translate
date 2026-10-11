@@ -3,13 +3,13 @@
   "standardVersion": "v1",
   "authority": {
     "repository": "https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git",
-    "commit": "a403abdf038a3346d775431a6908a71cc3d35a5b",
-    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/a403abdf038a3346d775431a6908a71cc3d35a5b",
-    "archiveSha256": "17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3",
+    "commit": "ff85d5f80fe795b96354e753074b5ce59ad04ecd",
+    "archiveUrl": "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/ff85d5f80fe795b96354e753074b5ce59ad04ecd",
+    "archiveSha256": "3dc38613f2e2316ad8fcc79d4bf48d0b03fd8398f8dacc72d156abcbce95ea9d",
     "files": [
       {
         "path": "docs/standards/README.md",
-        "sha256": "5e1ddd737d26a5ec1ff1ebd08e158376ddaf1ea21008bb987fc7f51376923f7c"
+        "sha256": "43c1526ac55302f62b706688905be160d9805cc3a6a800189d689e66fa727b71"
       },
       {
         "path": "docs/standards/managed-skill-lifecycle.md",
@@ -29,39 +29,111 @@
       },
       {
         "path": "docs/standards/schemas/validation-security-gate-v1.schema.json",
-        "sha256": "56979baa08f3ec5534e3a17f925d53e69accd4cdc500872e92ca56b694044ea6"
+        "sha256": "ac58302e0e350c1ab4ba4dad8a33cd3abce12d592537fbdb23dfb1936d064e91"
       },
       {
         "path": "docs/standards/skill-repository-review-matrix.md",
-        "sha256": "c345ad3ec32d1941df5c5757ce96b4430c0223b3f8ed99f2a4de7dc9923410f2"
+        "sha256": "299925aabe3cab360827baad9bdeb1f0f56fc320dad967e49fe0b6bf9cdf8f8a"
       },
       {
         "path": "docs/standards/skill-repository-standard.md",
-        "sha256": "78a72aa8214acd5a5e202df34bbb20f8cfd841ab3d181de10645a777267cfd5d"
+        "sha256": "86a24a75eaf96f9eaa02307937a46d1b2ce788cf63b4657c60bec9815b2ca4b3"
       },
       {
         "path": "docs/standards/upstream-interoperability.md",
-        "sha256": "9c544fbfb6b77a589514f1926aa1488882e932786a303a42ce6c6c9b2ba80c7e"
+        "sha256": "4329e8586e88713027bcd95c7537331e050a89b004f2361223efdc01bf44370e"
       },
       {
         "path": "docs/standards/validation-security-gate.json",
-        "sha256": "e303e8c3d484012022f5c4da694c3fe21ff02395b0b9b7e973a4234d4182f485"
+        "sha256": "657122dde340f1f7f4442780cc27ffcb00b60c0d2afdcea22d63fbf7dbfdca7d"
       },
       {
         "path": "docs/standards/validation-toolchain.json",
-        "sha256": "5925dcb1aea1e545b9787a29825e7a0cc03a04c777cd68ab44c9bdd7482ff579"
+        "sha256": "1dddbf4c5736e22e56f6ecb298542f41d39e116ab00ca24ad18beb7a3eab40ed"
       },
       {
         "path": "scripts/Invoke-StandardAuthorityGate.ps1",
-        "sha256": "c98d3f1b181ba0e7d3894729a8f1636984407c20454a27e0e383799c2f90425f"
+        "sha256": "8e00ee1e48ef8359ab7be3539f8f7585ccde18b41e26d810843715ebc3656a4c"
       },
       {
         "path": "scripts/Resolve-PythonWheelClosure.py",
-        "sha256": "7fa1511a3e3ba257c6d9e37f929f68e5684184a3a2756a3f9e765ccc6e69d208"
+        "sha256": "f9fcd99c408849f98564fbc4c30f3d7e6ad8148b60cb4d8f58fc29b040c4519c"
       },
       {
         "path": "scripts/Resolve-StandardValidationTool.ps1",
-        "sha256": "3744bc4549612e5997361315a8fd5e1ea803ade26052cf4eaf2ccdc1776fcf6e"
+        "sha256": "71e6d5b191b74202e96f34a856d3317efb18662e17c8368d112d89b7d6795b15"
+      },
+      {
+        "path": "docs/standards/schemas/standard-validation-adapter-v1.schema.json",
+        "sha256": "11aa88fc25716d748bd4f514f1a44f02390ad1745dd5a5c5beee07f642fd5639"
+      },
+      {
+        "path": "docs/standards/schemas/standard-validation-evidence-v1.schema.json",
+        "sha256": "8ed4a9d7158273d7a1e9d898acf07f57e9170822cb7cbb70f1e2eec7195867ee"
+      },
+      {
+        "path": "docs/standards/standard-validation-contract-v1.json",
+        "sha256": "707edf8945ad9a7097df1dfb22a8f05ce47d0e0a66e2e44381036d630e854da0"
+      },
+      {
+        "path": "docs/standards/pr12-source-merge-adoption.json",
+        "sha256": "4c5262f2a11d228195230c15fa4faaf9614af6b59f110e5d9c08f242ce809175"
+      },
+      {
+        "path": "docs/standards/trust-anchors/human-approval-public-key.xml",
+        "sha256": "1e46153b72d02f3ce2fb26becd449df4f1590d8e5cb441b1954006a5602bbd9b"
+      },
+      {
+        "path": "docs/standards/trust-anchors/trusted-supervisor-public-key.xml",
+        "sha256": "4d550851f43405920156f40c9fc648d99a69dd73efc200f6968d8a837e7fbf27"
+      },
+      {
+        "path": "scripts/Invoke-StandardValidation.ps1",
+        "sha256": "a4ee880810171428a6abd2e8fd5db2da1eaeda4abc0fc6c72dc259b4a709174b"
+      },
+      {
+        "path": "docs/standards/schemas/standard-semantic-consent-evidence-v2.schema.json",
+        "sha256": "109091979d0a47e2035d3d8b20963fcdb85680e5da737bf1f27121608115d430"
+      },
+      {
+        "path": "scripts/StandardSemanticBridge.psm1",
+        "sha256": "daf90f703898cc56fc3310e1eec462bafa6552edcac0de4f08a3cd4b9f63a429"
+      },
+      {
+        "path": "docs/standards/schemas/upstream-adapter-v1.schema.json",
+        "sha256": "3cff6246463188a91cc54c6a46315a949314767a759c6214e5b28e4db95ac8d7"
+      },
+      {
+        "path": "docs/standards/upstream-adapter.json",
+        "sha256": "c4f5133b24841bb9c66182dc3d5a027596f864ec28e410d47249a67b3b97ad31"
+      },
+      {
+        "path": "scripts/Validate-UpstreamAdapter.ps1",
+        "sha256": "3b6e6474690b1ae9f9486544b68f50ca29b96f5dbe6aa8d6c6cd8570afad500b"
+      },
+      {
+        "path": "docs/standards/standard-core-validation-v2.json",
+        "sha256": "2ba91aec827a642517fd90d294524e0dfc3fed9ae19c27d867d442d73b4915d6"
+      },
+      {
+        "path": "docs/standards/schemas/standard-core-adapter-v2.schema.json",
+        "sha256": "7399980e8765528b759a3734a133447eb9581ac24a9c4780dc8faadd6af0c1c5"
+      },
+      {
+        "path": "docs/standards/schemas/standard-core-evidence-v2.schema.json",
+        "sha256": "4a8c61f32484bfe928e4f15f6422de7dc7b63d9d1fc95bca4f8f5c4c37334d24"
+      },
+      {
+        "path": "docs/standards/third-party-raw-skill-sources.md",
+        "sha256": "18649fd56eada4a94a5d47de778669b0ebcecfb85b84f5c581d283b21979f7ac"
+      },
+      {
+        "path": "docs/standards/schemas/third-party-raw-skill-source-v1.schema.json",
+        "sha256": "9d8585d95c606486f947a3f89e39341af840335376e86910eb7f4ed25bdc16ed"
+      },
+      {
+        "path": "docs/standards/examples/third-party-raw-skill-source-v1.json",
+        "sha256": "decbf276cbeea33c60d8b36b7b16838babe951cd84d13ae4a8a7a8261dc6d9c8"
       }
     ]
   },

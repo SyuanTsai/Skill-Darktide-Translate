@@ -23,6 +23,7 @@ Describe 'Atomic caller-specified validation output' {
                     '-NonInteractive',
                     '-File', $script:RepositoryValidator,
                     '-RepositoryRoot', $script:RepositoryRoot,
+                    '-ReadOnlySnapshot',
                     '-OutputPath', $OutputPath)) {
                 [void]$startInfo.ArgumentList.Add([string]$argument)
             }

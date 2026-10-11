@@ -66,7 +66,8 @@ Describe 'Repository pre-push validation' {
         $prePush | Should -Match 'ArtifactsRoot'
         $prePush | Should -Match 'BaseCommit'
         $prePush | Should -Not -Match 'tests/Invoke-Tests\.ps1'
-        $prePush | Should -Not -Match 'Test-ReferenceIntegrity\.ps1'
+        $prePush | Should -Match 'Test-ReferenceIntegrity\.ps1'
+        $prePush | Should -Match 'Assert-StandardCoreSourceCheckReport'
     }
 }
 

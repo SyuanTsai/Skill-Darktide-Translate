@@ -26,3 +26,5 @@ Create a new commit that restores the previous behavior and publish a new patch 
 ## Safe fallback
 
 If the pinned Workflow, Review Baseline, Schema 15 extension, package binding, source commit, or content hash cannot be verified, treat the Skill as unavailable for new claims. Preserve existing run state, source archives, receipts, acquisition records, reservations, worktrees, branches, PRs, and evidence until the original tuple can be restored.
+
+Source checks use the merged SYP-280 authority through explicit, separate `-PrepareSourceTools` and `-SourceValidation` requests to `scripts/Validate.ps1`. The pre-push wrapper prepares verified tools once, then executes the same frozen run with real package tools, SkillSpector Static, and the complete Pester tree. Reports retain `releaseEligible=false`: passing source checks permits source review and does not approve a release or USER deployment. PR validation uses the exact protected base driver; consumer updates remain separate. Historical helpers under `tests/fixtures/` are inactive regression fixtures and cannot replace the canonical gate.

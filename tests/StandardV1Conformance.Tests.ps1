@@ -42,48 +42,13 @@ Describe 'Darktide Translate Standard v1 conformance' {
         $adapter.deviations | Should -Be 'None'
     }
 
-    It 'exposes the canonical validator and central tool integration' {
+    # Scenario: source validation uses the central Core v2 adapter and frozen real tools.
+    # Purpose: Bind the current executable gate rather than the inactive legacy fixture.
+    It 'exposes the canonical source validator and central tool integration' {
         $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
-        $validator | Should -Match 'Test-Repository\.ps1'
-        $validator | Should -Match 'skillspector'
-        $validator | Should -Match 'skill-validator'
-        $validator | Should -Match 'skill-tools'
-        $validator | Should -Match 'Invoke-Pester'
-        $validator | Should -Match '\[string\] \$BaseCommit'
-        $validator | Should -Match 'repositoryValidatorBytes'
-        $validator | Should -Match 'postPesterRepositoryValidatorScript'
-        $validator | Should -Match '\[scriptblock\]::Create'
-        $validator | Should -Match 'rev-parse --git-common-dir'
-        $validator | Should -Match 'Git common metadata directory'
-        $validator | Should -Not -Match 'postPesterRepositoryValidatorPath'
-    }
-
-    # Scenario: The canonical validator is invoked on a host outside the supported Windows CI runtime.
-    # Purpose: Fail before validation setup so an unsupported host cannot produce a misleading report.
-    It 'UnitT50_RejectsUnsupportedHostsBeforeValidationSetup' {
-        $validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
-        $hostDetection = $validator.IndexOf('$script:IsWindowsHost =', [StringComparison]::Ordinal)
-        $validationSetup = $validator.IndexOf('function Read-StrictUtf8File', [StringComparison]::Ordinal)
-        $guard = [regex]::Match($validator,
-            "(?s)if \(-not \`$script:IsWindowsHost\) \{\s*throw 'Standard v1 validation requires Windows with PowerShell 7\.'\s*\}")
-
-        $hostDetection | Should -BeGreaterOrEqual 0
-        $guard.Success | Should -BeTrue
-        $guard.Index | Should -BeGreaterThan $hostDetection
-        $guard.Index | Should -BeLessThan $validationSetup
-
-        $guardBlock = [scriptblock]::Create($guard.Value)
-        $previousHostFlag = Get-Variable -Name IsWindowsHost -Scope Script -ErrorAction SilentlyContinue
-        try {
-            $script:IsWindowsHost = $false
-            { & $guardBlock } | Should -Throw -ExpectedMessage 'Standard v1 validation requires Windows with PowerShell 7.'
-            $script:IsWindowsHost = $true
-            { & $guardBlock } | Should -Not -Throw
+        foreach ($name in @('Test-Repository.ps1','skillspector','skill-validator','skill-tools','SourceValidation','PrepareSourceTools','Invoke-StandardValidation.ps1','New-StandardCoreAdapterV2','Assert-AuthorityConfig')) {
+            $validator | Should -Match ([regex]::Escape($name))
         }
-        finally {
-            if ($null -ne $previousHostFlag) { $script:IsWindowsHost = $previousHostFlag.Value }
-            else { Remove-Variable -Name IsWindowsHost -Scope Script -ErrorAction SilentlyContinue }
-        }
+        $validator | Should -Not -Match 'approvedAuthorityCommit|LegacyValidate.ps1'
     }
-
 }

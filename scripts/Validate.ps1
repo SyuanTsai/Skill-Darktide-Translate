@@ -1,75 +1,86 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 #requires -Version 7.0
-
 [CmdletBinding()]
 param(
     [string] $RepositoryRoot,
-    [string] $ArtifactsRoot = $(
-        if (-not [string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) { $env:RUNNER_TEMP }
-        else { [IO.Path]::GetTempPath() }
-    ),
+    [string] $ArtifactsRoot = $([IO.Path]::GetTempPath()),
     [string] $AuthorityArchivePath,
+    [string] $AuthorityRepositoryRoot,
+    [string] $TrustedToolRoot,
     [string] $BaseCommit,
-    [string] $TrustedTestCommit,
     [string] $ExpectedGoRuntimeVersion = $env:STANDARD_GO_RUNTIME_VERSION,
     [string] $OutputPath,
-    [switch] $BootstrapTransition,
-    [switch] $EnableSemanticScan,
-    [string[]] $SemanticCredentialNames = @(),
-    [switch] $ProtectedPesterServerProxy,
-    [switch] $ProtectedPesterSupervisor,
-    [string] $PesterWorkerPath,
-    [string] $PesterTestsRoot,
-    [string] $PesterModulePath,
-    [string] $PesterExpectedVersion,
-    [string] $PesterMirrorRoot,
-    [string] $PesterInstallRoot,
-    [string] $PesterSupervisorPath,
-    [string] $PesterChildWritableRoot,
-    [string] $PesterDiagnosticRoot,
-    [string] $PesterRunnerSha256,
-    [string] $PesterTrustedTestCommit,
-    [string] $PesterProxyPowerShellPath,
-    [string] $PesterProxyWorkingDirectory,
-    [string] $PesterProxyDiagnosticRoot,
-    [string] $PesterProxyChildWritableRoot,
-    [string] $PesterProxyReadOnlyPathsJson
+    [switch] $PrepareSourceTools,
+    [switch] $SourceValidation,
+    [string] $SourceToolsPath,
+    [ValidateRange(1,10800)][int] $TimeoutSeconds = 1800
 )
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:IsWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
-if (-not $script:IsWindowsHost) {
-    throw 'Standard v1 validation requires Windows with PowerShell 7.'
+$script:SourceRepository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+$script:AuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
+$script:SourceAuthorityCommit = 'ff85d5f80fe795b96354e753074b5ce59ad04ecd'
+$script:SourceAuthorityArchiveSha256 = '3dc38613f2e2316ad8fcc79d4bf48d0b03fd8398f8dacc72d156abcbce95ea9d'
+$script:SourceAuthorityFiles = [ordered]@{
+    'docs/standards/README.md' = '43c1526ac55302f62b706688905be160d9805cc3a6a800189d689e66fa727b71'
+    'docs/standards/managed-skill-lifecycle.md' = '70950cf8bdd02819efae6f6e06ac5be1da3e70f809c23e3c6f8d3b217797416c'
+    'docs/standards/schemas/managed-skill-lifecycle-v1.schema.json' = '9a7f4c02588d2b88194e953a41766a72a9426fa89d4c3781c5750dcc22d35863'
+    'docs/standards/schemas/openai-agent-metadata.schema.json' = '23c1aaee28a54fea1946a61d6122a2097906ffa5bdd66c8014fc6b1625c9062a'
+    'docs/standards/schemas/source-inventory-v2.schema.json' = '084550944b4141ab5535f58fb6e99730a5c34b56103f6b59fd5a352679caa98e'
+    'docs/standards/schemas/validation-security-gate-v1.schema.json' = 'ac58302e0e350c1ab4ba4dad8a33cd3abce12d592537fbdb23dfb1936d064e91'
+    'docs/standards/skill-repository-review-matrix.md' = '299925aabe3cab360827baad9bdeb1f0f56fc320dad967e49fe0b6bf9cdf8f8a'
+    'docs/standards/skill-repository-standard.md' = '86a24a75eaf96f9eaa02307937a46d1b2ce788cf63b4657c60bec9815b2ca4b3'
+    'docs/standards/upstream-interoperability.md' = '4329e8586e88713027bcd95c7537331e050a89b004f2361223efdc01bf44370e'
+    'docs/standards/validation-security-gate.json' = '657122dde340f1f7f4442780cc27ffcb00b60c0d2afdcea22d63fbf7dbfdca7d'
+    'docs/standards/validation-toolchain.json' = '1dddbf4c5736e22e56f6ecb298542f41d39e116ab00ca24ad18beb7a3eab40ed'
+    'scripts/Invoke-StandardAuthorityGate.ps1' = '8e00ee1e48ef8359ab7be3539f8f7585ccde18b41e26d810843715ebc3656a4c'
+    'scripts/Resolve-PythonWheelClosure.py' = 'f9fcd99c408849f98564fbc4c30f3d7e6ad8148b60cb4d8f58fc29b040c4519c'
+    'scripts/Resolve-StandardValidationTool.ps1' = '71e6d5b191b74202e96f34a856d3317efb18662e17c8368d112d89b7d6795b15'
+    'docs/standards/schemas/standard-validation-adapter-v1.schema.json' = '11aa88fc25716d748bd4f514f1a44f02390ad1745dd5a5c5beee07f642fd5639'
+    'docs/standards/schemas/standard-validation-evidence-v1.schema.json' = '8ed4a9d7158273d7a1e9d898acf07f57e9170822cb7cbb70f1e2eec7195867ee'
+    'docs/standards/standard-validation-contract-v1.json' = '707edf8945ad9a7097df1dfb22a8f05ce47d0e0a66e2e44381036d630e854da0'
+    'docs/standards/pr12-source-merge-adoption.json' = '4c5262f2a11d228195230c15fa4faaf9614af6b59f110e5d9c08f242ce809175'
+    'docs/standards/trust-anchors/human-approval-public-key.xml' = '1e46153b72d02f3ce2fb26becd449df4f1590d8e5cb441b1954006a5602bbd9b'
+    'docs/standards/trust-anchors/trusted-supervisor-public-key.xml' = '4d550851f43405920156f40c9fc648d99a69dd73efc200f6968d8a837e7fbf27'
+    'scripts/Invoke-StandardValidation.ps1' = 'a4ee880810171428a6abd2e8fd5db2da1eaeda4abc0fc6c72dc259b4a709174b'
+    'docs/standards/schemas/standard-semantic-consent-evidence-v2.schema.json' = '109091979d0a47e2035d3d8b20963fcdb85680e5da737bf1f27121608115d430'
+    'scripts/StandardSemanticBridge.psm1' = 'daf90f703898cc56fc3310e1eec462bafa6552edcac0de4f08a3cd4b9f63a429'
+    'docs/standards/schemas/upstream-adapter-v1.schema.json' = '3cff6246463188a91cc54c6a46315a949314767a759c6214e5b28e4db95ac8d7'
+    'docs/standards/upstream-adapter.json' = 'c4f5133b24841bb9c66182dc3d5a027596f864ec28e410d47249a67b3b97ad31'
+    'scripts/Validate-UpstreamAdapter.ps1' = '3b6e6474690b1ae9f9486544b68f50ca29b96f5dbe6aa8d6c6cd8570afad500b'
+    'docs/standards/standard-core-validation-v2.json' = '2ba91aec827a642517fd90d294524e0dfc3fed9ae19c27d867d442d73b4915d6'
+    'docs/standards/schemas/standard-core-adapter-v2.schema.json' = '7399980e8765528b759a3734a133447eb9581ac24a9c4780dc8faadd6af0c1c5'
+    'docs/standards/schemas/standard-core-evidence-v2.schema.json' = '4a8c61f32484bfe928e4f15f6422de7dc7b63d9d1fc95bca4f8f5c4c37334d24'
+    'docs/standards/third-party-raw-skill-sources.md' = '18649fd56eada4a94a5d47de778669b0ebcecfb85b84f5c581d283b21979f7ac'
+    'docs/standards/schemas/third-party-raw-skill-source-v1.schema.json' = '9d8585d95c606486f947a3f89e39341af840335376e86910eb7f4ed25bdc16ed'
+    'docs/standards/examples/third-party-raw-skill-source-v1.json' = 'decbf276cbeea33c60d8b36b7b16838babe951cd84d13ae4a8a7a8261dc6d9c8'
 }
-$toolResolutionGitHubToken = [Environment]::GetEnvironmentVariable('GITHUB_TOKEN', [EnvironmentVariableTarget]::Process)
-Remove-Item -LiteralPath 'Env:GITHUB_TOKEN' -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath 'Env:GH_TOKEN' -Force -ErrorAction SilentlyContinue
-$env:GIT_NO_REPLACE_OBJECTS = '1'
 
-function Read-StrictUtf8File {
-    param([Parameter(Mandatory = $true)][string] $Path)
-
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $offset = if ($bytes.Length -ge 3 -and
-        $bytes[0] -eq 0xEF -and
-        $bytes[1] -eq 0xBB -and
-        $bytes[2] -eq 0xBF) {
-        3
-    }
-    else {
-        0
-    }
-    return [Text.UTF8Encoding]::new($false, $true).GetString(
-        $bytes,
-        $offset,
-        $bytes.Length - $offset
+function Assert-ExactPropertySet {
+    param(
+        [Parameter(Mandatory = $true)] $Value,
+        [Parameter(Mandatory = $true)][string[]] $Expected,
+        [Parameter(Mandatory = $true)][string] $Context
     )
+
+    if ($null -eq $Value -or $Value -is [array] -or $Value -is [string] -or $null -eq $Value.PSObject) {
+        throw "$Context must be a JSON object."
+    }
+    $actual = @($Value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $missing = @($Expected | Where-Object { $actual -cnotcontains $_ })
+    $unexpected = @($actual | Where-Object { $Expected -cnotcontains $_ })
+    if ($missing.Count -gt 0 -or $unexpected.Count -gt 0 -or $actual.Count -ne $Expected.Count) {
+        throw "$Context has an invalid property set. Missing='$($missing -join ',')' Unexpected='$($unexpected -join ',')'."
+    }
 }
 
 function Assert-NoDuplicateJsonProperties {
-    param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement] $Element, [string] $Context = '$')
+    param(
+        [Parameter(Mandatory = $true)][System.Text.Json.JsonElement] $Element,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+
     if ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
         $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($property in $Element.EnumerateObject()) {
@@ -85,14 +96,16 @@ function Assert-NoDuplicateJsonProperties {
         }
     }
 }
+
 function Read-JsonFile {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
         [Parameter(Mandatory = $true)][string] $Context
     )
+
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Context is missing: $Path" }
     try {
-        $text = Read-StrictUtf8File -Path $Path
+        $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
         $document = [System.Text.Json.JsonDocument]::Parse($text)
         try { Assert-NoDuplicateJsonProperties -Element $document.RootElement -Context $Context }
         finally { $document.Dispose() }
@@ -101,4951 +114,1275 @@ function Read-JsonFile {
     catch { throw "$Context is not valid unambiguous UTF-8 JSON: $($_.Exception.Message)" }
 }
 
-function Assert-Sha256 {
-    param($Value, [string] $Context)
-    if ($Value -isnot [string] -or [string]$Value -cnotmatch '^[0-9a-f]{64}$') {
-        throw "$Context must be a lowercase SHA-256 value."
-    }
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
 }
 
-function Get-RequiredProperty {
+function Get-GitBlobSha256 {
     param(
-        [Parameter(Mandatory = $true)] $Object,
-        [Parameter(Mandatory = $true)][string] $Name,
-        [Parameter(Mandatory = $true)][string] $Context
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $Revision,
+        [Parameter(Mandatory = $true)][string] $RelativePath,
+        [ValidateRange(1, 300)][int] $ProcessTimeoutSeconds = 30
     )
-    if ($Object -isnot [pscustomobject] -or $null -eq $Object.PSObject.Properties[$Name]) {
-        throw "$Context is missing required property '$Name'."
+
+    $normalizedPath = $RelativePath.Replace([char]92, [char]47)
+    $treeInfo = [Diagnostics.ProcessStartInfo]::new()
+    $treeInfo.FileName = $GitPath
+    $treeInfo.UseShellExecute = $false
+    $treeInfo.CreateNoWindow = $true
+    $treeInfo.RedirectStandardOutput = $true
+    $treeInfo.RedirectStandardError = $true
+    foreach ($argument in @('-C', $RepositoryRoot, 'ls-tree', $Revision, '--', $normalizedPath)) {
+        [void]$treeInfo.ArgumentList.Add($argument)
     }
-    # Keep scalar JSON properties scalar while preserving array-valued properties
-    # as one pipeline object for callers that validate their exact array shape.
-    $propertyValue = $Object.PSObject.Properties[$Name].Value
-    if ($propertyValue -is [array]) {
-        Write-Output -NoEnumerate $propertyValue
+    $treeProcess = [Diagnostics.Process]::new()
+    $treeProcess.StartInfo = $treeInfo
+    $treeStarted = $false
+    $treeFailure = $null
+    $treeCleanupError = $null
+    $treeOutput = $null
+    try {
+        if (-not $treeProcess.Start()) { throw "Could not start Git tree lookup for '$normalizedPath'." }
+        $treeStarted = $true
+        $treeClock = [Diagnostics.Stopwatch]::StartNew()
+        $treeOutputTask = $treeProcess.StandardOutput.ReadToEndAsync()
+        $treeErrorTask = $treeProcess.StandardError.ReadToEndAsync()
+        while (-not ($treeProcess.HasExited -and $treeOutputTask.IsCompleted -and $treeErrorTask.IsCompleted)) {
+            if ($treeClock.Elapsed.TotalSeconds -ge $ProcessTimeoutSeconds) {
+                throw "Git tree lookup timed out after $ProcessTimeoutSeconds seconds for '$normalizedPath'."
+            }
+            [void]$treeProcess.WaitForExit(100)
+        }
+        $treeOutput = $treeOutputTask.GetAwaiter().GetResult()
+        [void]$treeErrorTask.GetAwaiter().GetResult()
+        if ($treeProcess.ExitCode -ne 0) { throw "Pinned authority path is not one tracked file: $normalizedPath" }
     }
-    else {
-        return $propertyValue
+    catch { $treeFailure = $_ }
+    finally {
+        if ($treeStarted -and -not $treeProcess.HasExited) {
+            try { $treeProcess.Kill($true) }
+            catch { if (-not $treeProcess.HasExited) { $treeCleanupError = $_.Exception.Message } }
+            if (-not $treeProcess.WaitForExit(5000)) { $treeCleanupError = 'Git tree lookup did not exit after owned process-tree termination.' }
+        }
+        $treeProcess.Dispose()
     }
+    if ($null -ne $treeCleanupError) { throw "Git tree lookup cleanup failed for '$normalizedPath': $treeCleanupError" }
+    if ($null -ne $treeFailure) { throw $treeFailure }
+    $treeEntry = @($treeOutput -split '\r?\n' | Where-Object { $_.Length -gt 0 })
+    if ($treeEntry.Count -ne 1) { throw "Pinned authority path is not one tracked file: $normalizedPath" }
+    $treePattern = '^(?<mode>100644|100755) blob (?<objectId>[0-9a-f]{40})\t' + [regex]::Escape($normalizedPath) + '$'
+    if ([string]$treeEntry[0] -cnotmatch $treePattern) { throw "Pinned authority path is not a regular Git blob: $normalizedPath" }
+    $objectId = [string]$Matches.objectId
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $GitPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @('-C', $RepositoryRoot, 'cat-file', 'blob', $objectId)) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    $started = $false
+    $failure = $null
+    $cleanupError = $null
+    $result = $null
+    try {
+        if (-not $process.Start()) { throw "Could not start Git blob reader for '$normalizedPath'." }
+        $started = $true
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $hashTask = $hasher.ComputeHashAsync($process.StandardOutput.BaseStream)
+        $stderrTail = [Text.StringBuilder]::new()
+        $stderrLimit = 4096
+        $stderrTruncated = $false
+        $stderrBuffer = [char[]]::new(4096)
+        $stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+        $stderrDone = $false
+        while ($true) {
+            if ($null -ne $stderrTask -and $stderrTask.IsCompleted) {
+                $readCount = $stderrTask.GetAwaiter().GetResult()
+                if ($readCount -eq 0) {
+                    $stderrDone = $true
+                    $stderrTask = $null
+                }
+                else {
+                    $take = [Math]::Min($readCount, $stderrLimit - $stderrTail.Length)
+                    if ($take -gt 0) { [void]$stderrTail.Append($stderrBuffer, 0, $take) }
+                    if ($take -lt $readCount) { $stderrTruncated = $true }
+                    $stderrTask = $process.StandardError.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+                }
+            }
+            if ($process.HasExited -and $hashTask.IsCompleted -and $stderrDone) { break }
+            if ($clock.Elapsed.TotalSeconds -ge $ProcessTimeoutSeconds) {
+                throw "Git blob reader timed out after $ProcessTimeoutSeconds seconds for '$normalizedPath'."
+            }
+            if ($null -ne $stderrTask) { [void]$stderrTask.Wait(100) }
+            elseif (-not $process.HasExited) { [void]$process.WaitForExit(100) }
+            else { Start-Sleep -Milliseconds 50 }
+        }
+        $hash = $hashTask.GetAwaiter().GetResult()
+        $stderr = $stderrTail.ToString()
+        if ($stderrTruncated) { $stderr += '[truncated]' }
+        if ($process.ExitCode -ne 0) {
+            throw "Git blob reader failed for '$normalizedPath' with exit $($process.ExitCode): $stderr"
+        }
+        $result = ([BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+    }
+    catch { $failure = $_ }
+    finally {
+        if ($started -and -not $process.HasExited) {
+            try { $process.Kill($true) }
+            catch { if (-not $process.HasExited) { $cleanupError = $_.Exception.Message } }
+            if (-not $process.WaitForExit(5000)) { $cleanupError = 'Git blob reader did not exit after owned process-tree termination.' }
+        }
+        $hasher.Dispose()
+        $process.Dispose()
+    }
+    if ($null -ne $cleanupError) { throw "Git blob reader cleanup failed for '$normalizedPath': $cleanupError" }
+    if ($null -ne $failure) { throw $failure }
+    return $result
 }
 
-function Assert-SkillInventoryUnchanged {
+function Test-AuthorityWorktreeSha256 {
     param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Before,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $After,
-        [Parameter(Mandatory = $true)][string] $SkillId,
-        [Parameter(Mandatory = $true)][string] $Context
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $ExpectedSha256
     )
-    if ($Before.Count -ne 1 -or $After.Count -ne 1) {
-        throw "$Context for Skill '$SkillId' did not return exactly one before/after inventory."
-    }
 
-    $beforeSkill = $Before[0]
-    $afterSkill = $After[0]
-    $beforeContentSha256 = Get-RequiredProperty -Object $beforeSkill -Name 'contentSha256' -Context "$Context before inventory for '$SkillId'"
-    $afterContentSha256 = Get-RequiredProperty -Object $afterSkill -Name 'contentSha256' -Context "$Context after inventory for '$SkillId'"
-    Assert-Sha256 -Value $beforeContentSha256 -Context "$Context before content hash for '$SkillId'"
-    Assert-Sha256 -Value $afterContentSha256 -Context "$Context after content hash for '$SkillId'"
-    if ([string]$beforeContentSha256 -cne [string]$afterContentSha256) {
-        throw "Candidate Skill '$SkillId' content identity changed $Context."
-    }
-
-    $beforeFiles = @((Get-RequiredProperty -Object $beforeSkill -Name 'files' -Context "$Context before inventory for '$SkillId'"))
-    $afterFiles = @((Get-RequiredProperty -Object $afterSkill -Name 'files' -Context "$Context after inventory for '$SkillId'"))
-    if ($beforeFiles.Count -ne $afterFiles.Count -or $beforeFiles.Count -eq 0) {
-        throw "Candidate Skill '$SkillId' file inventory changed $Context."
-    }
-
-    $afterFilesByPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    foreach ($afterFile in $afterFiles) {
-        $afterPath = Get-RequiredProperty -Object $afterFile -Name 'path' -Context "$Context after file inventory for '$SkillId'"
-        if ($afterPath -isnot [string] -or [string]::IsNullOrWhiteSpace($afterPath) -or
-            -not $afterFilesByPath.TryAdd([string]$afterPath, $afterFile)) {
-            throw "Candidate Skill '$SkillId' has a duplicate or invalid file path $Context."
-        }
-    }
-
-    $beforePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($beforeFile in $beforeFiles) {
-        $beforePath = Get-RequiredProperty -Object $beforeFile -Name 'path' -Context "$Context before file inventory for '$SkillId'"
-        if ($beforePath -isnot [string] -or [string]::IsNullOrWhiteSpace($beforePath) -or
-            -not $beforePaths.Add([string]$beforePath)) {
-            throw "Candidate Skill '$SkillId' has a duplicate or invalid file path before $Context."
-        }
-        $afterFile = $null
-        if (-not $afterFilesByPath.TryGetValue([string]$beforePath, [ref]$afterFile)) {
-            throw "Candidate Skill '$SkillId' file '$beforePath' is missing after $Context."
-        }
-        $beforeRawSha256 = Get-RequiredProperty -Object $beforeFile -Name 'rawSha256' -Context "$Context before file '$beforePath' for '$SkillId'"
-        $afterRawSha256 = Get-RequiredProperty -Object $afterFile -Name 'rawSha256' -Context "$Context after file '$beforePath' for '$SkillId'"
-        Assert-Sha256 -Value $beforeRawSha256 -Context "$Context before raw hash for '$SkillId/$beforePath'"
-        Assert-Sha256 -Value $afterRawSha256 -Context "$Context after raw hash for '$SkillId/$beforePath'"
-        if ([string]$beforeRawSha256 -cne [string]$afterRawSha256) {
-            throw "Candidate Skill '$SkillId' file '$beforePath' changed raw bytes $Context."
-        }
-    }
-}
-
-function Get-FileByteSha256 {
-    param(
-        [Parameter(Mandatory = $true)][string] $Path
-    )
+    # Git may check out text with CRLF on Windows. Compare actual bytes first,
+    # then permit only that line-ending conversion from the pinned Git blob.
     $bytes = [IO.File]::ReadAllBytes($Path)
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
-        return ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+        $actual = ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+        if ($actual -ceq $ExpectedSha256) { return $true }
+        $normalized = [IO.MemoryStream]::new($bytes.Length)
+        try {
+            for ($index = 0; $index -lt $bytes.Length; $index++) {
+                if ($bytes[$index] -eq 13 -and $index + 1 -lt $bytes.Length -and $bytes[$index + 1] -eq 10) {
+                    continue
+                }
+                $normalized.WriteByte($bytes[$index])
+            }
+            $actual = ([BitConverter]::ToString($hasher.ComputeHash($normalized.ToArray())) -replace '-', '').ToLowerInvariant()
+            return $actual -ceq $ExpectedSha256
+        }
+        finally { $normalized.Dispose() }
     }
-    finally {
-        $hasher.Dispose()
-    }
+    finally { $hasher.Dispose() }
 }
 
-function Get-DescendantProcessIds {
-    param(
-        [Parameter(Mandatory = $true)][int] $RootProcessId
-    )
-    $processes = @(Get-WindowsProcessTable)
-
-    $frontier = @($RootProcessId)
-    $descendantIds = [Collections.Generic.List[int]]::new()
-    while ($frontier.Count -gt 0) {
-        $next = [Collections.Generic.List[int]]::new()
-        foreach ($process in $processes) {
-            $processId = [int]$process.processId
-            if ($frontier -contains [int]$process.parentProcessId -and
-                -not $descendantIds.Contains($processId)) {
-                [void]$descendantIds.Add($processId)
-                [void]$next.Add($processId)
-            }
-        }
-        $frontier = @($next.ToArray())
-    }
-    return @($descendantIds.ToArray())
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-function Test-ProcessIdExists {
-    param(
-        [Parameter(Mandatory = $true)][int] $ProcessId
-    )
-    if ($ProcessId -le 0) { return $false }
-    try {
-        Get-Process -Id $ProcessId -ErrorAction Stop | Out-Null
-        return $true
-    }
-    catch {
-        return $false
-    }
-}
-
-function Get-ProcessIdentity {
-    param(
-        [Parameter(Mandatory = $true)][int] $ProcessId
-    )
-    if ($ProcessId -le 0) { throw 'Process identity inspection requires a positive process id.' }
-    $process = Get-Process -Id $ProcessId -ErrorAction Stop
-    try {
-        $startTime = $process.StartTime.ToUniversalTime().Ticks
-        return 'start-time:{0}' -f $startTime
-    }
-    finally {
-        $process.Dispose()
-    }
-}
-
-function Test-ProcessIdentity {
-    param(
-        [Parameter(Mandatory = $true)][int] $ProcessId,
-        [Parameter(Mandatory = $true)][string] $Identity
-    )
-    try {
-        return (Get-ProcessIdentity -ProcessId $ProcessId) -ceq $Identity
-    }
-    catch {
-        return $false
-    }
-}
-
-
-function Get-WindowsProcessBoundaryType {
-    if (-not $script:IsWindowsHost) {
-        throw 'The Windows process boundary is supported only on Windows hosts.'
-    }
-    $nativeType = 'Codex.Validation.WindowsProcessBoundary' -as [type]
-    if ($null -eq $nativeType) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-namespace Codex.Validation {
-    public static class WindowsProcessBoundary {
-        [StructLayout(LayoutKind.Sequential)]
-        private struct IoCounters {
-            public ulong ReadOperationCount;
-            public ulong WriteOperationCount;
-            public ulong OtherOperationCount;
-            public ulong ReadTransferCount;
-            public ulong WriteTransferCount;
-            public ulong OtherTransferCount;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct BasicLimitInformation {
-            public long PerProcessUserTimeLimit;
-            public long PerJobUserTimeLimit;
-            public uint LimitFlags;
-            public UIntPtr MinimumWorkingSetSize;
-            public UIntPtr MaximumWorkingSetSize;
-            public uint ActiveProcessLimit;
-            public UIntPtr Affinity;
-            public uint PriorityClass;
-            public uint SchedulingClass;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct ExtendedLimitInformation {
-            public BasicLimitInformation BasicLimitInformation;
-            public IoCounters IoInfo;
-            public UIntPtr ProcessMemoryLimit;
-            public UIntPtr JobMemoryLimit;
-            public UIntPtr PeakProcessMemoryUsed;
-            public UIntPtr PeakJobMemoryUsed;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct NativeFileTime {
-            public uint LowDateTime;
-            public uint HighDateTime;
-        }
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool SetInformationJobObject(
-            IntPtr jobHandle,
-            int jobObjectInformationClass,
-            IntPtr jobObjectInformation,
-            uint jobObjectInformationLength);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool AssignProcessToJobObject(IntPtr jobHandle, IntPtr processHandle);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool TerminateJobObject(IntPtr jobHandle, uint exitCode);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool GetProcessTimes(
-            IntPtr processHandle,
-            out NativeFileTime creationTime,
-            out NativeFileTime exitTime,
-            out NativeFileTime kernelTime,
-            out NativeFileTime userTime);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool TerminateProcess(IntPtr processHandle, uint exitCode);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool CloseHandle(IntPtr handle);
-
-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            string stringSecurityDescriptor,
-            uint stringSDRevision,
-            out IntPtr securityDescriptor,
-            out uint securityDescriptorSize);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool SetKernelObjectSecurity(
-            IntPtr handle,
-            uint securityInformation,
-            IntPtr securityDescriptor);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr LocalFree(IntPtr handle);
-
-        public static IntPtr CreateKillOnCloseJob() {
-            IntPtr jobHandle = CreateJobObject(IntPtr.Zero, null);
-            if (jobHandle == IntPtr.Zero) {
-                return IntPtr.Zero;
-            }
-            ExtendedLimitInformation information = new ExtendedLimitInformation();
-            const uint JobObjectLimitKillOnClose = 0x00002000;
-            const uint JobObjectLimitActiveProcess = 0x00000008;
-            const uint JobObjectLimitJobMemory = 0x00000200;
-            const uint JobObjectLimitJobTime = 0x00000004;
-            const uint JobObjectLimitDieOnUnhandledException = 0x00000400;
-            information.BasicLimitInformation.LimitFlags =
-                JobObjectLimitKillOnClose |
-                JobObjectLimitActiveProcess |
-                JobObjectLimitJobMemory |
-                JobObjectLimitJobTime |
-                JobObjectLimitDieOnUnhandledException;
-            information.BasicLimitInformation.ActiveProcessLimit = 256;
-            information.BasicLimitInformation.PerJobUserTimeLimit = 300L * 10000000L;
-            information.JobMemoryLimit = new UIntPtr(2147483648UL);
-            int informationLength = Marshal.SizeOf(typeof(ExtendedLimitInformation));
-            IntPtr informationBuffer = Marshal.AllocHGlobal(informationLength);
-            try {
-                Marshal.StructureToPtr(information, informationBuffer, false);
-                if (!SetInformationJobObject(jobHandle, 9, informationBuffer, (uint)informationLength)) {
-                    CloseHandle(jobHandle);
-                    return IntPtr.Zero;
-                }
-                return jobHandle;
-            }
-            finally {
-                Marshal.FreeHGlobal(informationBuffer);
-            }
-        }
-
-        public static bool AssignProcess(IntPtr jobHandle, IntPtr processHandle) {
-            return AssignProcessToJobObject(jobHandle, processHandle);
-        }
-
-        public static bool TerminateJob(IntPtr jobHandle, uint exitCode) {
-            return TerminateJobObject(jobHandle, exitCode);
-        }
-
-        public static IntPtr OpenProcessForTermination(int processId) {
-            return OpenProcess(0x00100401, false, (uint)processId);
-        }
-
-        public static long GetProcessCreationTimeTicks(IntPtr processHandle) {
-            NativeFileTime creationTime;
-            NativeFileTime exitTime;
-            NativeFileTime kernelTime;
-            NativeFileTime userTime;
-            if (!GetProcessTimes(processHandle, out creationTime, out exitTime, out kernelTime, out userTime)) {
-                return -1;
-            }
-            long fileTime = ((long)creationTime.HighDateTime << 32) | (long)creationTime.LowDateTime;
-            return DateTime.FromFileTimeUtc(fileTime).Ticks;
-        }
-
-        public static bool TerminateProcessHandle(IntPtr processHandle, uint exitCode) {
-            return TerminateProcess(processHandle, exitCode);
-        }
-
-        public static bool Close(IntPtr handle) {
-            return CloseHandle(handle);
-        }
-
-        public static bool SetLowIntegrityKernelObject(IntPtr handle) {
-            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) {
-                return false;
-            }
-            IntPtr securityDescriptor = IntPtr.Zero;
-            uint securityDescriptorSize;
-            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                "S:(ML;;NW;;;LW)",
-                1,
-                out securityDescriptor,
-                out securityDescriptorSize)) {
-                return false;
-            }
-            try {
-                const uint LabelSecurityInformation = 0x00000010;
-                return SetKernelObjectSecurity(handle, LabelSecurityInformation, securityDescriptor);
-            }
-            finally {
-                if (securityDescriptor != IntPtr.Zero) {
-                    LocalFree(securityDescriptor);
-                }
-            }
-        }
-    }
-}
-'@ -ErrorAction Stop
-        $nativeType = 'Codex.Validation.WindowsProcessBoundary' -as [type]
-    }
-    if ($null -eq $nativeType) {
-        throw 'The Windows process boundary interop type could not be loaded.'
-    }
-    return $nativeType
-}
-
-function Get-WindowsProcessTable {
-    if (-not $script:IsWindowsHost) {
-        throw 'Windows process-table enumeration is supported only on Windows hosts.'
-    }
-    $nativeType = 'Codex.Validation.WindowsProcessEnumeration' -as [type]
-    if ($null -eq $nativeType) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-
-namespace Codex.Validation {
-    public sealed class WindowsProcessEntry {
-        public int ProcessId { get; private set; }
-        public int ParentProcessId { get; private set; }
-
-        internal WindowsProcessEntry(int processId, int parentProcessId) {
-            ProcessId = processId;
-            ParentProcessId = parentProcessId;
-        }
-    }
-
-    public static class WindowsProcessEnumeration {
-        private const uint SnapshotProcess = 0x00000002;
-        private static readonly IntPtr InvalidHandle = new IntPtr(-1);
-
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        private struct NativeProcessEntry {
-            public uint Size;
-            public uint Usage;
-            public uint ProcessId;
-            public IntPtr DefaultHeapId;
-            public uint ModuleId;
-            public uint Threads;
-            public uint ParentProcessId;
-            public int PriorityClassBase;
-            public uint Flags;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
-            public string ExecutableFile;
-        }
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool Process32FirstW(IntPtr snapshot, ref NativeProcessEntry entry);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool Process32NextW(IntPtr snapshot, ref NativeProcessEntry entry);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CloseHandle(IntPtr handle);
-
-        public static WindowsProcessEntry[] GetAll() {
-            IntPtr snapshot = CreateToolhelp32Snapshot(SnapshotProcess, 0);
-            if (snapshot == IntPtr.Zero || snapshot == InvalidHandle) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateToolhelp32Snapshot failed.");
-            }
-            try {
-                NativeProcessEntry entry = new NativeProcessEntry();
-                entry.Size = (uint)Marshal.SizeOf(typeof(NativeProcessEntry));
-                if (!Process32FirstW(snapshot, ref entry)) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Process32FirstW failed.");
-                }
-                List<WindowsProcessEntry> result = new List<WindowsProcessEntry>();
-                do {
-                    if (entry.ProcessId > 0) {
-                        result.Add(new WindowsProcessEntry((int)entry.ProcessId, (int)entry.ParentProcessId));
-                    }
-                    entry.Size = (uint)Marshal.SizeOf(typeof(NativeProcessEntry));
-                }
-                while (Process32NextW(snapshot, ref entry));
-                int error = Marshal.GetLastWin32Error();
-                if (error != 18) {
-                    throw new Win32Exception(error, "Process32NextW failed.");
-                }
-                return result.ToArray();
-            }
-            finally {
-                CloseHandle(snapshot);
-            }
-        }
-    }
-}
-'@ -ErrorAction Stop
-        $nativeType = 'Codex.Validation.WindowsProcessEnumeration' -as [type]
-    }
-    if ($null -eq $nativeType) {
-        throw 'The Windows process-table interop type could not be loaded.'
-    }
-    $entries = @($nativeType::GetAll())
-    if ($entries.Count -eq 0) {
-        throw 'The Windows process-table snapshot was empty.'
-    }
-    return @($entries | ForEach-Object {
-        [pscustomobject]@{
-            processId = [int]$_.ProcessId
-            parentProcessId = [int]$_.ParentProcessId
-        }
-    })
-}
-
-function Get-WindowsSuspendedProcessBoundaryType {
-    # The interop type also owns the cross-platform bounded output reader. The
-    # Windows-only process-start entry point is called only on Windows.
-    $nativeType = 'Codex.Validation.WindowsSuspendedProcessBoundary' -as [type]
-    if ($null -eq $nativeType) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading.Tasks;
-using Microsoft.Win32.SafeHandles;
-
-namespace Codex.Validation {
-    public sealed class BoundedProcessOutputResult {
-        public string Text { get; private set; }
-        public bool Truncated { get; private set; }
-        public long TotalCharacters { get; private set; }
-
-        internal BoundedProcessOutputResult(string text, bool truncated, long totalCharacters) {
-            Text = text;
-            Truncated = truncated;
-            TotalCharacters = totalCharacters;
-        }
-    }
-
-    public sealed class WindowsSuspendedProcess : IDisposable {
-        private IntPtr processHandle;
-        private IntPtr threadHandle;
-        private bool disposed;
-
-        public int Id { get; private set; }
-        public IntPtr ProcessHandle { get { return processHandle; } }
-        public StreamWriter StandardInput { get; private set; }
-        public StreamReader StandardOutput { get; private set; }
-        public StreamReader StandardError { get; private set; }
-
-        internal WindowsSuspendedProcess(
-            ProcessInformation processInformation,
-            IntPtr standardInputWrite,
-            IntPtr standardOutputRead,
-            IntPtr standardErrorRead) {
-            processHandle = processInformation.ProcessHandle;
-            threadHandle = processInformation.ThreadHandle;
-            Id = processInformation.ProcessId;
-            StandardInput = standardInputWrite == IntPtr.Zero
-                ? null
-                : new StreamWriter(
-                    new FileStream(new SafeFileHandle(standardInputWrite, true), FileAccess.Write, 4096, false),
-                    new UTF8Encoding(false));
-            StandardOutput = new StreamReader(
-                new FileStream(new SafeFileHandle(standardOutputRead, true), FileAccess.Read, 4096, false),
-                new UTF8Encoding(false), false, 4096);
-            StandardError = new StreamReader(
-                new FileStream(new SafeFileHandle(standardErrorRead, true), FileAccess.Read, 4096, false),
-                new UTF8Encoding(false), false, 4096);
-        }
-
-        public bool HasExited {
-            get {
-                EnsureNotDisposed();
-                return WaitForSingleObject(processHandle, 0) == 0;
-            }
-        }
-
-        public bool WaitForExit(int milliseconds) {
-            EnsureNotDisposed();
-            uint timeout = milliseconds < 0 ? 0xffffffffU : (uint)milliseconds;
-            return WaitForSingleObject(processHandle, timeout) == 0;
-        }
-
-        public int ExitCode {
-            get {
-                EnsureNotDisposed();
-                uint exitCode;
-                if (!GetExitCodeProcess(processHandle, out exitCode)) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetExitCodeProcess failed.");
-                }
-                return unchecked((int)exitCode);
-            }
-        }
-
-        public bool Resume() {
-            EnsureNotDisposed();
-            if (threadHandle == IntPtr.Zero) { return false; }
-            uint previousSuspendCount = ResumeThread(threadHandle);
-            if (previousSuspendCount == 0xffffffffU) { return false; }
-            CloseHandle(threadHandle);
-            threadHandle = IntPtr.Zero;
-            return true;
-        }
-
-        public bool Terminate() {
-            EnsureNotDisposed();
-            return TerminateProcess(processHandle, 1);
-        }
-
-        private void EnsureNotDisposed() {
-            if (disposed || processHandle == IntPtr.Zero) {
-                throw new ObjectDisposedException("WindowsSuspendedProcess");
-            }
-        }
-
-        public void Dispose() {
-            if (disposed) { return; }
-            disposed = true;
-            if (StandardInput != null) { StandardInput.Dispose(); }
-            if (StandardOutput != null) { StandardOutput.Dispose(); }
-            if (StandardError != null) { StandardError.Dispose(); }
-            if (threadHandle != IntPtr.Zero) {
-                CloseHandle(threadHandle);
-                threadHandle = IntPtr.Zero;
-            }
-            if (processHandle != IntPtr.Zero) {
-                CloseHandle(processHandle);
-                processHandle = IntPtr.Zero;
-            }
-        }
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern uint ResumeThread(IntPtr threadHandle);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool GetExitCodeProcess(IntPtr processHandle, out uint exitCode);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool TerminateProcess(IntPtr processHandle, uint exitCode);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool CloseHandle(IntPtr handle);
-    }
-
-    public sealed class ProcessInformation {
-        public IntPtr ProcessHandle;
-        public IntPtr ThreadHandle;
-        public int ProcessId;
-        public int ThreadId;
-    }
-
-    public static class WindowsSuspendedProcessBoundary {
-        private const uint CreateSuspended = 0x00000004;
-        private const uint CreateUnicodeEnvironment = 0x00000400;
-        private const uint CreateExtendedStartupInfo = 0x00080000;
-        private const uint CreateNoWindow = 0x08000000;
-        private const uint StartfUseStdHandles = 0x00000100;
-        private const uint HandleFlagInherit = 0x00000001;
-        private const uint ProcThreadAttributeHandleList = 0x00020002;
-        private const int ErrorInsufficientBuffer = 122;
-        private const uint WaitObject0 = 0x00000000;
-        private const uint TokenAssignPrimary = 0x00000001;
-        private const uint TokenDuplicate = 0x00000002;
-        private const uint TokenQuery = 0x00000008;
-        private const uint TokenAdjustDefault = 0x00000080;
-        private const int TokenIsRestricted = 40;
-        private const int TokenIntegrityLevel = 25;
-        private const int TokenPrimary = 1;
-        private const int SecurityImpersonation = 2;
-        private const uint DisableMaxPrivilege = 0x00000001;
-        private const uint SeGroupIntegrity = 0x00000020;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct SecurityAttributes {
-            public int Length;
-            public IntPtr SecurityDescriptor;
-            [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct StartupInfo {
-            public int Size;
-            public IntPtr Reserved;
-            public IntPtr Desktop;
-            public IntPtr Title;
-            public int X;
-            public int Y;
-            public int XSize;
-            public int YSize;
-            public int XCountChars;
-            public int YCountChars;
-            public int FillAttribute;
-            public uint Flags;
-            public short ShowWindow;
-            public short Reserved2;
-            public IntPtr Reserved2Data;
-            public IntPtr StandardInput;
-            public IntPtr StandardOutput;
-            public IntPtr StandardError;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct StartupInfoEx {
-            public StartupInfo StartupInfo;
-            public IntPtr AttributeList;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct NativeProcessInformation {
-            public IntPtr ProcessHandle;
-            public IntPtr ThreadHandle;
-            public int ProcessId;
-            public int ThreadId;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct SidAndAttributes {
-            public IntPtr Sid;
-            public uint Attributes;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct TokenMandatoryLabel {
-            public SidAndAttributes Label;
-        }
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CreatePipe(
-            out IntPtr readHandle,
-            out IntPtr writeHandle,
-            ref SecurityAttributes attributes,
-            int size);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool SetHandleInformation(
-            IntPtr handle,
-            uint mask,
-            uint flags);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CreateProcessW(
-            string applicationName,
-            StringBuilder commandLine,
-            IntPtr processAttributes,
-            IntPtr threadAttributes,
-            bool inheritHandles,
-            uint creationFlags,
-            IntPtr environment,
-            string currentDirectory,
-            ref StartupInfoEx startupInfo,
-            out NativeProcessInformation processInformation);
-
-        [DllImport("kernel32.dll", SetLastError = false)]
-        private static extern IntPtr GetCurrentProcess();
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool OpenProcessToken(
-            IntPtr processHandle,
-            uint desiredAccess,
-            out IntPtr tokenHandle);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CreateRestrictedToken(
-            IntPtr existingTokenHandle,
-            uint flags,
-            uint disableSidCount,
-            IntPtr sidsToDisable,
-            uint deletePrivilegeCount,
-            IntPtr privilegesToDelete,
-            uint restrictedSidCount,
-            IntPtr sidsToRestrict,
-            out IntPtr newTokenHandle);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool DuplicateTokenEx(
-            IntPtr existingTokenHandle,
-            uint desiredAccess,
-            IntPtr tokenAttributes,
-            int impersonationLevel,
-            int tokenType,
-            out IntPtr newTokenHandle);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GetTokenInformation(
-            IntPtr tokenHandle,
-            int tokenInformationClass,
-            out int tokenInformation,
-            int tokenInformationLength,
-            out int returnLength);
-
-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool ConvertStringSidToSidW(
-            string stringSid,
-            out IntPtr sid);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern uint GetLengthSid(IntPtr sid);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool SetTokenInformation(
-            IntPtr tokenHandle,
-            int tokenInformationClass,
-            IntPtr tokenInformation,
-            int tokenInformationLength);
-
-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CreateProcessAsUserW(
-            IntPtr token,
-            string applicationName,
-            StringBuilder commandLine,
-            IntPtr processAttributes,
-            IntPtr threadAttributes,
-            bool inheritHandles,
-            uint creationFlags,
-            IntPtr environment,
-            string currentDirectory,
-            ref StartupInfoEx startupInfo,
-            out NativeProcessInformation processInformation);
-
-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CreateProcessWithTokenW(
-            IntPtr token,
-            uint logonFlags,
-            string applicationName,
-            StringBuilder commandLine,
-            uint creationFlags,
-            IntPtr environment,
-            string currentDirectory,
-            ref StartupInfoEx startupInfo,
-            out NativeProcessInformation processInformation);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool InitializeProcThreadAttributeList(
-            IntPtr attributeList,
-            int attributeCount,
-            uint flags,
-            ref IntPtr size);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool UpdateProcThreadAttribute(
-            IntPtr attributeList,
-            uint flags,
-            IntPtr attribute,
-            IntPtr value,
-            IntPtr size,
-            IntPtr previousValue,
-            IntPtr returnSize);
-
-        [DllImport("kernel32.dll", SetLastError = false)]
-        private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool CloseHandle(IntPtr handle);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr LocalFree(IntPtr handle);
-
-        private static void SetLowIntegrityLevel(IntPtr tokenHandle) {
-            IntPtr integritySid = IntPtr.Zero;
-            IntPtr labelBuffer = IntPtr.Zero;
-            if (!ConvertStringSidToSidW("S-1-16-4096", out integritySid)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "ConvertStringSidToSidW failed.");
-            }
-            try {
-                uint sidLength = GetLengthSid(integritySid);
-                if (sidLength == 0) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetLengthSid failed.");
-                }
-                int labelLength = Marshal.SizeOf(typeof(TokenMandatoryLabel));
-                int informationLength = checked(labelLength + (int)sidLength);
-                labelBuffer = Marshal.AllocHGlobal(informationLength);
-                TokenMandatoryLabel label = new TokenMandatoryLabel();
-                label.Label.Sid = integritySid;
-                label.Label.Attributes = SeGroupIntegrity;
-                Marshal.StructureToPtr(label, labelBuffer, false);
-                if (!SetTokenInformation(
-                    tokenHandle,
-                    TokenIntegrityLevel,
-                    labelBuffer,
-                    informationLength)) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "SetTokenInformation(TokenIntegrityLevel) failed.");
-                }
-            }
-            finally {
-                if (labelBuffer != IntPtr.Zero) {
-                    Marshal.FreeHGlobal(labelBuffer);
-                }
-                if (integritySid != IntPtr.Zero) {
-                    LocalFree(integritySid);
-                }
-            }
-        }
-
-        private static IntPtr CreateRestrictedPrimaryToken() {
-            IntPtr sourceToken = IntPtr.Zero;
-            if (!OpenProcessToken(
-                GetCurrentProcess(),
-                TokenAssignPrimary | TokenDuplicate | TokenQuery | TokenAdjustDefault,
-                out sourceToken)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken failed.");
-            }
-            try {
-                int isRestricted;
-                int returnLength;
-                if (!GetTokenInformation(
-                    sourceToken,
-                    TokenIsRestricted,
-                    out isRestricted,
-                    sizeof(int),
-                    out returnLength)) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation(TokenIsRestricted) failed.");
-                }
-                if (isRestricted != 0) {
-                    IntPtr duplicatedRestrictedToken;
-                    if (!DuplicateTokenEx(
-                        sourceToken,
-                        TokenAssignPrimary | TokenDuplicate | TokenQuery | TokenAdjustDefault,
-                        IntPtr.Zero,
-                        SecurityImpersonation,
-                        TokenPrimary,
-                        out duplicatedRestrictedToken)) {
-                        throw new Win32Exception(Marshal.GetLastWin32Error(), "DuplicateTokenEx failed.");
-                    }
-                    try {
-                        SetLowIntegrityLevel(duplicatedRestrictedToken);
-                        return duplicatedRestrictedToken;
-                    }
-                    catch {
-                        CloseHandle(duplicatedRestrictedToken);
-                        throw;
-                    }
-                }
-                IntPtr restrictedToken;
-                if (!CreateRestrictedToken(
-                    sourceToken,
-                    DisableMaxPrivilege,
-                    0,
-                    IntPtr.Zero,
-                    0,
-                    IntPtr.Zero,
-                    0,
-                    IntPtr.Zero,
-                    out restrictedToken)) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateRestrictedToken failed.");
-                }
-                try {
-                    SetLowIntegrityLevel(restrictedToken);
-                    return restrictedToken;
-                }
-                catch {
-                    CloseHandle(restrictedToken);
-                    throw;
-                }
-            }
-            finally {
-                CloseHandle(sourceToken);
-            }
-        }
-
-        public static WindowsSuspendedProcess Start(
-            string fileName,
-            string[] arguments,
-            string workingDirectory,
-            IDictionary environment,
-            bool useStandardInput,
-            bool useRestrictedToken) {
-            if (String.IsNullOrWhiteSpace(fileName)) { throw new ArgumentException("fileName"); }
-            if (String.IsNullOrWhiteSpace(workingDirectory)) { throw new ArgumentException("workingDirectory"); }
-
-            IntPtr childStandardInput = IntPtr.Zero;
-            IntPtr parentStandardInput = IntPtr.Zero;
-            IntPtr parentStandardOutput = IntPtr.Zero;
-            IntPtr childStandardOutput = IntPtr.Zero;
-            IntPtr parentStandardError = IntPtr.Zero;
-            IntPtr childStandardError = IntPtr.Zero;
-            IntPtr environmentBlock = IntPtr.Zero;
-            IntPtr attributeList = IntPtr.Zero;
-            IntPtr attributeListSize = IntPtr.Zero;
-            IntPtr handleList = IntPtr.Zero;
-            IntPtr restrictedToken = IntPtr.Zero;
-            bool attributeListInitialized = false;
-            NativeProcessInformation nativeProcessInformation = new NativeProcessInformation();
-            WindowsSuspendedProcess result = null;
-            try {
-                SecurityAttributes pipeAttributes = new SecurityAttributes {
-                    Length = Marshal.SizeOf(typeof(SecurityAttributes)),
-                    SecurityDescriptor = IntPtr.Zero,
-                    InheritHandle = true
-                };
-                ThrowIfFalse(CreatePipe(out childStandardInput, out parentStandardInput, ref pipeAttributes, 0), "CreatePipe(stdin)");
-                ThrowIfFalse(CreatePipe(out parentStandardOutput, out childStandardOutput, ref pipeAttributes, 0), "CreatePipe(stdout)");
-                ThrowIfFalse(CreatePipe(out parentStandardError, out childStandardError, ref pipeAttributes, 0), "CreatePipe(stderr)");
-                ThrowIfFalse(SetHandleInformation(parentStandardInput, HandleFlagInherit, 0), "SetHandleInformation(stdin)");
-                ThrowIfFalse(SetHandleInformation(parentStandardOutput, HandleFlagInherit, 0), "SetHandleInformation(stdout)");
-                ThrowIfFalse(SetHandleInformation(parentStandardError, HandleFlagInherit, 0), "SetHandleInformation(stderr)");
-
-                if (!useStandardInput) {
-                    CloseHandle(parentStandardInput);
-                    parentStandardInput = IntPtr.Zero;
-                }
-
-                StartupInfoEx startupInfo = new StartupInfoEx {
-                    StartupInfo = new StartupInfo {
-                        Size = Marshal.SizeOf(typeof(StartupInfoEx)),
-                        Flags = StartfUseStdHandles,
-                        StandardInput = childStandardInput,
-                        StandardOutput = childStandardOutput,
-                        StandardError = childStandardError
-                    }
-                };
-                bool initialAttributeListResult = InitializeProcThreadAttributeList(
-                    IntPtr.Zero,
-                    1,
-                    0,
-                    ref attributeListSize);
-                int initialAttributeListError = Marshal.GetLastWin32Error();
-                if (initialAttributeListResult || initialAttributeListError != ErrorInsufficientBuffer || attributeListSize == IntPtr.Zero) {
-                    throw new Win32Exception(initialAttributeListError, "InitializeProcThreadAttributeList(size) failed.");
-                }
-                attributeList = Marshal.AllocHGlobal(attributeListSize);
-                ThrowIfFalse(InitializeProcThreadAttributeList(
-                    attributeList,
-                    1,
-                    0,
-                    ref attributeListSize), "InitializeProcThreadAttributeList");
-                attributeListInitialized = true;
-                IntPtr[] inheritedHandles = new IntPtr[] {
-                    childStandardInput,
-                    childStandardOutput,
-                    childStandardError
-                };
-                handleList = Marshal.AllocHGlobal(new IntPtr(IntPtr.Size * inheritedHandles.Length));
-                Marshal.Copy(inheritedHandles, 0, handleList, inheritedHandles.Length);
-                ThrowIfFalse(UpdateProcThreadAttribute(
-                    attributeList,
-                    0,
-                    (IntPtr)ProcThreadAttributeHandleList,
-                    handleList,
-                    new IntPtr(IntPtr.Size * inheritedHandles.Length),
-                    IntPtr.Zero,
-                    IntPtr.Zero), "UpdateProcThreadAttribute(handle list)");
-                startupInfo.AttributeList = attributeList;
-                string environmentText = BuildEnvironment(environment);
-                environmentBlock = Marshal.StringToHGlobalUni(environmentText);
-                string commandLineText = BuildCommandLine(fileName, arguments);
-                uint creationFlags = CreateSuspended | CreateUnicodeEnvironment | CreateExtendedStartupInfo | CreateNoWindow;
-                if (useRestrictedToken) {
-                    restrictedToken = CreateRestrictedPrimaryToken();
-                    bool processCreated = CreateProcessAsUserW(
-                        restrictedToken,
-                        fileName,
-                        new StringBuilder(commandLineText),
-                        IntPtr.Zero,
-                        IntPtr.Zero,
-                        true,
-                        creationFlags,
-                        environmentBlock,
-                        workingDirectory,
-                        ref startupInfo,
-                        out nativeProcessInformation);
-                    int firstCreateError = processCreated ? 0 : Marshal.GetLastWin32Error();
-                    if (!processCreated) {
-                        processCreated = CreateProcessWithTokenW(
-                            restrictedToken,
-                            0,
-                            fileName,
-                            new StringBuilder(commandLineText),
-                            creationFlags,
-                            environmentBlock,
-                            workingDirectory,
-                            ref startupInfo,
-                            out nativeProcessInformation);
-                    }
-                    if (!processCreated) {
-                        int createError = Marshal.GetLastWin32Error();
-                        if (createError == 0) { createError = firstCreateError; }
-                        throw new Win32Exception(createError, "CreateProcessAsUserW/CreateProcessWithTokenW failed.");
-                    }
-                }
-                else {
-                    ThrowIfFalse(CreateProcessW(
-                        fileName,
-                        new StringBuilder(commandLineText),
-                        IntPtr.Zero,
-                        IntPtr.Zero,
-                        true,
-                        creationFlags,
-                        environmentBlock,
-                        workingDirectory,
-                        ref startupInfo,
-                        out nativeProcessInformation), "CreateProcessW");
-                }
-
-                CloseHandle(childStandardInput); childStandardInput = IntPtr.Zero;
-                CloseHandle(childStandardOutput); childStandardOutput = IntPtr.Zero;
-                CloseHandle(childStandardError); childStandardError = IntPtr.Zero;
-                result = new WindowsSuspendedProcess(
-                    new ProcessInformation {
-                        ProcessHandle = nativeProcessInformation.ProcessHandle,
-                        ThreadHandle = nativeProcessInformation.ThreadHandle,
-                        ProcessId = nativeProcessInformation.ProcessId,
-                        ThreadId = nativeProcessInformation.ThreadId
-                    },
-                    parentStandardInput,
-                    parentStandardOutput,
-                    parentStandardError);
-                nativeProcessInformation.ProcessHandle = IntPtr.Zero;
-                nativeProcessInformation.ThreadHandle = IntPtr.Zero;
-                parentStandardInput = IntPtr.Zero;
-                parentStandardOutput = IntPtr.Zero;
-                parentStandardError = IntPtr.Zero;
-                return result;
-            }
-            finally {
-                CloseIfPresent(childStandardInput);
-                CloseIfPresent(childStandardOutput);
-                CloseIfPresent(childStandardError);
-                CloseIfPresent(parentStandardInput);
-                CloseIfPresent(parentStandardOutput);
-                CloseIfPresent(parentStandardError);
-                CloseIfPresent(nativeProcessInformation.ProcessHandle);
-                CloseIfPresent(nativeProcessInformation.ThreadHandle);
-                if (attributeListInitialized) { DeleteProcThreadAttributeList(attributeList); }
-                if (attributeList != IntPtr.Zero) { Marshal.FreeHGlobal(attributeList); }
-                if (handleList != IntPtr.Zero) { Marshal.FreeHGlobal(handleList); }
-                if (environmentBlock != IntPtr.Zero) { Marshal.FreeHGlobal(environmentBlock); }
-                CloseIfPresent(restrictedToken);
-            }
-        }
-
-        public static Task<BoundedProcessOutputResult> ReadBoundedAsync(TextReader reader, int maximumCharacters) {
-            return Task.Run(() => ReadBounded(reader, maximumCharacters));
-        }
-
-        private static BoundedProcessOutputResult ReadBounded(TextReader reader, int maximumCharacters) {
-            if (reader == null) { throw new ArgumentNullException("reader"); }
-            if (maximumCharacters < 1) { throw new ArgumentOutOfRangeException("maximumCharacters"); }
-            char[] buffer = new char[8192];
-            StringBuilder captured = new StringBuilder(Math.Min(maximumCharacters, 65536));
-            long totalCharacters = 0;
-            bool truncated = false;
-            int read;
-            while ((read = reader.Read(buffer, 0, buffer.Length)) > 0) {
-                totalCharacters += read;
-                int remaining = maximumCharacters - captured.Length;
-                if (remaining > 0) {
-                    int take = Math.Min(remaining, read);
-                    captured.Append(buffer, 0, take);
-                    if (take < read) { truncated = true; }
-                }
-                else {
-                    truncated = true;
-                }
-            }
-            return new BoundedProcessOutputResult(captured.ToString(), truncated, totalCharacters);
-        }
-
-        private static string BuildEnvironment(IDictionary environment) {
-            List<string> entries = new List<string>();
-            if (environment != null) {
-                foreach (DictionaryEntry entry in environment) {
-                    string name = Convert.ToString(entry.Key);
-                    string value = entry.Value == null ? String.Empty : Convert.ToString(entry.Value);
-                    if (String.IsNullOrEmpty(name) || name.IndexOf('\0') >= 0 || name[0] == '=') {
-                        throw new ArgumentException("Invalid environment variable name.");
-                    }
-                    if (value.IndexOf('\0') >= 0) {
-                        throw new ArgumentException("Invalid environment variable value.");
-                    }
-                    entries.Add(name + "=" + value);
-                }
-            }
-            entries.Sort(StringComparer.OrdinalIgnoreCase);
-            StringBuilder block = new StringBuilder();
-            foreach (string entry in entries) { block.Append(entry).Append('\0'); }
-            block.Append('\0');
-            return block.ToString();
-        }
-
-        private static string BuildCommandLine(string fileName, string[] arguments) {
-            StringBuilder commandLine = new StringBuilder(QuoteArgument(fileName));
-            if (arguments != null) {
-                foreach (string argument in arguments) {
-                    commandLine.Append(' ').Append(QuoteArgument(argument ?? String.Empty));
-                }
-            }
-            return commandLine.ToString();
-        }
-
-        private static string QuoteArgument(string argument) {
-            StringBuilder result = new StringBuilder();
-            result.Append('"');
-            int backslashes = 0;
-            foreach (char character in argument) {
-                if (character == '\\') { backslashes++; continue; }
-                if (character == '"') {
-                    result.Append('\\', backslashes * 2 + 1).Append('"');
-                    backslashes = 0;
-                    continue;
-                }
-                result.Append('\\', backslashes);
-                backslashes = 0;
-                result.Append(character);
-            }
-            result.Append('\\', backslashes * 2).Append('"');
-            return result.ToString();
-        }
-
-        private static void ThrowIfFalse(bool value, string operation) {
-            if (!value) { throw new Win32Exception(Marshal.GetLastWin32Error(), operation + " failed."); }
-        }
-
-        private static void CloseIfPresent(IntPtr handle) {
-            if (handle != IntPtr.Zero) { CloseHandle(handle); }
-        }
-    }
-}
-'@ -ErrorAction Stop
-        $nativeType = 'Codex.Validation.WindowsSuspendedProcessBoundary' -as [type]
-    }
-    if ($null -eq $nativeType) {
-        throw 'The suspended Windows process boundary interop type could not be loaded.'
-    }
-    return $nativeType
-}
-
-function Start-WindowsSuspendedProcess {
-    param(
-        [Parameter(Mandatory = $true)][string] $FileName,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
-        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
-        [Parameter(Mandatory = $true)] [Collections.IDictionary] $EnvironmentVariables,
-        [Parameter(Mandatory = $true)][bool] $UseStandardInput,
-        [Parameter(Mandatory = $true)][bool] $UseRestrictedToken
-    )
-    $nativeType = Get-WindowsSuspendedProcessBoundaryType
-    return $nativeType::Start($FileName, $Arguments, $WorkingDirectory, $EnvironmentVariables, $UseStandardInput, $UseRestrictedToken)
-}
-
-function New-WindowsKillOnCloseJob {
-    param([Parameter(Mandatory = $true)][string] $Context)
-    # The handle's creation time is checked before TerminateProcess is called
-    # on that same handle; no numeric PID is reused for the signal operation.
-    $nativeType = Get-WindowsProcessBoundaryType
-    $jobHandle = $nativeType::CreateKillOnCloseJob()
-    if ($jobHandle -eq [IntPtr]::Zero) {
-        throw "$Context could not create a kill-on-close Windows Job Object."
-    }
-    return $jobHandle
-}
-
-function Assign-WindowsProcessToJob {
-    param(
-        [Parameter(Mandatory = $true)][IntPtr] $JobHandle,
-        [Parameter(Mandatory = $true)][object] $Process,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $nativeType = Get-WindowsProcessBoundaryType
-    $processHandle = if ($Process -is [Diagnostics.Process]) { $Process.Handle } else { [IntPtr]$Process.ProcessHandle }
-    if (-not $nativeType::AssignProcess($JobHandle, $processHandle)) {
-        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        throw "$Context could not assign the child to its Windows Job Object (Win32 error $errorCode)."
-    }
-}
-
-function Stop-WindowsProcessByIdentity {
-    param(
-        [Parameter(Mandatory = $true)][int] $ProcessId,
-        [Parameter(Mandatory = $true)][string] $Identity
-    )
-    if ($ProcessId -le 0 -or [string]::IsNullOrWhiteSpace($Identity)) {
-        return $false
-    }
-    $prefix = 'start-time:'
-    if (-not $Identity.StartsWith($prefix, [StringComparison]::Ordinal)) {
-        return $false
-    }
-    try {
-        $expectedTicks = [long]::Parse(
-            $Identity.Substring($prefix.Length),
-            [Globalization.CultureInfo]::InvariantCulture
-        )
-    }
-    catch {
-        return $false
-    }
-    $nativeType = Get-WindowsProcessBoundaryType
-    $processHandle = $nativeType::OpenProcessForTermination($ProcessId)
-    if ($processHandle -eq [IntPtr]::Zero) {
-        return (-not (Test-ProcessIdExists -ProcessId $ProcessId))
-    }
-    try {
-        $actualTicks = $nativeType::GetProcessCreationTimeTicks($processHandle)
-        if ($actualTicks -lt 0 -or $actualTicks -ne $expectedTicks) {
-            return $false
-        }
-        if ($nativeType::TerminateProcessHandle($processHandle, 1)) {
-            return $true
-        }
-        return (-not (Test-ProcessIdentity -ProcessId $ProcessId -Identity $Identity))
-    }
-    finally {
-        [void]$nativeType::Close($processHandle)
-    }
-}
-
-function Stop-WindowsProcessJob {
-    param([Parameter(Mandatory = $true)][IntPtr] $JobHandle)
-    $nativeType = Get-WindowsProcessBoundaryType
-    if (-not $nativeType::TerminateJob($JobHandle, 1)) {
-        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        throw "Could not terminate the candidate Windows Job Object (Win32 error $errorCode)."
-    }
-}
-
-function Close-WindowsProcessJob {
-    param([Parameter(Mandatory = $true)][IntPtr] $JobHandle)
-    if ($JobHandle -eq [IntPtr]::Zero) { return }
-    $nativeType = Get-WindowsProcessBoundaryType
-    [void]$nativeType::Close($JobHandle)
-}
-
-
-
-
-function Add-ProcessIdentityToObservation {
-    param(
-        [Parameter(Mandatory = $true)][int] $ProcessId,
-        [Parameter(Mandatory = $true)] $ObservedProcessIdentities
-    )
-    if ($ProcessId -le 0 -or $ObservedProcessIdentities.ContainsKey($ProcessId)) { return }
-    if (-not (Test-ProcessIdExists -ProcessId $ProcessId)) { return }
-    try {
-        $identity = Get-ProcessIdentity -ProcessId $ProcessId
-    }
-    catch {
-        if (Test-ProcessIdExists -ProcessId $ProcessId) {
-            throw ("Could not bind candidate process identity for process " + $ProcessId + ": " + $_.Exception.Message)
-        }
-        return
-    }
-    [void]$ObservedProcessIdentities.Add($ProcessId, [string]$identity)
-}
-
-function Add-ObservedProcessIds {
-    param(
-        [Parameter(Mandatory = $true)][int] $RootProcessId,
-        [Parameter(Mandatory = $true)] $ObservedProcessIdentities,
-        [Parameter()][int] $SupervisorProcessId = 0,
-        [Parameter()][AllowNull()] $BaselineSupervisorProcessIdentities
-    )
-    if (Test-ProcessIdExists -ProcessId $RootProcessId) {
-        foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) {
-            if ($processId -ne $RootProcessId) {
-                Add-ProcessIdentityToObservation -ProcessId ([int]$processId) -ObservedProcessIdentities $ObservedProcessIdentities
-            }
-        }
-    }
-    if ($SupervisorProcessId -gt 0 -and $SupervisorProcessId -ne $RootProcessId) {
-        foreach ($processId in @(Get-DescendantProcessIds -RootProcessId $SupervisorProcessId)) {
-            if ($processId -eq $RootProcessId) { continue }
-            $isBaseline = $false
-            if ($null -ne $BaselineSupervisorProcessIdentities -and
-                $BaselineSupervisorProcessIdentities.ContainsKey([int]$processId)) {
-                $isBaseline = Test-ProcessIdentity -ProcessId ([int]$processId) -Identity ([string]$BaselineSupervisorProcessIdentities[[int]$processId])
-            }
-            if (-not $isBaseline) {
-                Add-ProcessIdentityToObservation -ProcessId ([int]$processId) -ObservedProcessIdentities $ObservedProcessIdentities
-            }
-        }
-    }
-}
-
-function Stop-ProcessTree {
-    param(
-        [Parameter(Mandatory = $true)][int] $RootProcessId,
-        [Parameter()][AllowNull()][string] $RootProcessIdentity,
-        [Parameter(Mandatory = $true)] $ObservedProcessIdentities,
-        [Parameter()][IntPtr] $WindowsJobHandle = [IntPtr]::Zero
-    )
-    if ($RootProcessId -le 0) { throw 'Process-tree cleanup requires a positive root process id.' }
-    [void](Get-WindowsProcessBoundaryType)
-
-    for ($round = 0; $round -lt 3; $round++) {
-        $rootIsCandidate = if ([string]::IsNullOrWhiteSpace($RootProcessIdentity)) {
-            Test-ProcessIdExists -ProcessId $RootProcessId
-        }
-        else {
-            Test-ProcessIdentity -ProcessId $RootProcessId -Identity $RootProcessIdentity
-        }
-        if ($rootIsCandidate) {
-            Add-ObservedProcessIds -RootProcessId $RootProcessId -ObservedProcessIdentities $ObservedProcessIdentities
-        }
-        $targets = @($ObservedProcessIdentities.Keys | Where-Object {
-            [int]$_ -gt 0 -and [int]$_ -ne $RootProcessId -and
-            (Test-ProcessIdentity -ProcessId ([int]$_) -Identity ([string]$ObservedProcessIdentities[[int]$_]))
-        } | Sort-Object -Unique -Descending)
-        if ($WindowsJobHandle -ne [IntPtr]::Zero -and $round -eq 0) {
-            Stop-WindowsProcessJob -JobHandle $WindowsJobHandle
-        }
-        foreach ($processId in $targets) {
-            [void](Stop-WindowsProcessByIdentity -ProcessId ([int]$processId) -Identity ([string]$ObservedProcessIdentities[[int]$processId]))
-        }
-        if ($rootIsCandidate) {
-            if ([string]::IsNullOrWhiteSpace($RootProcessIdentity)) {
-                if ($WindowsJobHandle -eq [IntPtr]::Zero) {
-                    throw 'Could not safely terminate the candidate Windows root without a bound process identity or Job Object.'
-                }
-            }
-            else {
-                [void](Stop-WindowsProcessByIdentity -ProcessId $RootProcessId -Identity $RootProcessIdentity)
-            }
-        }
-        Start-Sleep -Milliseconds 100
-        if ($rootIsCandidate) {
-            Add-ObservedProcessIds -RootProcessId $RootProcessId -ObservedProcessIdentities $ObservedProcessIdentities
-        }
-        $remainingRoot = if ([string]::IsNullOrWhiteSpace($RootProcessIdentity)) {
-            Test-ProcessIdExists -ProcessId $RootProcessId
-        }
-        else {
-            Test-ProcessIdentity -ProcessId $RootProcessId -Identity $RootProcessIdentity
-        }
-        $remainingObserved = @($ObservedProcessIdentities.Keys | Where-Object {
-            Test-ProcessIdentity -ProcessId ([int]$_) -Identity ([string]$ObservedProcessIdentities[[int]$_])
-        })
-        if (-not $remainingRoot -and @($remainingObserved).Count -eq 0) { return }
-    }
-    throw "Could not terminate the complete candidate process boundary rooted at process $RootProcessId."
-}
-
-function Get-RunnerCommandFileSnapshot {
-    param(
-        [Parameter(Mandatory = $true)][string[]] $Names
-    )
-    $snapshot = [ordered]@{}
-    foreach ($name in $Names) {
-        $path = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
-        if ([string]::IsNullOrWhiteSpace($path)) {
-            $snapshot[$name] = [pscustomobject][ordered]@{
-                path = ''
-                exists = $false
-                sha256 = ''
-            }
-            continue
-        }
-        $fullPath = [IO.Path]::GetFullPath($path)
-        $exists = Test-Path -LiteralPath $fullPath -PathType Leaf
-        $hash = ''
-        if ($exists) {
-            Assert-NoReparseAncestors -Path $fullPath -Context "Protected $name command file"
-            $hash = Get-FileByteSha256 -Path $fullPath
-        }
-        $snapshot[$name] = [pscustomobject][ordered]@{
-            path = $fullPath
-            exists = [bool]$exists
-            sha256 = $hash
-        }
-    }
-    return $snapshot
-}
-
-function Assert-RunnerCommandFilesUnchanged {
-    param(
-        [Parameter(Mandatory = $true)] $Before,
-        [Parameter(Mandatory = $true)][string[]] $Names
-    )
-    foreach ($name in $Names) {
-        $beforeEntry = $Before[$name]
-        $path = [string]$beforeEntry.path
-        if ([string]::IsNullOrWhiteSpace($path)) { continue }
-        $exists = Test-Path -LiteralPath $path -PathType Leaf
-        if ([bool]$beforeEntry.exists -ne [bool]$exists) {
-            throw "Protected $name command file was created or removed by candidate code."
-        }
-        if ($exists) {
-            Assert-NoReparseAncestors -Path $path -Context "Protected $name command file"
-            $actualHash = Get-FileByteSha256 -Path $path
-            if ($actualHash -cne [string]$beforeEntry.sha256) {
-                throw "Protected $name command file changed while candidate code was running."
-            }
-        }
-    }
-}
-
-function ConvertTo-NativeProcessArgumentString {
-    param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Arguments
-    )
-    $rendered = foreach ($argument in $Arguments) {
-        $value = [string]$argument
-        $builder = [Text.StringBuilder]::new()
-        [void]$builder.Append([char]34)
-        $backslashCount = 0
-        for ($index = 0; $index -lt $value.Length; $index++) {
-            $character = $value[$index]
-            if ($character -eq [char]92) {
-                $backslashCount++
-                continue
-            }
-            if ($character -eq [char]34) {
-                [void]$builder.Append([char]92, ($backslashCount * 2) + 1)
-                [void]$builder.Append([char]34)
-                $backslashCount = 0
-                continue
-            }
-            if ($backslashCount -gt 0) {
-                [void]$builder.Append([char]92, $backslashCount)
-                $backslashCount = 0
-            }
-            [void]$builder.Append($character)
-        }
-        if ($backslashCount -gt 0) {
-            [void]$builder.Append([char]92, $backslashCount * 2)
-        }
-        [void]$builder.Append([char]34)
-        $builder.ToString()
-    }
-    return ($rendered -join ' ')
-}
-
-function Get-ValidationSecurityAction {
-    param(
-        [Parameter(Mandatory = $true)] $Policy,
-        [Parameter(Mandatory = $true)][string] $Severity,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $severityMatches = @($Policy.security.severity | Where-Object { $_.level -ceq $Severity })
-    if ($severityMatches.Count -ne 1 -or $severityMatches[0].action -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$severityMatches[0].action)) {
-        throw "$Context has no unique central action for severity '$Severity'."
-    }
-    return [string]$severityMatches[0].action
-}
-
-function ConvertTo-ValidationSecurityFinding {
-    param(
-        [Parameter(Mandatory = $true)] $Policy,
-        [Parameter(Mandatory = $true)][string] $ReportedSeverity,
-        [Parameter(Mandatory = $true)][string] $Stage,
-        [Parameter(Mandatory = $true)][string] $SkillId,
-        [Parameter(Mandatory = $true)] $Issue
-    )
-    $severityAliases = [ordered]@{
-        critical = 'critical'
-        high = 'high'
-        medium = 'medium'
-        low = 'low'
-        informational = 'informational'
-        info = 'informational'
-    }
-    $severityKey = $ReportedSeverity.ToLowerInvariant()
-    if (-not $severityAliases.Contains($severityKey)) {
-        throw "$Stage returned unsupported severity '$ReportedSeverity' for '$SkillId'."
-    }
-    $severity = [string]$severityAliases[$severityKey]
-    $action = Get-ValidationSecurityAction -Policy $Policy -Severity $severity -Context $Stage
-    [pscustomobject][ordered]@{
-        stage = $Stage
-        skillId = $SkillId
-        severity = $severity
-        action = $action
-        issue = $Issue
-    }
-}
-
-function Test-PathEqual {
-    param([string] $Left, [string] $Right)
-    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
-    return [IO.Path]::GetFullPath($Left).Equals([IO.Path]::GetFullPath($Right), $comparison)
+function Assert-Sha256 {
+    param([Parameter(Mandatory = $true)][string] $Value, [Parameter(Mandatory = $true)][string] $Context)
+    if ($Value -cnotmatch '^[0-9a-f]{64}$') { throw "$Context must be a lowercase SHA-256 value." }
 }
 
 function Test-PathWithinOrEqual {
-    param([string] $Path, [string] $Root)
+    param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Root)
     $fullPath = [IO.Path]::GetFullPath($Path)
-    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd(
-        [IO.Path]::DirectorySeparatorChar,
-        [IO.Path]::AltDirectorySeparatorChar
-    )
+    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
     return $fullPath.Equals($fullRoot, $comparison) -or
         $fullPath.StartsWith($fullRoot + [IO.Path]::DirectorySeparatorChar, $comparison)
 }
 
-function Assert-NoReparseAncestors {
-    param([string] $Path, [string] $Context)
-    $currentPath = [IO.Path]::GetFullPath($Path)
-    while (-not [string]::IsNullOrWhiteSpace($currentPath)) {
-        $item = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "$Context is backed by a reparse point: $currentPath"
-        }
-        $parentPath = Split-Path -Parent $currentPath
-        if ([string]::IsNullOrWhiteSpace($parentPath) -or (Test-PathEqual -Left $parentPath -Right $currentPath)) { break }
-        $currentPath = $parentPath
-    }
+function Test-PathEqual {
+    param([Parameter(Mandatory = $true)][string] $Left, [Parameter(Mandatory = $true)][string] $Right)
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    return [IO.Path]::GetFullPath($Left).Equals([IO.Path]::GetFullPath($Right), $comparison)
 }
 
-function Assert-NoReparseTree {
+function Assert-PathWithinRoot {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Root,
         [Parameter(Mandatory = $true)][string] $Context
     )
     $fullPath = [IO.Path]::GetFullPath($Path)
-    Assert-NoReparseAncestors -Path $fullPath -Context $Context
-    $rootItem = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
-    if (-not $rootItem.PSIsContainer) {
-        throw "$Context is not a directory: $fullPath"
-    }
-    foreach ($item in @(Get-ChildItem -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop)) {
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "$Context contains a reparse point: $($item.FullName)"
-        }
-    }
+    if (-not (Test-PathWithinOrEqual -Path $fullPath -Root $Root)) { throw "$Context must stay within '$Root': $Path" }
+    return $fullPath
 }
 
-function Write-ExclusiveUtf8File {
+function Assert-OutsideRoot {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][string] $Text,
+        [Parameter(Mandatory = $true)][string] $Root,
         [Parameter(Mandatory = $true)][string] $Context
     )
+    if (Test-PathWithinOrEqual -Path $Path -Root $Root) { throw "$Context must be outside '$Root': $Path" }
+}
 
-    $Path = [IO.Path]::GetFullPath($Path)
-    $outputDirectory = Split-Path -Parent $Path
-    if ([string]::IsNullOrWhiteSpace($outputDirectory)) {
-        throw "$Context has no parent directory: $Path"
+function Assert-NoReparseAncestors {
+    param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Context)
+    $current = [IO.Path]::GetFullPath($Path)
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$Context is backed by a reparse point: $current" }
+        $parent = Split-Path -Parent $current
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $current) { break }
+        $current = $parent
     }
-    # Inspect the nearest existing ancestor before creating any missing
-    # directory. This prevents a reparse-point parent from being traversed
-    # during directory creation while still allowing a new nested output
-    # directory.
-    $existingDirectory = $outputDirectory
-    while (-not (Test-Path -LiteralPath $existingDirectory)) {
-        $parentDirectory = Split-Path -Parent $existingDirectory
-        if ([string]::IsNullOrWhiteSpace($parentDirectory) -or
-            (Test-PathEqual -Left $parentDirectory -Right $existingDirectory)) {
-            throw "$Context directory has no existing ancestor: $outputDirectory"
-        }
-        $existingDirectory = $parentDirectory
-    }
-    $existingDirectoryItem = Get-Item -LiteralPath $existingDirectory -Force -ErrorAction Stop
-    if (-not $existingDirectoryItem.PSIsContainer) {
-        throw "$Context output parent is not a directory: $existingDirectory"
-    }
-    Assert-NoReparseAncestors -Path $existingDirectory -Context "$Context directory"
-    if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
-        [void](New-Item -ItemType Directory -Path $outputDirectory -Force)
-    }
-    Assert-NoReparseAncestors -Path $outputDirectory -Context "$Context directory"
-    if ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
-        throw "$Context path already exists; evidence must not overwrite prior content: $Path"
-    }
+}
 
-    $encoding = [Text.UTF8Encoding]::new($false)
-    $bytes = $encoding.GetBytes($Text)
+function Write-Utf8NoBom {
+    param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Text)
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent)) { [void](New-Item -ItemType Directory -Path $parent -Force) }
+    [IO.File]::WriteAllText([IO.Path]::GetFullPath($Path), $Text, [Text.UTF8Encoding]::new($false))
+}
+
+function Write-Utf8NoBomCreateNew {
+    param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Text)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $parent = Split-Path -Parent $fullPath
+    if (-not [string]::IsNullOrWhiteSpace($parent)) { [void](New-Item -ItemType Directory -Path $parent -Force) }
     $stream = $null
     try {
-        $stream = [IO.File]::Open(
-            $Path,
-            [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::None
+        $stream = [IO.File]::Open($fullPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+}
+
+function Get-ResolvedGitPath {
+    $command = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    return [IO.Path]::GetFullPath([string]$command.Path)
+}
+
+function Get-ResolvedPowerShellPath {
+    $command = Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    return [IO.Path]::GetFullPath([string]$command.Path)
+}
+
+function Resolve-GitRevision {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string] $Root,
+        [Parameter(Mandatory = $true)][string] $Revision,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    $output = @(& $GitPath -C $Root rev-parse --verify --end-of-options "$Revision^{commit}" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1 -or ([string]$output[0]).Trim() -cnotmatch '^[0-9a-f]{40}$') {
+        throw "$Context '$Revision' does not resolve to one immutable commit."
+    }
+    return ([string]$output[0]).Trim()
+}
+
+function Resolve-GoRuntimeVersion {
+    param([string] $Expected)
+    if (-not [string]::IsNullOrWhiteSpace($Expected)) {
+        if ($Expected -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'ExpectedGoRuntimeVersion must be a stable semantic Go version.' }
+        return $Expected
+    }
+    $go = Get-Command go -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $output = @(& $go.Path version)
+    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1 -or [string]$output[0] -notmatch '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+)\s') {
+        throw 'Could not resolve the current stable Go runtime version.'
+    }
+    return [string]$Matches.version
+}
+
+function Get-EventName {
+    $event = [string]$env:GITHUB_EVENT_NAME
+    switch ($event) {
+        'pull_request' { return 'pull_request' }
+        'push' { return 'push' }
+        'workflow_dispatch' { return 'workflow_dispatch' }
+        'pre-push' { return 'pre-push' }
+        default { return 'local' }
+    }
+}
+
+function Assert-StandardCoreAuthorityCheckout {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string] $AuthorityRoot,
+        [Parameter(Mandatory = $true)] $AuthorityPin
+    )
+
+    $fullRoot = [IO.Path]::GetFullPath($AuthorityRoot)
+    if (-not (Test-Path -LiteralPath $fullRoot -PathType Container)) { throw "Pinned authority Git checkout is missing: $fullRoot" }
+    Assert-NoReparseAncestors -Path $fullRoot -Context 'Pinned authority checkout'
+    $top = @(& $GitPath -C $fullRoot rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $top.Count -ne 1 -or -not (Test-PathEqual -Left ([string]$top[0]) -Right $fullRoot)) {
+        throw 'Pinned authority path is not the root of a Git checkout.'
+    }
+    $head = Resolve-GitRevision -GitPath $GitPath -Root $fullRoot -Revision 'HEAD' -Context 'Pinned authority HEAD'
+    if ($head -cne [string]$AuthorityPin.commit) { throw 'Pinned authority checkout HEAD does not match the selected authority revision.' }
+    $origins = @(& $GitPath -C $fullRoot config --local --get-all remote.origin.url 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $origins.Count -ne 1) { throw 'Pinned authority checkout must have exactly one origin URL.' }
+    $origin = ([string]$origins[0]).Trim().TrimEnd('/') -replace '\.git$', ''
+    $expectedOrigin = ([string]$AuthorityPin.repository).Trim().TrimEnd('/') -replace '\.git$', ''
+    if (-not $origin.Equals($expectedOrigin, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Pinned authority checkout origin does not match the selected authority repository.'
+    }
+    $dirty = @(& $GitPath -C $fullRoot status --porcelain=v1 --untracked-files=all)
+    if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { throw 'Pinned authority checkout must be clean and immutable.' }
+
+    foreach ($entry in $AuthorityPin.files.GetEnumerator()) {
+        $filePath = Assert-PathWithinRoot -Path (Join-Path $fullRoot ($entry.Key -replace '/', [IO.Path]::DirectorySeparatorChar)) -Root $fullRoot -Context 'Pinned authority file'
+        Assert-NoReparseAncestors -Path $filePath -Context 'Pinned authority file'
+        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf) -or
+            (Get-GitBlobSha256 -GitPath $GitPath -RepositoryRoot $fullRoot -Revision $head -RelativePath $entry.Key) -cne [string]$entry.Value -or
+            -not (Test-AuthorityWorktreeSha256 -Path $filePath -ExpectedSha256 ([string]$entry.Value))) {
+            throw "Pinned authority file identity mismatch: $($entry.Key)"
+        }
+    }
+    $coreContract = Join-Path $fullRoot 'docs/standards/standard-core-validation-v2.json'
+    Assert-NoReparseAncestors -Path $coreContract -Context 'Pinned Core v2 contract'
+    if (-not (Test-Path -LiteralPath $coreContract -PathType Leaf)) {
+        throw 'Pinned authority checkout is missing the tracked Core v2 contract.'
+    }
+    $coreContractSha256 = Get-GitBlobSha256 -GitPath $GitPath -RepositoryRoot $fullRoot -Revision $head -RelativePath 'docs/standards/standard-core-validation-v2.json'
+    if (-not (Test-AuthorityWorktreeSha256 -Path $coreContract -ExpectedSha256 $coreContractSha256)) {
+        throw 'Pinned Core v2 contract worktree content differs from the immutable authority commit.'
+    }
+    return [pscustomobject]@{
+        root = $fullRoot
+        runnerPath = (Join-Path $fullRoot 'scripts/Invoke-StandardValidation.ps1')
+        revision = $head
+    }
+}
+
+function New-StandardCoreAuthoritySnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string] $SourceRoot,
+        [Parameter(Mandatory = $true)][string] $OwnedRoot,
+        [Parameter(Mandatory = $true)] $AuthorityPin
+    )
+
+    $snapshotRoot = Assert-PathWithinRoot -Path (Join-Path $OwnedRoot 'authority') -Root $OwnedRoot -Context 'Core authority snapshot'
+    if (Test-Path -LiteralPath $snapshotRoot) { throw 'Core authority snapshot path already exists.' }
+    $hooksRoot = Join-Path $OwnedRoot '.empty-git-hooks'
+    [void](New-Item -ItemType Directory -Path $hooksRoot -ErrorAction Stop)
+    Assert-NoReparseAncestors -Path $hooksRoot -Context 'Core authority snapshot hooks'
+    # A local no-hardlink clone copies available Git objects, including partial
+    # clone packs, without sharing the caller's mutable worktree or object files.
+    & $GitPath -c "core.hooksPath=$hooksRoot" -c core.autocrlf=false -c core.longpaths=true clone --quiet --local --no-hardlinks --no-checkout -- $SourceRoot $snapshotRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Could not materialize the pinned authority Git objects in the run-owned snapshot.' }
+    & $GitPath -C $snapshotRoot config --local core.autocrlf false
+    if ($LASTEXITCODE -ne 0) { throw 'Could not disable checkout line-ending conversion in the authority snapshot.' }
+    & $GitPath -C $snapshotRoot config --local core.longpaths true
+    if ($LASTEXITCODE -ne 0) { throw 'Could not enable long paths in the authority snapshot.' }
+    $snapshotPaths = @($AuthorityPin.files.Keys) + @('docs/standards/standard-core-validation-v2.json')
+    & $GitPath -c "core.hooksPath=$hooksRoot" -C $snapshotRoot sparse-checkout set --no-cone -- $snapshotPaths
+    if ($LASTEXITCODE -ne 0) { throw 'Could not select the pinned authority files for the run-owned snapshot.' }
+    & $GitPath -C $snapshotRoot config --local --replace-all remote.origin.url ([string]$AuthorityPin.repository)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not bind the authority snapshot origin.' }
+    & $GitPath -c "core.hooksPath=$hooksRoot" -c core.autocrlf=false -C $snapshotRoot checkout --quiet --detach ([string]$AuthorityPin.commit)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not check out the exact pinned authority commit.' }
+    return Assert-StandardCoreAuthorityCheckout -GitPath $GitPath -AuthorityRoot $snapshotRoot -AuthorityPin $AuthorityPin
+}
+
+function New-StandardCoreAdapterV2 {
+    param(
+        [Parameter(Mandatory = $true)][string] $PowerShellPath,
+        [Parameter(Mandatory = $true)][string] $TrustedToolRoot,
+        [Parameter(Mandatory = $true)][string] $CandidateAuthorityAdapterRunId,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $ActiveSkillIds
+    )
+
+    $fullPowerShellPath = [IO.Path]::GetFullPath($PowerShellPath)
+    $fullTrustedToolRoot = [IO.Path]::GetFullPath($TrustedToolRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if (-not (Test-Path -LiteralPath $fullPowerShellPath -PathType Leaf) -or
+        (-not $fullPowerShellPath.Equals($fullTrustedToolRoot, $comparison) -and
+         -not $fullPowerShellPath.StartsWith($fullTrustedToolRoot + [IO.Path]::DirectorySeparatorChar, $comparison))) {
+        throw 'Trusted PowerShell executable must be a regular file within TrustedToolRoot.'
+    }
+    if ($CandidateAuthorityAdapterRunId -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'Core Pester requires the canonical outer adapter run identity.'
+    }
+    if ($ActiveSkillIds.Count -eq 0) { throw 'Core adapter requires at least one active Skill.' }
+    foreach ($skillId in $ActiveSkillIds) {
+        if ($skillId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "Core adapter contains an invalid active Skill ID: '$skillId'." }
+    }
+    $powerShellSha256 = (Get-FileHash -LiteralPath $fullPowerShellPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $generalArguments = @('-NoProfile', '-NonInteractive', '-File', 'scripts/Test-Repository.ps1', '-ReadOnlySnapshot')
+    $pesterArguments = @('-NoProfile', '-NonInteractive', '-File', 'scripts/Invoke-CorePester.ps1',
+        '-CandidateAuthorityAdapterRunId', $CandidateAuthorityAdapterRunId)
+    return [ordered]@{
+        schemaVersion = 2
+        adapter = 'standard-core-adapter-v2'
+        skillsRoot = 'skills'
+        activeSkills = @($ActiveSkillIds)
+        checks = @(
+            [ordered]@{ id = 'repository-general'; kind = 'general'; executable = $fullPowerShellPath; executableSha256 = $powerShellSha256; arguments = $generalArguments },
+            [ordered]@{ id = 'repository-pester'; kind = 'pester'; executable = $fullPowerShellPath; executableSha256 = $powerShellSha256; arguments = $pesterArguments }
         )
-        try {
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
-        }
-        finally {
-            $stream.Dispose()
-        }
-    }
-    catch {
-        throw "$Context could not be created exclusively: $($_.Exception.Message)"
-    }
-
-    Assert-NoReparseAncestors -Path $Path -Context $Context
-    $writtenBytes = [IO.File]::ReadAllBytes($Path)
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try {
-        $expectedSha256 = ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
-        $actualSha256 = ([BitConverter]::ToString($hasher.ComputeHash($writtenBytes)) -replace '-', '').ToLowerInvariant()
-    }
-    finally {
-        $hasher.Dispose()
-    }
-    if ($actualSha256 -cne $expectedSha256) {
-        throw "$Context changed during immediate readback: $Path"
-    }
-    return [pscustomobject][ordered]@{
-        path = $Path
-        sha256 = $actualSha256
     }
 }
 
-function Expand-TrustedGitArchive {
+function New-SourceToolSetup {
+    param([string] $Root, [string] $AuthorityRoot, $AuthorityPin, [string] $PowerShell,
+        [string] $CandidateRevision, [string] $Git, [string] $CandidateRoot,
+        [string] $PreparedPath, [string] $GoVersion, [int] $LimitSeconds)
+    $setupId = [guid]::NewGuid().ToString('N')
+    $owned = Assert-PathWithinRoot -Path (Join-Path $Root "source-tools-$setupId") -Root $Root -Context 'Source setup owned root'
+    if (Test-Path -LiteralPath $owned) { throw 'Source setup root already exists.' }
+    [void](New-Item -ItemType Directory -Path $owned -ErrorAction Stop)
+    Assert-NoReparseAncestors -Path $owned -Context 'Source setup owned root'
+    $runner = Join-Path $AuthorityRoot 'scripts/Invoke-StandardValidation.ps1'
+    . $runner -DefineFunctionsOnly -CandidateRoot $CandidateRoot -AdapterPath $PreparedPath -ArtifactsRoot $Root `
+        -SourceRepository $script:SourceRepository -SourceRevision $CandidateRevision -BaseRevision $CandidateRevision
+    $resolver = Join-Path $AuthorityRoot 'scripts/Resolve-StandardValidationTool.ps1'
+    $policy = Join-Path $AuthorityRoot 'docs/standards/validation-toolchain.json'
+    $receipts = [ordered]@{}
+    $receiptBindings = @()
+    foreach ($tool in @('skill-validator', 'skill-tools', 'skillspector')) {
+        $receiptPath = Join-Path $owned "receipt-$tool.json"
+        $result = Invoke-StandardValidationProcess -Command $PowerShell -Arguments @('-NoProfile','-NonInteractive','-File',$resolver,
+            '-PolicyPath',$policy,'-ToolName',$tool,'-Install','-InstallRoot',(Join-Path $owned 'installed'),
+            '-ExpectedGoRuntimeVersion',$GoVersion,'-RunId',$setupId,'-OutputPath',$receiptPath) `
+            -WorkingDirectory $owned -Environment @{} -TimeoutSeconds $LimitSeconds -CoreLifecycleOnly
+        Write-Utf8NoBomCreateNew -Path (Join-Path $owned "setup-$tool-process.json") -Text ($result | ConvertTo-Json -Depth 30)
+        if ($result.status -cne 'passed' -or $result.exitCode -ne 0 -or -not $result.cleanedUp) { throw "Source setup $tool failed: $($result.status), exit=$($result.exitCode), cleanup=$($result.cleanedUp). $($result.stderr)" }
+        $receipts[$tool] = Read-JsonFile -Path $receiptPath -Context "$tool source receipt"
+        $receiptBindings += [pscustomobject]@{path=$receiptPath;sha256=(Get-FileSha256 -Path $receiptPath)}
+    }
+    $toolchain = [ordered]@{
+        centralRunnerPath=$runner; centralRunnerSha256=(Get-FileSha256 -Path $runner)
+        upstreamAdapterValidatorPath=(Join-Path $AuthorityRoot 'scripts/Validate-UpstreamAdapter.ps1')
+        upstreamAdapterValidatorSha256=(Get-FileSha256 -Path (Join-Path $AuthorityRoot 'scripts/Validate-UpstreamAdapter.ps1'))
+        upstreamPolicyPath=(Join-Path $AuthorityRoot 'docs/standards/upstream-adapter.json')
+        upstreamPolicySha256=(Get-FileSha256 -Path (Join-Path $AuthorityRoot 'docs/standards/upstream-adapter.json'))
+        skillValidatorPath=[string]$receipts.'skill-validator'.executablePath; skillValidatorSha256=[string]$receipts.'skill-validator'.executableSha256
+        skillToolsNodePath=[string]$receipts.'skill-tools'.nodePath; skillToolsNodeSha256=[string]$receipts.'skill-tools'.nodeSha256
+        skillToolsEntryPointPath=[string]$receipts.'skill-tools'.entryPointPath; skillToolsEntryPointSha256=[string]$receipts.'skill-tools'.entryPointSha256
+        skillSpectorPath=[string]$receipts.skillspector.executablePath; skillSpectorSha256=[string]$receipts.skillspector.executableSha256
+        skillSpectorReceiptPath=[string]$receiptBindings[2].path; skillSpectorReceiptSha256=[string]$receiptBindings[2].sha256
+    }
+    $toolchainPath = Join-Path $owned 'toolchain.json'
+    Write-Utf8NoBomCreateNew -Path $toolchainPath -Text ($toolchain | ConvertTo-Json -Depth 20)
+    $wrapper = Join-Path $owned 'Invoke-DarktideValidationChild.ps1'
+    Write-Utf8NoBomCreateNew -Path $wrapper -Text $childRunnerText
+    $archive = Join-Path $owned 'candidate.zip'
+    & $Git -C $CandidateRoot archive --format=zip "--output=$archive" $CandidateRevision
+    if ($LASTEXITCODE -ne 0) { throw 'Source setup could not archive the exact candidate.' }
+    $arguments = @('-NoProfile','-NonInteractive','-File',$wrapper,'-ToolchainPath',$toolchainPath,
+        '-ToolchainSha256',(Get-FileSha256 -Path $toolchainPath),'-SourceRepository',$script:SourceRepository,
+        '-SourceRevision',$CandidateRevision,'-ArchiveSha256',(Get-FileSha256 -Path $archive))
+    $files = @($PowerShell,$wrapper,$toolchainPath,$runner,$toolchain.upstreamAdapterValidatorPath,$toolchain.upstreamPolicyPath,
+        $toolchain.skillValidatorPath,[string]$receipts.'skill-tools'.executablePath,$toolchain.skillToolsNodePath,$toolchain.skillToolsEntryPointPath,$toolchain.skillSpectorPath) + @($receiptBindings.path)
+    $frozen = @(foreach ($file in @($files | Select-Object -Unique)) { [pscustomobject]@{path=[IO.Path]::GetFullPath($file);sha256=(Get-FileSha256 -Path $file)} })
+    Assert-StandardCoreFrozenFiles -Files $frozen
+    Assert-StandardCoreSourceToolReceipts -Bindings $receiptBindings -FrozenFiles $frozen -RunId $setupId
+    $dispatch = [ordered]@{
+        packageAdapter=[ordered]@{command=$PowerShell;arguments=@($arguments + @('-Mode','package-adapter'))}
+        skillValidator=[ordered]@{command=$PowerShell;arguments=@($arguments + @('-Mode','skill-validator'))}
+        skillTools=[ordered]@{command=$PowerShell;arguments=@($arguments + @('-Mode','skill-tools'))}
+        staticAnalyzer=[ordered]@{command=$PowerShell;arguments=@($arguments + @('-Mode','static'))}
+        frozenFiles=$frozen;toolReceipts=$receiptBindings
+    }
+    Write-Utf8NoBomCreateNew -Path $PreparedPath -Text ([ordered]@{
+        schemaVersion=1; preparation='darktide-source-tools';runId=$setupId;sourceRevision=$CandidateRevision
+        authorityRevision=[string]$AuthorityPin.commit;ownedRoot=$owned;sourceValidation=$dispatch
+    } | ConvertTo-Json -Depth 40)
+}
+
+function Read-SourceToolSetup {
+    param([string] $Path, [string] $SourceRevision, [string] $AuthorityRevision, [string] $PowerShell, [string] $AuthorityRoot)
+    if (-not [string]::IsNullOrWhiteSpace($AuthorityRoot)) {
+        . (Join-Path $AuthorityRoot 'scripts/Invoke-StandardValidation.ps1') -DefineFunctionsOnly `
+            -CandidateRoot $AuthorityRoot -AdapterPath $Path -ArtifactsRoot (Split-Path -Parent $Path) `
+            -SourceRepository $script:SourceRepository -SourceRevision $SourceRevision -BaseRevision $SourceRevision -AuthorityRevision $AuthorityRevision
+    }
+    Assert-NoReparseAncestors -Path $Path -Context 'Prepared source setup'
+    $prepared = Read-JsonFile -Path $Path -Context 'Prepared source setup'
+    Assert-ExactPropertySet -Value $prepared -Expected @('schemaVersion','preparation','runId','sourceRevision','authorityRevision','ownedRoot','sourceValidation') -Context 'Prepared source setup'
+    if ($prepared.schemaVersion -ne 1 -or $prepared.preparation -cne 'darktide-source-tools' -or
+        $prepared.runId -cnotmatch '^[0-9a-f]{32}$' -or $prepared.sourceRevision -cne $SourceRevision -or
+        $prepared.authorityRevision -cne $AuthorityRevision -or $prepared.sourceValidation.packageAdapter.command -cne $PowerShell) {
+        throw 'Prepared source tools do not bind this candidate, authority and runtime.'
+    }
+    $expectedOwned = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($Path))) "source-tools-$($prepared.runId)"
+    if (-not (Test-PathEqual -Left $prepared.ownedRoot -Right $expectedOwned)) { throw 'Prepared source setup owned root differs.' }
+    Assert-NoReparseAncestors -Path $expectedOwned -Context 'Prepared source setup owned root'
+    $wrapper = Join-Path $expectedOwned 'Invoke-DarktideValidationChild.ps1'
+    $wrapperHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($childRunnerText))).ToLowerInvariant()
+    if ((Get-FileSha256 -Path $wrapper) -cne $wrapperHash) { throw 'Prepared source wrapper differs from the protected driver.' }
+    $toolchain = Join-Path $expectedOwned 'toolchain.json'
+    Assert-StandardCoreFrozenFiles -Files @($prepared.sourceValidation.frozenFiles)
+    Assert-StandardCoreSourceToolReceipts -Bindings @($prepared.sourceValidation.toolReceipts) -FrozenFiles @($prepared.sourceValidation.frozenFiles) -RunId $prepared.runId
+    $receipts = @{}
+    foreach ($receiptBinding in @($prepared.sourceValidation.toolReceipts)) {
+        $receipt = Read-JsonFile -Path $receiptBinding.path -Context 'Prepared source resolver receipt'
+        $receipts[[string]$receipt.toolName] = $receipt
+    }
+    $preparedToolchain = Read-JsonFile -Path $toolchain -Context 'Prepared source toolchain'
+    if (-not [string]::IsNullOrWhiteSpace($AuthorityRoot)) {
+        foreach ($authorityBinding in @(
+            @('centralRunnerPath','centralRunnerSha256','scripts/Invoke-StandardValidation.ps1'),
+            @('upstreamAdapterValidatorPath','upstreamAdapterValidatorSha256','scripts/Validate-UpstreamAdapter.ps1'),
+            @('upstreamPolicyPath','upstreamPolicySha256','docs/standards/upstream-adapter.json')
+        )) {
+            $expectedAuthorityFile = Join-Path $AuthorityRoot $authorityBinding[2]
+            if ([string]$preparedToolchain.($authorityBinding[0]) -cne [string]$expectedAuthorityFile -or
+                [string]$preparedToolchain.($authorityBinding[1]) -cne (Get-FileSha256 -Path $expectedAuthorityFile)) {
+                throw 'Prepared source toolchain differs from the verified authority files.'
+            }
+        }
+    }
+    foreach ($binding in @(
+        @{ actualPath=$preparedToolchain.skillValidatorPath; actualSha=$preparedToolchain.skillValidatorSha256; expectedPath=$receipts.'skill-validator'.executablePath; expectedSha=$receipts.'skill-validator'.executableSha256; name='skill-validator' },
+        @{ actualPath=$preparedToolchain.skillToolsNodePath; actualSha=$preparedToolchain.skillToolsNodeSha256; expectedPath=$receipts.'skill-tools'.nodePath; expectedSha=$receipts.'skill-tools'.nodeSha256; name='skill-tools Node' },
+        @{ actualPath=$preparedToolchain.skillToolsEntryPointPath; actualSha=$preparedToolchain.skillToolsEntryPointSha256; expectedPath=$receipts.'skill-tools'.entryPointPath; expectedSha=$receipts.'skill-tools'.entryPointSha256; name='skill-tools entry point' },
+        @{ actualPath=$preparedToolchain.skillSpectorPath; actualSha=$preparedToolchain.skillSpectorSha256; expectedPath=$receipts.skillspector.executablePath; expectedSha=$receipts.skillspector.executableSha256; name='skillspector' }
+    )) {
+        if ([string]$binding.actualPath -cne [string]$binding.expectedPath -or [string]$binding.actualSha -cne [string]$binding.expectedSha) {
+            throw "Prepared source toolchain does not match the $($binding.name) resolver receipt."
+        }
+    }
+    $staticReceipt = @($prepared.sourceValidation.toolReceipts | Where-Object { [string]$_.path -ceq [string]$preparedToolchain.skillSpectorReceiptPath })
+    if ($staticReceipt.Count -ne 1 -or [string]$staticReceipt[0].sha256 -cne [string]$preparedToolchain.skillSpectorReceiptSha256 -or
+        (Read-JsonFile -Path $staticReceipt[0].path -Context 'Prepared Static receipt').toolName -cne 'skillspector') {
+        throw 'Prepared source Static receipt differs.'
+    }
+    $arguments = @('-NoProfile','-NonInteractive','-File',$wrapper,'-ToolchainPath',$toolchain,
+        '-ToolchainSha256',(Get-FileSha256 -Path $toolchain),'-SourceRepository',$script:SourceRepository,
+        '-SourceRevision',$SourceRevision,'-ArchiveSha256',(Get-FileSha256 -Path (Join-Path $expectedOwned 'candidate.zip')))
+    foreach ($entry in @(@('packageAdapter','package-adapter'),@('skillValidator','skill-validator'),@('skillTools','skill-tools'),@('staticAnalyzer','static'))) {
+        $command = $prepared.sourceValidation.($entry[0])
+        if ([string]$command.command -cne $PowerShell -or
+            (ConvertTo-Json -InputObject @($command.arguments) -Compress) -cne (ConvertTo-Json -InputObject @($arguments + @('-Mode',$entry[1])) -Compress)) {
+            throw 'Prepared source dispatch differs from the protected driver.'
+        }
+    }
+    return $prepared
+}
+
+function Get-StandardCoreRunPaths {
     param(
-        [Parameter(Mandatory = $true)][string] $GitPath,
-        [Parameter(Mandatory = $true)][string[]] $GitConfigArguments,
-        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $Revision,
-        [Parameter(Mandatory = $true)][string] $DestinationRoot,
-        [Parameter()][AllowEmptyCollection()][string[]] $PathSpec = @(),
-        [Parameter(Mandatory = $true)][string] $Context
+        [Parameter(Mandatory = $true)][string] $ArtifactsRoot,
+        [Parameter(Mandatory = $true)][bool] $ArtifactsRootWasExplicit,
+        [string] $OutputPath,
+        [string] $PreparedRunId
     )
-    $destination = [IO.Path]::GetFullPath($DestinationRoot)
-    [void](New-Item -ItemType Directory -Path $destination -Force)
-    Assert-NoReparseAncestors -Path $destination -Context "$Context destination"
-    $archivePath = Join-Path (Split-Path -Parent $destination) ('.trusted-git-{0}.zip' -f [guid]::NewGuid().ToString('N'))
-    try {
-        & $GitPath @GitConfigArguments -C $RepositoryRoot archive --format=zip --output=$archivePath $Revision @PathSpec
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
-            throw "$Context could not create the immutable Git archive."
-        }
-        Expand-Archive -LiteralPath $archivePath -DestinationPath $destination -Force
-    }
-    finally {
-        if (Test-Path -LiteralPath $archivePath -PathType Leaf) {
-            Remove-Item -LiteralPath $archivePath -Force -ErrorAction Stop
-        }
-    }
-    Assert-NoReparseTree -Path $destination -Context $Context
-}
 
-function Assert-TrustedGitTreeFile {
-    param(
-        [Parameter(Mandatory = $true)][string] $GitPath,
-        [Parameter(Mandatory = $true)][string[]] $GitConfigArguments,
-        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $Revision,
-        [Parameter(Mandatory = $true)][string] $RelativePath,
-        [Parameter(Mandatory = $true)][string] $MaterializedPath,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $item = Get-Item -LiteralPath $MaterializedPath -Force -ErrorAction Stop
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$Context is not a regular non-reparse file: $MaterializedPath"
+    $requestedRoot = [IO.Path]::GetFullPath($ArtifactsRoot)
+    $runId = if ([string]::IsNullOrWhiteSpace($PreparedRunId)) { [guid]::NewGuid().ToString('N') } else { $PreparedRunId }
+    if ($runId -cnotmatch '^[0-9a-f]{32}$') { throw 'Source setup run identity is invalid.' }
+    if ($ArtifactsRootWasExplicit) {
+        $coreArtifactsRoot = $requestedRoot
+        $adapterParent = Split-Path -Parent $coreArtifactsRoot
     }
-    Assert-NoReparseAncestors -Path $MaterializedPath -Context $Context
-    $revisionPath = "$Revision`:$RelativePath"
-    $expected = ([string](@(& $GitPath @GitConfigArguments -C $RepositoryRoot rev-parse --verify $revisionPath 2>$null) | Select-Object -First 1)).Trim()
-    if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') {
-        throw "$Context could not resolve the trusted Git blob: $RelativePath"
+    else {
+        if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
+            throw 'Core Run requires an explicit -ArtifactsRoot when -OutputPath is supplied.'
+        }
+        $coreArtifactsRoot = Join-Path $requestedRoot "core-v2-$runId"
+        $adapterParent = $requestedRoot
     }
-    $actual = ([string](@(& $GitPath @GitConfigArguments -C $RepositoryRoot hash-object --no-filters -- $MaterializedPath 2>$null) | Select-Object -First 1)).Trim()
-    if ($LASTEXITCODE -ne 0 -or $actual -cne $expected) {
-        throw "$Context does not match the trusted Git blob: $RelativePath"
+    if ([string]::IsNullOrWhiteSpace($adapterParent)) { throw 'Core Run could not resolve a sibling adapter directory.' }
+
+    $adapterRoot = Join-Path $adapterParent ".core-v2-adapter-$runId"
+    if ((Test-PathWithinOrEqual -Path $adapterRoot -Root $coreArtifactsRoot) -or
+        (Test-PathWithinOrEqual -Path $coreArtifactsRoot -Root $adapterRoot)) {
+        throw 'Core adapter and ArtifactsRoot must be separate sibling paths.'
+    }
+    $resolvedOutputPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+        Join-Path $coreArtifactsRoot 'standard-core-validation-v2-report.json'
+    }
+    else {
+        Assert-PathWithinRoot -Path $OutputPath -Root $coreArtifactsRoot -Context 'OutputPath'
+    }
+    return [pscustomobject]@{
+        runId = $runId
+        artifactsRoot = [IO.Path]::GetFullPath($coreArtifactsRoot)
+        artifactsRootWasExplicit = $ArtifactsRootWasExplicit
+        adapterRoot = [IO.Path]::GetFullPath($adapterRoot)
+        adapterPath = [IO.Path]::GetFullPath((Join-Path $adapterRoot 'standard-core-adapter-v2.json'))
+        outputPath = [IO.Path]::GetFullPath($resolvedOutputPath)
     }
 }
 
+function Get-ActiveSkillIds {
+    param([Parameter(Mandatory = $true)][string] $Root)
+    $inventory = Read-JsonFile -Path (Join-Path $Root 'catalog/source.json') -Context 'catalog/source.json'
+    Assert-ExactPropertySet -Value $inventory -Expected @('schemaVersion', 'sourceId', 'repository', 'skillsRoot', 'skills') -Context 'catalog/source.json'
+    if ($inventory.schemaVersion -ne 2 -or $inventory.sourceId -cne 'darktide-translate' -or
+        $inventory.repository -cne $script:SourceRepository -or $inventory.skillsRoot -cne 'skills' -or
+        $inventory.skills -isnot [array] -or @($inventory.skills).Count -eq 0) {
+        throw 'catalog/source.json is not the strict Darktide source inventory.'
+    }
+    if (Test-Path -LiteralPath (Join-Path $Root 'catalog/skills-catalog.json') -PathType Leaf) {
+        throw 'Legacy source-owned cross-source catalog must not coexist with catalog/source.json.'
+    }
+    $trackedProjection = @(& (Get-ResolvedGitPath) -C $Root ls-files -- .agents/skills)
+    if ($LASTEXITCODE -ne 0 -or $trackedProjection.Count -ne 0) { throw 'Tracked consumer Skill projections must not coexist with canonical source packages.' }
+    [string[]]$declared = @($inventory.skills | ForEach-Object {
+        if ($_ -isnot [string] -or [string]$_ -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "Invalid Skill ID in catalog/source.json: '$_'." }
+        [string]$_
+    })
+    [string[]]$sorted = @($declared)
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($skillId in $declared) { if (-not $seen.Add($skillId)) { throw "Duplicate Skill ID '$skillId'." } }
+    if (($declared -join "`n") -cne ($sorted -join "`n")) { throw 'catalog/source.json skills must use ordinal ascending order.' }
+    $skillsRoot = Join-Path $Root 'skills'
+    if (-not (Test-Path -LiteralPath $skillsRoot -PathType Container)) { throw 'Canonical skills/ source root is missing.' }
+    $actual = @(Get-ChildItem -LiteralPath $skillsRoot -Directory -Force | ForEach-Object { [string]$_.Name })
+    [Array]::Sort($actual, [StringComparer]::Ordinal)
+    if (($actual -join "`n") -cne ($sorted -join "`n")) { throw 'catalog/source.json inventory does not exactly match skills/ directories.' }
+    return $sorted
+}
 
+$childRunnerText = @'
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
+#requires -Version 7.0
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][ValidateSet('package-adapter', 'skill-validator', 'skill-tools', 'static', 'repository-general', 'repository-pester')][string] $Mode,
+    [Parameter(Mandatory = $true)][string] $ToolchainPath,
+    [Parameter(Mandatory = $true)][string] $ToolchainSha256,
+    [string] $SourceRepository,
+    [string] $SourceRevision,
+    [string] $ArchiveSha256,
+    [string] $SemanticRequired = 'false'
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+function Assert-FileIdentity {
+    param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Sha256, [Parameter(Mandatory = $true)][string] $Context)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Get-FileSha256 -Path $Path) -cne $Sha256) { throw "$Context changed or is missing." }
+}
+function Get-Property {
+    param([Parameter(Mandatory = $true)] $Object, [Parameter(Mandatory = $true)][string] $Name, [Parameter(Mandatory = $true)][string] $Context)
+    if ($null -eq $Object -or $null -eq $Object.PSObject.Properties[$Name]) { throw "$Context is missing '$Name'." }
+    return $Object.PSObject.Properties[$Name].Value
+}
+function Read-Json {
+    param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Context)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Context is missing: $Path" }
+    try { return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 100) }
+    catch { throw "$Context is not valid JSON: $($_.Exception.Message)" }
+}
+function Test-PathEqual {
+    param([Parameter(Mandatory = $true)][string] $Left, [Parameter(Mandatory = $true)][string] $Right)
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    return [IO.Path]::GetFullPath($Left).Equals([IO.Path]::GetFullPath($Right), $comparison)
+}
+function Test-PathWithin {
+    param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Root)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    return $fullPath.Equals($fullRoot, $comparison) -or $fullPath.StartsWith($fullRoot + [IO.Path]::DirectorySeparatorChar, $comparison)
+}
+function Get-ActiveSkills {
+    $values = @([string]$env:STANDARD_VALIDATION_ACTIVE_SKILLS -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($values.Count -eq 0) { throw 'Central runner did not provide active Skill identities.' }
+    return [string[]]$values
+}
+function Get-SkillRoot {
+    param([Parameter(Mandatory = $true)][string] $SkillId)
+    $skillsRoot = [IO.Path]::GetFullPath([string]$env:STANDARD_VALIDATION_SKILLS_ROOT)
+    $skillRoot = [IO.Path]::GetFullPath((Join-Path $skillsRoot $SkillId))
+    if (-not (Test-PathWithin -Path $skillRoot -Root $skillsRoot) -or -not (Test-Path -LiteralPath $skillRoot -PathType Container)) {
+        throw "Central runner supplied an unsafe or missing Skill root: $SkillId"
+    }
+    return $skillRoot
+}
+function Get-InventoryPaths {
+    param([Parameter(Mandatory = $true)][string] $SkillRoot)
+    $root = [IO.Path]::GetFullPath($SkillRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $paths = @(
+        Get-ChildItem -LiteralPath $root -Recurse -File -Force |
+            ForEach-Object { $_.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar).Replace([IO.Path]::DirectorySeparatorChar, '/') }
+    )
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    if ($paths.Count -eq 0) { throw "Skill inventory is empty: $SkillRoot" }
+    return [string[]]$paths
+}
 function Resolve-ReportedFilePath {
     param(
         [Parameter(Mandatory = $true)] $Value,
         [Parameter(Mandatory = $true)][string] $SkillRoot,
-        [Parameter(Mandatory = $true)][string[]] $ExpectedInventoryPaths,
+        [Parameter(Mandatory = $true)][string[]] $ExpectedPaths,
         [Parameter(Mandatory = $true)][string] $Context
     )
-    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) { throw "$Context must be a non-empty path string." }
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) { throw "$Context must identify a file." }
     $candidate = [string]$Value
     if ($candidate -cmatch '^file:') {
         $uri = $null
-        if (-not [Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -or -not $uri.IsFile) {
-            throw "$Context must be a local Skill path."
-        }
+        if (-not [Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -or -not $uri.IsFile) { throw "$Context must be a local file." }
         $candidate = $uri.LocalPath
     }
-    elseif (-not [IO.Path]::IsPathRooted($candidate) -and $candidate -cmatch '^[a-zA-Z][a-zA-Z0-9+.-]*:') {
-        throw "$Context must be a local Skill path."
+    elseif (-not [IO.Path]::IsPathRooted($candidate)) { $candidate = Join-Path $SkillRoot $candidate }
+    $full = [IO.Path]::GetFullPath($candidate)
+    if (-not (Test-PathWithin -Path $full -Root $SkillRoot)) { throw "$Context escapes the Skill root." }
+    foreach ($relative in $ExpectedPaths) {
+        if (Test-PathEqual -Left $full -Right (Join-Path $SkillRoot $relative)) { return $full }
     }
-    if (-not [IO.Path]::IsPathRooted($candidate)) { $candidate = Join-Path $SkillRoot $candidate }
-    $fullPath = Assert-PathWithinRoot -Path $candidate -Root $SkillRoot -Context $Context
-    foreach ($relativePath in $ExpectedInventoryPaths) {
-        if (Test-PathEqual -Left $fullPath -Right (Join-Path $SkillRoot $relativePath)) { return $fullPath }
+    throw "$Context is outside the candidate-bound inventory."
+}
+function Get-TextSha256 {
+    param([Parameter(Mandatory = $true)][string] $Text)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text))) -replace '-', '').ToLowerInvariant() }
+    finally { $hasher.Dispose() }
+}
+function New-Finding {
+    param([Parameter(Mandatory = $true)] $Issue, [Parameter(Mandatory = $true)][string] $SkillId, [Parameter(Mandatory = $true)][string] $Stage)
+    $severity = [string](Get-Property -Object $Issue -Name 'severity' -Context "$Stage issue").ToLowerInvariant()
+    $severity = switch ($severity) {
+        'critical' { 'critical'; break }
+        'high' { 'high'; break }
+        'medium' { 'medium'; break }
+        'low' { 'low'; break }
+        'informational' { 'informational'; break }
+        'info' { 'informational'; break }
+        default { throw "$Stage returned unsupported severity '$severity' for '$SkillId'." }
     }
-    throw "$Context does not identify a file in the candidate-bound Skill inventory: $fullPath"
+    $issueJson = $Issue | ConvertTo-Json -Depth 30 -Compress
+    $path = if ($null -ne $Issue.PSObject.Properties['file']) { [string]$Issue.file } elseif ($null -ne $Issue.PSObject.Properties['path']) { [string]$Issue.path } else { '' }
+    return [ordered]@{
+        severity = $severity
+        fingerprint = Get-TextSha256 -Text $issueJson
+        ruleId = if ($null -ne $Issue.PSObject.Properties['rule_id']) { [string]$Issue.rule_id } elseif ($null -ne $Issue.PSObject.Properties['ruleId']) { [string]$Issue.ruleId } else { $Stage }
+        message = if ($null -ne $Issue.PSObject.Properties['message']) { [string]$Issue.message } else { $issueJson }
+        path = $path
+        skillId = $SkillId
+    }
+}
+$script:NativeReports = @()
+function Add-NativeReport {
+    param([string] $Command, [string[]] $Arguments, [int] $ExitCode, [string] $Path, [string] $SkillId)
+    $script:NativeReports += [pscustomobject]@{skillId=$SkillId;command=$Command;commandSha256=(Get-FileSha256 -Path $Command);arguments=@($Arguments);exitCode=$ExitCode;path=[IO.Path]::GetFullPath($Path);sha256=(Get-FileSha256 -Path $Path)}
+}
+function New-Envelope {
+    param(
+        [Parameter(Mandatory = $true)][string[]] $ActiveSkills,
+        [array] $Findings = @(),
+        [hashtable] $Additional
+    )
+    $value = [ordered]@{
+        schemaVersion = 1
+        status = 'passed'
+        decision = 'PASS'
+        candidateIdentity = [string]$env:STANDARD_VALIDATION_CANDIDATE_ID
+        activeSkills = @($ActiveSkills)
+        findings = @($Findings)
+    }
+    if ($Mode -cin @('skill-validator','skill-tools','static')) { $value.nativeReports = @($script:NativeReports) }
+    if ($null -ne $Additional) {
+        foreach ($key in $Additional.Keys) { $value[$key] = $Additional[$key] }
+    }
+    [Console]::Out.WriteLine(($value | ConvertTo-Json -Depth 100 -Compress))
+    exit 0
+}
+function Invoke-NativeJson {
+    param([Parameter(Mandatory = $true)][string] $Command, [Parameter(Mandatory = $true)][string[]] $Arguments, [Parameter(Mandatory = $true)][string] $Context)
+    $stderrPath = Join-Path (Get-Location) (([guid]::NewGuid().ToString('N')) + '.stderr')
+    try {
+        $lines = @(& $Command @Arguments 2> $stderrPath)
+        $exitCode = $LASTEXITCODE
+        $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+        $json = ($lines -join "`n").Trim()
+        $nativePath = Join-Path (Get-Location) ("native-$Mode-$($env:STANDARD_VALIDATION_SKILL_ID).json")
+        [IO.File]::WriteAllText($nativePath, $json, [Text.UTF8Encoding]::new($false))
+        Add-NativeReport -Command $Command -Arguments $Arguments -ExitCode $exitCode -Path $nativePath -SkillId $env:STANDARD_VALIDATION_SKILL_ID
+        if ($exitCode -ne 0) { throw "$Context returned exit code $exitCode. $stderr" }
+        if ([string]::IsNullOrWhiteSpace($json)) { throw "$Context produced no JSON output." }
+        return ($json | ConvertFrom-Json -Depth 100)
+    }
+    finally {
+        if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+function Assert-SkillValidatorReport {
+    param([Parameter(Mandatory = $true)] $Report, [Parameter(Mandatory = $true)][string] $SkillRoot, [Parameter(Mandatory = $true)][string[]] $Inventory, [Parameter(Mandatory = $true)][string] $SkillId)
+    $results = @(Assert-StandardValidationSkillValidatorReport -Report $Report -SkillRoot $SkillRoot -SkillId $SkillId)
+    $findings = @()
+    foreach ($result in $results) {
+        $level = [string](Get-Property -Object $result -Name 'level' -Context 'skill-validator result')
+        if ($null -ne $result.PSObject.Properties['file']) {
+            [void](Resolve-ReportedFilePath -Value $result.file -SkillRoot $SkillRoot -ExpectedPaths $Inventory -Context 'skill-validator result file')
+        }
+        if ($level -eq 'info') {
+            $findings += [ordered]@{ severity = 'informational'; fingerprint = Get-TextSha256 -Text ($result | ConvertTo-Json -Depth 20 -Compress); ruleId = [string]$result.category; message = [string]$result.message; path = if ($null -ne $result.PSObject.Properties['file']) { [string]$result.file } else { '' }; skillId = $SkillId }
+        }
+    }
+    return ,$findings
+}
+function Assert-SkillToolsReport {
+    param([Parameter(Mandatory = $true)] $Report, [Parameter(Mandatory = $true)][string] $SkillRoot, [Parameter(Mandatory = $true)][string[]] $Inventory, [Parameter(Mandatory = $true)][string] $SkillId)
+    $version = [string](Get-Property -Object $Report -Name 'version' -Context 'skill-tools SARIF')
+    $runs = @(Get-Property -Object $Report -Name 'runs' -Context 'skill-tools SARIF')
+    if ($version -cne '2.1.0' -or $runs.Count -ne 1) { throw "skill-tools did not produce SARIF 2.1.0 for '$SkillId'." }
+    $run = $runs[0]
+    $driver = Get-Property -Object (Get-Property -Object $run -Name 'tool' -Context 'skill-tools SARIF run') -Name 'driver' -Context 'skill-tools SARIF tool'
+    $driverName = [string](Get-Property -Object $driver -Name 'name' -Context 'skill-tools SARIF driver')
+    $rules = @(Get-Property -Object $driver -Name 'rules' -Context 'skill-tools SARIF driver')
+    $results = @(Get-Property -Object $run -Name 'results' -Context 'skill-tools SARIF run')
+    if ($driverName -cne 'skill-tools') { throw "skill-tools SARIF driver identity is invalid for '$SkillId'." }
+    $ruleById = @{}
+    foreach ($rule in $rules) { $ruleById[[string](Get-Property -Object $rule -Name 'id' -Context 'skill-tools SARIF rule')] = $rule }
+    $findings = @()
+    foreach ($result in $results) {
+        $ruleId = [string](Get-Property -Object $result -Name 'ruleId' -Context 'skill-tools SARIF result')
+        if (-not $ruleById.ContainsKey($ruleId)) { throw "skill-tools SARIF references an unknown rule for '$SkillId'." }
+        $level = if ($null -ne $result.PSObject.Properties['level']) { [string]$result.level } else {
+            [string](Get-Property -Object (Get-Property -Object $ruleById[$ruleId] -Name 'defaultConfiguration' -Context 'skill-tools SARIF rule') -Name 'level' -Context 'skill-tools SARIF rule default')
+        }
+        if ($level -notin @('none', 'note', 'warning', 'error')) { throw "skill-tools SARIF level is malformed for '$SkillId'." }
+        if ($level -in @('warning', 'error')) { throw "skill-tools SARIF contains a blocking result for '$SkillId'." }
+        $message = Get-Property -Object $result -Name 'message' -Context 'skill-tools SARIF result'
+        $locations = @(Get-Property -Object $result -Name 'locations' -Context 'skill-tools SARIF result')
+        if ([string]::IsNullOrWhiteSpace([string](Get-Property -Object $message -Name 'text' -Context 'skill-tools SARIF message')) -or $locations.Count -eq 0) { throw "skill-tools SARIF lacks candidate-bound evidence for '$SkillId'." }
+        foreach ($location in $locations) {
+            $physical = Get-Property -Object $location -Name 'physicalLocation' -Context 'skill-tools SARIF location'
+            $artifact = Get-Property -Object $physical -Name 'artifactLocation' -Context 'skill-tools SARIF physical location'
+            [void](Resolve-ReportedFilePath -Value (Get-Property -Object $artifact -Name 'uri' -Context 'skill-tools SARIF artifact location') -SkillRoot $SkillRoot -ExpectedPaths $Inventory -Context 'skill-tools SARIF artifact location')
+        }
+        if ($level -eq 'note') {
+            $findings += [ordered]@{ severity = 'informational'; fingerprint = Get-TextSha256 -Text ($result | ConvertTo-Json -Depth 20 -Compress); ruleId = $ruleId; message = [string]$message.text; path = ''; skillId = $SkillId }
+        }
+    }
+    return ,$findings
+}
+function Assert-SkillSpectorReport {
+    param([Parameter(Mandatory = $true)] $Report, [Parameter(Mandatory = $true)][string] $SkillRoot, [Parameter(Mandatory = $true)][string] $SkillId, [Parameter(Mandatory = $true)][string[]] $Inventory)
+    $execution = Get-Property -Object $Report -Name 'execution_successful' -Context 'SkillSpector report'
+    $completeness = Get-Property -Object $Report -Name 'analysis_completeness' -Context 'SkillSpector report'
+    if ($execution -isnot [bool] -or -not $execution -or
+        (Get-Property -Object $completeness -Name 'execution_successful' -Context 'SkillSpector completeness') -isnot [bool] -or
+        -not (Get-Property -Object $completeness -Name 'execution_successful' -Context 'SkillSpector completeness') -or
+        (Get-Property -Object $completeness -Name 'is_complete' -Context 'SkillSpector completeness') -isnot [bool] -or
+        -not (Get-Property -Object $completeness -Name 'is_complete' -Context 'SkillSpector completeness') -or
+        [string](Get-Property -Object $completeness -Name 'status' -Context 'SkillSpector completeness') -cne 'complete' -or
+        [double](Get-Property -Object $completeness -Name 'coverage_percent' -Context 'SkillSpector completeness') -ne 100) {
+        throw "SkillSpector did not prove complete static analysis for '$SkillId'."
+    }
+    foreach ($name in @('ledger_exceptions', 'scope_exclusions', 'limitations')) {
+        if (@(Get-Property -Object $completeness -Name $name -Context 'SkillSpector completeness').Count -ne 0) { throw "SkillSpector reported incomplete '$name' evidence for '$SkillId'." }
+    }
+    $skill = Get-Property -Object $Report -Name 'skill' -Context 'SkillSpector report'
+    if ([string](Get-Property -Object $skill -Name 'name' -Context 'SkillSpector skill identity') -cne $SkillId -or
+        -not (Test-PathEqual -Left ([string](Get-Property -Object $skill -Name 'source' -Context 'SkillSpector skill identity')) -Right $SkillRoot)) {
+        throw "SkillSpector report identity does not match '$SkillId'."
+    }
+    $components = @(Get-Property -Object $Report -Name 'components' -Context 'SkillSpector report')
+    if ($components.Count -ne $Inventory.Count) { throw "SkillSpector did not cover the exact inventory for '$SkillId'." }
+    $observed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($component in $components) {
+        $path = [string](Get-Property -Object $component -Name 'path' -Context 'SkillSpector component')
+        if (-not ($Inventory -ccontains $path) -or -not $observed.Add($path)) { throw "SkillSpector did not cover the exact inventory for '$SkillId'." }
+    }
+    $issues = @(Get-Property -Object $Report -Name 'issues' -Context 'SkillSpector report')
+    $findings = @()
+    foreach ($issue in $issues) { $findings += New-Finding -Issue $issue -SkillId $SkillId -Stage 'skillspector-static' }
+    return ,$findings
 }
 
-function Assert-SkillSpectorReport {
-    param(
-        $Report,
-        [string] $SkillRoot,
-        [string] $SkillId,
-        [string[]] $ExpectedInventoryPaths,
-        [string] $CandidateCommit,
-        [string] $ScannerVersion,
-        [string] $InventorySha256
-    )
-    $numericTypes = @([byte], [sbyte], [int16], [uint16], [int], [uint32], [long], [uint64], [single], [double], [decimal])
-    $readDiagnosticField = {
-        param($Object, [string] $Name)
-        if ($Object -is [pscustomobject]) {
-            $property = $Object.PSObject.Properties[$Name]
-            if ($null -ne $property) { return [pscustomobject]@{ Present = $true; Value = $property.Value } }
+try {
+    $toolchain = Read-Json -Path $ToolchainPath -Context 'run-owned validation toolchain'
+    Assert-FileIdentity -Path $ToolchainPath -Sha256 $ToolchainSha256 -Context 'run-owned validation toolchain'
+    $candidateRoot = [IO.Path]::GetFullPath([string]$env:STANDARD_VALIDATION_CANDIDATE_ROOT)
+    if ($Mode -eq 'skill-validator') {
+        Assert-FileIdentity -Path ([string]$toolchain.centralRunnerPath) -Sha256 ([string]$toolchain.centralRunnerSha256) -Context 'central validation runner'
+        $sharedReportFunctions = & {
+            param($RunnerPath, $CandidateRoot, $ToolchainPath)
+            . $RunnerPath -DefineFunctionsOnly -CandidateRoot $CandidateRoot -AdapterPath $ToolchainPath `
+                -ArtifactsRoot ([IO.Path]::GetFullPath((Get-Location).Path)) -SourceRepository 'https://example.test' `
+                -SourceRevision ('0' * 40) -BaseRevision ('0' * 40)
+            $exports = @{}
+            foreach ($name in @(
+                'Get-StandardValidationFullPath',
+                'Get-StandardValidationCaseVariant',
+                'Get-StandardValidationPathCaseBehavior',
+                'Get-StandardValidationPathComparison',
+                'Test-StandardValidationSameResolvedPath',
+                'Assert-StandardValidationSkillValidatorReport'
+            )) {
+                $exports[$name] = (Get-Command $name -CommandType Function -ErrorAction Stop).ScriptBlock
+            }
+            return $exports
+        } ([string]$toolchain.centralRunnerPath) $candidateRoot $ToolchainPath
+        foreach ($name in $sharedReportFunctions.Keys) {
+            Set-Item -Path "function:$name" -Value $sharedReportFunctions[$name]
         }
-        return [pscustomobject]@{ Present = $false; Value = $null }
     }
-    $formatDiagnosticField = {
-        param([string] $Name, $Field)
-        if (-not $Field.Present) { return "$Name=missing" }
-        $value = $Field.Value
-        if ($null -eq $value) { return "$Name<null>=null" }
+    $activeSkills = Get-ActiveSkills
+    $candidateId = [string]$env:STANDARD_VALIDATION_CANDIDATE_ID
+    if ([string]::IsNullOrWhiteSpace($candidateId)) { throw 'Central runner did not provide a candidate identity.' }
 
-        $typeName = $value.GetType().Name
-        if ($typeName.Length -gt 32) { $typeName = $typeName.Substring(0, 32) }
-        if ($value -is [bool]) {
-            $valueSummary = if ($value) { 'true' } else { 'false' }
+    switch ($Mode) {
+        'package-adapter' {
+            Assert-FileIdentity -Path ([string]$toolchain.upstreamAdapterValidatorPath) -Sha256 ([string]$toolchain.upstreamAdapterValidatorSha256) -Context 'upstream adapter validator'
+            Assert-FileIdentity -Path ([string]$toolchain.upstreamPolicyPath) -Sha256 ([string]$toolchain.upstreamPolicySha256) -Context 'upstream adapter policy'
+            $reportPath = Join-Path (Get-Location) 'upstream-adapter-report.json'
+            & ([string]$toolchain.upstreamAdapterValidatorPath) -PackageRoot $candidateRoot -PolicyPath ([string]$toolchain.upstreamPolicyPath) -SourceRepository $SourceRepository -SourceRevision $SourceRevision -ArchiveSha256 $ArchiveSha256 -OutputPath $reportPath | Out-Null
+            $report = Read-Json -Path $reportPath -Context 'upstream adapter report'
+            $status = [string](Get-Property -Object $report -Name 'status' -Context 'upstream adapter report')
+            $decision = [string](Get-Property -Object $report -Name 'decision' -Context 'upstream adapter report')
+            if (($status -eq 'passed' -and $decision -ne 'PASS') -or ($status -eq 'not-applicable' -and $decision -ne 'NOT_APPLICABLE') -or $status -notin @('passed', 'not-applicable')) { throw 'Upstream adapter report did not pass or prove not-applicable.' }
+            New-Envelope -ActiveSkills $activeSkills -Additional @{ adapterStatus = $status; adapterSurfaces = @($report.surfaces); semanticRequired = $false }
         }
-        elseif ($Name -ceq 'analysis_completeness.status' -and $value -is [string]) {
-            if (@('complete', 'incomplete', 'partial', 'unknown', 'error', 'cancelled') -ccontains $value) {
-                $valueSummary = $value
-            }
-            else { $valueSummary = "redacted-string-length:$($value.Length)" }
+        'skill-validator' {
+            $skillId = [string]$env:STANDARD_VALIDATION_SKILL_ID
+            $skillRoot = Get-SkillRoot -SkillId $skillId
+            $inventory = Get-InventoryPaths -SkillRoot $skillRoot
+            Assert-FileIdentity -Path ([string]$toolchain.skillValidatorPath) -Sha256 ([string]$toolchain.skillValidatorSha256) -Context 'skill-validator executable'
+            $report = Invoke-NativeJson -Command ([string]$toolchain.skillValidatorPath) -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator '$skillId'"
+            $findings = Assert-SkillValidatorReport -Report $report -SkillRoot $skillRoot -Inventory $inventory -SkillId $skillId
+            New-Envelope -ActiveSkills $activeSkills -Findings $findings -Additional @{ skillId = $skillId; skillInventorySha256 = [string]$env:STANDARD_VALIDATION_SKILL_INVENTORY_SHA256; semanticRequired = $false }
         }
-        elseif ($Name -ceq 'analysis_completeness.coverage_percent') {
-            $isDiagnosticNumeric = $false
-            foreach ($numericType in $numericTypes) {
-                if ($value -is $numericType) { $isDiagnosticNumeric = $true; break }
-            }
-            if ($isDiagnosticNumeric) {
-                $valueSummary = [Convert]::ToString($value, [Globalization.CultureInfo]::InvariantCulture)
-                if ($valueSummary.Length -gt 32) { $valueSummary = $valueSummary.Substring(0, 32) + '...' }
-            }
-            elseif ($value -is [string]) { $valueSummary = "redacted-string-length:$($value.Length)" }
-            else { $valueSummary = 'redacted' }
+        'skill-tools' {
+            $skillId = [string]$env:STANDARD_VALIDATION_SKILL_ID
+            $skillRoot = Get-SkillRoot -SkillId $skillId
+            $inventory = Get-InventoryPaths -SkillRoot $skillRoot
+            Assert-FileIdentity -Path ([string]$toolchain.skillToolsNodePath) -Sha256 ([string]$toolchain.skillToolsNodeSha256) -Context 'skill-tools Node runtime'
+            Assert-FileIdentity -Path ([string]$toolchain.skillToolsEntryPointPath) -Sha256 ([string]$toolchain.skillToolsEntryPointSha256) -Context 'skill-tools entry point'
+            $report = Invoke-NativeJson -Command ([string]$toolchain.skillToolsNodePath) -Arguments @([string]$toolchain.skillToolsEntryPointPath, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools '$skillId'"
+            $findings = Assert-SkillToolsReport -Report $report -SkillRoot $skillRoot -Inventory $inventory -SkillId $skillId
+            New-Envelope -ActiveSkills $activeSkills -Findings $findings -Additional @{ skillId = $skillId; skillInventorySha256 = [string]$env:STANDARD_VALIDATION_SKILL_INVENTORY_SHA256; semanticRequired = $false }
         }
-        elseif ($value -is [string]) { $valueSummary = "redacted-string-length:$($value.Length)" }
-        else { $valueSummary = 'redacted' }
-
-        return "$Name<$typeName>=$valueSummary"
-    }
-
-    $reportExecutionField = & $readDiagnosticField $Report 'execution_successful'
-    $completenessObjectField = & $readDiagnosticField $Report 'analysis_completeness'
-    $completeness = if ($completenessObjectField.Present) { $completenessObjectField.Value } else { $null }
-    $completenessExecutionField = & $readDiagnosticField $completeness 'execution_successful'
-    $isCompleteField = & $readDiagnosticField $completeness 'is_complete'
-    $statusField = & $readDiagnosticField $completeness 'status'
-    $coverageField = & $readDiagnosticField $completeness 'coverage_percent'
-    $executionSuccessful = $reportExecutionField.Value
-    $coverage = $coverageField.Value
-    $coverageIsNumeric = $false
-    foreach ($type in $numericTypes) { if ($coverage -is $type) { $coverageIsNumeric = $true; break } }
-    $safeSkillId = '[redacted]'
-    if ($SkillId -cmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$' -and $SkillId.Length -le 64) { $safeSkillId = $SkillId }
-    if (-not $reportExecutionField.Present -or $executionSuccessful -isnot [bool] -or -not $executionSuccessful -or
-        -not $completenessObjectField.Present -or $completeness -isnot [pscustomobject] -or
-        -not $completenessExecutionField.Present -or $completenessExecutionField.Value -isnot [bool] -or
-        -not $completenessExecutionField.Value -or
-        -not $isCompleteField.Present -or $isCompleteField.Value -isnot [bool] -or -not $isCompleteField.Value -or
-        -not $statusField.Present -or $statusField.Value -isnot [string] -or $statusField.Value -cne 'complete' -or
-        -not $coverageField.Present -or -not $coverageIsNumeric -or $coverage -ne 100) {
-        $diagnosticFields = @(
-            (& $formatDiagnosticField 'execution_successful' $reportExecutionField)
-            (& $formatDiagnosticField 'analysis_completeness.execution_successful' $completenessExecutionField)
-            (& $formatDiagnosticField 'analysis_completeness.is_complete' $isCompleteField)
-            (& $formatDiagnosticField 'analysis_completeness.status' $statusField)
-            (& $formatDiagnosticField 'analysis_completeness.coverage_percent' $coverageField)
-        )
-        $ledgerField = & $readDiagnosticField $completeness 'ledger_exceptions'
-        if ($ledgerField.Present -and $ledgerField.Value -is [array] -and $ledgerField.Value.Count -gt 0) {
-            # The report is untrusted. Log only fixed labels, bounded counts, and
-            # indices into the candidate's ordinal-sorted integrity inventory.
-            $ledgerItems = @($ledgerField.Value)
-            $limit = [Math]::Min($ledgerItems.Count, 32)
-            $staticParseLimitCount = 0
-            $otherCount = 0
-            $inventoryIndices = [Collections.Generic.List[int]]::new()
-            for ($i = 0; $i -lt $limit; $i++) {
-                $entry = $ledgerItems[$i]
-                $reasonField = & $readDiagnosticField $entry 'reason_code'
-                $pathField = & $readDiagnosticField $entry 'path'
-                if ($reasonField.Present -and $reasonField.Value -is [string] -and
-                    $reasonField.Value -ceq 'static_parse_limit') {
-                    $staticParseLimitCount++
-                    if ($pathField.Present -and $pathField.Value -is [string]) {
-                        for ($index = 0; $index -lt $ExpectedInventoryPaths.Count; $index++) {
-                            if ([string]::Equals($ExpectedInventoryPaths[$index], $pathField.Value, [StringComparison]::Ordinal)) {
-                                $inventoryIndices.Add($index)
-                                break
+        'static' {
+            Assert-FileIdentity -Path ([string]$toolchain.skillSpectorPath) -Sha256 ([string]$toolchain.skillSpectorSha256) -Context 'SkillSpector executable'
+            # Keep Python import caches outside the frozen installed tool closure.
+            $env:PYTHONDONTWRITEBYTECODE = '1'
+            $findings = @()
+            foreach ($skillId in $activeSkills) {
+                $skillRoot = Get-SkillRoot -SkillId $skillId
+                $inventory = Get-InventoryPaths -SkillRoot $skillRoot
+                $reportPath = Join-Path (Get-Location) ("skillspector-$skillId.json")
+                $nativeArguments = @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath)
+                & ([string]$toolchain.skillSpectorPath) @nativeArguments | Out-Null
+                $nativeExit = $LASTEXITCODE
+                if (Test-Path -LiteralPath $reportPath -PathType Leaf) { Add-NativeReport -Command ([string]$toolchain.skillSpectorPath) -Arguments $nativeArguments -ExitCode $nativeExit -Path $reportPath -SkillId $skillId }
+                if ($nativeExit -ne 0) { throw "SkillSpector scan for '$skillId' returned exit code $nativeExit." }
+                $report = Read-Json -Path $reportPath -Context "SkillSpector report for '$skillId'"
+                $findings += Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId -Inventory $inventory
+            }
+            $semantic = ($SemanticRequired -ceq 'true') -or $findings.Count -gt 0
+            New-Envelope -ActiveSkills $activeSkills -Findings $findings -Additional @{ scannerIdentity = 'SkillSpector'; analyzerCompleteness = 'complete'; semanticRequired = $semantic }
+        }
+        'repository-general' {
+            $validatorPath = Join-Path $candidateRoot 'scripts/Test-Repository.ps1'
+            if (-not (Test-Path -LiteralPath $validatorPath -PathType Leaf)) { throw 'Test-Repository.ps1 is missing from the candidate snapshot.' }
+            $reportPath = Join-Path (Get-Location) 'repository-general-report.json'
+            & $validatorPath -RepositoryRoot $candidateRoot -OutputPath $reportPath -ReadOnlySnapshot *> $null
+            $report = Read-Json -Path $reportPath -Context 'Test-Repository report'
+            if ([string]$report.result -cne 'passed' -or [int]$report.activeSkillCount -ne $activeSkills.Count) { throw 'Test-Repository did not pass the complete active Skill inventory.' }
+            $reportedSkills = @($report.skills | ForEach-Object { [string]$_.skillId })
+            if ((@($reportedSkills | Sort-Object) -join "`n") -cne (@($activeSkills | Sort-Object) -join "`n")) { throw 'Test-Repository reported a different active Skill inventory.' }
+            $testInventory = @($activeSkills | ForEach-Object { "domain-inventory:$($_)" })
+            New-Envelope -ActiveSkills $activeSkills -Additional @{ testInventory = $testInventory; testResult = [ordered]@{ status = 'passed'; decision = 'PASS'; result = 'Test-Repository' }; domainAdapterResult = [ordered]@{ status = 'passed'; decision = 'PASS'; result = 'Darktide-domain-contract' } }
+        }
+        'repository-pester' {
+            Assert-FileIdentity -Path ([string]$toolchain.pesterModulePath) -Sha256 ([string]$toolchain.pesterModuleSha256) -Context 'Pester module'
+            Import-Module -Name ([string]$toolchain.pesterModulePath) -Force -ErrorAction Stop
+            $loaded = Get-Module Pester | Select-Object -First 1
+            if ($null -eq $loaded -or [string]$loaded.Version -cne [string]$toolchain.pesterVersion) { throw 'The resolved Pester module identity was not loaded.' }
+            $testRoot = Join-Path $candidateRoot 'tests'
+            # The run-owned Core snapshot is unique. A stable name lets the
+            # workflow recover the last completed case after a forced timeout.
+            $progressPath = Join-Path (Get-Location) 'repository-pester-progress.log'
+            if (Test-Path -LiteralPath $progressPath) { throw 'Pester progress path already exists in the owned snapshot.' }
+            $progressTail = [Collections.Generic.Queue[string]]::new()
+            $progressLineCount = 0
+            $completedCaseCount = 0
+            $liveChars = 0
+            $liveLimit = 120000
+            function Write-PesterProgressTail {
+                param([string] $Path)
+                if (Test-Path -LiteralPath $Path -PathType Leaf) {
+                    foreach ($line in @(Get-Content -LiteralPath $Path -Tail 24 -ErrorAction SilentlyContinue)) {
+                        $boundedLine = [string]$line
+                        if ($boundedLine.Length -gt 300) { $boundedLine = $boundedLine.Substring(0, 300) + '[truncated]' }
+                        if ($boundedLine.Length -gt 0) { [Console]::Error.WriteLine("Pester progress: $boundedLine") }
+                    }
+                }
+            }
+            try {
+                $previousErrorActionPreference = $ErrorActionPreference
+                try {
+                    # Tests exercise non-zero native children. Keep stderr non-terminating while
+                    # Pester evaluates them; stream bounded progress without changing JSON stdout.
+                    $ErrorActionPreference = 'Continue'
+                    $result = Invoke-Pester -Path $testRoot -Output Detailed -PassThru 3>$null 6>&1 |
+                        ForEach-Object {
+                            if ($_ -is [Management.Automation.InformationRecord]) {
+                                foreach ($rawLine in @(([string]$_.MessageData) -split '\r?\n')) {
+                                    $line = [string]$rawLine
+                                    if ($line.Length -eq 0) { continue }
+                                    if ($line.Length -gt 300) { $line = $line.Substring(0, 300) + '[truncated]' }
+                                    $progressLineCount++
+                                    if ($line -match '^\s*\[[+-]\]') { $completedCaseCount++ }
+                                    $entry = "completed=$completedCaseCount line=$progressLineCount $line"
+                                    $progressTail.Enqueue($entry)
+                                    if ($progressTail.Count -gt 24) { [void]$progressTail.Dequeue() }
+                                    [IO.File]::WriteAllLines($progressPath, $progressTail.ToArray(), [Text.UTF8Encoding]::new($false))
+                                    if ($liveChars + $entry.Length -le $liveLimit) {
+                                        [Console]::Error.WriteLine("Pester progress: $entry")
+                                        $liveChars += $entry.Length
+                                    }
+                                    elseif ($liveChars -le $liveLimit) {
+                                        [Console]::Error.WriteLine('Pester live progress cap reached; run-owned tail continues.')
+                                        $liveChars = $liveLimit + 1
+                                    }
+                                }
+                            }
+                            else { $_ }
+                        }
+                }
+                catch {
+                    [Console]::Error.WriteLine('Pester counts: result=exception')
+                    Write-PesterProgressTail -Path $progressPath
+                    throw
+                }
+                finally {
+                    $ErrorActionPreference = $previousErrorActionPreference
+                }
+                $invalid = $null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.PassedCount -le 0 -or
+                    [int64]$result.FailedCount -ne 0 -or [int64]$result.FailedBlocksCount -ne 0 -or [int64]$result.FailedContainersCount -ne 0 -or
+                    [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount
+                if ($invalid) {
+                    if ($null -eq $result) {
+                        [Console]::Error.WriteLine('Pester counts: result=missing')
+                    }
+                    else {
+                        [Console]::Error.WriteLine("Pester counts: total=$([int64]$result.TotalCount) passed=$([int64]$result.PassedCount) skipped=$([int64]$result.SkippedCount) failed=$([int64]$result.FailedCount) failedBlocks=$([int64]$result.FailedBlocksCount) failedContainers=$([int64]$result.FailedContainersCount) notRun=$([int64]$result.NotRunCount)")
+                        foreach ($failedContainer in @($result.FailedContainers)) {
+                            [Console]::Error.WriteLine("Pester container failed: $($failedContainer.Name)")
+                            foreach ($failure in @($failedContainer.ErrorRecord)) {
+                                [Console]::Error.WriteLine("Pester container error: $($failure.Exception.Message)")
+                            }
+                        }
+                        foreach ($failedBlock in @($result.FailedBlocks)) {
+                            [Console]::Error.WriteLine("Pester block failed: $($failedBlock.Name)")
+                            foreach ($failure in @($failedBlock.ErrorRecord)) {
+                                [Console]::Error.WriteLine("Pester block error: $($failure.Exception.Message)")
+                            }
+                        }
+                        foreach ($failedTest in @($result.Failed)) {
+                            [Console]::Error.WriteLine("Pester test failed: $($failedTest.ExpandedPath)")
+                            foreach ($failure in @($failedTest.ErrorRecord)) {
+                                [Console]::Error.WriteLine("Pester test error: $($failure.Exception.Message)")
                             }
                         }
                     }
+                    Write-PesterProgressTail -Path $progressPath
+                    throw 'Pester repository regression did not complete successfully.'
                 }
-                else { $otherCount++ }
-            }
-            if ($CandidateCommit -cmatch '^[0-9a-f]{40}$') { $diagnosticFields += "candidateCommit=$CandidateCommit" }
-            if ($ScannerVersion -cmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -and $ScannerVersion.Length -le 32) {
-                $diagnosticFields += "scannerVersion=$ScannerVersion"
-            }
-            if ($InventorySha256 -cmatch '^[0-9a-f]{64}$') { $diagnosticFields += "inventorySha256=$InventorySha256" }
-            $indices = if ($inventoryIndices.Count -gt 0) { $inventoryIndices.ToArray() -join ',' } else { 'none' }
-            $truncated = if ($ledgerItems.Count -gt $limit) { 'true' } else { 'false' }
-            $diagnosticFields += "inventoryCount=$($ExpectedInventoryPaths.Count)"
-            $diagnosticFields += "ledgerTotal=$($ledgerItems.Count)"
-            $diagnosticFields += "sampledLedgerEntries=$limit"
-            $diagnosticFields += "staticParseLimitInSample=$staticParseLimitCount"
-            $diagnosticFields += "otherInSample=$otherCount"
-            $diagnosticFields += "inventoryIndicesInSample=$indices"
-            $diagnosticFields += "truncated=$truncated"
-        }
-        $diagnostic = "SkillSpector completeness rejected: skillId=$safeSkillId; $($diagnosticFields -join '; ')"
-        throw "SkillSpector did not prove complete static analysis for '$safeSkillId'. $diagnostic"
-    }
-    foreach ($name in @('ledger_exceptions', 'scope_exclusions', 'limitations')) {
-        $items = Get-RequiredProperty -Object $completeness -Name $name -Context 'SkillSpector completeness'
-        if ($items -isnot [array] -or @($items).Count -ne 0) {
-            $count = if ($items -is [array]) { @($items).Count } else { 'invalid-type' }
-            throw "SkillSpector reported incomplete '$name' evidence for '$safeSkillId': count=$count"
-        }
-    }
-    $skill = Get-RequiredProperty -Object $Report -Name 'skill' -Context 'SkillSpector report'
-    $reportedName = Get-RequiredProperty -Object $skill -Name 'name' -Context 'SkillSpector skill identity'
-    $reportedSource = Get-RequiredProperty -Object $skill -Name 'source' -Context 'SkillSpector skill identity'
-    if ($reportedName -isnot [string] -or $reportedName -cne $SkillId -or
-        $reportedSource -isnot [string] -or -not (Test-PathEqual -Left $reportedSource -Right $SkillRoot)) {
-        throw "SkillSpector report identity does not match '$SkillId'."
-    }
-    $components = Get-RequiredProperty -Object $Report -Name 'components' -Context 'SkillSpector report'
-    if ($components -isnot [array] -or @($components).Count -ne $ExpectedInventoryPaths.Count) {
-        throw "SkillSpector did not cover the exact candidate-bound inventory for '$SkillId'."
-    }
-    $observed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($component in @($components)) {
-        $path = Get-RequiredProperty -Object $component -Name 'path' -Context 'SkillSpector component'
-        if ($path -isnot [string] -or -not ($ExpectedInventoryPaths -ccontains $path) -or -not $observed.Add($path)) {
-            throw "SkillSpector did not cover the exact candidate-bound inventory for '$SkillId'."
-        }
-    }
-    $issues = Get-RequiredProperty -Object $Report -Name 'issues' -Context 'SkillSpector report'
-    if ($issues -isnot [array]) { throw "SkillSpector issues must be an array for '$SkillId'." }
-    return @($issues)
-}
-
-function Assert-SkillValidatorReport {
-    param($Report, [string] $SkillRoot, [string[]] $ExpectedInventoryPaths, [string] $SkillId)
-    $skillDirectory = Get-RequiredProperty -Object $Report -Name 'skill_dir' -Context 'skill-validator report'
-    $passed = Get-RequiredProperty -Object $Report -Name 'passed' -Context 'skill-validator report'
-    $errors = Get-RequiredProperty -Object $Report -Name 'errors' -Context 'skill-validator report'
-    $warnings = Get-RequiredProperty -Object $Report -Name 'warnings' -Context 'skill-validator report'
-    $results = Get-RequiredProperty -Object $Report -Name 'results' -Context 'skill-validator report'
-    if ($skillDirectory -isnot [string] -or -not (Test-PathEqual -Left $skillDirectory -Right $SkillRoot) -or
-        $passed -isnot [bool] -or -not $passed -or
-        ($errors -isnot [int] -and $errors -isnot [long]) -or [int64]$errors -ne 0 -or
-        ($warnings -isnot [int] -and $warnings -isnot [long]) -or [int64]$warnings -ne 0 -or
-        $results -isnot [array] -or @($results).Count -le 0) {
-        throw "skill-validator did not produce a clean candidate-bound report for '$SkillId'."
-    }
-    foreach ($result in @($results)) {
-        $level = Get-RequiredProperty -Object $result -Name 'level' -Context 'skill-validator result'
-        $category = Get-RequiredProperty -Object $result -Name 'category' -Context 'skill-validator result'
-        $message = Get-RequiredProperty -Object $result -Name 'message' -Context 'skill-validator result'
-        if ($level -isnot [string] -or $level -cnotin @('pass', 'info', 'warning', 'error') -or $level -in @('warning', 'error') -or
-            $category -isnot [string] -or [string]::IsNullOrWhiteSpace($category) -or
-            $message -isnot [string] -or [string]::IsNullOrWhiteSpace($message)) {
-            throw "skill-validator returned a malformed or blocking result for '$SkillId'."
-        }
-        if ($null -ne $result.PSObject.Properties['file']) {
-            [void](Resolve-ReportedFilePath -Value $result.file -SkillRoot $SkillRoot -ExpectedInventoryPaths $ExpectedInventoryPaths -Context 'skill-validator result file')
-        }
-        if ($null -ne $result.PSObject.Properties['line'] -and
-            (($result.line -isnot [int] -and $result.line -isnot [long]) -or [int64]$result.line -le 0)) {
-            throw "skill-validator returned an invalid line for '$SkillId'."
-        }
-    }
-}
-
-function Assert-SkillToolsReport {
-    param($Report, [string] $SkillRoot, [string[]] $ExpectedInventoryPaths, [string] $SkillId)
-    $version = Get-RequiredProperty -Object $Report -Name 'version' -Context 'skill-tools SARIF'
-    $runs = Get-RequiredProperty -Object $Report -Name 'runs' -Context 'skill-tools SARIF'
-    if ($version -isnot [string] -or $version -cne '2.1.0' -or $runs -isnot [array] -or @($runs).Count -ne 1) {
-        throw "skill-tools did not produce SARIF 2.1.0 for '$SkillId'."
-    }
-    $run = $runs[0]
-    $driver = Get-RequiredProperty -Object (Get-RequiredProperty -Object $run -Name 'tool' -Context 'skill-tools SARIF run') -Name 'driver' -Context 'skill-tools SARIF tool'
-    $driverName = Get-RequiredProperty -Object $driver -Name 'name' -Context 'skill-tools SARIF driver'
-    $rules = Get-RequiredProperty -Object $driver -Name 'rules' -Context 'skill-tools SARIF driver'
-    $results = Get-RequiredProperty -Object $run -Name 'results' -Context 'skill-tools SARIF run'
-    if ($driverName -isnot [string] -or $driverName -cne 'skill-tools' -or $rules -isnot [array] -or
-        $results -isnot [array]) {
-        throw "skill-tools SARIF is incomplete for '$SkillId'."
-    }
-    $ruleById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    foreach ($rule in @($rules)) {
-        $ruleId = Get-RequiredProperty -Object $rule -Name 'id' -Context 'skill-tools SARIF rule'
-        if ($ruleId -isnot [string] -or [string]::IsNullOrWhiteSpace($ruleId) -or $ruleById.ContainsKey($ruleId)) {
-            throw "skill-tools SARIF rule metadata is malformed for '$SkillId'."
-        }
-        $ruleById.Add($ruleId, $rule)
-    }
-    foreach ($result in @($results)) {
-        $ruleId = Get-RequiredProperty -Object $result -Name 'ruleId' -Context 'skill-tools SARIF result'
-        if ($ruleId -isnot [string] -or -not $ruleById.ContainsKey($ruleId)) { throw "skill-tools SARIF references an unknown rule for '$SkillId'." }
-        $effectiveLevel = if ($null -ne $result.PSObject.Properties['level']) { $result.level } else {
-            $configuration = Get-RequiredProperty -Object $ruleById[$ruleId] -Name 'defaultConfiguration' -Context 'skill-tools SARIF rule'
-            Get-RequiredProperty -Object $configuration -Name 'level' -Context 'skill-tools SARIF rule default'
-        }
-        if ($effectiveLevel -isnot [string] -or $effectiveLevel -cnotin @('none', 'note', 'warning', 'error') -or $effectiveLevel -ceq 'error') {
-            throw "skill-tools SARIF contains a malformed or error-level result for '$SkillId'."
-        }
-        $message = Get-RequiredProperty -Object $result -Name 'message' -Context 'skill-tools SARIF result'
-        $messageText = Get-RequiredProperty -Object $message -Name 'text' -Context 'skill-tools SARIF message'
-        $locations = Get-RequiredProperty -Object $result -Name 'locations' -Context 'skill-tools SARIF result'
-        if ($messageText -isnot [string] -or [string]::IsNullOrWhiteSpace($messageText) -or $locations -isnot [array] -or @($locations).Count -le 0) {
-            throw "skill-tools SARIF lacks candidate-bound evidence for '$SkillId'."
-        }
-        foreach ($location in @($locations)) {
-            $physical = Get-RequiredProperty -Object $location -Name 'physicalLocation' -Context 'skill-tools SARIF location'
-            $artifact = Get-RequiredProperty -Object $physical -Name 'artifactLocation' -Context 'skill-tools SARIF physical location'
-            $uri = Get-RequiredProperty -Object $artifact -Name 'uri' -Context 'skill-tools SARIF artifact location'
-            [void](Resolve-ReportedFilePath -Value $uri -SkillRoot $SkillRoot -ExpectedInventoryPaths $ExpectedInventoryPaths -Context 'skill-tools SARIF artifact location')
-        }
-    }
-}
-
-function Assert-PathWithinRoot {
-    param([string] $Path, [string] $Root, [string] $Context)
-    $fullPath = [IO.Path]::GetFullPath($Path)
-    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd(
-        [IO.Path]::DirectorySeparatorChar,
-        [IO.Path]::AltDirectorySeparatorChar
-    ) + [IO.Path]::DirectorySeparatorChar
-    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
-    if (-not $fullPath.StartsWith($fullRoot, $comparison)) { throw "$Context escapes its controlled root: $fullPath" }
-    return $fullPath
-}
-
-function Assert-InstalledClosureSafeRelativePath {
-    param(
-        [Parameter(Mandatory = $true)][string] $Value,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    if ([string]::IsNullOrEmpty($Value) -or $Value.StartsWith('/') -or $Value.Contains('\') -or
-        $Value.Contains(':') -or $Value -match '[\x00-\x1F\x7F]') {
-        throw "$Context contains an unsafe relative path: '$Value'."
-    }
-    foreach ($segment in $Value.Split('/')) {
-        if ([string]::IsNullOrEmpty($segment) -or $segment -ceq '.' -or $segment -ceq '..') {
-            throw "$Context contains an unsafe relative path: '$Value'."
-        }
-    }
-    try {
-        $utf8 = [Text.UTF8Encoding]::new($false, $true)
-        [void]$utf8.GetBytes($Value)
-    }
-    catch {
-        throw "$Context contains a non-UTF-8 relative path: '$Value'."
-    }
-}
-
-
-
-
-function Get-InstalledClosureAsciiCaseFold {
-    param([Parameter(Mandatory = $true)][string] $Value)
-    $builder = [Text.StringBuilder]::new()
-    foreach ($character in $Value.ToCharArray()) {
-        $code = [int][char]$character
-        if ($code -ge 65 -and $code -le 90) { $code += 32 }
-        [void]$builder.Append([char]$code)
-    }
-    return $builder.ToString()
-}
-
-function Add-InstalledClosureEntry {
-    param(
-        [Parameter(Mandatory = $true)] $Entries,
-        [Parameter(Mandatory = $true)] $OrdinalPaths,
-        [Parameter(Mandatory = $true)] $NfcPaths,
-        [Parameter(Mandatory = $true)] $AsciiCasePaths,
-        [Parameter(Mandatory = $true)] $Entry,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $relative = [string]$Entry.path
-    Assert-InstalledClosureSafeRelativePath -Value $relative -Context $Context
-    if (-not $OrdinalPaths.Add($relative)) {
-        throw "$Context contains a duplicate path: '$relative'."
-    }
-    $nfc = $relative.Normalize([Text.NormalizationForm]::FormC)
-    if ($NfcPaths.ContainsKey($nfc) -and -not [string]::Equals([string]$NfcPaths[$nfc], $relative, [StringComparison]::Ordinal)) {
-        throw "$Context contains Unicode-normalization-colliding paths: '$($NfcPaths[$nfc])' and '$relative'."
-    }
-    $NfcPaths[$nfc] = $relative
-    $asciiCase = Get-InstalledClosureAsciiCaseFold -Value $nfc
-    if ($AsciiCasePaths.ContainsKey($asciiCase) -and -not [string]::Equals([string]$AsciiCasePaths[$asciiCase], $relative, [StringComparison]::Ordinal)) {
-        throw "$Context contains ASCII-case-colliding paths: '$($AsciiCasePaths[$asciiCase])' and '$relative'."
-    }
-    $AsciiCasePaths[$asciiCase] = $relative
-    [void]$Entries.Add($Entry)
-}
-
-function Sort-InstalledClosureEntriesByOrdinalPath {
-    param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Entries
-    )
-
-    $entriesByPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    foreach ($entry in $Entries) {
-        $path = [string]$entry.path
-        if (-not $entriesByPath.TryAdd($path, $entry)) {
-            throw "Installed closure contains a duplicate path: '$path'."
-        }
-    }
-    $orderedPaths = [string[]]@($entriesByPath.Keys | ForEach-Object { [string]$_ })
-    [Array]::Sort($orderedPaths, [StringComparer]::Ordinal)
-    $ordered = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($path in $orderedPaths) {
-        [void]$ordered.Add($entriesByPath[$path])
-    }
-    return ,$ordered
-}
-
-function Get-InstalledDirectoryClosureSha256 {
-    param(
-        [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $root = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "$Context install root is missing: $root" }
-    Assert-NoReparseAncestors -Path $root -Context "$Context install root"
-    $entries = New-Object 'System.Collections.Generic.List[object]'
-    $ordinalPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-    $nfcPaths = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
-    $asciiCasePaths = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
-    foreach ($item in @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop)) {
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "$Context installed closure contains a reparse point: $($item.FullName)"
-        }
-        if ($item.PSIsContainer) { continue }
-        if ($item -isnot [IO.FileInfo]) {
-            throw "$Context installed closure contains a non-regular filesystem entry: $($item.FullName)"
-        }
-        $relative = $item.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-        $relative = $relative.Replace([IO.Path]::DirectorySeparatorChar, '/').Replace([IO.Path]::AltDirectorySeparatorChar, '/')
-        Assert-NoReparseAncestors -Path $item.FullName -Context "$Context installed closure file"
-        $entry = [pscustomobject][ordered]@{
-            path = $relative
-            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash.ToLowerInvariant()
-        }
-        Add-InstalledClosureEntry -Entries $entries -OrdinalPaths $ordinalPaths -NfcPaths $nfcPaths -AsciiCasePaths $asciiCasePaths -Entry $entry -Context $Context
-    }
-    if ($entries.Count -eq 0) { throw "$Context install root is empty: $root" }
-    $ordered = Sort-InstalledClosureEntriesByOrdinalPath -Entries $entries
-    $canonical = ($ordered | ForEach-Object { "$($_.path)`t$($_.sha256)`n" }) -join ''
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try {
-        return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))) -replace '-', '').ToLowerInvariant()
-    }
-    finally { $hasher.Dispose() }
-}
-
-function Assert-ReceiptInstalledClosure {
-    param(
-        [Parameter(Mandatory = $true)] $Receipt,
-        [Parameter(Mandatory = $true)][string] $InstallRoot,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $rootValue = $Receipt.PSObject.Properties['installRoot']
-    $hashValue = $Receipt.PSObject.Properties['installedClosureSha256']
-    if ($null -eq $rootValue -or $rootValue.Value -isnot [string] -or
-        $null -eq $hashValue -or $hashValue.Value -isnot [string]) {
-        throw "$Context receipt does not provide installRoot/installedClosureSha256."
-    }
-    Assert-Sha256 -Value ([string]$hashValue.Value) -Context "$Context installed closure hash"
-    $root = Assert-PathWithinRoot -Path ([string]$rootValue.Value) -Root $InstallRoot -Context "$Context install root"
-    $actual = Get-InstalledDirectoryClosureSha256 -Path $root -Context $Context
-    if ($actual -cne [string]$hashValue.Value) {
-        throw "$Context installed closure changed after resolution."
-    }
-    return $root
-}
-
-function Assert-ReceiptFile {
-    param(
-        [Parameter(Mandatory = $true)] $Receipt,
-        [Parameter(Mandatory = $true)][string] $PathProperty,
-        [Parameter(Mandatory = $true)][string] $HashProperty,
-        [Parameter(Mandatory = $true)][string] $InstallRoot,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $pathValue = $Receipt.PSObject.Properties[$PathProperty]
-    $hashValue = $Receipt.PSObject.Properties[$HashProperty]
-    if ($null -eq $pathValue -or $pathValue.Value -isnot [string] -or
-        $null -eq $hashValue -or $hashValue.Value -isnot [string]) {
-        throw "$Context receipt does not provide $PathProperty/$HashProperty."
-    }
-    Assert-Sha256 -Value ([string]$hashValue.Value) -Context "$Context receipt file hash"
-    $path = Assert-PathWithinRoot -Path ([string]$pathValue.Value) -Root $InstallRoot -Context $Context
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "$Context installed file is missing: $path" }
-    Assert-NoReparseAncestors -Path $path -Context "$Context installed file"
-    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
-    if ($actual -cne [string]$hashValue.Value) { throw "$Context installed file changed after resolution." }
-    return $path
-}
-
-function Assert-ExternalReceiptFile {
-    param(
-        [Parameter(Mandatory = $true)] $Receipt,
-        [Parameter(Mandatory = $true)][string] $PathProperty,
-        [Parameter(Mandatory = $true)][string] $HashProperty,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $pathValue = $Receipt.PSObject.Properties[$PathProperty]
-    $hashValue = $Receipt.PSObject.Properties[$HashProperty]
-    if ($null -eq $pathValue -or $pathValue.Value -isnot [string] -or
-        $null -eq $hashValue -or $hashValue.Value -isnot [string]) {
-        throw "$Context receipt does not provide $PathProperty/$HashProperty."
-    }
-    if (-not [IO.Path]::IsPathRooted([string]$pathValue.Value)) {
-        throw "$Context receipt path must be absolute."
-    }
-    Assert-Sha256 -Value ([string]$hashValue.Value) -Context "$Context receipt file hash"
-    $path = [IO.Path]::GetFullPath([string]$pathValue.Value)
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "$Context runtime file is missing: $path" }
-    Assert-NoReparseAncestors -Path $path -Context "$Context runtime file"
-    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
-    if ($actual -cne [string]$hashValue.Value) { throw "$Context runtime file changed after resolution." }
-    return $path
-}
-
-function Set-WindowsLowIntegrityDirectory {
-    param(
-        [Parameter(Mandatory = $true)][string] $Path
-    )
-    if (-not $script:IsWindowsHost) {
-        return
-    }
-    $fullPath = [IO.Path]::GetFullPath($Path)
-    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
-    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Windows low-integrity boundary path must be a regular non-reparse directory: $fullPath"
-    }
-    Assert-NoReparseAncestors -Path $fullPath -Context 'Windows low-integrity boundary directory'
-    $icaclsCommand = Get-Command icacls.exe -CommandType Application -ErrorAction Stop |
-        Select-Object -First 1
-    $icaclsPath = [IO.Path]::GetFullPath([string]$icaclsCommand.Path)
-    if (-not (Test-Path -LiteralPath $icaclsPath -PathType Leaf)) {
-        throw "Windows low-integrity boundary utility is missing: $icaclsPath"
-    }
-    Assert-NoReparseAncestors -Path $icaclsPath -Context 'Windows low-integrity boundary utility'
-    $arguments = @($fullPath, '/setintegritylevel', '(OI)(CI)L')
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $icaclsPath
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
-    if ($null -ne $argumentListProperty) {
-        foreach ($argument in $arguments) {
-            [void]$startInfo.ArgumentList.Add([string]$argument)
-        }
-    }
-    else {
-        $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $arguments
-    }
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    try {
-        if (-not $process.Start()) {
-            throw 'Windows low-integrity boundary utility did not start.'
-        }
-        $standardOutput = $process.StandardOutput.ReadToEnd()
-        $standardError = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
-        if ($process.ExitCode -ne 0) {
-            $diagnostic = (($standardOutput, $standardError | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' ').Trim()
-            throw "icacls could not set the low-integrity label on '$fullPath' (exit code $($process.ExitCode)): $diagnostic"
-        }
-    }
-    finally {
-        $process.Dispose()
-    }
-}
-
-function New-ContainedProcessEnvironment {
-    param(
-        [Parameter(Mandatory = $true)][string] $DiagnosticRoot
-    )
-    $allowedNames = @(
-        'PATH', 'PATHEXT', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PSHOME', 'PSModulePath',
-        'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TMP', 'TEMP', 'TMPDIR',
-        'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
-        'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TERM_PROGRAM', 'COLORTERM',
-        'CI', 'NO_COLOR', 'FORCE_COLOR', 'PWSH_DISTRIBUTION_CHANNEL', 'POWERSHELL_DISTRIBUTION_CHANNEL',
-        'GITHUB_ACTIONS', 'GITHUB_ACTION', 'GITHUB_ACTION_PATH', 'GITHUB_ACTION_REPOSITORY',
-        'GITHUB_ACTION_REF', 'GITHUB_ACTOR', 'GITHUB_BASE_REF', 'GITHUB_ENV', 'GITHUB_EVENT_NAME',
-        'GITHUB_EVENT_PATH', 'GITHUB_GRAPHQL_URL', 'GITHUB_HEAD_REF', 'GITHUB_JOB', 'GITHUB_OUTPUT',
-        'GITHUB_PATH', 'GITHUB_REF', 'GITHUB_REF_NAME', 'GITHUB_REF_PROTECTED', 'GITHUB_REF_TYPE',
-        'GITHUB_REPOSITORY', 'GITHUB_REPOSITORY_ID', 'GITHUB_REPOSITORY_OWNER',
-        'GITHUB_REPOSITORY_OWNER_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_RUN_ID', 'GITHUB_RUN_NUMBER',
-        'GITHUB_SERVER_URL', 'GITHUB_SHA', 'GITHUB_STATE', 'GITHUB_STEP_SUMMARY', 'GITHUB_WORKFLOW',
-        'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_WORKSPACE', 'RUNNER_ARCH', 'RUNNER_DEBUG',
-        'RUNNER_NAME', 'RUNNER_OS', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE', 'RUNNER_TRACKING_ID',
-        'RUNNER_WORKSPACE', 'ImageOS', 'ImageVersion',
-        'GIT_NO_REPLACE_OBJECTS'
-    )
-    $environment = [ordered]@{}
-    foreach ($name in $allowedNames) {
-        $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
-        if ($null -ne $value) {
-            $environment[$name] = [string]$value
-        }
-    }
-    # Candidate processes receive run-owned temporary/configuration locations,
-    # never the runner's user profile or shared temp roots. Secrets and mutable
-    # package-manager configuration are intentionally absent from the allowlist.
-    $containmentRoot = Join-Path $DiagnosticRoot ("native-environment-{0}" -f [guid]::NewGuid().ToString('N'))
-    [void](New-Item -ItemType Directory -Path $containmentRoot -Force)
-    $containmentItem = Get-Item -LiteralPath $containmentRoot -Force
-    if (-not $containmentItem.PSIsContainer -or ($containmentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'Contained native-process environment root must be a regular non-reparse directory.'
-    }
-    Assert-NoReparseAncestors -Path $containmentRoot -Context 'Contained native-process environment root'
-    $homePath = Join-Path $containmentRoot 'home'
-    $tempPath = Join-Path $containmentRoot 'temp'
-    $configPath = Join-Path $containmentRoot 'config'
-    $cachePath = Join-Path $containmentRoot 'cache'
-    $dataPath = Join-Path $containmentRoot 'data'
-    foreach ($path in @($homePath, $tempPath, $configPath, $cachePath, $dataPath)) {
-        [void](New-Item -ItemType Directory -Path $path -Force)
-        $item = Get-Item -LiteralPath $path -Force
-        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Contained native-process environment path is not a regular non-reparse directory: $path"
-        }
-        Assert-NoReparseAncestors -Path $path -Context 'Contained native-process environment path'
-    }
-    Set-WindowsLowIntegrityDirectory -Path $containmentRoot
-    $environment['HOME'] = $homePath
-    $environment['USERPROFILE'] = $homePath
-    $environment['TMP'] = $tempPath
-    $environment['TEMP'] = $tempPath
-    $environment['TMPDIR'] = $tempPath
-    $environment['XDG_CONFIG_HOME'] = $configPath
-    $environment['XDG_CACHE_HOME'] = $cachePath
-    $environment['XDG_DATA_HOME'] = $dataPath
-    $environment['RUNNER_TEMP'] = $tempPath
-    $environment['GIT_NO_REPLACE_OBJECTS'] = '1'
-    $environment.Remove('GITHUB_TOKEN')
-    $environment.Remove('GH_TOKEN')
-    $environment.Remove('ACTIONS_RUNTIME_TOKEN')
-    $environment.Remove('ACTIONS_ID_TOKEN_REQUEST_TOKEN')
-    $environment.Remove('ACTIONS_ID_TOKEN_REQUEST_URL')
-    return $environment
-}
-
-function Protect-ProcessCredentialEnvironment {
-    param(
-        [Parameter()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
-    )
-    Assert-SemanticCredentialHostSupport -SemanticCredentialNames $SemanticCredentialNames
-    $credentialNamePattern = '(?i)(^|_)(API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIALS?|AUTH)(_|$)'
-    $exactCredentialNames = @(
-        'GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
-        'ACTIONS_ID_TOKEN_REQUEST_URL', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
-        'AWS_SESSION_TOKEN', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID',
-        'GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_API_KEY', 'KUBECONFIG', 'DOCKER_HOST',
-        'DOCKER_CONFIG', 'CONTAINER_HOST'
-    )
-    $requestedNames = @($SemanticCredentialNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    $requestedSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $semanticEnvironment = [ordered]@{}
-    foreach ($nameValue in $requestedNames) {
-        $name = [string]$nameValue
-        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
-            throw "Semantic credential environment variable name is invalid: '$name'."
-        }
-        if (-not $requestedSet.Add($name)) {
-            throw "Semantic credential environment variable '$name' was specified more than once."
-        }
-        $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
-        if ([string]::IsNullOrWhiteSpace([string]$value)) {
-            throw "Requested semantic credential environment variable '$name' is missing or empty."
-        }
-        $semanticEnvironment[$name] = [string]$value
-    }
-    $namesToRemove = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in $exactCredentialNames) { [void]$namesToRemove.Add($name) }
-    foreach ($name in @($requestedSet)) { [void]$namesToRemove.Add([string]$name) }
-    foreach ($entry in @(Get-ChildItem Env: -ErrorAction SilentlyContinue)) {
-        $name = [string]$entry.Name
-        if ($name -match $credentialNamePattern) { [void]$namesToRemove.Add($name) }
-    }
-    foreach ($name in @($namesToRemove)) {
-        [Environment]::SetEnvironmentVariable([string]$name, $null, [EnvironmentVariableTarget]::Process)
-    }
-    return $semanticEnvironment
-}
-
-function Assert-SemanticCredentialHostSupport {
-    param(
-        [Parameter()][AllowNull()][AllowEmptyCollection()][string[]] $SemanticCredentialNames
-    )
-    if (-not $script:IsWindowsHost) { return }
-    foreach ($name in $SemanticCredentialNames) {
-        if (-not [string]::IsNullOrWhiteSpace($name)) {
-            throw 'Credential-backed semantic validation is not supported on Windows because the protected Pester boundary does not establish credential confidentiality.'
-        }
-    }
-}
-
-function Get-RepositoryRawSnapshot {
-    param(
-        [Parameter(Mandatory = $true)][string] $RepositoryRoot
-    )
-    $root = [IO.Path]::GetFullPath($RepositoryRoot)
-    $topLevel = @(Get-ChildItem -LiteralPath $root -Force)
-    $items = foreach ($entry in $topLevel) {
-        if ([string]$entry.Name -ceq '.git') {
-            continue
-        }
-        $entry
-        if ($entry.PSIsContainer) {
-            Get-ChildItem -LiteralPath $entry.FullName -Recurse -Force
-        }
-    }
-    $snapshot = foreach ($item in @($items)) {
-        $relativePath = [IO.Path]::GetRelativePath($root, $item.FullName).Replace([IO.Path]::DirectorySeparatorChar, '/')
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Repository contains a reparse entry while taking the raw snapshot: $relativePath"
-        }
-        if (-not $item.PSIsContainer) {
-            Assert-RegularFileForHash -Item $item -Context "Repository snapshot entry '$relativePath'"
-        }
-        [pscustomobject][ordered]@{
-            path = $relativePath
-            isContainer = [bool]$item.PSIsContainer
-            length = if ($item.PSIsContainer) { [int64]-1 } else { [int64]$item.Length }
-            rawSha256 = if ($item.PSIsContainer) { '' } else { (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash.ToLowerInvariant() }
-        }
-    }
-    @($snapshot | Sort-Object -Property path)
-}
-
-function Assert-RepositoryRawSnapshotUnchanged {
-    param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Before,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $After
-    )
-    if ($Before.Count -ne $After.Count) {
-        throw 'Candidate repository filesystem changed during repository tests.'
-    }
-    for ($index = 0; $index -lt $Before.Count; $index++) {
-        $beforeEntry = $Before[$index]
-        $afterEntry = $After[$index]
-        foreach ($propertyName in @('path', 'isContainer', 'length', 'rawSha256')) {
-            if ([string]$beforeEntry.$propertyName -cne [string]$afterEntry.$propertyName) {
-                throw "Candidate repository entry '$($beforeEntry.path)' changed during repository tests."
-            }
-        }
-    }
-}
-
-function Assert-BootstrapTransitionChangedPaths {
-    param(
-        [Parameter(Mandatory = $true)][string] $GitPath,
-        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
-        [Parameter(Mandatory = $true)][string] $BaseCommit,
-        [Parameter(Mandatory = $true)][string] $CandidateCommit
-    )
-    if ([string]::IsNullOrWhiteSpace($BaseCommit)) {
-        throw 'Bootstrap transition requires a distinct base commit for changed-path binding.'
-    }
-
-    $allowedPathList = @(
-        '.github/workflows/skill-validator.yml'
-        '.github/workflows/standard-v1-candidate-windows.yml'
-        'scripts/Install-LatestPowerShell.ps1'
-        'scripts/PowerShellRelease.psm1'
-        'scripts/Test-Repository.ps1'
-        'scripts/Validate.ps1'
-        'tests/BootstrapTransition.Tests.ps1'
-        'tests/CanonicalValidation.Tests.ps1'
-        'tests/LocalizationWorkset.Tests.ps1'
-        'tests/ModUpdateAutomation.Tests.ps1'
-        'tests/RepositoryContract.Tests.ps1'
-        'tests/RepositoryValidation.Tests.ps1'
-        'tests/Schema15Coordination.Tests.ps1'
-        'tests/Schema15SourceAcquisition.Tests.ps1'
-        'tests/SkillContract.Tests.ps1'
-        'tests/SourcePin.Tests.ps1'
-        'tests/StandardV1Conformance.Tests.ps1'
-        'tests/Test-Repository.Tests.ps1'
-        'tests/TestSupport.ps1'
-        'tests/ValidationTransition.Tests.ps1'
-    )
-    $allowedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($path in $allowedPathList) { [void]$allowedPaths.Add($path) }
-    $retiredPathList = @(
-        '.github/workflows/standard-v1-protected.yml'
-        'tests/validate-windows-powershell.ps1'
-    )
-    $retiredPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($path in $retiredPathList) { [void]$retiredPaths.Add($path) }
-    $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
-    $gitOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot diff --find-renames=100% --name-status -z "$BaseCommit...$CandidateCommit") -join '')
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not compare bootstrap transition candidate '$CandidateCommit' with base commit '$BaseCommit'."
-    }
-    $tokens = @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })
-    if ($tokens.Count -eq 0) {
-        throw 'Bootstrap transition changed-path binding found no candidate changes.'
-    }
-    $changedPaths = [Collections.Generic.List[string]]::new()
-    $changedPathSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    for ($index = 0; $index -lt $tokens.Count; $index++) {
-        $status = [string]$tokens[$index]
-        if ($status -cmatch '^[RC][0-9]{3}$') {
-            throw "Bootstrap transition changed-path allowlist rejects rename/copy status '$status'."
-        }
-        if ($index + 1 -ge $tokens.Count) {
-            throw 'Git returned an incomplete bootstrap transition status record.'
-        }
-        $path = [string]$tokens[$index + 1]
-        if ($status -ceq 'D') {
-            if (-not $retiredPaths.Contains($path)) {
-                throw "Bootstrap transition changed-path allowlist rejects deletion '$path'."
-            }
-        }
-        elseif ($status -cnotmatch '^[AM]$' -or -not $allowedPaths.Contains($path)) {
-            throw "Bootstrap transition changed-path allowlist rejects '$path'."
-        }
-        if (-not $changedPathSet.Add($path)) {
-            throw "Bootstrap transition changed-path binding returned duplicate path '$path'."
-        }
-        [void]$changedPaths.Add($path)
-        $index++
-    }
-
-    $requiredPathList = @(
-        'scripts/Test-Repository.ps1'
-        'scripts/Validate.ps1'
-    )
-    # A maintenance update need not rewrite every established trust anchor.
-    # Both immutable revisions must still contain every anchor as a regular blob.
-    foreach ($revision in @($BaseCommit, $CandidateCommit)) {
-        foreach ($requiredPath in $requiredPathList) {
-            $anchorOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $revision -- $requiredPath) -join '')
-            if ($LASTEXITCODE -ne 0) {
-                throw "Could not inspect bootstrap trust anchor '$requiredPath' at '$revision'."
-            }
-            $anchorRecords = @($anchorOutput.Split([char]0) | Where-Object { $_ -ne '' })
-            if ($anchorRecords.Count -ne 1 -or
-                $anchorRecords[0] -cnotmatch '^(?<mode>100644|100755) blob [0-9a-f]{40}\t(?<path>[^\x00\r\n]+)$' -or
-                $Matches.path -cne $requiredPath) {
-                throw "Bootstrap transition requires tracked regular trust anchor '$requiredPath' at '$revision'."
-            }
-        }
-    }
-    foreach ($requiredPath in @(
-            '.github/workflows/standard-v1-candidate-windows.yml'
-            'scripts/Install-LatestPowerShell.ps1'
-            'scripts/PowerShellRelease.psm1'
-        )) {
-        $anchorOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $CandidateCommit -- $requiredPath) -join '')
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not inspect latest-only Windows validation anchor '$requiredPath' at '$CandidateCommit'."
-        }
-        $anchorRecords = @($anchorOutput.Split([char]0) | Where-Object { $_ -ne '' })
-        if ($anchorRecords.Count -ne 1 -or
-            $anchorRecords[0] -cnotmatch '^(?<mode>100644|100755) blob [0-9a-f]{40}\t(?<path>[^\x00\r\n]+)$' -or
-            $Matches.path -cne $requiredPath) {
-            throw "Latest-only Windows validation requires tracked regular anchor '$requiredPath' at '$CandidateCommit'."
-        }
-    }
-    foreach ($retiredPath in $retiredPathList) {
-        $baseOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $BaseCommit -- $retiredPath) -join '')
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not inspect retired validation anchor '$retiredPath' at '$BaseCommit'."
-        }
-        $baseRecords = @($baseOutput.Split([char]0) | Where-Object { $_ -ne '' })
-        if ($baseRecords.Count -ne 1 -or
-            $baseRecords[0] -cnotmatch '^(?<mode>100644|100755) blob [0-9a-f]{40}\t(?<path>[^\x00\r\n]+)$' -or
-            $Matches.path -cne $retiredPath) {
-            throw "Bootstrap retirement requires the old validation anchor '$retiredPath' at '$BaseCommit'."
-        }
-        $candidateOutput = [string](@(& $GitPath @gitConfigArguments -C $RepositoryRoot ls-tree --full-tree -z $CandidateCommit -- $retiredPath) -join '')
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not inspect retired validation anchor '$retiredPath' at '$CandidateCommit'."
-        }
-        if (@($candidateOutput.Split([char]0) | Where-Object { $_ -ne '' }).Count -ne 0) {
-            throw "Bootstrap retirement requires '$retiredPath' to be absent from '$CandidateCommit'."
-        }
-    }
-    return [pscustomobject][ordered]@{
-        baseCommit = $BaseCommit
-        candidateCommit = $CandidateCommit
-        allowedPaths = @($allowedPathList)
-        changedPaths = @($changedPaths.ToArray() | Sort-Object)
-    }
-}
-
-function Invoke-BootstrapTransitionValidation {
-    param(
-        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
-        [Parameter(Mandatory = $true)][string] $ArtifactsRoot,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $OutputPath,
-        [Parameter(Mandatory = $true)][string] $RepositoryValidatorPath,
-        [Parameter(Mandatory = $true)][string] $RepositoryValidatorHash,
-        [Parameter(Mandatory = $true)][string] $GitPath,
-        [Parameter(Mandatory = $true)][string] $CandidateCommit,
-        [Parameter(Mandatory = $true)][string] $CandidateTree,
-        [Parameter(Mandatory = $true)][string] $BaseCommit,
-        [Parameter(Mandatory = $true)][string] $GitIndexPath,
-        [Parameter(Mandatory = $true)][string] $GitIndexSha256,
-        [Parameter(Mandatory = $true)][string] $GitConfigPath,
-        [Parameter(Mandatory = $true)][bool] $GitConfigExists,
-        [Parameter(Mandatory = $true)][string] $GitConfigSha256,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $RepositorySnapshot
-    )
-
-    $transitionScope = Assert-BootstrapTransitionChangedPaths `
-        -GitPath $GitPath `
-        -RepositoryRoot $RepositoryRoot `
-        -BaseCommit $BaseCommit `
-        -CandidateCommit $CandidateCommit
-    $artifactsRootPath = [IO.Path]::GetFullPath($ArtifactsRoot)
-    if (Test-PathWithinOrEqual -Path $artifactsRootPath -Root $RepositoryRoot) {
-        throw 'Bootstrap transition artifacts root must be outside the candidate repository.'
-    }
-    [void](New-Item -ItemType Directory -Path $artifactsRootPath -Force)
-    $artifactsItem = Get-Item -LiteralPath $artifactsRootPath -Force
-    if (-not $artifactsItem.PSIsContainer -or ($artifactsItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'Bootstrap transition artifacts root must be a regular non-reparse directory.'
-    }
-    Assert-NoReparseAncestors -Path $artifactsRootPath -Context 'Bootstrap transition artifacts root'
-    $runRoot = Join-Path $artifactsRootPath "sgv1-bootstrap-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
-    if (Test-Path -LiteralPath $runRoot) { throw 'Bootstrap transition run path unexpectedly already exists.' }
-    [void](New-Item -ItemType Directory -Path $runRoot -Force)
-    Assert-NoReparseAncestors -Path $runRoot -Context 'Bootstrap transition run path'
-    Set-WindowsLowIntegrityDirectory -Path $runRoot
-
-    $probePath = [IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
-    if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
-        throw "Bootstrap transition process-boundary probe executable is missing: $probePath"
-    }
-    Assert-NoReparseAncestors -Path $probePath -Context 'Bootstrap transition process-boundary probe executable'
-    [void](Invoke-NativeChecked `
-        -Command $probePath `
-        -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'exit 0') `
-        -Context 'Bootstrap transition trusted process-boundary probe' `
-        -DiagnosticRoot $runRoot `
-        -IsolateRunnerCommandFiles `
-        -TerminateProcessTree `
-        -ProtectRunnerCommandFiles `
-        -NetworkProfile Offline `
-        -TimeoutMilliseconds 10000)
-
-    try {
-        [void](Invoke-NativeChecked `
-            -Command $probePath `
-            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'Start-Sleep -Seconds 30') `
-            -Context 'Bootstrap transition bounded cancellation probe' `
-            -DiagnosticRoot $runRoot `
-            -IsolateRunnerCommandFiles `
-            -TerminateProcessTree `
-            -ProtectRunnerCommandFiles `
-            -NetworkProfile Offline `
-            -TimeoutMilliseconds 1000)
-        throw 'Bootstrap transition bounded cancellation probe completed unexpectedly.'
-    }
-    catch {
-        $cancellationMessage = [string]$_.Exception.Message
-        if ($cancellationMessage -notmatch 'bounded candidate execution timeout') {
-            throw "Bootstrap transition bounded cancellation probe failed without the expected timeout cleanup result: $cancellationMessage"
-        }
-    }
-    $platformBoundary = [ordered]@{
-        host = 'windows'
-        processIdentity = 'passed'
-        processGroup = 'windows-job-object'
-        restrictedExecution = 'restricted-token'
-        integrityLevel = 'low'
-        resourceLimits = 'job-active-process-256-cpu-300s-memory-2GiB'
-        commandFileBoundary = 'passed'
-        networkProfile = 'offline'
-        probe = 'passed'
-        cancellationCleanup = 'passed'
-    }
-
-    $integrityReportPath = Join-Path $runRoot 'candidate-integrity.json'
-    $integrityJson = & $RepositoryValidatorPath `
-        -RepositoryRoot $RepositoryRoot `
-        -OutputPath $integrityReportPath `
-        -TrustedGitPath $GitPath `
-        -BootstrapTransition | Select-Object -Last 1
-    $integrityReport = $integrityJson | ConvertFrom-Json -Depth 100
-    if ($integrityReport.result -cne 'passed' -or
-        $integrityReport.validationMode -cne 'bootstrap-transition' -or
-        [int]$integrityReport.activeSkillCount -le 0) {
-        throw 'Bootstrap transition integrity verification did not bind a non-empty current-layout Skill inventory.'
-    }
-    if (-not (Test-Path -LiteralPath $integrityReportPath -PathType Leaf)) {
-        throw 'Bootstrap transition integrity evidence was not written by the trusted repository validator.'
-    }
-    Assert-NoReparseAncestors -Path $integrityReportPath -Context 'Bootstrap transition integrity evidence'
-
-    $postCommit = ([string](@(& $GitPath -c "safe.directory=$RepositoryRoot" -c "core.worktree=$RepositoryRoot" -C $RepositoryRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
-    if ($LASTEXITCODE -ne 0 -or $postCommit -cne $CandidateCommit) {
-        throw "Bootstrap transition changed the candidate commit; expected '$CandidateCommit' but found '$postCommit'."
-    }
-    $postTree = ([string](@(& $GitPath -c "safe.directory=$RepositoryRoot" -c "core.worktree=$RepositoryRoot" -C $RepositoryRoot rev-parse "$postCommit^{tree}" 2>$null) | Select-Object -First 1)).Trim()
-    if ($LASTEXITCODE -ne 0 -or $postTree -cne $CandidateTree) {
-        throw "Bootstrap transition changed the candidate tree; expected '$CandidateTree' but found '$postTree'."
-    }
-    $postDirty = @(& $GitPath -c "safe.directory=$RepositoryRoot" -c "core.worktree=$RepositoryRoot" -C $RepositoryRoot status --porcelain=v1 --untracked-files=all)
-    if ($LASTEXITCODE -ne 0 -or $postDirty.Count -ne 0) {
-        throw 'Bootstrap transition changed the candidate Git status.'
-    }
-    $postIndexItem = Get-Item -LiteralPath $GitIndexPath -Force -ErrorAction SilentlyContinue
-    if ($null -eq $postIndexItem -or $postIndexItem.PSIsContainer -or
-        ($postIndexItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'Candidate Git index is missing or changed type after bootstrap transition.'
-    }
-    $postIndexSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $GitIndexPath).Hash.ToLowerInvariant()
-    if ($postIndexSha256 -cne $GitIndexSha256) {
-        throw 'Candidate Git index changed during bootstrap transition.'
-    }
-    $postConfigExists = Test-Path -LiteralPath $GitConfigPath -PathType Leaf
-    if ($postConfigExists -ne $GitConfigExists) {
-        throw 'Candidate Git config existence changed during bootstrap transition.'
-    }
-    if ($postConfigExists) {
-        $postConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $GitConfigPath).Hash.ToLowerInvariant()
-        if ($postConfigSha256 -cne $GitConfigSha256) {
-            throw 'Candidate Git config changed during bootstrap transition.'
-        }
-    }
-    $postSnapshot = @(Get-RepositoryRawSnapshot -RepositoryRoot $RepositoryRoot)
-    Assert-RepositoryRawSnapshotUnchanged -Before $RepositorySnapshot -After $postSnapshot
-
-    $summary = [ordered]@{
-        schemaVersion = 1
-        validationMode = 'bootstrap-transition'
-        candidate = [ordered]@{ commit = $CandidateCommit; tree = $CandidateTree }
-        transitionScope = $transitionScope
-        trusted = [ordered]@{
-            repositoryValidatorSha256 = $RepositoryValidatorHash
-            candidateCodeExecuted = $false
-            candidateExecutionProfile = 'not-run'
-            assertions = 'trusted-supervisor-only'
-        }
-        stages = [ordered]@{
-            bootstrapFixture = 'passed'
-            platformBoundary = 'passed'
-            cancellationCleanup = 'passed'
-            integrityVerification = 'passed'
-            candidateExecution = 'not-run'
-            postTestIdentity = 'passed'
-            externalAuthority = 'not-required-before-standard-v1-promotion'
-            scanner = 'not-run-before-standard-v1-promotion'
-            repositoryRegression = 'deferred-to-standard-v1-promotion'
-        }
-        platformBoundary = $platformBoundary
-        integrity = [ordered]@{
-            skillsRoot = [string]$integrityReport.skillsRoot
-            activeSkillCount = [int]$integrityReport.activeSkillCount
-            skills = @($integrityReport.skills | ForEach-Object {
-                [pscustomobject][ordered]@{
-                    skillId = [string]$_.skillId
-                    contentSha256 = [string]$_.contentSha256
-                }
-            })
-        }
-        result = 'passed'
-    }
-    $summaryJson = $summary | ConvertTo-Json -Depth 100
-    $summaryPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-        Join-Path $runRoot 'conformance-report.json'
-    }
-    else {
-        Assert-PathWithinRoot -Path ([IO.Path]::GetFullPath($OutputPath)) -Root $artifactsRootPath -Context 'Bootstrap transition output'
-    }
-    if (Test-Path -LiteralPath $summaryPath) { throw 'Bootstrap transition output path already exists; evidence must not overwrite prior content.' }
-    $summaryEncoding = [Text.UTF8Encoding]::new($false)
-    $summaryBytes = $summaryEncoding.GetBytes($summaryJson + [Environment]::NewLine)
-    $summaryHasher = [Security.Cryptography.SHA256]::Create()
-    try {
-        $summarySha256 = ([BitConverter]::ToString($summaryHasher.ComputeHash($summaryBytes)) -replace '-', '').ToLowerInvariant()
-    }
-    finally { $summaryHasher.Dispose() }
-    [void](Write-ExclusiveUtf8File -Path $summaryPath -Text ($summaryJson + [Environment]::NewLine) -Context 'Bootstrap transition output')
-    Assert-NoReparseAncestors -Path $summaryPath -Context 'Bootstrap transition output'
-    $writtenSummarySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $summaryPath).Hash.ToLowerInvariant()
-    if ($writtenSummarySha256 -cne $summarySha256) {
-        throw 'Bootstrap transition evidence changed during immediate readback.'
-    }
-    $githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
-    if (-not [string]::IsNullOrWhiteSpace($githubOutputPath)) {
-        if (-not (Test-Path -LiteralPath $githubOutputPath -PathType Leaf)) {
-            throw "GitHub output command file is missing: $githubOutputPath"
-        }
-        Assert-NoReparseAncestors -Path $githubOutputPath -Context 'GitHub output command file'
-        [IO.File]::AppendAllText($githubOutputPath, "standard_v1_evidence_sha256=$summarySha256$([Environment]::NewLine)", $summaryEncoding)
-    }
-    Write-Host "Darktide Translate bootstrap transition validation passed. Evidence: $summaryPath"
-    return $summaryJson
-}
-
-function Assert-RegularFileForHash {
-    param(
-        [Parameter(Mandatory = $true)][IO.FileSystemInfo] $Item,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$Context is not a regular non-reparse file: $($Item.FullName)"
-    }
-}
-
-function Resolve-GitCommonDirectoryFromMetadata {
-    param(
-        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $metadataPath = Join-Path $RepositoryRoot '.git'
-    if (-not (Test-Path -LiteralPath $metadataPath)) {
-        throw "$Context Git metadata path is missing: $metadataPath"
-    }
-    $metadataItem = Get-Item -LiteralPath $metadataPath -Force
-    if (($metadataItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$Context Git metadata path is a reparse point: $metadataPath"
-    }
-    $gitDirectory = if ($metadataItem.PSIsContainer) {
-        $metadataItem.FullName
-    }
-    else {
-        if ($metadataItem.Length -gt 4096) { throw "$Context Git metadata pointer is too large: $metadataPath" }
-        $metadataText = (Read-StrictUtf8File -Path $metadataItem.FullName).Trim()
-        if ($metadataText -notmatch '^gitdir:\s*(?<path>[^\r\n]+)$') {
-            throw "$Context Git metadata pointer is invalid: $metadataPath"
-        }
-        $pointerPath = [string]$Matches.path
-        if (-not [IO.Path]::IsPathRooted($pointerPath)) {
-            $pointerPath = Join-Path (Split-Path -Parent $metadataItem.FullName) $pointerPath
-        }
-        [IO.Path]::GetFullPath($pointerPath)
-    }
-    $gitDirectory = [IO.Path]::GetFullPath($gitDirectory)
-    if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container)) {
-        throw "$Context Git metadata directory is missing: $gitDirectory"
-    }
-    $gitDirectoryItem = Get-Item -LiteralPath $gitDirectory -Force
-    if (($gitDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$Context Git metadata directory is a reparse point: $gitDirectory"
-    }
-    Assert-NoReparseAncestors -Path $gitDirectory -Context "$Context Git metadata directory"
-
-    $commonDirectory = $gitDirectory
-    $commonDirectoryFile = Join-Path $gitDirectory 'commondir'
-    if (Test-Path -LiteralPath $commonDirectoryFile -PathType Leaf) {
-        $commonItem = Get-Item -LiteralPath $commonDirectoryFile -Force
-        if (($commonItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "$Context Git commondir file is a reparse point: $commonDirectoryFile"
-        }
-        if ($commonItem.Length -gt 4096) { throw "$Context Git commondir file is too large: $commonDirectoryFile" }
-        $commonValue = (Read-StrictUtf8File -Path $commonItem.FullName).Trim()
-        if ([string]::IsNullOrWhiteSpace($commonValue) -or $commonValue -match '[\r\n]') {
-            throw "$Context Git commondir file is invalid: $commonDirectoryFile"
-        }
-        $commonDirectory = if ([IO.Path]::IsPathRooted($commonValue)) {
-            $commonValue
-        }
-        else {
-            Join-Path $gitDirectory $commonValue
-        }
-    }
-    $commonDirectory = [IO.Path]::GetFullPath($commonDirectory)
-    if (-not (Test-Path -LiteralPath $commonDirectory -PathType Container)) {
-        throw "$Context Git common metadata directory is missing: $commonDirectory"
-    }
-    $commonDirectoryItem = Get-Item -LiteralPath $commonDirectory -Force
-    if (($commonDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$Context Git common metadata directory is a reparse point: $commonDirectory"
-    }
-    Assert-NoReparseAncestors -Path $commonDirectory -Context "$Context Git common metadata directory"
-    return $commonDirectory
-}
-
-function Assert-NoGitReplacementObjects {
-    param(
-        [Parameter(Mandatory = $true)][string] $GitPath,
-        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
-        [Parameter(Mandatory = $true)][string] $Context
-    )
-    $gitConfigArguments = @(
-        '-c', "safe.directory=$RepositoryRoot",
-        '-c', "core.worktree=$RepositoryRoot"
-    )
-    $replacePathOutput = @(& $GitPath @gitConfigArguments -C $RepositoryRoot rev-parse --git-path refs/replace 2>$null)
-    $replacePathExitCode = $LASTEXITCODE
-    $replacePath = $null
-    if ($replacePathExitCode -eq 0 -and $replacePathOutput.Count -eq 1 -and
-        -not [string]::IsNullOrWhiteSpace([string]$replacePathOutput[0])) {
-        $replacePath = [string]$replacePathOutput[0].Trim()
-    }
-    else {
-        # Some hosted Git checkouts do not return a single value for
-        # --git-path refs/replace. Resolve the common metadata directory
-        # explicitly while keeping the same fail-closed metadata checks.
-        $gitCommonDirOutput = @(& $GitPath @gitConfigArguments -C $RepositoryRoot rev-parse --git-common-dir 2>$null)
-        $gitCommonDirExitCode = $LASTEXITCODE
-        if ($gitCommonDirExitCode -eq 0 -and $gitCommonDirOutput.Count -eq 1 -and
-            -not [string]::IsNullOrWhiteSpace([string]$gitCommonDirOutput[0])) {
-            $gitCommonDir = [string]$gitCommonDirOutput[0].Trim()
-            if (-not [IO.Path]::IsPathRooted($gitCommonDir)) {
-                $gitCommonDir = Join-Path $RepositoryRoot $gitCommonDir
-            }
-            $gitCommonDir = [IO.Path]::GetFullPath($gitCommonDir)
-            if (-not (Test-Path -LiteralPath $gitCommonDir -PathType Container)) {
-                throw "$Context Git common metadata directory is missing: $gitCommonDir"
-            }
-            $gitCommonDirItem = Get-Item -LiteralPath $gitCommonDir -Force
-            if (($gitCommonDirItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "$Context Git common metadata directory is a reparse point: $gitCommonDir"
-            }
-            Assert-NoReparseAncestors -Path $gitCommonDir -Context "$Context Git common metadata directory"
-        }
-        else {
-            $gitCommonDir = Resolve-GitCommonDirectoryFromMetadata -RepositoryRoot $RepositoryRoot -Context $Context
-        }
-        $replacePath = Join-Path $gitCommonDir 'refs/replace'
-    }
-    if (-not [IO.Path]::IsPathRooted($replacePath)) {
-        $replacePath = Join-Path $RepositoryRoot $replacePath
-    }
-    $replacePath = [IO.Path]::GetFullPath($replacePath)
-    if (-not (Test-Path -LiteralPath $replacePath)) { return }
-    $replaceItem = Get-Item -LiteralPath $replacePath -Force
-    if (-not $replaceItem.PSIsContainer -or ($replaceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "$Context Git replacement-object path is not a regular non-reparse directory."
-    }
-    Assert-NoReparseAncestors -Path $replacePath -Context "$Context Git replacement-object directory"
-    $replacementEntries = @(Get-ChildItem -LiteralPath $replacePath -Force -ErrorAction Stop)
-    if ($replacementEntries.Count -ne 0) {
-        throw "$Context found Git replacement objects; replacement refs are not permitted."
-    }
-}
-
-function Invoke-NativeChecked {
-    param(
-        [Parameter(Mandatory = $true)][string] $Command,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
-        [Parameter(Mandatory = $true)][string] $Context,
-        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
-        [Parameter()][AllowNull()][string] $ChildWritableRoot,
-        [Parameter()][AllowNull()][string] $StandardInput,
-        [Parameter()][AllowNull()][Collections.IDictionary] $AdditionalEnvironmentVariables,
-        [Parameter()][switch] $IsolateRunnerCommandFiles,
-        [Parameter()][switch] $TerminateProcessTree,
-        [Parameter()][switch] $ProtectRunnerCommandFiles,
-        [Parameter()][switch] $DirectWindowsProcess,
-        [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline',
-        [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
-    )
-    if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) { throw "$Context executable is missing: $Command" }
-    # On Windows, the child is created with a restricted primary token and a
-    # resource-limited Job Object before its suspended thread is released.
-    if ($ProtectRunnerCommandFiles -and -not $IsolateRunnerCommandFiles) {
-        throw "$Context cannot protect runner command files without isolation."
-    }
-    if ($null -ne $AdditionalEnvironmentVariables -and -not $TerminateProcessTree) {
-        throw "$Context cannot add environment variables without process containment."
-    }
-    $diagnosticRootFullPath = [IO.Path]::GetFullPath($DiagnosticRoot)
-    if (-not (Test-Path -LiteralPath $diagnosticRootFullPath -PathType Container)) {
-        throw "$Context diagnostic root is missing: $diagnosticRootFullPath"
-    }
-    $childWritableRootPath = if ([string]::IsNullOrWhiteSpace($ChildWritableRoot)) {
-        $diagnosticRootFullPath
-    }
-    else {
-        [IO.Path]::GetFullPath($ChildWritableRoot)
-    }
-    if (-not (Test-Path -LiteralPath $childWritableRootPath -PathType Container)) {
-        throw "$Context child-writable output root is missing: $childWritableRootPath"
-    }
-    if (-not (Test-PathWithinOrEqual -Path $childWritableRootPath -Root $diagnosticRootFullPath)) {
-        throw "$Context child-writable output root must remain within the diagnostic root."
-    }
-    Assert-NoReparseAncestors -Path $childWritableRootPath -Context "$Context child-writable output root"
-    $stderrPath = Join-Path $childWritableRootPath ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
-    $runnerCommandFileNames = @(
-        'GITHUB_ENV',
-        'GITHUB_PATH',
-        'GITHUB_OUTPUT',
-        'GITHUB_STATE',
-        'GITHUB_STEP_SUMMARY'
-    )
-    $previousRunnerCommandFileValues = [ordered]@{}
-    $runnerCommandFileSnapshot = $null
-    $runnerCommandFileIsolationStarted = $false
-    $childProcess = $null
-    $childProcessId = 0
-    $childProcessIdentity = ''
-    $observedProcessIdentities = [Collections.Generic.Dictionary[int,string]]::new()
-    $baselineSupervisorProcessIdentities = [Collections.Generic.Dictionary[int,string]]::new()
-    $processTreeStopped = $false
-    $windowsJobHandle = [IntPtr]::Zero
-    $windowsResumeEvent = $null
-    $windowsResumeEventSignaled = $false
-    $stdoutTask = $null
-    $stderrTask = $null
-    $maxProcessOutputCharacters = 4 * 1024 * 1024
-    $windowsResumeEventReleaseEligible = $false
-    try {
-        if ($ProtectRunnerCommandFiles) {
-            $runnerCommandFileSnapshot = Get-RunnerCommandFileSnapshot -Names $runnerCommandFileNames
-        }
-        if ($IsolateRunnerCommandFiles) {
-            $runnerCommandFileIsolationStarted = $true
-            foreach ($name in $runnerCommandFileNames) {
-                $previousRunnerCommandFileValues[$name] = [Environment]::GetEnvironmentVariable(
-                    $name,
-                    [EnvironmentVariableTarget]::Process
-                )
-                $isolatedPath = Join-Path $childWritableRootPath ("isolated-{0}-{1}.txt" -f $name.ToLowerInvariant(), [guid]::NewGuid().ToString('N'))
-                $isolatedStream = [IO.File]::Open(
-                    $isolatedPath,
-                    [IO.FileMode]::CreateNew,
-                    [IO.FileAccess]::Write,
-                    [IO.FileShare]::Read
-                )
-                try {
-                    $isolatedStream.Flush($true)
-                }
-                finally {
-                    $isolatedStream.Dispose()
-                }
-                Assert-NoReparseAncestors -Path $isolatedPath -Context "Isolated $name command file"
-                [Environment]::SetEnvironmentVariable($name, $isolatedPath, [EnvironmentVariableTarget]::Process)
-            }
-        }
-        if ($TerminateProcessTree) {
-
-
-            foreach ($supervisorProcessId in @(Get-DescendantProcessIds -RootProcessId $PID)) {
-                Add-ProcessIdentityToObservation -ProcessId ([int]$supervisorProcessId) -ObservedProcessIdentities $baselineSupervisorProcessIdentities
-            }
-            if ($script:IsWindowsHost) {
-                # Create containment before Process.Start, then assign the child
-                # immediately after it returns so descendants stay in the boundary.
-                $windowsJobHandle = New-WindowsKillOnCloseJob -Context $Context
-            }
-            $nativeCommand = $Command
-            $nativeArguments = @($Arguments)
-            if ($script:IsWindowsHost) {
-                if ($DirectWindowsProcess) {
-                    # The actual command is created suspended, assigned to the
-                    # Job Object, and resumed below. Do not retain a same-level
-                    # wrapper while untrusted Pester code is running.
-                    $nativeCommand = $Command
-                    $nativeArguments = @($Arguments)
-                }
-                else {
-                    # Start a trusted gate that waits on a supervisor-owned event.
-                    # The candidate command is released only after Job Object assignment.
-                    $payloadJson = [ordered]@{
-                        command = $Command
-                        arguments = @($Arguments)
-                    } | ConvertTo-Json -Compress -Depth 20
-                    $payloadEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payloadJson))
-                    $createdNewEvent = $false
-                    $eventName = "Local\CodexValidationResume-{0}" -f [guid]::NewGuid().ToString('N')
-                    $windowsResumeEvent = [Threading.EventWaitHandle]::new(
-                        $false,
-                        [Threading.EventResetMode]::ManualReset,
-                        $eventName,
-                        [ref]$createdNewEvent
-                    )
-                    if (-not $createdNewEvent -or $null -eq $windowsResumeEvent) {
-                        throw "$Context could not create a private Windows resume event."
-                    }
-                    $eventBoundaryType = Get-WindowsProcessBoundaryType
-                    if (-not $eventBoundaryType::SetLowIntegrityKernelObject($windowsResumeEvent.SafeWaitHandle.DangerousGetHandle())) {
-                        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                        throw "$Context could not apply the low-integrity label to the Windows resume event (Win32 error $errorCode)."
-                    }
-                    $wrapperScript = @'
-$payloadEncoded = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_NATIVE_PAYLOAD')
-$eventName = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_RESUME_EVENT')
-$hasStandardInput = [Environment]::GetEnvironmentVariable('CODEX_VALIDATION_HAS_STANDARD_INPUT')
-if ([string]::IsNullOrWhiteSpace($payloadEncoded) -or [string]::IsNullOrWhiteSpace($eventName)) {
-    exit 1
-}
-$payloadJson = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($payloadEncoded))
-$payload = $payloadJson | ConvertFrom-Json -Depth 20
-$payloadArguments = @($payload.arguments | ForEach-Object { [string]$_ })
-$resumeEvent = [Threading.EventWaitHandle]::OpenExisting($eventName)
-try {
-    $standardInput = $null
-    if ($hasStandardInput -eq '1') {
-        $standardInput = [Console]::In.ReadToEnd()
-    }
-    if (-not $resumeEvent.WaitOne()) {
-        exit 1
-    }
-    if ($hasStandardInput -eq '1') {
-        $standardInput | & ([string]$payload.command) @payloadArguments
-    }
-    else {
-        & ([string]$payload.command) @payloadArguments
-    }
-    exit $LASTEXITCODE
-}
-finally {
-    $resumeEvent.Dispose()
-}
-'@
-                    $wrapperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapperScript))
-                    $nativeCommand = Join-Path $PSHOME 'pwsh.exe'
-                    if (-not (Test-Path -LiteralPath $nativeCommand -PathType Leaf)) {
-                        throw "$Context trusted PowerShell gate is missing: $nativeCommand"
-                    }
-                    Assert-NoReparseAncestors -Path $nativeCommand -Context "$Context trusted PowerShell gate"
-                    $nativeArguments = @(
-                        '-NoLogo',
-                        '-NoProfile',
-                        '-NonInteractive',
-                        '-EncodedCommand',
-                        $wrapperEncoded
-                    )
-                }
-            }
-            $startInfo = [Diagnostics.ProcessStartInfo]::new()
-            $startInfo.FileName = $nativeCommand
-            $startInfo.UseShellExecute = $false
-            $startInfo.CreateNoWindow = $true
-            $startInfo.RedirectStandardOutput = $true
-            $startInfo.RedirectStandardError = $true
-            if ($PSBoundParameters.ContainsKey('StandardInput')) {
-                $startInfo.RedirectStandardInput = $true
-            }
-            $nativeEnvironmentVariables = if ($TerminateProcessTree) {
-                New-ContainedProcessEnvironment -DiagnosticRoot $childWritableRootPath
-            }
-            else {
-                $null
-            }
-
-            if ($null -ne $nativeEnvironmentVariables) {
-                $startInfo.EnvironmentVariables.Clear()
-                foreach ($environmentName in @($nativeEnvironmentVariables.Keys)) {
-                    $startInfo.EnvironmentVariables[[string]$environmentName] = [string]$nativeEnvironmentVariables[$environmentName]
-                }
-            }
-            $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
-            if ($null -ne $argumentListProperty) {
-                foreach ($argument in $nativeArguments) {
-                    [void]$startInfo.ArgumentList.Add([string]$argument)
-                }
-            }
-            else {
-                $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $nativeArguments
-            }
-            $startInfo.WorkingDirectory = [string](Get-Location).Path
-            if ($script:IsWindowsHost) {
-                if ($DirectWindowsProcess) {
-                    foreach ($gateEnvironmentName in @(
-                        'CODEX_VALIDATION_NATIVE_PAYLOAD',
-                        'CODEX_VALIDATION_RESUME_EVENT',
-                        'CODEX_VALIDATION_HAS_STANDARD_INPUT'
-                    )) {
-                        [void]$startInfo.EnvironmentVariables.Remove($gateEnvironmentName)
-                    }
-                }
-                else {
-                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_NATIVE_PAYLOAD'] = $payloadEncoded
-                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_RESUME_EVENT'] = $eventName
-                    $startInfo.EnvironmentVariables['CODEX_VALIDATION_HAS_STANDARD_INPUT'] = if ($PSBoundParameters.ContainsKey('StandardInput')) { '1' } else { '0' }
-                }
-            }
-            $nativeEnvironmentVariables = @{}
-            foreach ($environmentName in @($startInfo.EnvironmentVariables.Keys)) {
-                $nativeEnvironmentVariables[[string]$environmentName] = [string]$startInfo.EnvironmentVariables[$environmentName]
-            }
-            if ($null -ne $AdditionalEnvironmentVariables) {
-                foreach ($environmentName in @($AdditionalEnvironmentVariables.Keys)) {
-                    $name = [string]$environmentName
-                    $value = [string]$AdditionalEnvironmentVariables[$environmentName]
-                    if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or $value.IndexOf([char]0) -ge 0) {
-                        throw "$Context received an invalid additional environment variable name or value."
-                    }
-                    $nativeEnvironmentVariables[$name] = $value
-                    $startInfo.EnvironmentVariables[$name] = $value
-                }
-            }
-            if ($script:IsWindowsHost) {
-                $childProcess = Start-WindowsSuspendedProcess -FileName $nativeCommand -Arguments $nativeArguments -WorkingDirectory $startInfo.WorkingDirectory -EnvironmentVariables $nativeEnvironmentVariables -UseStandardInput ($PSBoundParameters.ContainsKey('StandardInput')) -UseRestrictedToken $true
-            }
-            else {
-                $childProcess = [Diagnostics.Process]::new()
-                $childProcess.StartInfo = $startInfo
-                if (-not $childProcess.Start()) { throw "$Context process could not be started: $Command" }
-            }
-            $childProcessId = $childProcess.Id
-            if ($script:IsWindowsHost) {
-                Assign-WindowsProcessToJob -JobHandle $windowsJobHandle -Process $childProcess -Context $Context
-            }
-            if (Test-ProcessIdExists -ProcessId $childProcessId) {
-                try {
-                    $childProcessIdentity = Get-ProcessIdentity -ProcessId $childProcessId
-                }
-                catch {
-                    if (Test-ProcessIdExists -ProcessId $childProcessId) { throw }
-                }
-            }
-            if ((Test-ProcessIdExists -ProcessId $childProcessId) -and [string]::IsNullOrWhiteSpace($childProcessIdentity)) {
-                throw "$Context could not bind the child process identity before execution."
-            }
-            if ($script:IsWindowsHost) {
-                $windowsResumeEventReleaseEligible = $true
-            }
-
-            $outputBoundaryType = Get-WindowsSuspendedProcessBoundaryType
-            $stdoutTask = $outputBoundaryType::ReadBoundedAsync($childProcess.StandardOutput, $maxProcessOutputCharacters)
-            $stderrTask = $outputBoundaryType::ReadBoundedAsync($childProcess.StandardError, $maxProcessOutputCharacters)
-            if ($script:IsWindowsHost) {
-                if (-not $childProcess.Resume()) {
-                    throw "$Context could not resume the suspended Windows process after Job Object assignment."
-                }
-            }
-            if ($PSBoundParameters.ContainsKey('StandardInput')) {
-                $childProcess.StandardInput.Write($StandardInput)
-                $childProcess.StandardInput.Close()
-            }
-            if ($script:IsWindowsHost -and $null -ne $windowsResumeEvent) {
-                if (-not $windowsResumeEvent.Set()) {
-                    throw "$Context could not release the Windows candidate gate."
-                }
-                $windowsResumeEventSignaled = $true
-            }
-            $processDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
-            Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
-
-            while (-not $childProcess.HasExited) {
-                if ([DateTime]::UtcNow -ge $processDeadline) {
-                    throw "$Context exceeded the bounded candidate execution timeout of $TimeoutMilliseconds milliseconds."
-                }
-                [void]$childProcess.WaitForExit(100)
-                Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
-
-            }
-            Add-ObservedProcessIds -RootProcessId $childProcessId -ObservedProcessIdentities $observedProcessIdentities -SupervisorProcessId $PID -BaselineSupervisorProcessIdentities $baselineSupervisorProcessIdentities
-            Stop-ProcessTree -RootProcessId $childProcessId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
-            $processTreeStopped = $true
-            if (-not $childProcess.WaitForExit(5000)) {
-                throw "$Context process did not terminate after process-boundary cleanup."
-            }
-
-            if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
-                throw "$Context left redirected output handles open after process-tree cleanup."
-            }
-            $stdoutResult = $stdoutTask.GetAwaiter().GetResult()
-            $stderrResult = $stderrTask.GetAwaiter().GetResult()
-
-            if ($stdoutResult.Truncated -or $stderrResult.Truncated) {
-                throw "$Context exceeded the bounded native-process output limit of $maxProcessOutputCharacters characters per stream."
-            }
-            $stdoutText = [string]$stdoutResult.Text
-            $stderrText = [string]$stderrResult.Text
-            $exitCode = $childProcess.ExitCode
-        }
-        else {
-            $stdout = if ($PSBoundParameters.ContainsKey('StandardInput')) {
-                $StandardInput | & $Command @Arguments 2> $stderrPath
-            }
-            else {
-                @(& $Command @Arguments 2> $stderrPath)
-            }
-            $exitCode = $LASTEXITCODE
-            $stdoutText = ($stdout | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-            $stderrText = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -Encoding UTF8 } else { '' }
-        }
-        if ($ProtectRunnerCommandFiles) {
-            Assert-RunnerCommandFilesUnchanged -Before $runnerCommandFileSnapshot -Names $runnerCommandFileNames
-        }
-        if ($exitCode -ne 0) {
-            throw "$Context exited with code $exitCode.`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText"
-        }
-        return $stdoutText
-    }
-    finally {
-        try {
-            if ($script:IsWindowsHost -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $windowsResumeEventReleaseEligible) {
-                $terminated = $childProcess.Terminate()
-                if (-not $terminated -and -not $childProcess.HasExited) {
-                    throw "$Context could not terminate the unassigned suspended Windows process safely."
-                }
-            }
-            if ($TerminateProcessTree -and $null -ne $childProcess -and $childProcessId -gt 0 -and -not $processTreeStopped) {
-                Stop-ProcessTree -RootProcessId $childProcessId -RootProcessIdentity $childProcessIdentity -ObservedProcessIdentities $observedProcessIdentities -WindowsJobHandle $windowsJobHandle
-                $processTreeStopped = $true
-            }
-        }
-        finally {
-            if ($null -ne $windowsResumeEvent) {
-                $windowsResumeEvent.Dispose()
-                $windowsResumeEvent = $null
-            }
-            if ($windowsJobHandle -ne [IntPtr]::Zero) {
-                Close-WindowsProcessJob -JobHandle $windowsJobHandle
-                $windowsJobHandle = [IntPtr]::Zero
-            }
-            if ($runnerCommandFileIsolationStarted) {
-                foreach ($name in $runnerCommandFileNames) {
-                    if ($previousRunnerCommandFileValues.Contains($name)) {
-                        [Environment]::SetEnvironmentVariable(
-                            $name,
-                            $previousRunnerCommandFileValues[$name],
-                            [EnvironmentVariableTarget]::Process
-                        )
-                    }
-                }
-            }
-            if ($null -ne $childProcess) { $childProcess.Dispose() }
-            if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
-        }
-    }
-}
-
-function Test-SecurityRelevantSkillChange {
-    param([string] $GitPath, [string] $RepositoryRoot, [string] $BaseCommit)
-    if ([string]::IsNullOrWhiteSpace($BaseCommit)) {
-        # Without an immutable comparison base, fail closed instead of skipping
-        # the supplemental semantic-scan trigger decision.
-        return $true
-    }
-    $gitOutput = [string]((& $GitPath -c "safe.directory=$RepositoryRoot" -c "core.worktree=$RepositoryRoot" -C $RepositoryRoot diff --find-renames=100% --name-status -z "$BaseCommit...HEAD") -join '')
-    if ($LASTEXITCODE -ne 0) { throw "Could not compare candidate with base commit '$BaseCommit'." }
-    $tokens = @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })
-    for ($index = 0; $index -lt $tokens.Count; $index++) {
-        $status = [string]$tokens[$index]
-        if ($status -cmatch '^R[0-9]{3}$' -or $status -cmatch '^C[0-9]{3}$') {
-            if ($index + 2 -ge $tokens.Count) { throw 'Git returned an incomplete rename/copy status record.' }
-            $oldPath = [string]$tokens[$index + 1]
-            $newPath = [string]$tokens[$index + 2]
-            if ($status -ceq 'R100' -and $oldPath -clike '.agents/skills/*' -and $newPath -clike 'skills/*') {
-                $index += 2
-                continue
-            }
-            if ($oldPath -clike 'skills/*' -or $newPath -clike 'skills/*') { return $true }
-            $index += 2
-            continue
-        }
-        if ($index + 1 -ge $tokens.Count) { throw 'Git returned an incomplete path status record.' }
-        if ([string]$tokens[$index + 1] -clike 'skills/*') { return $true }
-        $index++
-    }
-    return $false
-}
-
-function Get-RequiredPesterTests {
-    param([switch] $IncludeTrustedPostPromotionTests)
-
-    $tests = @(
-        'BootstrapTransition.Tests.ps1'
-        'LocalizationWorkset.Tests.ps1'
-        'ModUpdateAutomation.Tests.ps1'
-        'RepositoryContract.Tests.ps1'
-        'RepositoryValidation.Tests.ps1'
-        'Schema15Coordination.Tests.ps1'
-        'Schema15SourceAcquisition.Tests.ps1'
-        'SkillContract.Tests.ps1'
-        'SourcePin.Tests.ps1'
-    )
-    if ($IncludeTrustedPostPromotionTests) {
-        $tests += 'InstalledClosureOrdering.Tests.ps1'
-    }
-    return @($tests)
-}
-
-function Get-ProtectedPesterShardTimeoutMilliseconds {
-    param([Parameter(Mandatory = $true)][string] $TestName)
-    if (@(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests) -cnotcontains $TestName) {
-        throw "Protected Pester shard '$TestName' is outside the immutable required inventory."
-    }
-
-    # These two measured I/O-heavy shards need a longer wall budget than the default.
-    # This does not widen the separate 300-second CPU, memory, active-process,
-    # or output boundaries.
-    if ($TestName -ceq 'ModUpdateAutomation.Tests.ps1' -or
-        $TestName -ceq 'Schema15SourceAcquisition.Tests.ps1') { return 600000 }
-    return 300000
-}
-
-function Invoke-TrustedPowerShellProcess {
-    param(
-        [Parameter(Mandatory = $true)][string] $Command,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $Arguments,
-        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
-        [Parameter()][AllowNull()][string] $StandardInput,
-        [Parameter(Mandatory = $true)][string] $Context,
-        [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
-    )
-    if (-not (Test-Path -LiteralPath $Command -PathType Leaf)) {
-        throw "$Context executable is missing: $Command"
-    }
-    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
-        throw "$Context working directory is missing: $WorkingDirectory"
-    }
-
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $Command
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardInput = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
-    foreach ($gateEnvironmentName in @(
-        'CODEX_VALIDATION_NATIVE_PAYLOAD',
-        'CODEX_VALIDATION_RESUME_EVENT',
-        'CODEX_VALIDATION_HAS_STANDARD_INPUT'
-    )) {
-        [void]$startInfo.EnvironmentVariables.Remove($gateEnvironmentName)
-    }
-    $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
-    if ($null -ne $argumentListProperty) {
-        foreach ($argument in $Arguments) {
-            [void]$startInfo.ArgumentList.Add([string]$argument)
-        }
-    }
-    else {
-        $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $Arguments
-    }
-
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    try {
-        if (-not $process.Start()) {
-            throw "$Context could not start the trusted process."
-        }
-        if ($PSBoundParameters.ContainsKey('StandardInput')) {
-            $process.StandardInput.Write([string]$StandardInput)
-        }
-        $process.StandardInput.Close()
-        $maxOutputCharacters = 4194304
-        $outputBoundaryType = Get-WindowsSuspendedProcessBoundaryType
-        $stdoutTask = $outputBoundaryType::ReadBoundedAsync($process.StandardOutput, $maxOutputCharacters)
-        $stderrTask = $outputBoundaryType::ReadBoundedAsync($process.StandardError, $maxOutputCharacters)
-        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
-            try {
-                $process.Kill($true)
-                $process.WaitForExit(5000)
-            }
-            catch {
-                throw "$Context timed out and could not be terminated safely: $($_.Exception.Message)"
-            }
-            throw "$Context exceeded its timeout of $TimeoutMilliseconds milliseconds."
-        }
-        $stdoutResult = $stdoutTask.GetAwaiter().GetResult()
-        $stderrResult = $stderrTask.GetAwaiter().GetResult()
-        if ($stdoutResult.Truncated -or $stderrResult.Truncated) {
-            throw "$Context exceeded the bounded trusted-process output limit."
-        }
-        $stdoutText = $stdoutResult.Text
-        $stderrText = $stderrResult.Text
-        if ($process.ExitCode -ne 0) {
-            throw "$Context exited with code $($process.ExitCode).`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText"
-        }
-        return $stdoutText
-    }
-    finally {
-        $process.Dispose()
-    }
-}
-
-
-
-function Invoke-ProtectedPesterServerProxy {
-    param(
-        [Parameter(Mandatory = $true)][string] $PowerShellPath,
-        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
-        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
-        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
-        [Parameter(Mandatory = $true)][string] $ReadOnlyPathsJson
-    )
-    if (-not $script:IsWindowsHost) {
-        throw 'Protected Pester server proxy requires Windows.'
-    }
-    if (-not (Test-Path -LiteralPath $PowerShellPath -PathType Leaf)) {
-        throw "Protected Pester server executable is missing: $PowerShellPath"
-    }
-    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
-        throw "Protected Pester server working directory is missing: $WorkingDirectory"
-    }
-    if (-not (Test-Path -LiteralPath $DiagnosticRoot -PathType Container)) {
-        throw "Protected Pester server diagnostic root is missing: $DiagnosticRoot"
-    }
-    if (-not (Test-Path -LiteralPath $ChildWritableRoot -PathType Container)) {
-        throw "Protected Pester server child-writable root is missing: $ChildWritableRoot"
-    }
-    $diagnosticRootPath = [IO.Path]::GetFullPath($DiagnosticRoot)
-    $childWritableRootPath = [IO.Path]::GetFullPath($ChildWritableRoot)
-    if (-not (Test-PathWithinOrEqual -Path $childWritableRootPath -Root $diagnosticRootPath)) {
-        throw 'Protected Pester server child-writable root must remain within the diagnostic root.'
-    }
-    Assert-NoReparseAncestors -Path $WorkingDirectory -Context 'Protected Pester server working directory'
-    Assert-NoReparseAncestors -Path $diagnosticRootPath -Context 'Protected Pester server diagnostic root'
-    Assert-NoReparseAncestors -Path $childWritableRootPath -Context 'Protected Pester server child-writable root'
-    $readOnlyPaths = @($ReadOnlyPathsJson | ConvertFrom-Json -Depth 20)
-    foreach ($readOnlyPath in $readOnlyPaths) {
-        if ([string]::IsNullOrWhiteSpace([string]$readOnlyPath) -or
-            -not (Test-Path -LiteralPath ([string]$readOnlyPath))) {
-            throw "Protected Pester server read-only path is missing: $readOnlyPath"
-        }
-        $readOnlyFullPath = [IO.Path]::GetFullPath([string]$readOnlyPath)
-        if (-not (Test-PathEqual -Left $readOnlyFullPath -Right $diagnosticRootPath) -and
-            ((Test-PathWithinOrEqual -Path $readOnlyFullPath -Root $childWritableRootPath) -or
-             (Test-PathWithinOrEqual -Path $childWritableRootPath -Root $readOnlyFullPath))) {
-            throw "Protected Pester server read-only path overlaps the child-writable root: $readOnlyFullPath"
-        }
-        Assert-NoReparseAncestors -Path $readOnlyFullPath -Context 'Protected Pester server read-only path'
-    }
-
-    $child = $null
-    $jobHandle = [IntPtr]::Zero
-    $inputStream = $null
-    $outputStream = $null
-    $errorStream = $null
-    $inputTask = $null
-    $outputTask = $null
-    $errorTask = $null
-    $proxyExitCode = 1
-    try {
-        $childEnvironment = New-ContainedProcessEnvironment -DiagnosticRoot $childWritableRootPath
-        $jobHandle = New-WindowsKillOnCloseJob -Context 'Protected Pester server proxy'
-        $child = Start-WindowsSuspendedProcess `
-            -FileName $PowerShellPath `
-            -Arguments @('-s', '-NoLogo', '-NoProfile', '-NonInteractive') `
-            -WorkingDirectory $WorkingDirectory `
-            -EnvironmentVariables $childEnvironment `
-            -UseStandardInput $true `
-            -UseRestrictedToken $true
-        Assign-WindowsProcessToJob -JobHandle $jobHandle -Process $child -Context 'Protected Pester server proxy'
-        if (-not $child.Resume()) {
-            throw 'Protected Pester server proxy could not resume the restricted PowerShell server.'
-        }
-
-        $inputStream = [Console]::OpenStandardInput()
-        $outputStream = [Console]::OpenStandardOutput()
-        $errorStream = [Console]::OpenStandardError()
-        $inputTask = $inputStream.CopyToAsync($child.StandardInput.BaseStream)
-        $outputTask = $child.StandardOutput.BaseStream.CopyToAsync($outputStream)
-        $errorTask = $child.StandardError.BaseStream.CopyToAsync($errorStream)
-        while (-not $child.HasExited) {
-            if ($inputTask.IsCompleted -and $null -ne $child.StandardInput) {
-                $child.StandardInput.Dispose()
-            }
-            Start-Sleep -Milliseconds 25
-        }
-        $proxyExitCode = $child.ExitCode
-        if ($null -ne $child.StandardInput) { $child.StandardInput.Dispose() }
-        if ($null -eq $outputTask -or -not $outputTask.Wait(10000) -or
-            $null -eq $errorTask -or -not $errorTask.Wait(10000)) {
-            throw 'Protected Pester server proxy left redirected output handles open.'
-        }
-        $outputTask.GetAwaiter().GetResult()
-        $errorTask.GetAwaiter().GetResult()
-    }
-    finally {
-        if ($null -ne $child -and -not $child.HasExited) {
-            [void]$child.Terminate()
-        }
-        if ($null -ne $inputStream) { $inputStream.Dispose() }
-        if ($null -ne $outputStream) { $outputStream.Dispose() }
-        if ($null -ne $errorStream) { $errorStream.Dispose() }
-        if ($null -ne $child) { $child.Dispose() }
-        if ($jobHandle -ne [IntPtr]::Zero) { Close-WindowsProcessJob -JobHandle $jobHandle }
-    }
-    return $proxyExitCode
-}
-
-if ($ProtectedPesterServerProxy) {
-    $proxyExitCode = Invoke-ProtectedPesterServerProxy `
-        -PowerShellPath $PesterProxyPowerShellPath `
-        -WorkingDirectory $PesterProxyWorkingDirectory `
-        -DiagnosticRoot $PesterProxyDiagnosticRoot `
-        -ChildWritableRoot $PesterProxyChildWritableRoot `
-        -ReadOnlyPathsJson $PesterProxyReadOnlyPathsJson
-    exit $proxyExitCode
-}
-
-function Invoke-ProtectedPesterRunspace {
-    param(
-        [Parameter(Mandatory = $true)][string] $WorkerPath,
-        [Parameter(Mandatory = $true)][string] $TestsRoot,
-        [Parameter(Mandatory = $true)][string] $PesterModulePath,
-        [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
-        [Parameter(Mandatory = $true)][string] $MirrorRoot,
-        [Parameter(Mandatory = $true)][string] $InstallRoot,
-        [Parameter(Mandatory = $true)][string] $SupervisorPath,
-        [Parameter(Mandatory = $true)][string] $WorkingDirectory,
-        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
-        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
-        [Parameter(Mandatory = $true)][string] $RunnerSha256,
-        [Parameter(Mandatory = $true)][string[]] $TestNames,
-        [Parameter(Mandatory = $true)][string] $TrustedTestCommit,
-        [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
-    )
-    if (@($TestNames).Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$TestNames[0])) {
-        throw 'Protected Pester runspace must receive exactly one trusted test file per resource shard.'
-    }
-    if ($TrustedTestCommit -cnotmatch '^[0-9a-f]{40}$') {
-        throw 'Protected Pester runspace requires the exact trusted test authority commit.'
-    }
-    $diagnosticRootFullPath = [IO.Path]::GetFullPath($DiagnosticRoot)
-    $childWritableRootPath = [IO.Path]::GetFullPath($ChildWritableRoot)
-    if (-not (Test-Path -LiteralPath $diagnosticRootFullPath -PathType Container) -or
-        -not (Test-Path -LiteralPath $childWritableRootPath -PathType Container)) {
-        throw 'Protected Pester execution requires existing diagnostic and child roots.'
-    }
-    if (-not (Test-PathWithinOrEqual -Path $childWritableRootPath -Root $diagnosticRootFullPath)) {
-        throw 'Protected Pester child-writable root must remain within the diagnostic root.'
-    }
-    Assert-NoReparseAncestors -Path $childWritableRootPath -Context 'Protected Pester child-writable root'
-    Assert-NoReparseAncestors -Path $SupervisorPath -Context 'Protected Pester supervisor'
-    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $SupervisorPath -Force) -Context 'Protected Pester supervisor'
-    $powerShellPath = Join-Path $PSHOME 'pwsh.exe'
-    if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
-        throw "Protected Pester server executable is missing: $powerShellPath"
-    }
-    Assert-Sha256 -Value $RunnerSha256 -Context 'Protected Pester worker script hash'
-    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Protected Pester worker' -Boundary $DiagnosticRoot
-    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Protected Pester worker'
-    $workerBytes = [IO.File]::ReadAllBytes($WorkerPath)
-    $workerHasher = [Security.Cryptography.SHA256]::Create()
-    try {
-        $workerActualSha256 = ([BitConverter]::ToString($workerHasher.ComputeHash($workerBytes)) -replace '-', '').ToLowerInvariant()
-    }
-    finally { $workerHasher.Dispose() }
-    if ($workerActualSha256 -cne $RunnerSha256) {
-        throw 'Protected Pester worker changed before its trusted script text was materialized.'
-    }
-    $workerScriptText = [Text.UTF8Encoding]::new($false, $true).GetString($workerBytes)
-    $readOnlyPaths = @(
-        [IO.Path]::GetFullPath($MirrorRoot),
-        [IO.Path]::GetFullPath($InstallRoot),
-        [IO.Path]::GetFullPath($WorkerPath),
-        [IO.Path]::GetFullPath($TestsRoot),
-        [IO.Path]::GetFullPath($PesterModulePath),
-        [IO.Path]::GetFullPath((Split-Path -Parent $PesterModulePath)),
-        [IO.Path]::GetFullPath($SupervisorPath),
-        [IO.Path]::GetFullPath($WorkingDirectory),
-        [IO.Path]::GetFullPath((Split-Path -Parent $powerShellPath))
-    ) | Select-Object -Unique
-    $readOnlyPathsJson = @($readOnlyPaths) | ConvertTo-Json -Compress -Depth 10
-    $serverProcessInstance = [Management.Automation.Runspaces.PowerShellProcessInstance]::new()
-    $runspace = $null
-    $powerShell = $null
-    $asyncResult = $null
-    try {
-        $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateOutOfProcessRunspace($null, $serverProcessInstance)
-        $startInfoField = $serverProcessInstance.GetType().GetField('_startInfo', [Reflection.BindingFlags]'Instance,NonPublic')
-        if ($null -eq $startInfoField) { throw 'Protected Pester server start information is unavailable.' }
-        $startInfo = $startInfoField.GetValue($serverProcessInstance)
-        $startInfo.FileName = $powerShellPath
-        $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
-        $proxyArguments = @(
-            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $SupervisorPath,
-            '-ProtectedPesterServerProxy',
-            '-PesterProxyPowerShellPath', $powerShellPath,
-            '-PesterProxyWorkingDirectory', $WorkingDirectory,
-            '-PesterProxyDiagnosticRoot', $DiagnosticRoot,
-            '-PesterProxyChildWritableRoot', $ChildWritableRoot,
-            '-PesterProxyReadOnlyPathsJson', $readOnlyPathsJson
-        )
-        $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
-        if ($null -ne $argumentListProperty) {
-            $startInfo.ArgumentList.Clear()
-            foreach ($argument in $proxyArguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
-        }
-        else { $startInfo.Arguments = ConvertTo-NativeProcessArgumentString -Arguments $proxyArguments }
-
-        try { $runspace.Open() }
-        catch {
-            if ($null -ne $serverProcessInstance.Process -and -not $serverProcessInstance.HasExited) {
-                [void]$serverProcessInstance.Process.WaitForExit(5000)
-            }
-            throw "Protected Pester server could not open its runspace: $($_.Exception.Message)"
-        }
-        $powerShell = [Management.Automation.PowerShell]::Create()
-        $powerShell.Runspace = $runspace
-        [void]$powerShell.AddScript($workerScriptText)
-        [void]$powerShell.AddParameter('TestsRoot', $TestsRoot)
-        [void]$powerShell.AddParameter('PesterModulePath', $PesterModulePath)
-        [void]$powerShell.AddParameter('ExpectedPesterVersion', $ExpectedPesterVersion)
-        [void]$powerShell.AddParameter('TestNames', [string[]]$TestNames)
-        [void]$powerShell.AddParameter('TrustedTestCommit', $TrustedTestCommit)
-        $asyncResult = $powerShell.BeginInvoke()
-        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
-        while (-not $asyncResult.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
-            if ($serverProcessInstance.HasExited) { break }
-
-            Start-Sleep -Milliseconds 50
-        }
-        if (-not $asyncResult.IsCompleted) {
-            throw 'Protected Pester remote pipeline exceeded its bounded execution timeout.'
-        }
-        $output = @($powerShell.EndInvoke($asyncResult))
-        if ($powerShell.InvocationStateInfo.State -ne [Management.Automation.PSInvocationState]::Completed) {
-            throw "Protected Pester remote pipeline did not complete normally: $($powerShell.InvocationStateInfo.State)."
-        }
-
-        if ($output.Count -ne 1) {
-            throw 'Protected Pester remote pipeline did not return exactly one completion payload.'
-        }
-        $workerResultPrefix = 'SGV1-Pester-Result:'
-        $workerResultObject = $output[0]
-        if ($null -eq $workerResultObject) {
-            throw 'Protected Pester remote pipeline returned a null completion payload.'
-        }
-        $baseObjectProperty = $workerResultObject.PSObject.Properties['BaseObject']
-        if ($null -ne $baseObjectProperty) { $workerResultObject = $baseObjectProperty.Value }
-        if ($workerResultObject -isnot [string]) {
-            throw 'Protected Pester remote pipeline returned a non-string completion payload.'
-        }
-        $workerResult = [string]$workerResultObject
-        if (-not $workerResult.StartsWith($workerResultPrefix, [StringComparison]::Ordinal)) {
-            throw 'Protected Pester remote pipeline returned an unexpected completion payload.'
-        }
-
-        return $workerResult.Substring($workerResultPrefix.Length)
-    }
-    finally {
-        if ($null -ne $powerShell) {
-            try { $powerShell.Stop() } catch { }
-            try { $powerShell.Dispose() } catch { }
-        }
-        if ($null -ne $runspace) {
-            try { $runspace.Close() } catch { }
-            try { $runspace.Dispose() } catch { }
-        }
-        if ($null -ne $serverProcessInstance.Process) {
-            try {
-                if (-not $serverProcessInstance.HasExited) {
-                    $serverProcessInstance.Process.Kill($true)
-                }
-                [void]$serverProcessInstance.Process.WaitForExit(5000)
-            }
-            catch { }
-        }
-        if ($null -ne $serverProcessInstance) { $serverProcessInstance.Dispose() }
-    }
-}
-
-function Invoke-ProtectedPesterSupervisor {
-    param(
-        [Parameter(Mandatory = $true)][string] $WorkerPath,
-        [Parameter(Mandatory = $true)][string] $TestsRoot,
-        [Parameter(Mandatory = $true)][string] $PesterModulePath,
-        [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
-        [Parameter(Mandatory = $true)][string] $MirrorRoot,
-        [Parameter(Mandatory = $true)][string] $InstallRoot,
-        [Parameter(Mandatory = $true)][string] $SupervisorPath,
-        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
-        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
-        [Parameter(Mandatory = $true)][string] $RunnerSha256,
-        [Parameter(Mandatory = $true)][string] $TrustedTestCommit
-    )
-    $completionMarker = ([Console]::In.ReadToEnd()).TrimEnd([char]13, [char]10)
-    if ($completionMarker -notmatch '^SGV1-Pester-Supervisor-[0-9a-f]{32}:$') {
-        throw 'The trusted Pester supervisor did not receive a valid one-time completion marker.'
-    }
-    if ($RunnerSha256 -notmatch '^[0-9a-f]{64}$') {
-        throw 'The trusted Pester supervisor requires an immutable runner SHA-256.'
-    }
-
-    $requiredPesterTests = @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests)
-    $requiredPesterTests = @($requiredPesterTests | Where-Object {
-        Test-Path -LiteralPath (Join-Path $TestsRoot $_) -PathType Leaf
-    })
-    if ($requiredPesterTests.Count -eq 0) {
-        throw 'The trusted Pester test root contains none of the required regression tests.'
-    }
-    Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
-    Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
-    $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
-    if ($runnerActualSha256 -cne $RunnerSha256) {
-        throw 'Trusted Pester worker changed before the protected run.'
-    }
-
-    # Each immutable regression file gets its own protected process. The suite
-    # is intentionally sharded because the per-candidate 300-second CPU
-    # boundary must remain hard while the complete domain regression inventory
-    # is materially larger than one bounded process. Results are aggregated
-    # only by this trusted supervisor after every shard has independently passed.
-    $aggregateTotalCount = [int64]0
-    $aggregatePassedCount = [int64]0
-    $aggregateFailedCount = [int64]0
-    $aggregateSkippedCount = [int64]0
-    $shardResults = [Collections.Generic.List[object]]::new()
-    foreach ($requiredPesterTest in $requiredPesterTests) {
-        $shardTimeoutMilliseconds = Get-ProtectedPesterShardTimeoutMilliseconds -TestName $requiredPesterTest
-        $workerResultJson = Invoke-ProtectedPesterRunspace `
-            -WorkerPath $WorkerPath `
-            -TestsRoot $TestsRoot `
-            -PesterModulePath $PesterModulePath `
-            -ExpectedPesterVersion $ExpectedPesterVersion `
-            -MirrorRoot $MirrorRoot `
-            -InstallRoot $InstallRoot `
-            -SupervisorPath $SupervisorPath `
-            -WorkingDirectory ([IO.Path]::GetFullPath((Get-Location).Path)) `
-            -ChildWritableRoot $ChildWritableRoot `
-            -DiagnosticRoot $DiagnosticRoot `
-            -RunnerSha256 $RunnerSha256 `
-            -TestNames @($requiredPesterTest) `
-            -TrustedTestCommit $TrustedTestCommit `
-            -TimeoutMilliseconds $shardTimeoutMilliseconds
-
-        Assert-NoReparseAncestors -Path $WorkerPath -Context 'Trusted Pester worker' -Boundary $DiagnosticRoot
-        Assert-RegularFileForHash -Item (Get-Item -LiteralPath $WorkerPath -Force) -Context 'Trusted Pester worker'
-        $runnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerPath).Hash.ToLowerInvariant()
-        if ($runnerActualSha256 -cne $RunnerSha256) {
-            throw 'Trusted Pester worker changed during the protected run.'
-        }
-
-        try {
-            $workerResultDocument = [System.Text.Json.JsonDocument]::Parse($workerResultJson)
-            try {
-                Assert-NoDuplicateJsonProperties -Element $workerResultDocument.RootElement -Context 'Protected Pester worker result'
             }
             finally {
-                $workerResultDocument.Dispose()
+                Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
             }
-            $workerResult = $workerResultJson | ConvertFrom-Json -Depth 20
-        }
-        catch {
-            throw "Protected Pester worker result is not valid unambiguous JSON: $($_.Exception.Message)"
-        }
-        if ($workerResult.result -cne 'passed' -or
-            $workerResult.pesterVersion -cne $ExpectedPesterVersion -or
-            [int64]$workerResult.TotalCount -le 0 -or [int64]$workerResult.FailedCount -ne 0 -or
-            [int64]$workerResult.SkippedCount -ne 0 -or
-            [int64]$workerResult.PassedCount + [int64]$workerResult.SkippedCount -ne [int64]$workerResult.TotalCount) {
-            throw "Protected Pester worker shard '$requiredPesterTest' result was missing, mismatched, or incomplete."
-        }
-        $workerRequiredTests = @($workerResult.requiredTests)
-        if ($workerResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne 1 -or
-            [string]$workerRequiredTests[0] -cne [string]$requiredPesterTest) {
-            throw "Protected Pester worker shard '$requiredPesterTest' did not report its exact trusted test inventory."
-        }
-        $aggregateTotalCount += [int64]$workerResult.TotalCount
-        $aggregatePassedCount += [int64]$workerResult.PassedCount
-        $aggregateFailedCount += [int64]$workerResult.FailedCount
-        $aggregateSkippedCount += [int64]$workerResult.SkippedCount
-        [void]$shardResults.Add([pscustomobject][ordered]@{
-            test = [string]$requiredPesterTest
-            totalCount = [int64]$workerResult.TotalCount
-            passedCount = [int64]$workerResult.PassedCount
-            failedCount = [int64]$workerResult.FailedCount
-            skippedCount = [int64]$workerResult.SkippedCount
-        })
-    }
-    $workerResultJson = [ordered]@{
-        result = 'passed'
-        pesterVersion = $ExpectedPesterVersion
-        totalCount = $aggregateTotalCount
-        passedCount = $aggregatePassedCount
-        failedCount = $aggregateFailedCount
-        skippedCount = $aggregateSkippedCount
-        requiredTests = @($requiredPesterTests)
-        shards = @($shardResults)
-    } | ConvertTo-Json -Depth 20 -Compress
-
-    # The trusted supervisor owns the remoting client and accepts a result only
-    # from a normally completed remote pipeline.  Candidate code runs in the
-    # low-integrity server process: direct Console.Out writes corrupt the
-    # remoting protocol, while Environment.Exit yields a broken/disconnected
-    # pipeline and never reaches this completion control path.
-    Write-Output ($completionMarker + $workerResultJson)
-}
-
-if ($ProtectedPesterSupervisor) {
-    Invoke-ProtectedPesterSupervisor `
-        -WorkerPath $PesterWorkerPath `
-        -TestsRoot $PesterTestsRoot `
-        -PesterModulePath $PesterModulePath `
-        -ExpectedPesterVersion $PesterExpectedVersion `
-        -MirrorRoot $PesterMirrorRoot `
-        -InstallRoot $PesterInstallRoot `
-        -SupervisorPath $PesterSupervisorPath `
-        -ChildWritableRoot $PesterChildWritableRoot `
-        -DiagnosticRoot $PesterDiagnosticRoot `
-        -RunnerSha256 $PesterRunnerSha256 `
-        -TrustedTestCommit $PesterTrustedTestCommit
-    exit 0
-}
-
-$repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
-    [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-}
-else { [IO.Path]::GetFullPath($RepositoryRoot) }
-$supervisorRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-$repositoryValidatorPath = Join-Path $supervisorRoot 'scripts/Test-Repository.ps1'
-if (-not (Test-Path -LiteralPath $repositoryValidatorPath -PathType Leaf)) {
-    throw "Trusted repository validator is missing: $repositoryValidatorPath"
-}
-Assert-NoReparseAncestors -Path $repositoryValidatorPath -Context 'Trusted repository validator'
-$repositoryValidatorBytes = [IO.File]::ReadAllBytes($repositoryValidatorPath)
-$repositoryValidatorHasher = [Security.Cryptography.SHA256]::Create()
-try {
-    $repositoryValidatorHash = [BitConverter]::ToString(
-        $repositoryValidatorHasher.ComputeHash($repositoryValidatorBytes)
-    ).Replace('-', '').ToLowerInvariant()
-}
-finally {
-    $repositoryValidatorHasher.Dispose()
-}
-$gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
-$gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
-Assert-NoGitReplacementObjects -GitPath $gitPath -RepositoryRoot $repoRoot -Context 'Pre-test candidate'
-$gitConfigArguments = @('-c', "safe.directory=$repoRoot", '-c', "core.worktree=$repoRoot")
-
-$candidateCommit = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
-if ($LASTEXITCODE -ne 0 -or $candidateCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Candidate must be an immutable Git commit.' }
-$candidateTree = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse "$candidateCommit^{tree}" 2>$null) | Select-Object -First 1)).Trim()
-if ($LASTEXITCODE -ne 0 -or $candidateTree -cnotmatch '^[0-9a-f]{40}$') { throw 'Candidate must be bound to one immutable Git tree.' }
-$dirty = @(& $gitPath @gitConfigArguments -C $repoRoot status --porcelain=v1 --untracked-files=all)
-if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
-    throw 'Canonical validation requires a clean candidate commit; commit or remove every tracked/untracked change first.'
-}
-$gitIndexOutput = @(& $gitPath @gitConfigArguments -C $repoRoot rev-parse --git-path index 2>$null)
-if ($LASTEXITCODE -ne 0 -or $gitIndexOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$gitIndexOutput[0])) {
-    throw 'Could not resolve the candidate Git index path before repository tests.'
-}
-$gitIndexPath = [string]$gitIndexOutput[0]
-if (-not [IO.Path]::IsPathRooted($gitIndexPath)) {
-    $gitIndexPath = Join-Path $repoRoot $gitIndexPath
-}
-$gitIndexPath = [IO.Path]::GetFullPath($gitIndexPath)
-if (-not (Test-Path -LiteralPath $gitIndexPath -PathType Leaf)) {
-    throw "Candidate Git index is missing before repository tests: $gitIndexPath"
-}
-Assert-NoReparseAncestors -Path $gitIndexPath -Context 'Candidate Git index'
-$gitConfigOutput = @(& $gitPath @gitConfigArguments -C $repoRoot rev-parse --git-path config 2>$null)
-if ($LASTEXITCODE -ne 0 -or $gitConfigOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$gitConfigOutput[0])) {
-    throw 'Could not resolve the candidate Git config path before repository tests.'
-}
-$gitConfigPath = [string]$gitConfigOutput[0].Trim()
-if (-not [IO.Path]::IsPathRooted($gitConfigPath)) {
-    $gitConfigPath = Join-Path $repoRoot $gitConfigPath
-}
-$gitConfigPath = [IO.Path]::GetFullPath($gitConfigPath)
-$prePesterGitConfigExists = Test-Path -LiteralPath $gitConfigPath -PathType Leaf
-$prePesterGitConfigSha256 = ''
-if ($prePesterGitConfigExists) {
-    $prePesterGitConfigItem = Get-Item -LiteralPath $gitConfigPath -Force
-    Assert-RegularFileForHash -Item $prePesterGitConfigItem -Context 'Candidate Git config'
-    $prePesterGitConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitConfigPath).Hash.ToLowerInvariant()
-}
-$prePesterGitIndexSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitIndexPath).Hash.ToLowerInvariant()
-$prePesterRepositoryRawSnapshot = @(Get-RepositoryRawSnapshot -RepositoryRoot $repoRoot)
-$resolvedBaseCommit = ''
-if (-not [string]::IsNullOrWhiteSpace($BaseCommit)) {
-    $baseRevision = "$BaseCommit^{commit}"
-    $baseOutput = @(& $gitPath @gitConfigArguments -C $repoRoot rev-parse --verify --end-of-options $baseRevision 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $baseOutput.Count -ne 1 -or [string]$baseOutput[0] -cnotmatch '^[0-9a-f]{40}$') {
-        throw "Base commit '$BaseCommit' does not resolve to one immutable commit."
-    }
-    $resolvedBaseCommit = ([string]$baseOutput[0]).Trim()
-    & $gitPath @gitConfigArguments -C $repoRoot merge-base --is-ancestor $resolvedBaseCommit $candidateCommit
-    if ($LASTEXITCODE -ne 0 -or $resolvedBaseCommit -ceq $candidateCommit) {
-        throw 'Base commit must be a distinct ancestor of the immutable candidate.'
-    }
-    $BaseCommit = $resolvedBaseCommit
-}
-
-if ($BootstrapTransition) {
-    if ([string]::IsNullOrWhiteSpace($resolvedBaseCommit)) {
-        throw 'Bootstrap transition requires a distinct base commit for changed-path binding.'
-    }
-    return Invoke-BootstrapTransitionValidation `
-        -RepositoryRoot $repoRoot `
-        -ArtifactsRoot $ArtifactsRoot `
-        -OutputPath ([string]$OutputPath) `
-        -RepositoryValidatorPath $repositoryValidatorPath `
-        -RepositoryValidatorHash $repositoryValidatorHash `
-        -GitPath $gitPath `
-        -CandidateCommit $candidateCommit `
-        -CandidateTree $candidateTree `
-        -BaseCommit $resolvedBaseCommit `
-        -GitIndexPath $gitIndexPath `
-        -GitIndexSha256 $prePesterGitIndexSha256 `
-        -GitConfigPath $gitConfigPath `
-        -GitConfigExists $prePesterGitConfigExists `
-        -GitConfigSha256 $prePesterGitConfigSha256 `
-        -RepositorySnapshot $prePesterRepositoryRawSnapshot
-}
-
-$adapterPath = Join-Path $repoRoot 'config/standard-v1.json'
-$adapter = Read-JsonFile -Path $adapterPath -Context 'Standard v1 repository adapter'
-$approvedAuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
-$approvedAuthorityCommit = 'a403abdf038a3346d775431a6908a71cc3d35a5b'
-$approvedAuthorityArchiveSha256 = '17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3'
-if ($adapter.schemaVersion -ne 1 -or $adapter.standardVersion -cne 'v1' -or $adapter.deviations -cne 'None') {
-    throw 'Standard v1 repository adapter identity or deviation contract is invalid.'
-}
-if ($adapter.authority.repository -cne $approvedAuthorityRepository -or
-    $adapter.authority.commit -cne $approvedAuthorityCommit -or
-    $adapter.authority.archiveUrl -cne "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/$approvedAuthorityCommit" -or
-    $adapter.authority.archiveSha256 -cne $approvedAuthorityArchiveSha256) {
-    throw 'Standard authority binding does not match the base-owned approved snapshot.'
-}
-$expectedArchiveUrl = "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/$approvedAuthorityCommit"
-if ($adapter.authority.archiveUrl -cne $expectedArchiveUrl) { throw 'Standard authority archive URL is not the exact approved immutable codeload path.' }
-Assert-Sha256 -Value $adapter.authority.archiveSha256 -Context 'Authority archive identity'
-
-$artifactsRootPath = [IO.Path]::GetFullPath($ArtifactsRoot)
-if (Test-PathWithinOrEqual -Path $artifactsRootPath -Root $repoRoot) {
-    throw 'Artifacts root must be outside the candidate repository.'
-}
-[void](New-Item -ItemType Directory -Path $artifactsRootPath -Force)
-$artifactsItem = Get-Item -LiteralPath $artifactsRootPath -Force
-if (-not $artifactsItem.PSIsContainer -or ($artifactsItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    throw 'Artifacts root must be a regular non-reparse directory.'
-}
-Assert-NoReparseAncestors -Path $artifactsRootPath -Context 'Artifacts root'
-$runId = [guid]::NewGuid().ToString('N')
-# Keep the on-disk prefix short enough for Windows venv and wheel paths; evidence retains the full run ID.
-$runRoot = Join-Path $artifactsRootPath "sgv1-$($runId.Substring(0, 12))"
-$authorityExtractRoot = Join-Path $runRoot 'authority'
-$installRoot = Join-Path $runRoot 'tools'
-$childOutputRoot = Join-Path $runRoot 'low-integrity-output'
-if (Test-Path -LiteralPath $runRoot) { throw 'Run-owned artifacts path unexpectedly already exists.' }
-[void](New-Item -ItemType Directory -Path $runRoot)
-Assert-NoReparseAncestors -Path $runRoot -Context 'Run-owned artifacts path'
-[void](New-Item -ItemType Directory -Path $childOutputRoot -Force)
-Assert-NoReparseAncestors -Path $childOutputRoot -Context 'Low-integrity child output root'
-Set-WindowsLowIntegrityDirectory -Path $childOutputRoot
-$semanticCredentialEnvironment = Protect-ProcessCredentialEnvironment -SemanticCredentialNames $SemanticCredentialNames
-# SkillSpector's supply-chain pass has its own short default timeout. Keep the
-# tool setting explicit and run-owned while the native process boundary below
-# remains the authoritative 300-second execution limit.
-$skillSpectorRuntimeEnvironment = [ordered]@{
-    'SKILLSPECTOR_MAX_WORKFLOW_SECONDS' = '1200'
-}
-[void](New-Item -ItemType Directory -Path $authorityExtractRoot -Force)
-[void](New-Item -ItemType Directory -Path $installRoot -Force)
-$trustedGitConfigPath = Join-Path $runRoot 'empty-git-config'
-$trustedGitHooksPath = Join-Path $runRoot 'empty-git-hooks'
-[IO.File]::WriteAllText($trustedGitConfigPath, '', [Text.UTF8Encoding]::new($false))
-[void](New-Item -ItemType Directory -Path $trustedGitHooksPath -Force)
-$trustedGitConfigItem = Get-Item -LiteralPath $trustedGitConfigPath -Force
-Assert-RegularFileForHash -Item $trustedGitConfigItem -Context 'Run-owned Git global config'
-Assert-NoReparseAncestors -Path $trustedGitConfigPath -Context 'Run-owned Git global config'
-Assert-NoReparseAncestors -Path $trustedGitHooksPath -Context 'Run-owned empty Git hooks directory'
-$trustedGitConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedGitConfigPath).Hash.ToLowerInvariant()
-
-# Bind the exact package/file inventory before any scanner is acquired or executed.
-$integrityReportPath = Join-Path $runRoot 'candidate-integrity.json'
-$integrityJson = & $repositoryValidatorPath -RepositoryRoot $repoRoot -OutputPath $integrityReportPath -TrustedGitPath $gitPath | Select-Object -Last 1
-$integrityReport = $integrityJson | ConvertFrom-Json -Depth 100
-if ($integrityReport.result -cne 'passed' -or [int]$integrityReport.activeSkillCount -le 0) {
-    throw 'Candidate integrity verification did not bind a non-empty active Skill inventory.'
-}
-$skillIds = @($integrityReport.skills | ForEach-Object { [string]$_.skillId })
-$skillsRoot = Join-Path $repoRoot 'skills'
-
-$archivePath = Join-Path $runRoot 'authority.zip'
-if ([string]::IsNullOrWhiteSpace($AuthorityArchivePath)) {
-    Invoke-WebRequest -Uri $adapter.authority.archiveUrl -OutFile $archivePath
-}
-else {
-    $suppliedArchive = [IO.Path]::GetFullPath($AuthorityArchivePath)
-    if (-not (Test-Path -LiteralPath $suppliedArchive -PathType Leaf)) { throw 'Supplied authority archive does not exist.' }
-    Copy-Item -LiteralPath $suppliedArchive -Destination $archivePath
-}
-$archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
-if ($archiveHash -cne [string]$adapter.authority.archiveSha256) { throw 'Authority archive SHA-256 does not match the approved immutable snapshot.' }
-Expand-Archive -LiteralPath $archivePath -DestinationPath $authorityExtractRoot
-$authorityRoots = @(Get-ChildItem -LiteralPath $authorityExtractRoot -Directory)
-if ($authorityRoots.Count -ne 1 -or ($authorityRoots[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    throw 'Authority archive must contain exactly one non-reparse repository root.'
-}
-$authorityRoot = $authorityRoots[0].FullName
-
-$authorityFiles = @()
-$seenAuthorityPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-foreach ($entry in @($adapter.authority.files)) {
-    if ($entry.path -isnot [string] -or [string]$entry.path -cnotmatch '^[a-zA-Z0-9._/-]+$' -or
-        [string]$entry.path -match '(^|/)\.\.?(/|$)' -or -not $seenAuthorityPaths.Add([string]$entry.path)) {
-        throw 'Authority file inventory contains an unsafe or duplicate path.'
-    }
-    Assert-Sha256 -Value $entry.sha256 -Context "Authority file '$($entry.path)' identity"
-    $authorityFile = Assert-PathWithinRoot -Path (Join-Path $authorityRoot ([string]$entry.path)) -Root $authorityRoot -Context 'Authority file'
-    if (-not (Test-Path -LiteralPath $authorityFile -PathType Leaf)) { throw "Authority file is missing: $($entry.path)" }
-    $fileHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $authorityFile).Hash.ToLowerInvariant()
-    if ($fileHash -cne [string]$entry.sha256) { throw "Authority file identity mismatch: $($entry.path)" }
-    $authorityFiles += [pscustomobject][ordered]@{ path = [string]$entry.path; sha256 = $fileHash }
-}
-$requiredAuthorityFiles = @(
-    'docs/standards/README.md',
-    'docs/standards/managed-skill-lifecycle.md',
-    'docs/standards/schemas/managed-skill-lifecycle-v1.schema.json',
-    'docs/standards/skill-repository-standard.md',
-    'docs/standards/skill-repository-review-matrix.md',
-    'docs/standards/upstream-interoperability.md',
-    'docs/standards/validation-security-gate.json',
-    'docs/standards/validation-toolchain.json',
-    'docs/standards/schemas/validation-security-gate-v1.schema.json',
-    'docs/standards/schemas/source-inventory-v2.schema.json',
-    'docs/standards/schemas/openai-agent-metadata.schema.json',
-    'scripts/Invoke-StandardAuthorityGate.ps1',
-    'scripts/Resolve-StandardValidationTool.ps1',
-    'scripts/Resolve-PythonWheelClosure.py'
-)
-foreach ($required in $requiredAuthorityFiles) {
-    if (-not $seenAuthorityPaths.Contains($required)) { throw "Authority inventory does not bind required file '$required'." }
-}
-
-$standardPath = Join-Path $authorityRoot 'docs/standards/skill-repository-standard.md'
-$standardText = Get-Content -LiteralPath $standardPath -Raw -Encoding UTF8
-if ($standardText -cnotmatch '(?m)^# Agent Skill Repository Standard v1$' -or $standardText -cnotmatch '(?m)^Status: \*\*Normative\*\*$') {
-    throw 'Verified authority snapshot does not identify normative Standard v1.'
-}
-$resolverPath = Join-Path $authorityRoot 'scripts/Resolve-StandardValidationTool.ps1'
-$policyPath = Join-Path $authorityRoot 'docs/standards/validation-toolchain.json'
-$authorityGatePath = Join-Path $authorityRoot 'scripts/Invoke-StandardAuthorityGate.ps1'
-$validationSecurityGatePath = Join-Path $authorityRoot 'docs/standards/validation-security-gate.json'
-. $authorityGatePath -DefineFunctionsOnly -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion
-$validationSecurityGate = Assert-AuthorityValidationSecurityGate `
-    -Policy (Read-JsonFile -Path $validationSecurityGatePath -Context 'Validation/security gate policy')
-$validationSecurityGatePolicySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $validationSecurityGatePath).Hash.ToLowerInvariant()
-
-$policyReceiptPath = Join-Path $runRoot 'policy.json'
-& $resolverPath -PolicyPath $policyPath -ValidatePolicyOnly -OutputPath $policyReceiptPath | Out-Host
-$policyReceipt = Read-JsonFile -Path $policyReceiptPath -Context 'Validation tool policy receipt'
-if ($policyReceipt.policy -cne 'latest-stable-per-validation-run' -or
-    $policyReceipt.sourceTrust.enforcement -cne 'exact-approved-source' -or
-    $policyReceipt.recordResolvedIdentityWhenAvailable -ne $true) {
-    throw 'Validation tool policy receipt does not preserve the central trust contract.'
-}
-
-$expectedSources = [ordered]@{
-    'skillspector' = 'NVIDIA/SkillSpector'
-    'skill-validator' = 'github.com/agent-ecosystem/skill-validator/cmd/skill-validator'
-    'skill-tools' = 'npm:skill-tools'
-    'pester' = 'PowerShellGallery:Pester'
-}
-$receipts = [ordered]@{}
-foreach ($toolName in $expectedSources.Keys) {
-    $receiptPath = Join-Path $runRoot "receipt-$toolName.json"
-    try {
-        if ($toolName -ceq 'skillspector' -and -not [string]::IsNullOrWhiteSpace($toolResolutionGitHubToken)) {
-            [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $toolResolutionGitHubToken, [EnvironmentVariableTarget]::Process)
-        }
-        & $resolverPath -PolicyPath $policyPath -ToolName $toolName -Install -InstallRoot $installRoot -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion -OutputPath $receiptPath | Out-Host
-    }
-    finally {
-        Remove-Item -LiteralPath 'Env:GITHUB_TOKEN' -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath 'Env:GH_TOKEN' -Force -ErrorAction SilentlyContinue
-        $toolResolutionGitHubToken = $null
-    }
-    $receipt = Read-JsonFile -Path $receiptPath -Context "$toolName resolver receipt"
-    if ($receipt.toolName -cne $toolName -or $receipt.source -cne $expectedSources[$toolName] -or
-        $receipt.channel -cne 'latest-stable' -or $receipt.frozenForRun -ne $true -or
-        [string]::IsNullOrWhiteSpace([string]$receipt.resolvedVersion) -or
-        [string]::IsNullOrWhiteSpace([string]$receipt.resolvedIdentity)) {
-        throw "$toolName receipt does not bind the approved frozen latest-stable identity."
-    }
-    $receipts[$toolName] = $receipt
-}
-
-$skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector'
-$skillValidatorPath = Assert-ReceiptFile -Receipt $receipts.'skill-validator' -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'skill-validator'
-$skillToolsNodePath = Assert-ExternalReceiptFile -Receipt $receipts.'skill-tools' -PathProperty 'nodePath' -HashProperty 'nodeSha256' -Context 'skill-tools Node'
-$skillToolsEntryPoint = Assert-ReceiptFile -Receipt $receipts.'skill-tools' -PathProperty 'entryPointPath' -HashProperty 'entryPointSha256' -InstallRoot $installRoot -Context 'skill-tools entry point'
-$pesterModulePath = Assert-ReceiptFile -Receipt $receipts.pester -PathProperty 'modulePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'Pester module'
-$receiptClosureRoots = @{}
-foreach ($toolName in $expectedSources.Keys) {
-    $receipt = $receipts[$toolName]
-    if ($null -ne $receipt.PSObject.Properties['installedClosureSha256']) {
-        $receiptClosureRoots[$toolName] = Assert-ReceiptInstalledClosure -Receipt $receipt -InstallRoot $installRoot -Context "$toolName installed closure"
-    }
-}
-
-$securityFindings = @()
-$securityBlockers = @()
-$securityHumanReview = @()
-$securityTracked = @()
-$staticReports = @()
-$staticFindingCount = 0
-$skillValidatorReports = @()
-$skillValidatorCheckReports = @()
-$skillToolsReports = @()
-$skillToolsRouteReports = @()
-
-# Stage 3: Package Validation. This must complete before any SkillSpector scan.
-foreach ($skillId in $skillIds) {
-    $skillRoot = Join-Path $repoRoot "skills/$skillId"
-    $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
-    $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
-    $validatorReportPath = Join-Path $runRoot "skill-validator-$skillId.json"
-    [IO.File]::WriteAllText($validatorReportPath, $validatorOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    $validatorReport = Read-JsonFile -Path $validatorReportPath -Context "skill-validator package validation report for $skillId"
-    Assert-SkillValidatorReport -Report $validatorReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
-    $skillValidatorReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($validatorReportPath) }
-
-    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
-    $checkReportPath = Join-Path $runRoot "skill-validator-check-$skillId.json"
-    [IO.File]::WriteAllText($checkReportPath, $checkOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    $checkReport = Read-JsonFile -Path $checkReportPath -Context "skill-validator full check report for $skillId"
-    Assert-SkillValidatorReport -Report $checkReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
-    $skillValidatorCheckReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($checkReportPath) }
-}
-
-# Stage 4: SkillSpector Static.
-foreach ($skillId in $skillIds) {
-    $skillRoot = Join-Path $repoRoot "skills/$skillId"
-    $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
-    $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $reportPath = Join-Path $childOutputRoot "skillspector-static-$skillId.json"
-    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $skillSpectorRuntimeEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
-    $report = Read-JsonFile -Path $reportPath -Context "SkillSpector static report for $skillId"
-    $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId `
-        -ExpectedInventoryPaths $expectedInventoryPaths -CandidateCommit $candidateCommit `
-        -ScannerVersion ([string]$receipts.skillspector.resolvedVersion) `
-        -InventorySha256 ([string]$skillIntegrity[0].contentSha256))
-    foreach ($issue in $issues) {
-        $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector issue'
-        if ($reportedSeverity -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedSeverity)) {
-            throw "SkillSpector returned an issue without severity for '$skillId'."
-        }
-        $finding = ConvertTo-ValidationSecurityFinding `
-            -Policy $validationSecurityGate `
-            -ReportedSeverity ([string]$reportedSeverity) `
-            -Stage 'skillspector-static' `
-            -SkillId $skillId `
-            -Issue $issue
-        $securityFindings += $finding
-        $staticFindingCount++
-        switch ([string]$finding.action) {
-            'BLOCK' { $securityBlockers += $finding }
-            'HUMAN_REVIEW_REQUIRED' { $securityHumanReview += $finding; $securityBlockers += $finding }
-            'RECORD_AND_TRACK' { $securityTracked += $finding }
-            default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
+            $testInventory = @(
+                Get-ChildItem -LiteralPath $testRoot -Recurse -File -Force |
+                    ForEach-Object { [IO.Path]::GetRelativePath($candidateRoot, $_.FullName).Replace([IO.Path]::DirectorySeparatorChar, '/') }
+            )
+            if ($testInventory.Count -eq 0) { throw 'Pester did not receive a non-empty test inventory.' }
+            New-Envelope -ActiveSkills $activeSkills -Additional @{ testInventory = $testInventory; testResult = [ordered]@{ status = 'passed'; decision = 'PASS'; total = [int64]$result.TotalCount; passed = [int64]$result.PassedCount; skipped = [int64]$result.SkippedCount; failed = [int64]$result.FailedCount }; domainAdapterResult = [ordered]@{ status = 'passed'; decision = 'PASS'; result = 'Pester' } }
         }
     }
-    $staticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($reportPath); findings = $issues.Count; files = $expectedInventoryPaths.Count }
-}
-
-$securityPreflightPath = Join-Path $runRoot 'security-preflight.json'
-$securityPreflight = [ordered]@{
-    result = if ($securityBlockers.Count -eq 0) { 'passed' } else { 'blocked' }
-    findings = @($securityFindings)
-    blockingFindings = @($securityBlockers)
-    humanReviewRequired = @($securityHumanReview)
-}
-[IO.File]::WriteAllText($securityPreflightPath, ($securityPreflight | ConvertTo-Json -Depth 100) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-$securityPreflightSummaryPath = Join-Path $runRoot 'security-preflight-summary.json'
-function Get-SanitizedSecurityFindingValue {
-    param(
-        [Parameter(Mandatory = $true)] $Finding,
-        [Parameter(Mandatory = $true)][string[]] $Names
-    )
-    foreach ($name in $Names) {
-        $property = $Finding.PSObject.Properties[$name]
-        if ($null -ne $property -and $null -ne $property.Value) {
-            $value = [string]$property.Value
-            if ($value.Length -gt 256) { $value = $value.Substring(0, 256) }
-            return $value
-        }
-    }
-    return ''
-}
-$sanitizedSecurityFindings = @($securityFindings | Select-Object -First 64 | ForEach-Object {
-    [ordered]@{
-        skill = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('skillId', 'skill')
-        rule = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('ruleId', 'rule', 'check')
-        severity = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('severity', 'reportedSeverity')
-        stage = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('stage')
-        action = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('action')
-        reportId = Get-SanitizedSecurityFindingValue -Finding $_ -Names @('reportId', 'report', 'path')
-    }
-})
-$securityPreflightSummary = [ordered]@{
-    schemaVersion = 1
-    result = if ($securityBlockers.Count -eq 0) { 'passed' } else { 'blocked' }
-    runId = $runId
-    diagnostics = $sanitizedSecurityFindings
-}
-$summaryBytes = [Text.UTF8Encoding]::new($false).GetBytes(($securityPreflightSummary | ConvertTo-Json -Depth 20) + [Environment]::NewLine)
-[IO.File]::WriteAllBytes($securityPreflightSummaryPath, $summaryBytes)
-# Bind the summary before any candidate-executing tests. The runner command
-# file stays outside candidate-writable mounts; hashing only during export
-# would instead authenticate an attacker-controlled replacement.
-$summaryHasher = [Security.Cryptography.SHA256]::Create()
-try { $summarySha256 = [BitConverter]::ToString($summaryHasher.ComputeHash($summaryBytes)).Replace('-', '').ToLowerInvariant() }
-finally { $summaryHasher.Dispose() }
-$summaryOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
-if (-not [string]::IsNullOrWhiteSpace($summaryOutputPath)) {
-    [IO.File]::AppendAllText($summaryOutputPath, "standard_v1_diagnostics_sha256=$summarySha256$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
-}
-if ($securityBlockers.Count -gt 0) {
-    throw 'SkillSpector classified one or more candidate files as BLOCK or HUMAN_REVIEW_REQUIRED; candidate-executing repository tests are not started.'
-}
-
-# Stage 5: Repository Tests.
-$repositoryReportPath = Join-Path $runRoot 'repository-validation.json'
-$repositoryJson = & $repositoryValidatorPath -RepositoryRoot $repoRoot -OutputPath $repositoryReportPath -TrustedGitPath $gitPath | Select-Object -Last 1
-$repositoryReport = $repositoryJson | ConvertFrom-Json -Depth 100
-if ($repositoryReport.result -cne 'passed' -or [int]$repositoryReport.activeSkillCount -ne $skillIds.Count) {
-    throw 'Repository validation did not cover the exact active Skill inventory.'
-}
-foreach ($skillId in $skillIds) {
-    $before = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    $after = @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    Assert-SkillInventoryUnchanged -Before $before -After $after -SkillId $skillId -Context 'between integrity verification and repository validation'
-}
-$diffArguments = if (-not [string]::IsNullOrWhiteSpace($BaseCommit)) {
-    @($gitConfigArguments + @('-C', $repoRoot, 'diff', '--check', "$BaseCommit...HEAD"))
-}
-else {
-    # A missing event base must validate the complete committed candidate,
-    # not only the final commit. All supported GitHub repositories use the
-    # SHA-1 object format, whose canonical empty tree object is stable.
-    $emptyTreeObject = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
-    @($gitConfigArguments + @('-C', $repoRoot, 'diff', '--check', $emptyTreeObject, 'HEAD'))
-}
-$diffOutput = @(& $gitPath @diffArguments 2>&1)
-if ($LASTEXITCODE -ne 0) {
-    throw "Whitespace validation failed for the candidate event range.`n$($diffOutput -join [Environment]::NewLine)"
-}
-
-foreach ($skillId in $skillIds) {
-    $skillRoot = Join-Path $repoRoot "skills/$skillId"
-    $expectedInventoryPaths = @(
-        @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
-            ForEach-Object { [string]$_.path }
-    )
-    $toolsOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @($skillToolsEntryPoint, 'check', $skillRoot, '--format', 'sarif', '--fail-on', 'warning', '--min-score', '91') -Context "skill-tools repository test for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
-    $toolsReportPath = Join-Path $runRoot "skill-tools-$skillId.sarif.json"
-    [IO.File]::WriteAllText($toolsReportPath, $toolsOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    $toolsReport = Read-JsonFile -Path $toolsReportPath -Context "skill-tools report for $skillId"
-    Assert-SkillToolsReport -Report $toolsReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
-    $skillToolsReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($toolsReportPath) }
-}
-
-$routeCases = @(
-    [pscustomobject]@{ query = 'Update a Warhammer 40,000 DARKTIDE MOD from a verified Nexus Main file and preserve active zh-tw'; expected = 'auto-update-darktide-mod' },
-    [pscustomobject]@{ query = 'Resume a DARKTIDE MOD update run using its exact evidence and finalize the merge'; expected = 'auto-update-darktide-mod' }
-)
-foreach ($routeCase in $routeCases) {
-    $routeOutput = Invoke-NativeChecked -Command $skillToolsNodePath -Arguments @(
-        $skillToolsEntryPoint, 'route', [string]$routeCase.query, '--skills', $skillsRoot, '--top-k', '1', '--format', 'json'
-    ) -Context "skill-tools route for '$($routeCase.query)'" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
-    $routePath = Join-Path $runRoot ("skill-tools-route-{0}.json" -f ([guid]::NewGuid().ToString('N')))
-    [IO.File]::WriteAllText($routePath, $routeOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    # PowerShell unwraps a one-item JSON array during assignment. Normalize the
-    # result before enforcing the contract so a valid top-k=1 result is not
-    # mistaken for a non-array value on the hosted runner.
-    $routeResults = @(Read-JsonFile -Path $routePath -Context "skill-tools route report for '$($routeCase.query)'")
-    if ($routeResults.Count -ne 1) {
-        throw "skill-tools route did not return exactly one result for '$($routeCase.query)'."
-    }
-    $routeSkill = Get-RequiredProperty -Object @($routeResults)[0] -Name 'skill' -Context 'skill-tools route result'
-    if ($routeSkill -isnot [string] -or $routeSkill -cne [string]$routeCase.expected) {
-        throw "skill-tools route selected '$routeSkill' for '$($routeCase.query)'; expected '$($routeCase.expected)'."
-    }
-    $skillToolsRouteReports += [pscustomobject][ordered]@{
-        query = [string]$routeCase.query
-        expected = [string]$routeCase.expected
-        selected = [string]$routeSkill
-        report = [IO.Path]::GetFileName($routePath)
-    }
-}
-
-# The optional semantic scanner is bound and executed before candidate Pester
-# code can modify any run-owned tool or report path. Its output remains part of
-# the final supervisor-owned summary, while post-Pester checks bind the final
-# candidate state.
-$semanticTriggerCandidate = $staticFindingCount -gt 0 -or (Test-SecurityRelevantSkillChange -GitPath $gitPath -RepositoryRoot $repoRoot -BaseCommit $BaseCommit)
-$semanticTriggered = [bool]$EnableSemanticScan -and $semanticTriggerCandidate
-$semanticReports = @()
-# Required CI remains credential-free and deterministic; semantic scanning is opt-in.
-if ($semanticTriggered) {
-    $skillSpectorPath = Assert-ReceiptFile -Receipt $receipts.skillspector -PathProperty 'executablePath' -HashProperty 'executableSha256' -InstallRoot $installRoot -Context 'SkillSpector semantic scanner'
-    if ($receiptClosureRoots.ContainsKey('skillspector')) {
-        [void](Assert-ReceiptInstalledClosure -Receipt $receipts.skillspector -InstallRoot $installRoot -Context 'SkillSpector semantic scanner')
-    }
-    foreach ($skillId in $skillIds) {
-        $skillRoot = Join-Path $repoRoot "skills/$skillId"
-        $expectedInventoryPaths = @(
-            @($repositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })[0].files |
-                ForEach-Object { [string]$_.path }
-        )
-        $semanticPath = Join-Path $childOutputRoot "skillspector-semantic-$skillId.json"
-        $semanticEnvironment = [ordered]@{}
-        foreach ($name in @($semanticCredentialEnvironment.Keys)) {
-            $semanticEnvironment[$name] = [string]$semanticCredentialEnvironment[$name]
-        }
-        foreach ($name in @($skillSpectorRuntimeEnvironment.Keys)) {
-            $semanticEnvironment[$name] = [string]$skillSpectorRuntimeEnvironment[$name]
-        }
-        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
-        $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
-        try {
-            $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
-        }
-        catch {
-            throw "Triggered SkillSpector semantic scan did not complete for '$skillId': $($_.Exception.Message)"
-        }
-        foreach ($issue in $semanticIssues) {
-            $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector semantic issue'
-            if ($reportedSeverity -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedSeverity)) {
-                throw "SkillSpector semantic scan returned an issue without severity for '$skillId'."
-            }
-            $finding = ConvertTo-ValidationSecurityFinding -Policy $validationSecurityGate -ReportedSeverity ([string]$reportedSeverity) -Stage 'conditional-semantic-scan' -SkillId $skillId -Issue $issue
-            $securityFindings += $finding
-            switch ([string]$finding.action) {
-                'BLOCK' { $securityBlockers += $finding }
-                'HUMAN_REVIEW_REQUIRED' { $securityHumanReview += $finding; $securityBlockers += $finding }
-                'RECORD_AND_TRACK' { $securityTracked += $finding }
-                default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
-            }
-        }
-        $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); findings = $semanticIssues.Count }
-    }
-}
-
-foreach ($name in @($semanticCredentialEnvironment.Keys)) {
-    $semanticCredentialEnvironment[$name] = ''
-}
-
-# Candidate tests are untrusted code.  Materialize a candidate snapshot for the
-# test suite, then replace its tests tree with the immutable base-owned tests.
-# The worker receives only this read-only mirror, so it cannot replace a test
-# after the protected inventory has been checked or mutate the candidate tree
-# while the suite is running.
-$requiredPesterTests = @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests)
-$trustedPesterCommit = [string]$TrustedTestCommit
-if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and [string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
-    throw 'Manual validation requires the resolved trusted supervisor SHA for its tests.'
-}
-if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
-    $trustedPesterCommit = [string]$BaseCommit
-}
-if ([string]::IsNullOrWhiteSpace($trustedPesterCommit)) {
-    $trustedPesterCommit = [string]$env:GITHUB_SHA
-}
-if ($trustedPesterCommit -notmatch '^[0-9a-f]{40}$') {
-    throw 'Protected Pester execution requires an immutable base or trusted supervisor commit.'
-}
-$pesterMirrorRoot = Join-Path $runRoot 'trusted-pester-worktree'
-Expand-TrustedGitArchive `
-    -GitPath $gitPath `
-    -GitConfigArguments $gitConfigArguments `
-    -RepositoryRoot $repoRoot `
-    -Revision $candidateCommit `
-    -DestinationRoot $pesterMirrorRoot `
-    -Context 'Trusted candidate Pester worktree'
-$candidateMirrorTestsRoot = Join-Path $pesterMirrorRoot 'tests'
-if (Test-Path -LiteralPath $candidateMirrorTestsRoot) {
-    Remove-Item -LiteralPath $candidateMirrorTestsRoot -Recurse -Force -ErrorAction Stop
-}
-Expand-TrustedGitArchive `
-    -GitPath $gitPath `
-    -GitConfigArguments $gitConfigArguments `
-    -RepositoryRoot $repoRoot `
-    -Revision $trustedPesterCommit `
-    -DestinationRoot $pesterMirrorRoot `
-    -PathSpec @('tests') `
-    -Context 'Trusted base Pester tests'
-$trustedPesterTestsRoot = Join-Path $pesterMirrorRoot 'tests'
-# A pull-request validation may introduce new tests that are not present in the
-# immutable base yet. Candidate-owned tests remain excluded from the protected
-# run; only fixed inventory entries present in the trusted archive are eligible.
-$requiredPesterTests = @($requiredPesterTests | Where-Object {
-    Test-Path -LiteralPath (Join-Path $trustedPesterTestsRoot $_) -PathType Leaf
-})
-if ($requiredPesterTests.Count -eq 0) {
-    throw 'The trusted base Pester archive contains none of the required regression tests.'
-}
-foreach ($requiredPesterTest in $requiredPesterTests) {
-    Assert-TrustedGitTreeFile `
-        -GitPath $gitPath `
-        -GitConfigArguments $gitConfigArguments `
-        -RepositoryRoot $repoRoot `
-        -Revision $trustedPesterCommit `
-        -RelativePath (Join-Path 'tests' $requiredPesterTest).Replace('\', '/') `
-        -MaterializedPath (Join-Path $trustedPesterTestsRoot $requiredPesterTest) `
-        -Context 'Trusted protected Pester test'
-}
-Assert-NoReparseTree -Path $pesterMirrorRoot -Context 'Trusted Pester worktree'
-
-# The worker script is trusted content written by this validator, but it runs
-# candidate code.  A separate same-integrity supervisor owns the remoting
-# client and launches a low-integrity server process; the parent accepts only
-# a result from a normally completed remote pipeline.
-$requiredPesterTestsFunction = (Get-Command Get-RequiredPesterTests -CommandType Function -ErrorAction Stop).ScriptBlock.ToString()
-$requiredPesterTestsFunctionDefinition = "function Get-RequiredPesterTests {`n$requiredPesterTestsFunction`n}"
-$pesterRunnerPath = Join-Path $runRoot 'invoke-pester-isolated.ps1'
-$pesterRunnerScript = @'
-#requires -Version 7.0
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory = $true)][string] $TestsRoot,
-    [Parameter(Mandatory = $true)][string] $PesterModulePath,
-    [Parameter(Mandatory = $true)][string] $ExpectedPesterVersion,
-    [Parameter(Mandatory = $true)][string[]] $TestNames,
-    [Parameter(Mandatory = $true)][string] $TrustedTestCommit
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-
-__REQUIRED_PESTER_TESTS_FUNCTION__
-
-$testsRoot = [IO.Path]::GetFullPath($TestsRoot)
-$pesterModulePath = [IO.Path]::GetFullPath($PesterModulePath)
-if (-not (Test-Path -LiteralPath $testsRoot -PathType Container)) { throw "Pester tests root is missing: $testsRoot" }
-if (-not (Test-Path -LiteralPath $pesterModulePath -PathType Leaf)) { throw "Pester module manifest is missing: $pesterModulePath" }
-
-Remove-Module Pester -Force -ErrorAction SilentlyContinue
-Import-Module -Name $pesterModulePath -Force -ErrorAction Stop
-$loadedPester = Get-Module Pester | Select-Object -First 1
-if ($null -eq $loadedPester -or [string]$loadedPester.Version -cne $ExpectedPesterVersion) {
-    throw 'The exact frozen Pester module was not imported in the isolated test process.'
-}
-
-$requiredPesterTests = @(Get-RequiredPesterTests -IncludeTrustedPostPromotionTests)
-$selectedPesterTests = @($TestNames)
-if ($selectedPesterTests.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$selectedPesterTests[0]) -or
-    $requiredPesterTests -cnotcontains [string]$selectedPesterTests[0]) {
-    throw 'The trusted Pester worker received a test file outside the immutable required inventory.'
-}
-if ($TrustedTestCommit -cnotmatch '^[0-9a-f]{40}$') {
-    throw 'The trusted Pester worker received an invalid trusted test authority commit.'
-}
-$requiredPesterTests = @($requiredPesterTests | Where-Object {
-    $selectedPesterTests -ccontains $_
-})
-$requiredPesterPaths = @($requiredPesterTests | ForEach-Object {
-    $testPath = Join-Path $testsRoot $_
-    $testItem = Get-Item -LiteralPath $testPath -Force -ErrorAction Stop
-    if ($testItem.PSIsContainer -or ($testItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Required Pester test is not a regular non-reparse file: $testPath"
-    }
-    [IO.Path]::GetFullPath($testPath)
-})
-$pesterConfiguration = New-PesterConfiguration
-$pesterConfiguration.Run.Path = $requiredPesterPaths
-$pesterConfiguration.Run.PassThru = $true
-# The immutable base regression suite requires the registry-backed test
-# discovery cache to remain disabled inside the protected runner.
-$pesterConfiguration.TestRegistry.Enabled = $false
-$result = Invoke-Pester -Configuration $pesterConfiguration
-if ($null -eq $result -or [int64]$result.TotalCount -le 0 -or [int64]$result.FailedCount -ne 0 -or
-    [int64]$result.SkippedCount -ne 0 -or
-    [int64]$result.PassedCount + [int64]$result.SkippedCount -ne [int64]$result.TotalCount) {
-    $failedTestDetails = @($result.Failed | ForEach-Object {
-        $name = ''
-        foreach ($propertyName in @('ExpandedPath', 'Path', 'Name')) {
-            $property = $_.PSObject.Properties[$propertyName]
-            if ($null -ne $property -and $null -ne $property.Value -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                $name = [string]$property.Value
-                break
-            }
-        }
-        $message = ''
-        $errorProperty = $_.PSObject.Properties['ErrorRecord']
-        if ($null -ne $errorProperty -and $null -ne $errorProperty.Value) {
-            foreach ($errorRecord in @($errorProperty.Value)) {
-                foreach ($messagePropertyName in @('DisplayErrorMessage', 'Message')) {
-                    $messageProperty = $errorRecord.PSObject.Properties[$messagePropertyName]
-                    if ($null -ne $messageProperty -and $null -ne $messageProperty.Value -and
-                        -not [string]::IsNullOrWhiteSpace([string]$messageProperty.Value)) {
-                        $message = [string]$messageProperty.Value
-                        break
-                    }
-                }
-                if ([string]::IsNullOrWhiteSpace($message)) {
-                    $exceptionProperty = $errorRecord.PSObject.Properties['Exception']
-                    if ($null -ne $exceptionProperty -and $null -ne $exceptionProperty.Value) {
-                        $messageProperty = $exceptionProperty.Value.PSObject.Properties['Message']
-                        if ($null -ne $messageProperty -and $null -ne $messageProperty.Value) {
-                            $message = [string]$messageProperty.Value
-                        }
-                    }
-                }
-                if (-not [string]::IsNullOrWhiteSpace($message)) { break }
-            }
-        }
-        if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$_ }
-        if ([string]::IsNullOrWhiteSpace($message)) { $name } else { "$name :: $message" }
-    })
-    if ($failedTestDetails.Count -eq 0) { $failedTestDetails = @('No bounded Pester failure detail was exposed.') }
-    $failureSummary = ($failedTestDetails -join ' | ')
-    if ($failureSummary.Length -gt 32768) { $failureSummary = $failureSummary.Substring(0, 32768) }
-    throw "Pester repository regression did not complete successfully. Total=$([int64]$result.TotalCount); Passed=$([int64]$result.PassedCount); Failed=$([int64]$result.FailedCount); Skipped=$([int64]$result.SkippedCount); FailedTests=$failureSummary"
-}
-
-$completionPayload = [ordered]@{
-    result = 'passed'
-    pesterVersion = [string]$loadedPester.Version
-    totalCount = [int64]$result.TotalCount
-    passedCount = [int64]$result.PassedCount
-    failedCount = [int64]$result.FailedCount
-    skippedCount = [int64]$result.SkippedCount
-    requiredTests = @($requiredPesterTests)
-}
-$completionJson = $completionPayload | ConvertTo-Json -Depth 20 -Compress
-# Emit the result only after this base-owned runner has returned from Invoke-Pester
-# and independently checked every required test.  The protected supervisor does
-# not trust raw child stdout: it accepts this value only as a pipeline object
-# delivered by the out-of-process PowerShell remoting protocol after completion.
-Write-Output ('SGV1-Pester-Result:' + $completionJson)
-'@
-$pesterRunnerScript = $pesterRunnerScript.Replace('__REQUIRED_PESTER_TESTS_FUNCTION__', $requiredPesterTestsFunctionDefinition)
-[IO.File]::WriteAllText($pesterRunnerPath, $pesterRunnerScript + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner'
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
-$pesterRunnerSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
-$powerShellExecutableName = 'pwsh.exe'
-$powerShellPath = Join-Path $PSHOME $powerShellExecutableName
-if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) { throw "PowerShell child executable is missing: $powerShellPath" }
-Assert-NoReparseAncestors -Path $powerShellPath -Context 'PowerShell child executable'
-Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
-$pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
-if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
-    throw 'Run-owned isolated Pester worker changed before candidate tests.'
-}
-$trustedPesterSupervisorPath = Join-Path $supervisorRoot 'scripts/Validate.ps1'
-Assert-NoReparseAncestors -Path $trustedPesterSupervisorPath -Context 'Trusted Pester supervisor'
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $trustedPesterSupervisorPath -Force) -Context 'Trusted Pester supervisor'
-$trustedPesterSupervisorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
-$trustedPesterSupervisorMarker = 'SGV1-Pester-Supervisor-{0}:' -f ([guid]::NewGuid().ToString('N'))
-$pesterOutput = Invoke-TrustedPowerShellProcess -Command $powerShellPath -Arguments @(
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', $trustedPesterSupervisorPath,
-    '-ProtectedPesterSupervisor',
-    '-PesterWorkerPath', $pesterRunnerPath,
-    '-PesterTestsRoot', $trustedPesterTestsRoot,
-    '-PesterModulePath', $pesterModulePath,
-    '-PesterExpectedVersion', [string]$receipts.pester.resolvedVersion,
-    '-PesterMirrorRoot', $pesterMirrorRoot,
-    '-PesterInstallRoot', $installRoot,
-    '-PesterSupervisorPath', $trustedPesterSupervisorPath,
-    '-PesterChildWritableRoot', $childOutputRoot,
-    '-PesterDiagnosticRoot', $runRoot,
-    '-PesterRunnerSha256', $pesterRunnerSha256,
-    '-PesterTrustedTestCommit', $trustedPesterCommit
-) -WorkingDirectory $repoRoot -StandardInput $trustedPesterSupervisorMarker -Context 'Trusted Pester supervisor' -TimeoutMilliseconds 1800000
-$trustedPesterSupervisorActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedPesterSupervisorPath).Hash.ToLowerInvariant()
-if ($trustedPesterSupervisorActualSha256 -cne $trustedPesterSupervisorSha256) {
-    throw 'Trusted Pester supervisor changed during the protected run.'
-}
-$pesterResultLines = @($pesterOutput -split "`r?`n" | Where-Object {
-    $_.StartsWith($trustedPesterSupervisorMarker, [StringComparison]::Ordinal)
-})
-if ($pesterResultLines.Count -ne 1) {
-    throw 'Trusted Pester supervisor exited without exactly one supervisor-owned completion result.'
-}
-Assert-NoReparseAncestors -Path $pesterRunnerPath -Context 'Run-owned isolated Pester runner' -Boundary $runRoot
-Assert-RegularFileForHash -Item (Get-Item -LiteralPath $pesterRunnerPath -Force) -Context 'Run-owned isolated Pester runner'
-$pesterRunnerActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pesterRunnerPath).Hash.ToLowerInvariant()
-if ($pesterRunnerActualSha256 -cne $pesterRunnerSha256) {
-    throw 'Run-owned isolated Pester worker changed during candidate tests.'
-}
-try {
-    $pesterResultJson = $pesterResultLines[0].Substring($trustedPesterSupervisorMarker.Length)
-    $pesterResultDocument = [System.Text.Json.JsonDocument]::Parse($pesterResultJson)
-    try {
-        Assert-NoDuplicateJsonProperties -Element $pesterResultDocument.RootElement -Context 'Isolated Pester result'
-    }
-    finally {
-        $pesterResultDocument.Dispose()
-    }
-    $pesterResult = $pesterResultJson | ConvertFrom-Json -Depth 20
 }
 catch {
-    throw "Trusted Pester supervisor result is not valid unambiguous JSON: $($_.Exception.Message)"
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
 }
-if ($pesterResult.result -cne 'passed' -or
-    $pesterResult.pesterVersion -cne [string]$receipts.pester.resolvedVersion -or
-    [int64]$pesterResult.TotalCount -le 0 -or [int64]$pesterResult.FailedCount -ne 0 -or
-    [int64]$pesterResult.SkippedCount -ne 0 -or
-    [int64]$pesterResult.PassedCount + [int64]$pesterResult.SkippedCount -ne [int64]$pesterResult.TotalCount) {
-    throw 'Trusted Pester supervisor result was missing, mismatched, or incomplete.'
+'@
+
+function Assert-SourceValidationRequest {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary] $BoundParameters)
+    $setup = (@($BoundParameters.Keys) -ccontains 'PrepareSourceTools') -and [bool]$BoundParameters['PrepareSourceTools']
+    $source = (@($BoundParameters.Keys) -ccontains 'SourceValidation') -and [bool]$BoundParameters['SourceValidation']
+    if ($setup -and $source) { throw 'PrepareSourceTools and SourceValidation must be separate requests.' }
+    if (-not ($setup -or $source)) { throw 'The canonical entry requires exactly one explicit source purpose.' }
+    if (@($BoundParameters.Keys) -cnotcontains 'SourceToolsPath' -or [string]::IsNullOrWhiteSpace([string]$BoundParameters['SourceToolsPath'])) {
+        throw 'Explicit source setup or validation requires SourceToolsPath.'
+    }
+    if ($source -and (@($BoundParameters.Keys) -ccontains 'ExpectedGoRuntimeVersion')) {
+        throw 'Go runtime resolution is allowed only during explicit setup.'
+    }
 }
-$workerRequiredTests = @($pesterResult.requiredTests)
-if ($pesterResult.requiredTests -isnot [array] -or $workerRequiredTests.Count -ne $requiredPesterTests.Count -or
-    @(
-        for ($requiredTestIndex = 0; $requiredTestIndex -lt $requiredPesterTests.Count; $requiredTestIndex++) {
-            if ([string]$workerRequiredTests[$requiredTestIndex] -cne [string]$requiredPesterTests[$requiredTestIndex]) {
-                $requiredTestIndex
+
+function Get-ApprovedSourceAuthorityPin {
+    param([AllowNull()][string] $Commit)
+    if ($PSBoundParameters.ContainsKey('Commit') -and $Commit -cne $script:SourceAuthorityCommit) {
+        throw 'Source authority must match the exact approved SYP-280 pin.'
+    }
+    return [pscustomobject]@{
+        repository = $script:AuthorityRepository
+        commit = $script:SourceAuthorityCommit
+        archiveUrl = "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/$($script:SourceAuthorityCommit)"
+        archiveSha256 = $script:SourceAuthorityArchiveSha256
+        files = $script:SourceAuthorityFiles
+    }
+}
+
+function Assert-AuthorityConfig {
+    param([Parameter(Mandatory = $true)] $Config)
+    Assert-ExactPropertySet -Value $Config -Expected @('schemaVersion','standardVersion','authority','deviations') -Context 'config/standard-v1.json'
+    Assert-ExactPropertySet -Value $Config.authority -Expected @('repository','commit','archiveUrl','archiveSha256','files') -Context 'authority'
+    $approved = Get-ApprovedSourceAuthorityPin
+    if ($Config.schemaVersion -isnot [long] -and $Config.schemaVersion -isnot [int]) {
+        throw 'Source authority schemaVersion must be a JSON integer.'
+    }
+    foreach ($value in @($Config.standardVersion,$Config.deviations,$Config.authority.repository,
+            $Config.authority.commit,$Config.authority.archiveUrl,$Config.authority.archiveSha256)) {
+        if ($value -isnot [string]) { throw 'Source authority tuple fields must be JSON strings.' }
+    }
+    if ($Config.schemaVersion -ne 1 -or $Config.standardVersion -cne 'v1' -or $Config.deviations -cne 'None' -or
+        $Config.authority.repository -cne $approved.repository -or $Config.authority.commit -cne $approved.commit -or
+        $Config.authority.archiveUrl -cne $approved.archiveUrl -or $Config.authority.archiveSha256 -cne $approved.archiveSha256 -or
+        $Config.authority.files -isnot [array] -or @($Config.authority.files).Count -ne $approved.files.Count) {
+        throw 'Source authority must match the complete reviewed immutable tuple.'
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($file in $Config.authority.files) {
+        Assert-ExactPropertySet -Value $file -Expected @('path','sha256') -Context 'authority file'
+        if ($file.path -isnot [string] -or $file.sha256 -isnot [string] -or -not $seen.Add([string]$file.path) -or
+            -not $approved.files.Contains([string]$file.path) -or $file.sha256 -cne $approved.files[[string]$file.path]) {
+            throw 'Source authority file inventory differs from the reviewed immutable tuple.'
+        }
+    }
+    return $approved
+}
+
+Assert-SourceValidationRequest -BoundParameters $PSBoundParameters
+$repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
+    [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+} else { [IO.Path]::GetFullPath($RepositoryRoot) }
+if (-not (Test-Path -LiteralPath $repoRoot -PathType Container)) { throw "RepositoryRoot does not exist: $repoRoot" }
+$gitPath = Get-ResolvedGitPath
+$pwshPath = Get-ResolvedPowerShellPath
+$candidateCommit = Resolve-GitRevision -GitPath $gitPath -Root $repoRoot -Revision 'HEAD' -Context 'Candidate revision'
+$dirty = @(& $gitPath -C $repoRoot status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { throw 'Canonical validation requires a clean immutable candidate commit.' }
+$baseInput = if ([string]::IsNullOrWhiteSpace($BaseCommit)) { 'HEAD^' } else { $BaseCommit }
+$baseRevision = Resolve-GitRevision -GitPath $gitPath -Root $repoRoot -Revision $baseInput -Context 'Base commit'
+& $gitPath -C $repoRoot merge-base --is-ancestor $baseRevision $candidateCommit
+if ($LASTEXITCODE -ne 0 -or $baseRevision -ceq $candidateCommit) { throw 'Base commit must be a distinct ancestor of the immutable candidate.' }
+$driverConfig = Read-JsonFile -Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'config/standard-v1.json') -Context 'Protected driver config'
+$driverAuthority = Assert-AuthorityConfig -Config $driverConfig
+$candidateConfig = Read-JsonFile -Path (Join-Path $repoRoot 'config/standard-v1.json') -Context 'Candidate config'
+$candidateAuthority = Assert-AuthorityConfig -Config $candidateConfig
+if (-not [string]::IsNullOrWhiteSpace($AuthorityArchivePath)) {
+    Assert-NoReparseAncestors -Path $AuthorityArchivePath -Context 'Pinned authority archive'
+    if ((Get-FileSha256 -Path $AuthorityArchivePath) -cne $candidateAuthority.archiveSha256) { throw 'Pinned authority archive hash differs.' }
+}
+$activeSkillIds = Get-ActiveSkillIds -Root $repoRoot
+$eventName = Get-EventName
+if ([string]::IsNullOrWhiteSpace($AuthorityRepositoryRoot)) { throw 'Source validation requires the pinned real Git AuthorityRepositoryRoot.' }
+$executionAuthority = $candidateAuthority
+
+        $authorityCheckout = Assert-StandardCoreAuthorityCheckout -GitPath $gitPath -AuthorityRoot $AuthorityRepositoryRoot -AuthorityPin $executionAuthority
+        $pwshPath = Get-ResolvedPowerShellPath
+        $trustedRoot = if ([string]::IsNullOrWhiteSpace($TrustedToolRoot)) { Split-Path -Parent $pwshPath } else { [IO.Path]::GetFullPath($TrustedToolRoot) }
+        if (-not (Test-Path -LiteralPath $trustedRoot -PathType Container)) { throw "Trusted PowerShell root is missing: $trustedRoot" }
+        Assert-NoReparseAncestors -Path $trustedRoot -Context 'Trusted PowerShell root'
+        if ($PrepareSourceTools) {
+            $setupRoot = [IO.Path]::GetFullPath($ArtifactsRoot)
+            Assert-OutsideRoot -Path $setupRoot -Root $repoRoot -Context 'Source setup artifacts'
+            Assert-OutsideRoot -Path $setupRoot -Root $authorityCheckout.root -Context 'Source setup artifacts'
+            Assert-OutsideRoot -Path $setupRoot -Root $trustedRoot -Context 'Source setup artifacts'
+            [void](New-Item -ItemType Directory -Path $setupRoot -Force)
+            Assert-NoReparseAncestors -Path $setupRoot -Context 'Source setup artifacts'
+            $preparedPath = Assert-PathWithinRoot -Path $SourceToolsPath -Root $setupRoot -Context 'Source toolset output'
+            if (-not (Test-PathEqual -Left (Split-Path -Parent $preparedPath) -Right $setupRoot)) { throw 'Source toolset output must be directly within its setup root.' }
+            if (Test-Path -LiteralPath $preparedPath) { throw 'Source toolset output already exists.' }
+            New-SourceToolSetup -Root $setupRoot -AuthorityRoot $authorityCheckout.root -AuthorityPin $executionAuthority `
+                -PowerShell $pwshPath -CandidateRevision $candidateCommit -Git $gitPath -CandidateRoot $repoRoot `
+                -PreparedPath $preparedPath -GoVersion (Resolve-GoRuntimeVersion -Expected $ExpectedGoRuntimeVersion) -LimitSeconds $TimeoutSeconds
+            exit 0
+        }
+        $preparedSource = if ($SourceValidation) {
+            Read-SourceToolSetup -Path $SourceToolsPath -SourceRevision $candidateCommit -AuthorityRevision $candidateAuthority.commit -PowerShell $pwshPath -AuthorityRoot $authorityCheckout.root
+        } else { $null }
+
+        $artifactsRootPath = [IO.Path]::GetFullPath($ArtifactsRoot)
+        Assert-OutsideRoot -Path $artifactsRootPath -Root $repoRoot -Context 'Artifacts root'
+        Assert-OutsideRoot -Path $artifactsRootPath -Root $authorityCheckout.root -Context 'Artifacts root'
+        Assert-OutsideRoot -Path $artifactsRootPath -Root $trustedRoot -Context 'Artifacts root'
+        [void](New-Item -ItemType Directory -Path $artifactsRootPath -Force)
+        Assert-NoReparseAncestors -Path $artifactsRootPath -Context 'Artifacts root'
+        Assert-OutsideRoot -Path $trustedRoot -Root $repoRoot -Context 'Trusted tool root'
+        Assert-OutsideRoot -Path $trustedRoot -Root $authorityCheckout.root -Context 'Trusted tool root'
+        $coreRunPaths = Get-StandardCoreRunPaths -ArtifactsRoot $artifactsRootPath `
+            -ArtifactsRootWasExplicit $PSBoundParameters.ContainsKey('ArtifactsRoot') -OutputPath $OutputPath `
+            -PreparedRunId $(if ($SourceValidation) { [string]$preparedSource.runId } else { '' })
+        $coreArtifactsRoot = [string]$coreRunPaths.artifactsRoot
+        $adapterRoot = [string]$coreRunPaths.adapterRoot
+        $adapterPath = [string]$coreRunPaths.adapterPath
+        $outputFull = [string]$coreRunPaths.outputPath
+        foreach ($root in @($coreArtifactsRoot, $adapterRoot)) {
+            Assert-OutsideRoot -Path $root -Root $repoRoot -Context 'Core run-owned root'
+            Assert-OutsideRoot -Path $root -Root $authorityCheckout.root -Context 'Core run-owned root'
+            Assert-OutsideRoot -Path $root -Root $trustedRoot -Context 'Core run-owned root'
+        }
+        Assert-OutsideRoot -Path $adapterRoot -Root $coreArtifactsRoot -Context 'Core adapter root'
+        if (-not (Test-Path -LiteralPath $coreArtifactsRoot -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $coreArtifactsRoot -ErrorAction Stop)
+        }
+        elseif (-not [bool]$coreRunPaths.artifactsRootWasExplicit) {
+            throw 'Default Core ArtifactsRoot unexpectedly exists; run-owned paths are create-only.'
+        }
+        Assert-NoReparseAncestors -Path $coreArtifactsRoot -Context 'Core ArtifactsRoot'
+        Assert-PathWithinRoot -Path $outputFull -Root $coreArtifactsRoot -Context 'OutputPath' | Out-Null
+        if (Test-Path -LiteralPath $outputFull) { throw "OutputPath already exists and evidence is create-only: $outputFull" }
+
+        $adapterRootCreated = $false
+        $coreExitCode = 1
+        try {
+            if (Test-Path -LiteralPath $adapterRoot) { throw 'Core adapter sibling path unexpectedly exists.' }
+            [void](New-Item -ItemType Directory -Path $adapterRoot -ErrorAction Stop)
+            $adapterRootCreated = $true
+            Assert-NoReparseAncestors -Path $adapterRoot -Context 'Core adapter root'
+            $authoritySnapshot = New-StandardCoreAuthoritySnapshot -GitPath $gitPath -SourceRoot $authorityCheckout.root -OwnedRoot $adapterRoot -AuthorityPin $candidateAuthority
+            $centralRunnerPath = [string]$authoritySnapshot.runnerPath
+            $adapter = New-StandardCoreAdapterV2 -PowerShellPath $pwshPath -TrustedToolRoot $trustedRoot `
+                -CandidateAuthorityAdapterRunId $coreRunPaths.runId -ActiveSkillIds $activeSkillIds
+            if ($SourceValidation) { $adapter.sourceValidation = $preparedSource.sourceValidation }
+            Write-Utf8NoBomCreateNew -Path $adapterPath -Text (($adapter | ConvertTo-Json -Depth 20) + [Environment]::NewLine)
+            $coreRunnerArgs = @(
+                '-CandidateRoot', $repoRoot,
+                '-AdapterPath', $adapterPath,
+                '-ArtifactsRoot', $coreArtifactsRoot,
+                '-OutputPath', $outputFull,
+                '-SourceRepository', $script:SourceRepository,
+                '-SourceRevision', $candidateCommit,
+                '-BaseRevision', $baseRevision,
+                '-EventName', $eventName,
+                '-AuthorityRevision', [string]$candidateAuthority.commit,
+                '-TimeoutSeconds', [string]$TimeoutSeconds,
+                '-TrustedToolRoot', $trustedRoot
+            )
+            if ($SourceValidation) { $coreRunnerArgs += @('-SourceValidation','-RunId',[string]$preparedSource.runId) }
+            Assert-NoReparseAncestors -Path $centralRunnerPath -Context 'Pinned Core runner before execution'
+            if (-not (Test-AuthorityWorktreeSha256 -Path $centralRunnerPath -ExpectedSha256 ([string]$candidateAuthority.files['scripts/Invoke-StandardValidation.ps1']))) {
+                throw 'Pinned Core runner worktree content changed before execution.'
+            }
+            & $pwshPath -NoProfile -NonInteractive -File $centralRunnerPath @coreRunnerArgs
+            $coreExitCode = $LASTEXITCODE
+        }
+        finally {
+            if ($adapterRootCreated) {
+                if (-not (Test-PathEqual -Left $adapterRoot -Right ([IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $coreArtifactsRoot) ".core-v2-adapter-$($coreRunPaths.runId)")))) -or
+                    -not (Test-PathWithinOrEqual -Path $adapterRoot -Root (Split-Path -Parent $coreArtifactsRoot)) -or
+                    (Test-PathWithinOrEqual -Path $adapterRoot -Root $coreArtifactsRoot)) {
+                    throw 'Core adapter cleanup path escaped its unique sibling boundary.'
+                }
+                Assert-NoReparseAncestors -Path $adapterRoot -Context 'Core adapter cleanup root'
+                Remove-Item -LiteralPath $adapterRoot -Recurse -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $adapterRoot) { throw 'Core adapter cleanup did not remove its run-owned sibling.' }
             }
         }
-    ).Count -gt 0) {
-    throw 'Trusted Pester supervisor did not report the exact trusted test inventory.'
-}
-$completionAttestationNonceBytes = [byte[]]::new(32)
-[Security.Cryptography.RandomNumberGenerator]::Fill($completionAttestationNonceBytes)
-$completionAttestationNonce = ([BitConverter]::ToString($completionAttestationNonceBytes) -replace '-', '').ToLowerInvariant()
-$receiptPayload = [ordered]@{
-    result = 'passed'
-    completionAttestation = 'trusted-parent-post-exit'
-    completionAttestationNonce = $completionAttestationNonce
-    pesterVersion = [string]$pesterResult.pesterVersion
-    totalCount = [int64]$pesterResult.TotalCount
-    passedCount = [int64]$pesterResult.PassedCount
-    failedCount = [int64]$pesterResult.FailedCount
-    skippedCount = [int64]$pesterResult.SkippedCount
-    requiredTests = @($requiredPesterTests)
-}
-$receiptIdBytes = [byte[]]::new(16)
-[Security.Cryptography.RandomNumberGenerator]::Fill($receiptIdBytes)
-$receiptId = ([BitConverter]::ToString($receiptIdBytes) -replace '-', '').ToLowerInvariant()
-$receiptPath = Join-Path $runRoot ("trusted-pester-receipt-{0}.json" -f $receiptId)
-$receiptJson = $receiptPayload | ConvertTo-Json -Depth 20 -Compress
-$receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
-$receiptStream = [IO.File]::Open($receiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-try {
-    $receiptStream.Write($receiptBytes, 0, $receiptBytes.Length)
-    $receiptStream.Flush($true)
-}
-finally {
-    $receiptStream.Dispose()
-}
-$receiptItem = Get-Item -LiteralPath $receiptPath -Force
-if ($receiptItem.PSIsContainer -or ($receiptItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$receiptItem.Length -gt 1048576) {
-    throw 'The trusted Pester receipt is not a bounded regular file.'
-}
-
-# Candidate Pester code runs in a contained child and may replace files in the
-# candidate checkout. Never invoke the original path again
-# after that untrusted process. Keep the trusted bytes in memory and execute
-# a scriptblock created directly from that pre-test snapshot; this avoids
-# reopening any candidate-writable pathname for post-test evidence.
-$postPesterValidatorHasher = [Security.Cryptography.SHA256]::Create()
-try {
-    $postPesterValidatorHash = ([BitConverter]::ToString($postPesterValidatorHasher.ComputeHash($repositoryValidatorBytes)) -replace '-', '').ToLowerInvariant()
-}
-finally {
-    $postPesterValidatorHasher.Dispose()
-}
-if ($postPesterValidatorHash -cne $repositoryValidatorHash) {
-    throw 'Post-Pester repository validator identity does not match the pre-test trusted bytes.'
-}
-$postPesterRepositoryValidatorText = [Text.UTF8Encoding]::new($false, $true).GetString($repositoryValidatorBytes)
-$postPesterRepositoryValidatorScript = [scriptblock]::Create($postPesterRepositoryValidatorText)
-if ($null -eq $postPesterRepositoryValidatorScript) {
-    throw 'Post-Pester repository validator script could not be created from the pre-test trusted bytes.'
-}
-
-$postPesterRepositoryReportPath = Join-Path $runRoot 'repository-validation-post-pester.json'
-$trustedGitConfigActualItem = Get-Item -LiteralPath $trustedGitConfigPath -Force
-Assert-RegularFileForHash -Item $trustedGitConfigActualItem -Context 'Run-owned Git global config'
-Assert-NoReparseAncestors -Path $trustedGitConfigPath -Context 'Run-owned Git global config'
-Assert-NoReparseAncestors -Path $trustedGitHooksPath -Context 'Run-owned empty Git hooks directory'
-$trustedGitConfigActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedGitConfigPath).Hash.ToLowerInvariant()
-if ($trustedGitConfigActualSha256 -cne $trustedGitConfigSha256) {
-    throw 'Run-owned Git global config changed before post-Pester evidence collection.'
-}
-$hookEntries = @(Get-ChildItem -LiteralPath $trustedGitHooksPath -Force)
-if ($hookEntries.Count -ne 0) {
-    throw 'Run-owned Git hooks directory is not empty before post-Pester evidence collection.'
-}
-$env:GIT_CONFIG_NOSYSTEM = '1'
-$env:GIT_CONFIG_GLOBAL = $trustedGitConfigPath
-$env:GIT_CONFIG_COUNT = '2'
-$env:GIT_CONFIG_KEY_0 = 'core.hooksPath'
-$env:GIT_CONFIG_VALUE_0 = $trustedGitHooksPath
-$env:GIT_CONFIG_KEY_1 = 'core.fsmonitor'
-$env:GIT_CONFIG_VALUE_1 = 'false'
-$postPesterGitConfigExists = Test-Path -LiteralPath $gitConfigPath -PathType Leaf
-if ($postPesterGitConfigExists -ne $prePesterGitConfigExists) {
-    throw 'Candidate Git config was created or removed during repository tests.'
-}
-if ($postPesterGitConfigExists) {
-    $postPesterGitConfigItem = Get-Item -LiteralPath $gitConfigPath -Force
-    Assert-RegularFileForHash -Item $postPesterGitConfigItem -Context 'Post-test candidate Git config'
-    $postPesterGitConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitConfigPath).Hash.ToLowerInvariant()
-    if ($postPesterGitConfigSha256 -cne $prePesterGitConfigSha256) {
-        throw 'Candidate Git config changed during repository tests.'
-    }
-}
-$postPesterCandidateCommit = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse HEAD 2>$null) | Select-Object -First 1)).Trim()
-if ($LASTEXITCODE -ne 0 -or $postPesterCandidateCommit -cne $candidateCommit) {
-    throw "Candidate commit changed during repository tests; expected '$candidateCommit' but found '$postPesterCandidateCommit'."
-}
-$postPesterTree = ([string](@(& $gitPath @gitConfigArguments -C $repoRoot rev-parse "$postPesterCandidateCommit^{tree}" 2>$null) | Select-Object -First 1)).Trim()
-if ($LASTEXITCODE -ne 0 -or $postPesterTree -cne $candidateTree) {
-    throw 'Candidate Git tree changed during repository tests.'
-}
-Assert-NoGitReplacementObjects -GitPath $gitPath -RepositoryRoot $repoRoot -Context 'Post-test candidate'
-$postPesterIndexItem = Get-Item -LiteralPath $gitIndexPath -Force -ErrorAction SilentlyContinue
-if ($null -eq $postPesterIndexItem -or $postPesterIndexItem.PSIsContainer -or
-    ($postPesterIndexItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    throw 'Candidate Git index was removed or replaced with a non-regular entry during repository tests.'
-}
-$postPesterGitIndexSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitIndexPath).Hash.ToLowerInvariant()
-if ($postPesterGitIndexSha256 -cne $prePesterGitIndexSha256) {
-    throw 'Candidate Git index changed during repository tests.'
-}
-$postPesterRepositoryJson = & $postPesterRepositoryValidatorScript -RepositoryRoot $repoRoot -OutputPath $postPesterRepositoryReportPath -TrustedGitPath $gitPath -NoFilters | Select-Object -Last 1
-$postPesterRepositoryReport = $postPesterRepositoryJson | ConvertFrom-Json -Depth 100
-if ($postPesterRepositoryReport.result -cne 'passed' -or [int]$postPesterRepositoryReport.activeSkillCount -ne $skillIds.Count) {
-    throw 'Post-Pester repository validation did not cover the exact active Skill inventory.'
-}
-foreach ($skillId in $skillIds) {
-    $before = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    $after = @($postPesterRepositoryReport.skills | Where-Object { $_.skillId -ceq $skillId })
-    Assert-SkillInventoryUnchanged -Before $before -After $after -SkillId $skillId -Context 'during repository tests'
-}
-$postPesterRepositoryRawSnapshot = @(Get-RepositoryRawSnapshot -RepositoryRoot $repoRoot)
-Assert-RepositoryRawSnapshotUnchanged -Before $prePesterRepositoryRawSnapshot -After $postPesterRepositoryRawSnapshot
-$repositoryReport = $postPesterRepositoryReport
-
-$summary = [pscustomobject][ordered]@{
-    schemaVersion = 1
-    standardVersion = 'v1'
-    runId = $runId
-    authority = [ordered]@{
-        repository = [string]$adapter.authority.repository
-        commit = [string]$adapter.authority.commit
-        archiveSha256 = $archiveHash
-        files = $authorityFiles
-    }
-    canonicalGate = [ordered]@{
-        policy = [string]$validationSecurityGate.policy
-        policyPath = 'docs/standards/validation-security-gate.json'
-        policySha256 = $validationSecurityGatePolicySha256
-        stageIds = @($validationSecurityGate.stages | ForEach-Object { [string]$_.id })
-    }
-    executionBoundary = [ordered]@{
-        candidateProfile = 'offline-candidate'
-        semanticProfile = if ($semanticTriggered) { 'trusted-semantic' } else { 'not-run' }
-        platform = 'windows-restricted-primary-token-job-object'
-        integrityLevel = 'low'
-        aggregateLimits = 'process-count-resident-memory-cpu-output-timeout'
-        cleanup = 'trusted-process-tree-and-sandbox-root-cleanup-verified'
-    }
-    assertionInventory = [ordered]@{
-        canonicalStages = @($validationSecurityGate.stages | ForEach-Object { [string]$_.id })
-        requiredPesterTests = @($requiredPesterTests)
-    }
-    candidate = [ordered]@{
-        repository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
-        commit = $candidateCommit
-        baseCommit = $resolvedBaseCommit
-    }
-    tools = @($expectedSources.Keys | ForEach-Object {
-        [pscustomobject][ordered]@{
-            toolName = $_
-            source = [string]$receipts[$_].source
-            version = [string]$receipts[$_].resolvedVersion
-            resolvedIdentity = [string]$receipts[$_].resolvedIdentity
-        }
-    })
-    skills = @($repositoryReport.skills | ForEach-Object { [pscustomobject][ordered]@{ skillId = $_.skillId; contentSha256 = $_.contentSha256 } })
-    security = [ordered]@{
-        result = if (@($securityBlockers).Count -eq 0) { 'passed' } else { 'blocked' }
-        findings = $securityFindings
-        humanReviewRequired = $securityHumanReview
-        blockingFindings = $securityBlockers
-        trackedFindings = $securityTracked
-    }
-    stages = [ordered]@{
-        controlledAcquisition = 'passed'
-        integrityVerification = 'passed'
-        packageValidation = [ordered]@{ structure = $skillValidatorReports; fullCheck = $skillValidatorCheckReports }
-        skillspectorStatic = $staticReports
-        repositoryTests = [ordered]@{
-            repositoryValidation = 'passed'
-            skillTools = $skillToolsReports
-            routing = $skillToolsRouteReports
-            pester = [ordered]@{
-                result = 'passed'
-                trustedCommit = $trustedPesterCommit
-                receipt = [IO.Path]::GetFileName($receiptPath)
-                total = [int]$pesterResult.TotalCount
-                passed = [int]$pesterResult.PassedCount
-                skipped = [int]$pesterResult.SkippedCount
-            }
-        }
-        conditionalSemanticScan = [ordered]@{ requested = [bool]$EnableSemanticScan; triggered = $semanticTriggered; candidateProfile = 'offline-candidate'; executionProfile = if ($semanticTriggered) { 'trusted-semantic' } else { 'not-run' }; reports = $semanticReports }
-        aiReview = 'required-before-release'
-        humanApproval = 'required-before-release'
-        publishOrInstall = 'blocked-until-approved-release'
-        postInstallVerification = 'required-after-install'
-    }
-    deviations = 'None'
-    result = if (@($securityBlockers).Count -eq 0) { 'passed' } else { 'blocked' }
-}
-$summaryJson = $summary | ConvertTo-Json -Depth 100
-$summaryPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    Join-Path $runRoot 'conformance-report.json'
-}
-else {
-    Assert-PathWithinRoot -Path ([IO.Path]::GetFullPath($OutputPath)) -Root $artifactsRootPath -Context 'Conformance output'
-}
-if (Test-Path -LiteralPath $summaryPath) { throw 'Conformance output path already exists; evidence must not overwrite prior content.' }
-$summaryEncoding = [Text.UTF8Encoding]::new($false)
-$summaryText = $summaryJson + [Environment]::NewLine
-$summaryBytes = $summaryEncoding.GetBytes($summaryText)
-$summaryHasher = [Security.Cryptography.SHA256]::Create()
-try {
-    $summarySha256 = ([BitConverter]::ToString($summaryHasher.ComputeHash($summaryBytes)) -replace '-', '').ToLowerInvariant()
-}
-finally {
-    $summaryHasher.Dispose()
-}
-[void](Write-ExclusiveUtf8File -Path $summaryPath -Text $summaryText -Context 'Supervisor-owned conformance evidence')
-Assert-NoReparseAncestors -Path $summaryPath -Context 'Conformance output'
-$writtenSummaryBytes = [IO.File]::ReadAllBytes($summaryPath)
-$readbackHasher = [Security.Cryptography.SHA256]::Create()
-try {
-    $writtenSummarySha256 = ([BitConverter]::ToString($readbackHasher.ComputeHash($writtenSummaryBytes)) -replace '-', '').ToLowerInvariant()
-}
-finally {
-    $readbackHasher.Dispose()
-}
-if ($writtenSummarySha256 -cne $summarySha256) {
-    throw 'Conformance evidence changed during immediate readback.'
-}
-$githubOutputPath = [Environment]::GetEnvironmentVariable('GITHUB_OUTPUT', [EnvironmentVariableTarget]::Process)
-if (-not [string]::IsNullOrWhiteSpace($githubOutputPath)) {
-    if (-not (Test-Path -LiteralPath $githubOutputPath -PathType Leaf)) {
-        throw "GitHub output command file is missing: $githubOutputPath"
-    }
-    Assert-NoReparseAncestors -Path $githubOutputPath -Context 'GitHub output command file'
-    [IO.File]::AppendAllText(
-        $githubOutputPath,
-        "standard_v1_evidence_sha256=$summarySha256$([Environment]::NewLine)",
-        $summaryEncoding
-    )
-}
-if (@($securityBlockers).Count -gt 0) {
-    Write-Host "Darktide Translate Standard v1 canonical validation blocked by the central security gate. Evidence: $summaryPath"
-}
-else {
-    Write-Host "Darktide Translate Standard v1 canonical validation passed. Evidence: $summaryPath"
-}
-$summaryJson
-if (@($securityBlockers).Count -gt 0) {
-    throw 'Canonical validation/security gate blocked the candidate; resolve central findings and obtain required Human Review before release or install.'
-}
+        exit $coreExitCode
