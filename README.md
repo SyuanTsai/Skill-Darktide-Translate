@@ -9,7 +9,7 @@ Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive up
 - Stable source ID: `darktide-translate`
 - Source inventory: `catalog/source.json`
 - Profile catalog extension: `catalog/profiles.json`
-- Current repository version: `0.3.13`
+- Current repository version: `0.3.14`
 - Delivery tracking is maintained outside this public source and does not change the repository licensing boundary.
 
 ## Skill
