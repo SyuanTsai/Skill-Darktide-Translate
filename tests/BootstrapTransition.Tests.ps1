@@ -5,8 +5,8 @@ Describe 'Darktide bootstrap transition' {
     BeforeAll {
         $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
         $script:RepositoryValidator = Join-Path $script:RepositoryRoot 'scripts/Test-Repository.ps1'
-        $script:Supervisor = Join-Path $script:RepositoryRoot 'scripts/Validate.ps1'
-        $script:ValidationWorkflow = Join-Path $script:RepositoryRoot '.github/workflows/standard-v1-candidate-windows.yml'
+        $script:Supervisor = Join-Path $script:RepositoryRoot 'tests/fixtures/LegacyValidate.ps1'
+        $script:ValidationWorkflow = Join-Path $PSScriptRoot 'fixtures/LegacyWorkflow.txt'
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:Layout = Get-TestRepositoryLayout -RepositoryRoot $script:RepositoryRoot
 

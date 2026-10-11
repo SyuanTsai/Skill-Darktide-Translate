@@ -91,3 +91,5 @@ The repository does not vendor third-party source code. CI and developer depende
 ## Scope
 
 This repository independently owns the packaged Skill, its Schema 14 Workflow and Review base, Schema 15 normative extension, source receipt boundary, deterministic localization worksets, stage runner, Candidate Gate, metadata, validation, and release contract. It is not added to the AI-Instructions Catalog, Lock, bootstrap, or fan-out; consumers install and pin it independently.
+
+Source checks use the merged SYP-280 authority through explicit, separate `-PrepareSourceTools` and `-SourceValidation` requests to `scripts/Validate.ps1`. The pre-push wrapper prepares verified tools once, then executes the same frozen run with real package tools, SkillSpector Static, and the complete Pester tree. Reports retain `releaseEligible=false`: passing source checks permits source review and does not approve a release or USER deployment. PR validation uses the exact protected base driver; consumer updates remain separate. Historical helpers under `tests/fixtures/` are inactive regression fixtures and cannot replace the canonical gate.

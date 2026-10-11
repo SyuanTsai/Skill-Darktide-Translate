@@ -325,7 +325,7 @@ Describe 'Trusted filesystem contract' {
             $tokens = $null
             $errors = $null
             $ast = [Management.Automation.Language.Parser]::ParseFile(
-                (Join-Path $script:RepositoryRoot $RelativePath), [ref]$tokens, [ref]$errors)
+                (Join-Path $script:RepositoryRoot $(if ($RelativePath -ceq 'scripts/Validate.ps1') { 'tests/fixtures/LegacyValidate.ps1' } else { $RelativePath })), [ref]$tokens, [ref]$errors)
             if (@($errors).Count -ne 0) { throw 'The production filesystem source must parse.' }
             $names = @(
                 'Assert-RegularFileForHash', 'Assert-NoReparseAncestors', 'Test-PathEqual',

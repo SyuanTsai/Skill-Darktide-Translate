@@ -8,6 +8,7 @@ param(
     [string] $OutputPath,
     [string] $TrustedGitPath,
     [switch] $BootstrapTransition,
+    [switch] $ReadOnlySnapshot,
     [switch] $NoFilters
 )
 
@@ -600,7 +601,8 @@ function Get-ContentInventory {
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
         [Parameter(Mandatory = $true)][string] $SkillId,
         [Parameter()][string] $SkillsRoot = 'skills',
-        [Parameter()][switch] $NoFilters
+        [Parameter()][switch] $NoFilters,
+        [Parameter()][switch] $ReadOnlySnapshot
     )
 
     $skillsRootRelative = $SkillsRoot.Replace('\', '/')
@@ -651,6 +653,28 @@ function Get-ContentInventory {
         $foldedPaths[$folded] = $relative
     }
     if ($pathToFile.Count -eq 0) { throw "Skill '$SkillId' has an empty package inventory." }
+
+    if ($ReadOnlySnapshot) {
+        # The central runner has already bound the tracked tree, index, modes
+        # and raw bytes before creating this snapshot without Git metadata.
+        [string[]]$sortedPaths = @($pathToFile.Keys)
+        [Array]::Sort($sortedPaths, [StringComparer]::Ordinal)
+        $files = @()
+        $canonical = [Text.StringBuilder]::new()
+        foreach ($path in $sortedPaths) {
+            $sha256 = Get-RawFileSha256 -Path $pathToFile[$path].FullName
+            $files += [pscustomobject][ordered]@{ path = $path; sha256 = $sha256; rawSha256 = $sha256 }
+            [void]$canonical.Append($path).Append("`t").Append($sha256).Append("`n")
+        }
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try {
+            $contentSha256 = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical.ToString()))) -replace '-', '').ToLowerInvariant()
+        }
+        finally { $hasher.Dispose() }
+        return [pscustomobject][ordered]@{
+            skillId = $SkillId; skillsRoot = $skillsRootRelative; contentSha256 = $contentSha256; files = $files
+        }
+    }
 
     $gitPath = $script:TrustedGitPath
     if ([string]::IsNullOrWhiteSpace($gitPath)) { throw 'Trusted Git executable was not bound before repository validation.' }
@@ -925,11 +949,11 @@ function Invoke-BootstrapTransitionRepositoryValidation {
     return Write-RepositoryValidationResult -Result $result -OutputPath $OutputPath -SuccessMessage 'Darktide Translate bootstrap transition repository validation passed.'
 }
 
-if ([string]::IsNullOrWhiteSpace($script:TrustedGitPath)) {
+if (-not $ReadOnlySnapshot -and [string]::IsNullOrWhiteSpace($script:TrustedGitPath)) {
     $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
     $script:TrustedGitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
 }
-if (-not (Test-Path -LiteralPath $script:TrustedGitPath -PathType Leaf)) {
+if (-not $ReadOnlySnapshot -and -not (Test-Path -LiteralPath $script:TrustedGitPath -PathType Leaf)) {
     throw "Trusted Git executable is missing: $($script:TrustedGitPath)"
 }
 $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
@@ -938,6 +962,7 @@ $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
 else { [IO.Path]::GetFullPath($RepositoryRoot) }
 
 if ($BootstrapTransition) {
+    if ($ReadOnlySnapshot) { throw 'ReadOnlySnapshot cannot replace Git-bound bootstrap transition validation.' }
     return Invoke-BootstrapTransitionRepositoryValidation `
         -RepositoryRoot $repoRoot `
         -OutputPath $OutputPath `
@@ -1066,7 +1091,25 @@ $requiredAuthorityPaths = @(
     'docs/standards/validation-toolchain.json',
     'scripts/Invoke-StandardAuthorityGate.ps1',
     'scripts/Resolve-PythonWheelClosure.py',
-    'scripts/Resolve-StandardValidationTool.ps1'
+    'scripts/Resolve-StandardValidationTool.ps1',
+    'docs/standards/schemas/standard-validation-adapter-v1.schema.json',
+    'docs/standards/schemas/standard-validation-evidence-v1.schema.json',
+    'docs/standards/standard-validation-contract-v1.json',
+    'docs/standards/pr12-source-merge-adoption.json',
+    'docs/standards/trust-anchors/human-approval-public-key.xml',
+    'docs/standards/trust-anchors/trusted-supervisor-public-key.xml',
+    'scripts/Invoke-StandardValidation.ps1',
+    'docs/standards/schemas/standard-semantic-consent-evidence-v2.schema.json',
+    'scripts/StandardSemanticBridge.psm1',
+    'docs/standards/schemas/upstream-adapter-v1.schema.json',
+    'docs/standards/upstream-adapter.json',
+    'scripts/Validate-UpstreamAdapter.ps1',
+    'docs/standards/standard-core-validation-v2.json',
+    'docs/standards/schemas/standard-core-adapter-v2.schema.json',
+    'docs/standards/schemas/standard-core-evidence-v2.schema.json',
+    'docs/standards/third-party-raw-skill-sources.md',
+    'docs/standards/schemas/third-party-raw-skill-source-v1.schema.json',
+    'docs/standards/examples/third-party-raw-skill-source-v1.json'
 )
 if ($adapter.authority.files -isnot [array] -or @($adapter.authority.files).Count -ne $requiredAuthorityPaths.Count) {
     throw 'config/standard-v1.json authority file inventory is incomplete.'
@@ -1267,7 +1310,7 @@ foreach ($skillId in $skillIds) {
     }
     [void](Read-SkillFrontmatter -Path $skillFile -ExpectedSkillId $skillId)
     [void](Read-OpenAiMetadata -Path $metadataFile -ExpectedSkillId $skillId)
-    $packages += Get-ContentInventory -RepositoryRoot $repoRoot -SkillId $skillId -NoFilters:$NoFilters
+    $packages += Get-ContentInventory -RepositoryRoot $repoRoot -SkillId $skillId -NoFilters:$NoFilters -ReadOnlySnapshot:$ReadOnlySnapshot
 }
 
 $result = [pscustomobject][ordered]@{

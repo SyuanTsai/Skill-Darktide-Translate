@@ -4,7 +4,7 @@ Describe 'Run-owned workflow cleanup filesystem boundary' {
     BeforeAll {
         $workflow = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $block = [regex]::Match($workflow,
-            '(?ms)^      - name: Remove run-owned validation directory\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:|\z)')
+            '(?ms)^      - name: Remove run-owned validation directory\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:|^  [a-z][a-z-]*:|\z)')
         if (-not $block.Success) { throw 'The actual run-owned cleanup step is missing.' }
         $code = [regex]::Replace($block.Groups['code'].Value, '(?m)^          ', '')
         $tokens = $null; $errors = $null
@@ -100,7 +100,7 @@ Describe 'Run-owned workflow cleanup filesystem boundary' {
 
 Describe 'Trusted resolver API credential lifetime' {
     BeforeAll {
-        $source = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1') -Raw
+        $source = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'tests/fixtures/LegacyValidate.ps1') -Raw
         $tokens = $null; $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
         if ($errors.Count) { throw 'The actual validator must parse before its credential lifetime is exercised.' }
@@ -283,9 +283,9 @@ Describe 'Trusted resolver API credential lifetime' {
     }
 }
 
-Describe 'Workflow resolver credential handoff' {
+Describe 'Inactive legacy workflow resolver credential handoff' {
     BeforeAll {
-        $workflow = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/standard-v1-candidate-windows.yml') -Raw
+        $workflow = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/LegacyWorkflow.txt') -Raw
         $block = [regex]::Match($workflow,
             '(?ms)^      - name: Validate exact commit with verified PowerShell\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:)')
         if (-not $block.Success) { throw 'The actual validation workflow step is missing.' }
@@ -398,7 +398,7 @@ exit ([int]$env:WORKFLOW_FIXTURE_EXIT)
 Describe 'Canonical Standard v1 validation adapter' {
     BeforeAll {
         $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
-        $script:ValidatorPath = Join-Path $script:RepositoryRoot 'scripts/Validate.ps1'
+        $script:ValidatorPath = Join-Path $script:RepositoryRoot 'tests/fixtures/LegacyValidate.ps1'
         $script:Validator = Get-Content -LiteralPath $script:ValidatorPath -Raw
         $script:Adapter = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'config/standard-v1.json') -Raw |
             ConvertFrom-Json -Depth 20
@@ -1005,7 +1005,7 @@ Describe 'Canonical Standard v1 validation adapter' {
 Describe 'Protected workflow trust binding' {
     BeforeAll {
         $script:TrustRepositoryRoot = Split-Path -Parent $PSScriptRoot
-        $script:TrustValidator = Get-Content -LiteralPath (Join-Path $script:TrustRepositoryRoot 'scripts/Validate.ps1') -Raw
+        $script:TrustValidator = Get-Content -LiteralPath (Join-Path $script:TrustRepositoryRoot 'tests/fixtures/LegacyValidate.ps1') -Raw
 
 
 

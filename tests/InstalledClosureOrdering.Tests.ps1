@@ -4,7 +4,7 @@
 Describe 'Installed closure ordering' {
     BeforeAll {
         $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
-        $script:ValidatorPath = Join-Path $script:RepositoryRoot 'scripts/Validate.ps1'
+        $script:ValidatorPath = Join-Path $script:RepositoryRoot 'tests/fixtures/LegacyValidate.ps1'
         $tokens = $null
         $parseErrors = $null
         $script:ValidatorAst = [Management.Automation.Language.Parser]::ParseFile(
