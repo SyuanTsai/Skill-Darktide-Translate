@@ -678,9 +678,9 @@ jobs:
             ${{ env.RUN_OWNED_ROOT }}/artifacts/runs/*/source-core-adapter.json
             ${{ env.RUN_OWNED_ROOT }}/artifacts/runs/*/repository-pester-case-inventory-v1.json
             ${{ env.RUN_OWNED_ROOT }}/t/source-tools.json
-            ${{ env.RUN_OWNED_ROOT }}/t/source-tools-*/receipt-*.json
-            ${{ env.RUN_OWNED_ROOT }}/t/source-tools-*/setup-*-process.json
-            ${{ env.RUN_OWNED_ROOT }}/t/source-tools-*/toolchain.json
+            ${{ env.RUN_OWNED_ROOT }}/t/s-*/receipt-*.json
+            ${{ env.RUN_OWNED_ROOT }}/t/s-*/setup-*-process.json
+            ${{ env.RUN_OWNED_ROOT }}/t/s-*/toolchain.json
             ${{ env.RUN_OWNED_ROOT }}/pester-setup/setup-receipt.json
 
       - name: Publish protected validation result

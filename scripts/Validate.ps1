@@ -531,7 +531,7 @@ function New-SourceToolSetup {
         [string] $CandidateRevision, [string] $Git, [string] $CandidateRoot,
         [string] $PreparedPath, [string] $GoVersion, [int] $LimitSeconds)
     $setupId = [guid]::NewGuid().ToString('N')
-    $owned = Assert-PathWithinRoot -Path (Join-Path $Root "source-tools-$setupId") -Root $Root -Context 'Source setup owned root'
+    $owned = Assert-PathWithinRoot -Path (Join-Path $Root "s-$setupId") -Root $Root -Context 'Source setup owned root'
     if (Test-Path -LiteralPath $owned) { throw 'Source setup root already exists.' }
     [void](New-Item -ItemType Directory -Path $owned -ErrorAction Stop)
     Assert-NoReparseAncestors -Path $owned -Context 'Source setup owned root'
@@ -608,7 +608,7 @@ function Read-SourceToolSetup {
         $prepared.authorityRevision -cne $AuthorityRevision -or $prepared.sourceValidation.packageAdapter.command -cne $PowerShell) {
         throw 'Prepared source tools do not bind this candidate, authority and runtime.'
     }
-    $expectedOwned = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($Path))) "source-tools-$($prepared.runId)"
+    $expectedOwned = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($Path))) "s-$($prepared.runId)"
     if (-not (Test-PathEqual -Left $prepared.ownedRoot -Right $expectedOwned)) { throw 'Prepared source setup owned root differs.' }
     Assert-NoReparseAncestors -Path $expectedOwned -Context 'Prepared source setup owned root'
     $wrapper = Join-Path $expectedOwned 'Invoke-DarktideValidationChild.ps1'
