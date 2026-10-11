@@ -67,13 +67,24 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         $before.skills[0].contentSha256 | Should -Not -Be $after.skills[0].contentSha256
     }
 
-    It 'reads non-ASCII Git paths from the NUL-delimited index output' {
+    # Scenario: Git returns a staged Unicode path while the host uses a non-UTF-8 console encoding.
+    # Purpose: Preserve Git's UTF-8 NUL-delimited paths independently of host stdout decoding.
+    It 'InterT30_ReadsUnicodeGitIndexPathsWithAsciiConsoleEncoding' {
         $unicodePath = Join-Path $script:SkillRoot 'references/使用.md'
         New-Item -ItemType Directory -Path (Split-Path -Parent $unicodePath) -Force | Out-Null
         Set-Content -LiteralPath $unicodePath -Value '# Unicode reference' -Encoding utf8NoBOM -NoNewline
         & $script:GitPath -C $script:FixtureRoot add -- "skills/$($script:SkillId)/references/使用.md"
         if ($LASTEXITCODE -ne 0) { throw 'Could not stage the Unicode fixture path.' }
-        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
+        $originalEncoding = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [Text.Encoding]::ASCII
+            $result = & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot | Select-Object -Last 1 | ConvertFrom-Json
+            @($result.skills[0].files | Where-Object path -CEq 'references/使用.md').Count | Should -Be 1
+            [Console]::OutputEncoding.CodePage | Should -Be ([Text.Encoding]::ASCII.CodePage)
+        }
+        finally {
+            [Console]::OutputEncoding = $originalEncoding
+        }
     }
 
     It 'rejects an unlisted Skill directory' {

@@ -269,6 +269,42 @@ function ConvertTo-AsciiLowerInvariant {
     return $builder.ToString()
 }
 
+function Get-GitIndexUtf8Output {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $SkillRootRelative
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $GitPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot", '-C', $RepositoryRoot, 'ls-files', '-s', '-z', '--', $SkillRootRelative)) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $buffer = [IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) { throw 'Could not start Git index reader.' }
+        $process.StandardInput.Close()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardOutput.BaseStream.CopyTo($buffer)
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw "Git inventory lookup failed: $stderr" }
+        # Git's -z path bytes are UTF-8; host console encoding must not alter them.
+        return [Text.UTF8Encoding]::new($false, $true).GetString($buffer.ToArray())
+    }
+    finally {
+        $buffer.Dispose()
+        $process.Dispose()
+    }
+}
+
 function Get-GitBlobSha256 {
     param(
         [Parameter(Mandatory = $true)][string] $GitPath,
@@ -680,8 +716,7 @@ function Get-ContentInventory {
     if ([string]::IsNullOrWhiteSpace($gitPath)) { throw 'Trusted Git executable was not bound before repository validation.' }
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
     $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    $gitOutput = [string]((& $gitPath @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- $skillRootRelative) -join '')
-    if ($LASTEXITCODE -ne 0) { throw "Git inventory lookup failed for '$SkillId'." }
+    $gitOutput = Get-GitIndexUtf8Output -GitPath $gitPath -RepositoryRoot $RepositoryRoot -SkillRootRelative $skillRootRelative
     foreach ($record in @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })) {
         if ([string]$record -cnotmatch '^(?<mode>[0-9]{6}) (?<objectId>[0-9a-f]{40}) (?<stage>[0-3])\t(?<path>[^\x00\r\n]+)$') {
             throw "Git returned malformed index entry for '$SkillId': $record"
