@@ -61,7 +61,7 @@ $candidate = ([string](& $gitCommand.Path -C $repoRoot rev-parse HEAD)).Trim()
 if ($LASTEXITCODE -ne 0 -or $candidate -cnotmatch '^[0-9a-f]{40}$') { throw 'Could not identify the exact source candidate.' }
 $dirty = @(& $gitCommand.Path -C $repoRoot status --porcelain=v1 --untracked-files=all)
 if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { throw 'Pre-push validation requires a clean immutable candidate.' }
-$owned = [IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ('darktide-source-' + [guid]::NewGuid().ToString('N'))))
+$owned = [IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ('dt-' + [guid]::NewGuid().ToString('N').Substring(0,12))))
 if ($owned.StartsWith($repoRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Run-owned evidence must remain outside the candidate repository.'
 }
