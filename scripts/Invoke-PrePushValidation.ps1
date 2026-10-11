@@ -103,7 +103,7 @@ if ([string]::IsNullOrWhiteSpace($PowerShellExecutable)) {
     finally { [Environment]::SetEnvironmentVariable('RUN_OWNED_ROOT', $previousOwnedRoot, 'Process') }
 }
 $PowerShellExecutable = [IO.Path]::GetFullPath($PowerShellExecutable)
-$setupRoot = Join-Path $owned 'tools'
+$setupRoot = Join-Path $owned 't'
 $preparedPath = Join-Path $setupRoot 'source-tools.json'
 $artifacts = Join-Path $owned 'artifacts'
 $reportPath = Join-Path $artifacts 'source-report.json'

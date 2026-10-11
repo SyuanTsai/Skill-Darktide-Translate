@@ -545,7 +545,7 @@ function New-SourceToolSetup {
     foreach ($tool in @('skill-validator', 'skill-tools', 'skillspector')) {
         $receiptPath = Join-Path $owned "receipt-$tool.json"
         $result = Invoke-StandardValidationProcess -Command $PowerShell -Arguments @('-NoProfile','-NonInteractive','-File',$resolver,
-            '-PolicyPath',$policy,'-ToolName',$tool,'-Install','-InstallRoot',(Join-Path $owned 'installed'),
+            '-PolicyPath',$policy,'-ToolName',$tool,'-Install','-InstallRoot',(Join-Path $owned 'i'),
             '-ExpectedGoRuntimeVersion',$GoVersion,'-RunId',$setupId,'-OutputPath',$receiptPath) `
             -WorkingDirectory $owned -Environment @{} -TimeoutSeconds $LimitSeconds -CoreLifecycleOnly
         Write-Utf8NoBomCreateNew -Path (Join-Path $owned "setup-$tool-process.json") -Text ($result | ConvertTo-Json -Depth 30)
