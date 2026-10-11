@@ -358,8 +358,12 @@ function Get-ResolvedGitPath {
 }
 
 function Get-ResolvedPowerShellPath {
-    $command = Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    return [IO.Path]::GetFullPath([string]$command.Path)
+    $path = [IO.Path]::GetFullPath([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+    if ([IO.Path]::GetFileName($path) -cnotin @('pwsh.exe','pwsh') -or
+        -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw 'Canonical validation must run in the verified PowerShell executable.'
+    }
+    return $path
 }
 
 function Resolve-GitRevision {
