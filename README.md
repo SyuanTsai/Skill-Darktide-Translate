@@ -80,7 +80,14 @@ GitHub Actions runs one read-only Windows workflow for pull requests and pushes 
 
 Release and immutable pin rules are in `docs/RELEASE.md`. Consumers start and roll back runs with the complete JSON emitted by `scripts/Get-SourcePin.ps1`, including the tag/ref, resolved commit, deterministic content hash, and installed Skill file manifest, as described in `docs/ROLLBACK.md`. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
 
-The real Reconnect trial, immutable Git evidence, Gate hashes, Review result, and measured wall-clock run are recorded in the versioned end-to-end evidence document.
+### Historical trial evidence
+
+These dated reports describe their recorded versions and are retained in Git history; current operations follow the packaged Schema 14/15 instructions.
+
+- [AutoMark (2026-08-30)](https://github.com/SyuanTsai/Skill-Darktide-Translate/blob/4bd1bbc34981ee6a3f9d84cf0cb8214f74c97b02/docs/AUTOMARK-REAL-MOD-TRIAL-2026-08-30.md)
+- [BetterMelk (2026-08-30)](https://github.com/SyuanTsai/Skill-Darktide-Translate/blob/4bd1bbc34981ee6a3f9d84cf0cb8214f74c97b02/docs/BETTERMELK-REAL-MOD-TRIAL-2026-08-30.md)
+- [BornReady (2026-08-30)](https://github.com/SyuanTsai/Skill-Darktide-Translate/blob/4bd1bbc34981ee6a3f9d84cf0cb8214f74c97b02/docs/BORNREADY-REAL-MOD-TRIAL-2026-08-30.md)
+- [Reconnect (2026-08-22)](https://github.com/SyuanTsai/Skill-Darktide-Translate/blob/4bd1bbc34981ee6a3f9d84cf0cb8214f74c97b02/docs/darktide-mod-e2e.md)
 
 ## License and contribution boundary
 
