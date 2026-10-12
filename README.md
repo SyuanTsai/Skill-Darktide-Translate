@@ -4,7 +4,9 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # Skill Darktide Translate
 
-Independent Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive updates and `zh-tw` source synchronization.
+Independent, Windows-only Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive updates and `zh-tw` source synchronization.
+
+Local development, installation, execution, testing, validation, and CI acceptance require a Windows host; Linux, macOS, and WSL are unsupported.
 
 - Stable source ID: `darktide-translate`
 - Source inventory: `catalog/source.json`
