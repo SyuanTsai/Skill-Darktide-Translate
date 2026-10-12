@@ -45,8 +45,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Import-Module -Name (Join-Path $PSScriptRoot 'WindowsHost.psm1') -ErrorAction Stop
-Assert-DarktideWindowsHost
 
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 

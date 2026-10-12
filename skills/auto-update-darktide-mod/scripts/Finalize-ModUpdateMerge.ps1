@@ -1,9 +1,6 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 
-Import-Module -Name (Join-Path $PSScriptRoot 'WindowsHost.psm1') -ErrorAction Stop
-Assert-DarktideWindowsHost
-
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 
 function Get-MergeFinalizationDisposition {

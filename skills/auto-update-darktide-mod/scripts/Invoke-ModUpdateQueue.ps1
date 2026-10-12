@@ -13,8 +13,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Import-Module -Name (Join-Path $PSScriptRoot 'WindowsHost.psm1') -ErrorAction Stop
-Assert-DarktideWindowsHost
 
 if ($ThrottleLimit -lt 1 -or $ThrottleLimit -gt 4) { throw 'ThrottleLimit must be between 1 and 4.' }
 $repository = [IO.Path]::GetFullPath($RepositoryRoot)
