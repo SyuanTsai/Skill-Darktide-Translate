@@ -13,6 +13,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $PSScriptRoot 'WindowsHost.psm1') -ErrorAction Stop
+Assert-DarktideWindowsHost
 $skillRoot = Split-Path -Parent $PSScriptRoot
 $provenancePath = Join-Path $skillRoot 'references/source-provenance.json'
 $integrityPath = Join-Path $PSScriptRoot 'Test-ReferenceIntegrity.ps1'

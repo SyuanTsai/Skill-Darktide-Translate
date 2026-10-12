@@ -1,6 +1,6 @@
 ---
 name: auto-update-darktide-mod
-description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs, preserve active zh-tw, and produce Schema 14 or 15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
+description: Update Warhammer 40,000 DARKTIDE MODs on Windows only from verified Nexus Main files or supplied ZIPs, preserve active zh-tw, and produce Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
 allowed-tools: "git, pwsh, webfetch"
 ---
 <!--
@@ -13,6 +13,8 @@ SPDX-License-Identifier: Apache-2.0
 `allowed-tools` is portable capability metadata for host routing and static review. It does not grant credentials, network access, write access, or approval bypass; controlled acquisition, integrity verification, security review, and Human Approval remain mandatory under Standard v1.
 
 Use the packaged Schema 14 workflow as the normative base. For a new automatic-source run, also use the verified Schema 15 extension. The Skill routes each operation through the evidence needed for a trustworthy, recoverable result.
+
+Local installation, execution, and validation require Windows with PowerShell 7; Linux, macOS, and WSL are unsupported.
 
 ## Load the authoritative instructions
 

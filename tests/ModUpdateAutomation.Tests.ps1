@@ -18,7 +18,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         Test-Path -LiteralPath $validatorPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath (Join-Path $skillRoot 'references/automation.md') -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath (Join-Path $skillRoot 'references/translation-quality.md') -PathType Leaf | Should -Be $true
-        foreach ($script in @('Receive-NexusMainFile.ps1', 'Test-SourceReceipt.ps1', 'Invoke-ModUpdateQueue.ps1', 'SharedCoordinationLock.psm1', 'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1')) {
+        foreach ($script in @('Receive-NexusMainFile.ps1', 'Test-SourceReceipt.ps1', 'Invoke-ModUpdateQueue.ps1', 'SharedCoordinationLock.psm1', 'WindowsHost.psm1', 'New-LocalizationWorkset.ps1', 'Apply-LocalizationWorkset.ps1')) {
             Test-Path -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') $script) -PathType Leaf | Should -Be $true
         }
 
@@ -3376,5 +3376,85 @@ function Get-SourceTupleContractSha256 {
         { & $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru } |
             Should -Throw '*canonical reservation tuple*'
         Test-Path -LiteralPath (Join-Path $runRoot 'staging/extracted') | Should -Be $false
+    }
+}
+
+Describe 'Darktide package host boundary' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $layout = Get-TestRepositoryLayout -RepositoryRoot $repoRoot
+        $skillRoot = $layout.SkillRoot
+        $scriptsRoot = Join-Path $skillRoot 'scripts'
+        $runnerPath = Join-Path $scriptsRoot 'mod-update.ps1'
+    }
+
+    # Scenario: Any package operation starts on a non-Windows host.
+    # Purpose: Reject unsupported hosts before a runner, queue, acquisition, localization, gate, or evidence helper mutates files.
+    It 'UnitT10_RejectsUnsupportedHostBeforeAnyMutation' {
+        $windowsHostModulePath = Join-Path $scriptsRoot 'WindowsHost.psm1'
+        Import-Module -Name $windowsHostModulePath -Force -ErrorAction Stop
+        (Get-Command Assert-DarktideWindowsHost -Module WindowsHost).Parameters.Count | Should -Be 0
+        { Assert-DarktideWindowsHost } | Should -Not -Throw
+
+        Mock Get-DarktideHostPlatform { [PlatformID]::Unix } -ModuleName WindowsHost
+        { Assert-DarktideWindowsHost } | Should -Throw '*Windows host*'
+
+        $fixtureRoot = Join-Path $TestDrive 'unsupported-host'
+        $repository = Join-Path $fixtureRoot 'repository'
+        $expandOutput = Join-Path $fixtureRoot 'expanded'
+        New-Item -ItemType Directory -Path $repository, $expandOutput -Force | Out-Null
+        $queuePath = Join-Path $fixtureRoot 'queue.json'
+        [IO.File]::WriteAllText($queuePath, '{"schemaVersion":1,"items":[]}')
+        $initialFixturePaths = @(Get-ChildItem -LiteralPath $fixtureRoot -Force -Recurse | Select-Object -ExpandProperty FullName)
+        $incomingDirectory = Join-Path $fixtureRoot 'incoming'
+        $deliveryDirectory = Join-Path $fixtureRoot 'delivery'
+        $outputPath = Join-Path $fixtureRoot 'workset.json'
+        $missingStatePath = Join-Path $fixtureRoot 'missing-state.json'
+        $runId = [guid]::NewGuid().ToString()
+
+        $mutationEntrypoints = @(
+            {
+                & $runnerPath -Command 'claim' -RepositoryRoot $repository -ArchivePath (Join-Path $fixtureRoot 'source.zip') -ModDirectory 'TestMod' -SourceRequestPath (Join-Path $fixtureRoot 'source-request.json') -SkillSourcePinPath (Join-Path $fixtureRoot 'missing-pin.json') -RunId $runId
+            }
+            {
+                & (Join-Path $scriptsRoot 'Invoke-ModUpdateQueue.ps1') -RepositoryRoot $repository -QueuePath $queuePath
+            }
+            {
+                & (Join-Path $scriptsRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $missingStatePath
+            }
+            {
+                & (Join-Path $scriptsRoot 'Expand-Schema14Reference.ps1') -Document Workflow -OutputDirectory $expandOutput
+            }
+            {
+                & (Join-Path $scriptsRoot 'Finalize-LocalizationWorksetEvidence.ps1') -StatePath $missingStatePath
+            }
+            { & (Join-Path $scriptsRoot 'Finalize-ModUpdateMerge.ps1') }
+            {
+                & (Join-Path $scriptsRoot 'New-LocalizationWorkset.ps1') -RepositoryRoot $repository -BaseOid ('a' * 40) -ModRelativePath 'TestMod/localization.lua' -StagingModPath $fixtureRoot -OutputPath $outputPath
+            }
+            {
+                & (Join-Path $scriptsRoot 'Receive-NexusMainFile.ps1') -SourceRequestPath (Join-Path $fixtureRoot 'source-request.json') -IncomingDirectory $incomingDirectory -DeliveryDirectory $deliveryDirectory -Provider browser -ReceiptPath (Join-Path $fixtureRoot 'receipt.json')
+            }
+            {
+                Import-Module -Name (Join-Path $scriptsRoot 'SharedCoordinationLock.psm1') -Force -ErrorAction Stop
+            }
+            {
+                & (Join-Path $scriptsRoot 'Test-ModUpdateCandidate.ps1') -StatePath $missingStatePath
+            }
+        )
+
+        foreach ($entrypoint in $mutationEntrypoints) {
+            $entrypoint | Should -Throw '*Windows host*'
+        }
+
+        Get-ChildItem -LiteralPath $repository -Force -Recurse | Should -BeNullOrEmpty
+        Get-ChildItem -LiteralPath $expandOutput -Force -Recurse | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $incomingDirectory | Should -BeFalse
+        Test-Path -LiteralPath $deliveryDirectory | Should -BeFalse
+        Test-Path -LiteralPath $outputPath | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $fixtureRoot 'receipt.json') | Should -BeFalse
+        $createdFixturePaths = @(Get-ChildItem -LiteralPath $fixtureRoot -Force -Recurse | Select-Object -ExpandProperty FullName | Where-Object { $_ -notin $initialFixturePaths })
+        $createdFixturePaths | Should -BeNullOrEmpty
     }
 }
