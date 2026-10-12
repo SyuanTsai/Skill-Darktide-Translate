@@ -3387,13 +3387,26 @@ Describe 'Darktide package host boundary' {
         $skillRoot = $layout.SkillRoot
         $scriptsRoot = Join-Path $skillRoot 'scripts'
         $runnerPath = Join-Path $scriptsRoot 'mod-update.ps1'
+        $windowsHostModulePath = Join-Path $scriptsRoot 'WindowsHost.psm1'
+        $preloadedWindowsHostModules = @(Get-Module -Name WindowsHost -All)
+        foreach ($module in $preloadedWindowsHostModules) {
+            Remove-Module -ModuleInfo $module -Force -ErrorAction Stop
+        }
+        Import-Module -Name $windowsHostModulePath -Force -ErrorAction Stop
+        $loadedWindowsHostModules = @(Get-Module -Name WindowsHost -All)
+        if ($loadedWindowsHostModules.Count -ne 1 -or $loadedWindowsHostModules[0].Path -cne $windowsHostModulePath) {
+            $loadedWindowsHostModulePaths = @($loadedWindowsHostModules | ForEach-Object { $_.Path }) -join '; '
+            $message = 'Host boundary test must import only the exact WindowsHost module path; observed {0}: {1}' -f $loadedWindowsHostModules.Count, $loadedWindowsHostModulePaths
+            throw $message
+        }
     }
 
     # Scenario: Any package operation starts on a non-Windows host.
     # Purpose: Reject unsupported hosts before a runner, queue, acquisition, localization, gate, or evidence helper mutates files.
     It 'UnitT10_RejectsUnsupportedHostBeforeAnyMutation' {
-        $windowsHostModulePath = Join-Path $scriptsRoot 'WindowsHost.psm1'
-        Import-Module -Name $windowsHostModulePath -Force -ErrorAction Stop
+        $loadedWindowsHostModules = @(Get-Module -Name WindowsHost -All)
+        $loadedWindowsHostModules.Count | Should -Be 1
+        $loadedWindowsHostModules[0].Path | Should -Be $windowsHostModulePath
         (Get-Command Assert-DarktideWindowsHost -Module WindowsHost).Parameters.Count | Should -Be 0
         { Assert-DarktideWindowsHost } | Should -Not -Throw
 
