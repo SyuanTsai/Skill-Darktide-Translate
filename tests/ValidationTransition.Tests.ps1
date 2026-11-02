@@ -174,6 +174,10 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflow | Should -Match '(?m)^    timeout-minutes:\s*[1-9][0-9]*\s*$'
         $workflow | Should -Match 'if:\s*always\(\)'
         $workflow | Should -Match 'SGV1_RUN_DIRECTORY'
+        $workflow | Should -Match "\$directoryName = 'sv'"
+        $workflow | Should -Match "\$directoryName -cne 'sv'"
+        $workflow | Should -Match 'beta_claude_tag_slack_channel_bundle_target_create_param\.py'
+        $workflow | Should -Match '\$longestSkillSpectorPath\.Length -ge 248'
         $workflow | Should -Match 'Remove run-owned validation directory'
         $workflow | Should -Not -Match 'repository-contract|skill-validator|skill-tools|publish-head-required-checks|CANONICAL_RESULT|ubuntu-latest|CODEX_PESTER_CGROUP_ROOT|actions/upload-artifact|GITHUB_STEP_SUMMARY'
         Test-Path -LiteralPath (Join-Path $script:WorkflowRoot 'standard-v1-protected.yml') | Should -BeFalse
@@ -226,6 +230,7 @@ Describe 'Standard v1 migration and canonical validation contracts' {
             'Schema15Coordination.Tests.ps1'
             'Schema15SourceAcquisition.Tests.ps1'
             'SkillContract.Tests.ps1'
+            'SkillSpectorOutput.Tests.ps1'
             'SourcePin.Tests.ps1'
         )
         @(Get-RequiredPesterTests) | Should -Be $expected

@@ -1724,7 +1724,7 @@ function Assert-NoReparseTree {
 function Write-ExclusiveUtf8File {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][string] $Text,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $Text,
         [Parameter(Mandatory = $true)][string] $Context
     )
 
@@ -3057,6 +3057,8 @@ function Invoke-NativeChecked {
         [Parameter()][switch] $TerminateProcessTree,
         [Parameter()][switch] $ProtectRunnerCommandFiles,
         [Parameter()][switch] $DirectWindowsProcess,
+        [Parameter()][AllowNull()][string] $StandardOutputPath,
+        [Parameter()][AllowNull()][string] $StandardErrorPath,
         [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline',
         [Parameter()][ValidateRange(1000, 3600000)][int] $TimeoutMilliseconds = 300000
     )
@@ -3086,6 +3088,28 @@ function Invoke-NativeChecked {
         throw "$Context child-writable output root must remain within the diagnostic root."
     }
     Assert-NoReparseAncestors -Path $childWritableRootPath -Context "$Context child-writable output root"
+    $captureNativeOutputFiles = $PSBoundParameters.ContainsKey('StandardOutputPath') -or
+        $PSBoundParameters.ContainsKey('StandardErrorPath')
+    if ($captureNativeOutputFiles -and
+        (-not $PSBoundParameters.ContainsKey('StandardOutputPath') -or
+            -not $PSBoundParameters.ContainsKey('StandardErrorPath'))) {
+        throw "$Context must receive both standard-output and standard-error paths."
+    }
+    if ($captureNativeOutputFiles) {
+        $standardOutputFullPath = [IO.Path]::GetFullPath($StandardOutputPath)
+        $standardErrorFullPath = [IO.Path]::GetFullPath($StandardErrorPath)
+        if (Test-PathEqual -Left $standardOutputFullPath -Right $standardErrorFullPath) {
+            throw "$Context standard-output and standard-error paths must be distinct."
+        }
+        foreach ($capturePath in @($standardOutputFullPath, $standardErrorFullPath)) {
+            if (-not (Test-PathWithinOrEqual -Path $capturePath -Root $childWritableRootPath)) {
+                throw "$Context native output files must remain within the child-writable output root."
+            }
+            if ($null -ne (Get-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue)) {
+                throw "$Context native output path already exists; scanner output must use a new file: $capturePath"
+            }
+        }
+    }
     $stderrPath = Join-Path $childWritableRootPath ("stderr-{0}.txt" -f [guid]::NewGuid().ToString('N'))
     $runnerCommandFileNames = @(
         'GITHUB_ENV',
@@ -3382,7 +3406,20 @@ finally {
         if ($ProtectRunnerCommandFiles) {
             Assert-RunnerCommandFilesUnchanged -Before $runnerCommandFileSnapshot -Names $runnerCommandFileNames
         }
+        if ($captureNativeOutputFiles) {
+            [void](Write-ExclusiveUtf8File -Path $standardOutputFullPath -Text $stdoutText -Context "$Context standard output")
+            [void](Write-ExclusiveUtf8File -Path $standardErrorFullPath -Text $stderrText -Context "$Context standard error")
+        }
         if ($exitCode -ne 0) {
+            if ($captureNativeOutputFiles) {
+                $boundedStandardError = if ($stderrText.Length -le 4096) {
+                    $stderrText
+                }
+                else {
+                    $stderrText.Substring(0, 4096) + '...[truncated]'
+                }
+                throw "$Context exited with code $exitCode. STDERR (bounded to 4096 characters):`n$boundedStandardError"
+            }
             throw "$Context exited with code $exitCode.`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText"
         }
         return $stdoutText
@@ -3424,6 +3461,56 @@ finally {
             if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
         }
     }
+}
+
+function Read-SkillSpectorJsonReport {
+    param(
+        [Parameter(Mandatory = $true)][string] $ReportPath,
+        [Parameter(Mandatory = $true)][string] $StandardErrorPath,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+    try {
+        return Read-JsonFile -Path $ReportPath -Context "$Context report"
+    }
+    catch {
+        $standardError = [IO.File]::ReadAllText($StandardErrorPath, [Text.UTF8Encoding]::new($false, $true))
+        if ($standardError.Length -gt 4096) {
+            $standardError = $standardError.Substring(0, 4096) + '...[truncated]'
+        }
+        throw "$($_.Exception.Message) STDERR (bounded to 4096 characters):`n$standardError"
+    }
+}
+
+function Invoke-SkillSpectorScan {
+    param(
+        [Parameter(Mandatory = $true)][string] $Command,
+        [Parameter(Mandatory = $true)][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $ReportPath,
+        [Parameter(Mandatory = $true)][string] $StandardErrorPath,
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
+        [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
+        [Parameter()][AllowNull()][Collections.IDictionary] $AdditionalEnvironmentVariables,
+        [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline'
+    )
+    if ($Arguments -ccontains '--output') {
+        throw "$Context must omit SkillSpector --output and capture stdout instead."
+    }
+    [void](Invoke-NativeChecked `
+        -Command $Command `
+        -Arguments $Arguments `
+        -Context $Context `
+        -DiagnosticRoot $DiagnosticRoot `
+        -ChildWritableRoot $ChildWritableRoot `
+        -AdditionalEnvironmentVariables $AdditionalEnvironmentVariables `
+        -IsolateRunnerCommandFiles `
+        -TerminateProcessTree `
+        -ProtectRunnerCommandFiles `
+        -NetworkProfile $NetworkProfile `
+        -StandardOutputPath $ReportPath `
+        -StandardErrorPath $StandardErrorPath)
+    return Read-SkillSpectorJsonReport -ReportPath $ReportPath `
+        -StandardErrorPath $StandardErrorPath -Context $Context
 }
 
 function Test-SecurityRelevantSkillChange {
@@ -3469,6 +3556,7 @@ function Get-RequiredPesterTests {
         'Schema15Coordination.Tests.ps1'
         'Schema15SourceAcquisition.Tests.ps1'
         'SkillContract.Tests.ps1'
+        'SkillSpectorOutput.Tests.ps1'
         'SourcePin.Tests.ps1'
     )
     if ($IncludeTrustedPostPromotionTests) {
@@ -4322,8 +4410,12 @@ foreach ($skillId in $skillIds) {
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
     $reportPath = Join-Path $childOutputRoot "skillspector-static-$skillId.json"
-    [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--no-llm', '--format', 'json', '--output', $reportPath) -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $skillSpectorRuntimeEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles)
-    $report = Read-JsonFile -Path $reportPath -Context "SkillSpector static report for $skillId"
+    $standardErrorPath = Join-Path $childOutputRoot "skillspector-static-$skillId.stderr.txt"
+    $skillSpectorArguments = @('scan', $skillRoot, '--no-llm', '--format', 'json')
+    $report = Invoke-SkillSpectorScan -Command $skillSpectorPath -Arguments $skillSpectorArguments `
+        -ReportPath $reportPath -StandardErrorPath $standardErrorPath `
+        -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot `
+        -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $skillSpectorRuntimeEnvironment
     $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId `
         -ExpectedInventoryPaths $expectedInventoryPaths -CandidateCommit $candidateCommit `
         -ScannerVersion ([string]$receipts.skillspector.resolvedVersion) `
@@ -4348,7 +4440,7 @@ foreach ($skillId in $skillIds) {
             default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
         }
     }
-    $staticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($reportPath); findings = $issues.Count; files = $expectedInventoryPaths.Count }
+    $staticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($reportPath); standardError = [IO.Path]::GetFileName($standardErrorPath); arguments = @($skillSpectorArguments); findings = $issues.Count; files = $expectedInventoryPaths.Count }
 }
 
 $securityPreflightPath = Join-Path $runRoot 'security-preflight.json'
@@ -4497,6 +4589,7 @@ if ($semanticTriggered) {
                 ForEach-Object { [string]$_.path }
         )
         $semanticPath = Join-Path $childOutputRoot "skillspector-semantic-$skillId.json"
+        $semanticStandardErrorPath = Join-Path $childOutputRoot "skillspector-semantic-$skillId.stderr.txt"
         $semanticEnvironment = [ordered]@{}
         foreach ($name in @($semanticCredentialEnvironment.Keys)) {
             $semanticEnvironment[$name] = [string]$semanticCredentialEnvironment[$name]
@@ -4504,8 +4597,12 @@ if ($semanticTriggered) {
         foreach ($name in @($skillSpectorRuntimeEnvironment.Keys)) {
             $semanticEnvironment[$name] = [string]$skillSpectorRuntimeEnvironment[$name]
         }
-        [void](Invoke-NativeChecked -Command $skillSpectorPath -Arguments @('scan', $skillRoot, '--format', 'json', '--output', $semanticPath) -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticEnvironment -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles -NetworkProfile TrustedSemantic)
-        $semanticReport = Read-JsonFile -Path $semanticPath -Context "SkillSpector semantic report for $skillId"
+        $semanticArguments = @('scan', $skillRoot, '--format', 'json')
+        $semanticReport = Invoke-SkillSpectorScan -Command $skillSpectorPath -Arguments $semanticArguments `
+            -ReportPath $semanticPath -StandardErrorPath $semanticStandardErrorPath `
+            -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot `
+            -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticEnvironment `
+            -NetworkProfile TrustedSemantic
         try {
             $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
         }
@@ -4526,7 +4623,7 @@ if ($semanticTriggered) {
                 default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
             }
         }
-        $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); findings = $semanticIssues.Count }
+        $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); standardError = [IO.Path]::GetFileName($semanticStandardErrorPath); arguments = @($semanticArguments); findings = $semanticIssues.Count }
     }
 }
 

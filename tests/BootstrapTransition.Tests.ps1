@@ -311,13 +311,14 @@ Describe 'Darktide bootstrap transition' {
             'Schema15Coordination.Tests.ps1'
             'Schema15SourceAcquisition.Tests.ps1'
             'SkillContract.Tests.ps1'
+            'SkillSpectorOutput.Tests.ps1'
             'SourcePin.Tests.ps1'
         )
-        $requiredTests.Count | Should -Be 9
+        $requiredTests.Count | Should -Be 10
         ($requiredTests -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
-        $postPromotionTests.Count | Should -Be 10
-        ($postPromotionTests[0..8] -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
-        $postPromotionTests[9] | Should -BeExactly 'InstalledClosureOrdering.Tests.ps1'
+        $postPromotionTests.Count | Should -Be 11
+        ($postPromotionTests[0..9] -join "`n") | Should -BeExactly ($expectedRequiredTests -join "`n")
+        $postPromotionTests[10] | Should -BeExactly 'InstalledClosureOrdering.Tests.ps1'
         $supervisor | Should -Not -Match '(?s)\$requiredPesterTests\s*=\s*@\(\s*''BootstrapTransition\.Tests\.ps1'''
         foreach ($testName in $requiredTests) {
             $actualTimeout = & $timeoutModule {

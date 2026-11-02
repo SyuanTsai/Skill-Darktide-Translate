@@ -58,13 +58,18 @@ jobs:
             throw 'Standard v1 CI requires a Windows runner.'
           }
           $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
-          $directoryName = 'sgv1-{0}-{1}-{2}' -f $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT, [guid]::NewGuid().ToString('N')
-          if ($directoryName -notmatch '^sgv1-[0-9]+-[0-9]+-[0-9a-f]{32}$') {
+          $directoryName = 'sv'
+          if ($directoryName -cne 'sv') {
             throw 'The run-owned validation directory name is malformed.'
           }
           $runDirectory = [IO.Path]::GetFullPath((Join-Path $runnerTemp $directoryName))
           if ([IO.Path]::GetDirectoryName($runDirectory) -cne $runnerTemp -or (Test-Path -LiteralPath $runDirectory)) {
             throw 'The run-owned validation directory is outside RUNNER_TEMP or already exists.'
+          }
+          $longestSkillSpectorMember = 'anthropic\types\beta\organization\claude_tag\bundles\beta_claude_tag_slack_channel_bundle_target_create_param.py'
+          $longestSkillSpectorPath = Join-Path $runDirectory "sgv1-aaaaaaaaaaaa\tools\ss-aaaaaaaaaaaa\venv\Lib\site-packages\$longestSkillSpectorMember"
+          if ($longestSkillSpectorPath.Length -ge 248) {
+            throw "The shortened run-owned directory still exceeds the SkillSpector Windows install-path limit: $($longestSkillSpectorPath.Length) characters."
           }
           [void](New-Item -ItemType Directory -Path $runDirectory -ErrorAction Stop)
           [IO.File]::AppendAllText($env:GITHUB_ENV, "SGV1_RUN_DIRECTORY=$runDirectory$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
@@ -185,8 +190,7 @@ jobs:
             $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
             $runDirectory = [IO.Path]::GetFullPath($env:SGV1_RUN_DIRECTORY)
             $directoryName = [IO.Path]::GetFileName($runDirectory)
-            $expectedName = '^sgv1-{0}-{1}-[0-9a-f]{{32}}$' -f [regex]::Escape($env:GITHUB_RUN_ID), [regex]::Escape($env:GITHUB_RUN_ATTEMPT)
-            if ([IO.Path]::GetDirectoryName($runDirectory) -cne $runnerTemp -or $directoryName -cnotmatch $expectedName) {
+            if ([IO.Path]::GetDirectoryName($runDirectory) -cne $runnerTemp -or $directoryName -cne 'sv') {
               throw 'Refusing to remove a path outside the exact run-owned RUNNER_TEMP directory.'
             }
             if (Test-Path -LiteralPath $runDirectory) {

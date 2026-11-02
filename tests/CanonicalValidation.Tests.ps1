@@ -34,7 +34,7 @@ Describe 'Run-owned workflow cleanup filesystem boundary' {
         function New-RunCleanupFixture {
             param([string] $Root)
             $parent = Join-Path $Root ([guid]::NewGuid().ToString('N'))
-            $owned = Join-Path $parent ('sgv1-123-1-' + [guid]::NewGuid().ToString('N'))
+            $owned = Join-Path $parent 'sv'
             [void][IO.Directory]::CreateDirectory($owned)
             return @{ parent = $parent; owned = $owned }
         }
@@ -951,6 +951,7 @@ Describe 'Canonical Standard v1 validation adapter' {
             'Schema15Coordination.Tests.ps1'
             'Schema15SourceAcquisition.Tests.ps1'
             'SkillContract.Tests.ps1'
+            'SkillSpectorOutput.Tests.ps1'
             'SourcePin.Tests.ps1'
         )
         $observedCoreInventory = @(Get-RequiredPesterTests)
