@@ -1066,7 +1066,26 @@ $requiredAuthorityPaths = @(
     'docs/standards/validation-toolchain.json',
     'scripts/Invoke-StandardAuthorityGate.ps1',
     'scripts/Resolve-PythonWheelClosure.py',
-    'scripts/Resolve-StandardValidationTool.ps1'
+    'scripts/Resolve-StandardValidationTool.ps1',
+    'docs/standards/skillspector-approved-sources.json',
+    'docs/standards/schemas/skillspector-approved-sources-v1.schema.json',
+    'docs/standards/static-parser-host-ownership.json',
+    'scripts/platform-runtime.psd1',
+    'scripts/platform-runtime.psm1',
+    'scripts/installer-safe-mutation.psm1',
+    'scripts/WindowsDacl.psm1',
+    'scripts/platform/PlatformNative.cs',
+    'scripts/platform/UnixNative.cs',
+    'scripts/platform/WindowsNative.cs',
+    'scripts/platform/WindowsInstallerMutation.cs',
+    'scripts/platform/OwnedProcess.cs',
+    'scripts/platform/UnixProcess.cs',
+    'scripts/platform/WindowsProcess.cs',
+    'scripts/platform/Unix.psm1',
+    'scripts/platform/RuntimePreparation.psm1',
+    'scripts/platform/Windows.psm1',
+    'scripts/platform/Linux.psm1',
+    'scripts/platform/MacOS.psm1'
 )
 if ($adapter.authority.files -isnot [array] -or @($adapter.authority.files).Count -ne $requiredAuthorityPaths.Count) {
     throw 'config/standard-v1.json authority file inventory is incomplete.'

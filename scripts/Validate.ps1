@@ -4187,8 +4187,8 @@ if ($BootstrapTransition) {
 $adapterPath = Join-Path $repoRoot 'config/standard-v1.json'
 $adapter = Read-JsonFile -Path $adapterPath -Context 'Standard v1 repository adapter'
 $approvedAuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
-$approvedAuthorityCommit = 'a403abdf038a3346d775431a6908a71cc3d35a5b'
-$approvedAuthorityArchiveSha256 = '17154929fadfa63487263db1efcb78f4948195af9c11c25a66432eff3411b2d3'
+$approvedAuthorityCommit = 'ead467c3488c103546f316d137196b447a1ff58a'
+$approvedAuthorityArchiveSha256 = 'ab304bc6caabe4bb9b605f403c852650e19e25f72999010db61bbad695e1c60b'
 if ($adapter.schemaVersion -ne 1 -or $adapter.standardVersion -cne 'v1' -or $adapter.deviations -cne 'None') {
     throw 'Standard v1 repository adapter identity or deviation contract is invalid.'
 }
@@ -4289,17 +4289,36 @@ $requiredAuthorityFiles = @(
     'docs/standards/README.md',
     'docs/standards/managed-skill-lifecycle.md',
     'docs/standards/schemas/managed-skill-lifecycle-v1.schema.json',
-    'docs/standards/skill-repository-standard.md',
+    'docs/standards/schemas/openai-agent-metadata.schema.json',
+    'docs/standards/schemas/source-inventory-v2.schema.json',
+    'docs/standards/schemas/validation-security-gate-v1.schema.json',
     'docs/standards/skill-repository-review-matrix.md',
+    'docs/standards/skill-repository-standard.md',
     'docs/standards/upstream-interoperability.md',
     'docs/standards/validation-security-gate.json',
     'docs/standards/validation-toolchain.json',
-    'docs/standards/schemas/validation-security-gate-v1.schema.json',
-    'docs/standards/schemas/source-inventory-v2.schema.json',
-    'docs/standards/schemas/openai-agent-metadata.schema.json',
     'scripts/Invoke-StandardAuthorityGate.ps1',
+    'scripts/Resolve-PythonWheelClosure.py',
     'scripts/Resolve-StandardValidationTool.ps1',
-    'scripts/Resolve-PythonWheelClosure.py'
+    'docs/standards/skillspector-approved-sources.json',
+    'docs/standards/schemas/skillspector-approved-sources-v1.schema.json',
+    'docs/standards/static-parser-host-ownership.json',
+    'scripts/platform-runtime.psd1',
+    'scripts/platform-runtime.psm1',
+    'scripts/installer-safe-mutation.psm1',
+    'scripts/WindowsDacl.psm1',
+    'scripts/platform/PlatformNative.cs',
+    'scripts/platform/UnixNative.cs',
+    'scripts/platform/WindowsNative.cs',
+    'scripts/platform/WindowsInstallerMutation.cs',
+    'scripts/platform/OwnedProcess.cs',
+    'scripts/platform/UnixProcess.cs',
+    'scripts/platform/WindowsProcess.cs',
+    'scripts/platform/Unix.psm1',
+    'scripts/platform/RuntimePreparation.psm1',
+    'scripts/platform/Windows.psm1',
+    'scripts/platform/Linux.psm1',
+    'scripts/platform/MacOS.psm1'
 )
 foreach ($required in $requiredAuthorityFiles) {
     if (-not $seenAuthorityPaths.Contains($required)) { throw "Authority inventory does not bind required file '$required'." }
@@ -4314,7 +4333,7 @@ $resolverPath = Join-Path $authorityRoot 'scripts/Resolve-StandardValidationTool
 $policyPath = Join-Path $authorityRoot 'docs/standards/validation-toolchain.json'
 $authorityGatePath = Join-Path $authorityRoot 'scripts/Invoke-StandardAuthorityGate.ps1'
 $validationSecurityGatePath = Join-Path $authorityRoot 'docs/standards/validation-security-gate.json'
-. $authorityGatePath -DefineFunctionsOnly -ExpectedGoRuntimeVersion $ExpectedGoRuntimeVersion
+. $authorityGatePath -DefineFunctionsOnly
 $validationSecurityGate = Assert-AuthorityValidationSecurityGate `
     -Policy (Read-JsonFile -Path $validationSecurityGatePath -Context 'Validation/security gate policy')
 $validationSecurityGatePolicySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $validationSecurityGatePath).Hash.ToLowerInvariant()
@@ -4336,6 +4355,7 @@ $expectedSources = [ordered]@{
 }
 $receipts = [ordered]@{}
 foreach ($toolName in $expectedSources.Keys) {
+    $expectedChannel = if ($toolName -ceq 'skillspector') { 'approved-source-registry' } else { 'latest-stable' }
     $receiptPath = Join-Path $runRoot "receipt-$toolName.json"
     try {
         if ($toolName -ceq 'skillspector' -and -not [string]::IsNullOrWhiteSpace($toolResolutionGitHubToken)) {
@@ -4350,10 +4370,10 @@ foreach ($toolName in $expectedSources.Keys) {
     }
     $receipt = Read-JsonFile -Path $receiptPath -Context "$toolName resolver receipt"
     if ($receipt.toolName -cne $toolName -or $receipt.source -cne $expectedSources[$toolName] -or
-        $receipt.channel -cne 'latest-stable' -or $receipt.frozenForRun -ne $true -or
+        $receipt.channel -cne $expectedChannel -or $receipt.frozenForRun -ne $true -or
         [string]::IsNullOrWhiteSpace([string]$receipt.resolvedVersion) -or
         [string]::IsNullOrWhiteSpace([string]$receipt.resolvedIdentity)) {
-        throw "$toolName receipt does not bind the approved frozen latest-stable identity."
+        throw "$toolName receipt does not bind the approved frozen channel identity."
     }
     $receipts[$toolName] = $receipt
 }

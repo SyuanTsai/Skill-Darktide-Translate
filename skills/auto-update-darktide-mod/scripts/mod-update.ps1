@@ -3257,7 +3257,8 @@ function Assert-NoArchiveFileAncestorCollisions {
         if (-not $pair.Value) { $null = $filePaths.Add($pair.Key) }
     }
     foreach ($path in $Seen.Keys) {
-        $separatorIndex = $path.IndexOf([char]'/')
+        # Written this way so SkillSpector static analysis can fully parse this command.
+        $separatorIndex = $path.IndexOf([char]47)
         while ($separatorIndex -ge 0) {
             if ($separatorIndex -gt 0) {
                 $ancestor = $path.Substring(0, $separatorIndex)
@@ -3265,7 +3266,8 @@ function Assert-NoArchiveFileAncestorCollisions {
                     throw "Archive file/ancestor archive path collision rejected: $ancestor"
                 }
             }
-            $separatorIndex = $path.IndexOf([char]'/', $separatorIndex + 1)
+            # Written this way so SkillSpector static analysis can fully parse this command.
+            $separatorIndex = $path.IndexOf([char]47, $separatorIndex + 1)
         }
     }
 }

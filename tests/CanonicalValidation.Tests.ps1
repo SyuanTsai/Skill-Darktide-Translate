@@ -191,8 +191,9 @@ Describe 'Trusted resolver API credential lifetime' {
                         })
                         if ($ToolName -ceq $script:FailTool) { throw 'fixture resolver failure before its own cleanup' }
                         # Deliberately leave the token intact: the actual parent must clean it.
+                        $receiptChannel = if ($ToolName -ceq 'skillspector') { 'approved-source-registry' } else { 'latest-stable' }
                         $receipt = [ordered]@{ toolName = $ToolName; source = $expectedSources[$ToolName]
-                            channel = 'latest-stable'; frozenForRun = $true
+                            channel = $receiptChannel; frozenForRun = $true
                             resolvedVersion = 'fixture-version'; resolvedIdentity = 'fixture-identity' }
                         [IO.File]::WriteAllText($OutputPath, ($receipt | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
                     }
@@ -501,6 +502,7 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match "'skill-validator' = 'github.com/agent-ecosystem/skill-validator/cmd/skill-validator'"
         $script:Validator | Should -Match "'skill-tools' = 'npm:skill-tools'"
         $script:Validator | Should -Match "'pester' = 'PowerShellGallery:Pester'"
+        $script:Validator | Should -Match '\$expectedChannel = if \(\$toolName -ceq ''skillspector''\) \{ ''approved-source-registry'' \} else \{ ''latest-stable'' \}'
         $script:Validator | Should -Match '\$resolverPath\s+-PolicyPath \$policyPath\s+-ToolName \$toolName\s+-Install\s+-InstallRoot \$installRoot\s+-ExpectedGoRuntimeVersion \$ExpectedGoRuntimeVersion'
 
         $freezeIndex = $script:Validator.IndexOf('foreach ($toolName in $expectedSources.Keys)')
