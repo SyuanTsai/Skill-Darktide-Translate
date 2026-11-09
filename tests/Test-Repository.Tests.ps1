@@ -20,8 +20,41 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         $script:SkillRoot = Join-Path $script:FixtureRoot "skills/$($script:SkillId)"
     }
 
-    It 'accepts the current schema v2 inventory and canonical Skill package' {
+    It 'accepts the current schema v2 inventory, 33-file authority inventory, and canonical Skill package' {
+        $adapter = Get-Content -LiteralPath (Join-Path $script:FixtureRoot 'config/standard-v1.json') -Raw |
+            ConvertFrom-Json -Depth 30
+        @($adapter.authority.files).Count | Should -Be 33
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
+    }
+
+    It 'rejects an authority inventory with a required file missing' {
+        $adapterPath = Join-Path $script:FixtureRoot 'config/standard-v1.json'
+        $adapter = Get-Content -LiteralPath $adapterPath -Raw | ConvertFrom-Json -Depth 30
+        $adapter.authority.files = @($adapter.authority.files | Select-Object -SkipLast 1)
+        $adapter | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $adapterPath -Encoding utf8NoBOM
+
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } |
+            Should -Throw '*authority file inventory is incomplete*'
+    }
+
+    It 'rejects an authority inventory with an extra file' {
+        $adapterPath = Join-Path $script:FixtureRoot 'config/standard-v1.json'
+        $adapter = Get-Content -LiteralPath $adapterPath -Raw | ConvertFrom-Json -Depth 30
+        $adapter.authority.files = @($adapter.authority.files) + @($adapter.authority.files[0].PSObject.Copy())
+        $adapter | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $adapterPath -Encoding utf8NoBOM
+
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } |
+            Should -Throw '*authority file inventory is incomplete*'
+    }
+
+    It 'rejects an authority inventory with an unknown path' {
+        $adapterPath = Join-Path $script:FixtureRoot 'config/standard-v1.json'
+        $adapter = Get-Content -LiteralPath $adapterPath -Raw | ConvertFrom-Json -Depth 30
+        $adapter.authority.files[0].path = 'docs/standards/unknown-authority-file.md'
+        $adapter | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $adapterPath -Encoding utf8NoBOM
+
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } |
+            Should -Throw '*authority file binding is invalid*'
     }
 
     # Scenario: The optional trusted Git path is blank, then an explicit Git path is missing.
