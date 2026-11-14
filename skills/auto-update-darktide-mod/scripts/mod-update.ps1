@@ -570,7 +570,7 @@ function Assert-NoReparsePath {
     $testReparse = {
         param([string] $CandidatePath, [AllowNull()][object] $CandidateItem)
         if ($null -ne $reparseCommand) {
-            return [bool](Test-PortableReparseItem -Path $CandidatePath -Item $CandidateItem -Label $Label)
+            return [bool](Test-PortableReparseItem -Path $CandidatePath -Item $CandidateItem -Label $Label -TrustedRoot $rootFull)
         }
         # The immutable legacy tests extract this function without its module
         # scope.  Preserve the same fail-closed provider/link inspection here
@@ -588,6 +588,11 @@ function Assert-NoReparsePath {
             }
             return $false
         }
+        # Same rule as PathSafety: on Unix-like hosts the raw ancestor walk
+        # stops at the trusted root, so operating-system aliases above it
+        # (for example macOS /var -> /private/var) are not managed-path links.
+        $fallbackIsWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+        $fallbackStopComparison = if ($fallbackIsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
         $probe = [IO.Path]::GetFullPath($CandidatePath)
         for ($probeDepth = 0; $probeDepth -lt 2048; $probeDepth++) {
             foreach ($info in @([IO.FileInfo]::new($probe), [IO.DirectoryInfo]::new($probe))) {
@@ -599,8 +604,9 @@ function Assert-NoReparsePath {
                     throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]($_.Exception.Message)))
                 }
             }
+            if (-not $fallbackIsWindows -and $probe.Equals($rootFull, $fallbackStopComparison)) { break }
             $parent = [IO.DirectoryInfo]::new($probe).Parent
-            if ($null -eq $parent -or $parent.FullName.Equals($probe, [StringComparison]::OrdinalIgnoreCase)) { break }
+            if ($null -eq $parent -or $parent.FullName.Equals($probe, $fallbackStopComparison)) { break }
             $probe = $parent.FullName
         }
         $false
@@ -651,7 +657,7 @@ function Assert-NoReparseTree {
     Update-ActiveReservationHeartbeat -Force
     Get-ChildItem -LiteralPath $treeFull -Recurse -Force | ForEach-Object {
         $item = $_
-        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label $Label) {
+        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label $Label -TrustedRoot $treeFull) {
             throw "$Label contains a symlink or reparse point."
         }
         Update-ActiveReservationHeartbeat
@@ -772,13 +778,21 @@ function Write-ModReservationOwner {
             if ([string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
                 throw 'Updating an existing MOD reservation requires its current reservation token.'
             }
-            $guardPath = Join-Path ([IO.Path]::GetFullPath($ModLockPath)) 'owner-update.guard'
-            for ($attempt = 0; $attempt -lt 80 -and -not $guardStream; $attempt++) {
-                try {
-                    $guardStream = [IO.File]::Open($guardPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            # The vendored authority lock is a Windows share-mode handle or a
+            # Unix flock on a fixed inode below the physically canonical root.
+            $guardRepository = [IO.Path]::GetFullPath($Repository)
+            $guardRelativeDirectory = [IO.Path]::GetRelativePath($guardRepository, [IO.Path]::GetFullPath($ModLockPath))
+            try {
+                $guardParameters = @{
+                    Root = $guardRepository
+                    RelativeDirectory = $guardRelativeDirectory
+                    Leaf = 'owner-update.guard'
+                    TimeoutMilliseconds = 2000
+                    Label = 'MOD owner update guard'
                 }
-                catch [IO.IOException] { [Threading.Thread]::Sleep(25) }
+                $guardStream = Enter-PortableFileLock @guardParameters
             }
+            catch [TimeoutException] { $guardStream = $null }
             if (-not $guardStream) { throw 'Unable to acquire the short MOD owner update guard.' }
             $current = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
             if ([string]$current.reservationToken -cne $ExpectedReservationToken -or
@@ -820,7 +834,7 @@ function Test-ProcessIdentityActive {
     }
     try {
         $process = Get-Process -Id ([int]$Owner[$ProcessIdField]) -ErrorAction Stop
-        $process.StartTime.ToUniversalTime().Ticks -eq [int64]$Owner[$ProcessStartField]
+        Test-CoordinationProcessStartMatch -ActualTicks $process.StartTime.ToUniversalTime().Ticks -ExpectedTicks ([int64]$Owner[$ProcessStartField])
     }
     catch { $false }
 }
@@ -2004,7 +2018,7 @@ function Test-RunWriterOwnerActive {
     }
     try {
         $process = Get-Process -Id ([int]$Owner.processId) -ErrorAction Stop
-        return $process.StartTime.ToUniversalTime().Ticks -eq [int64]$Owner.processStartTicks
+        return (Test-CoordinationProcessStartMatch -ActualTicks $process.StartTime.ToUniversalTime().Ticks -ExpectedTicks ([int64]$Owner.processStartTicks))
     }
     catch { return $false }
 }
@@ -3733,10 +3747,16 @@ function Invoke-Localization {
     if ($plan.mode -eq 'none' -and @($plan.files).Count -ne 0) { throw 'Localization mode none cannot contain files.' }
     $removedPaths = @()
     if ($plan.Contains('removedPaths')) { $removedPaths = @($plan.removedPaths) }
+    # Containment inside the canonical MOD directory must not be widened by a
+    # fixed ignore-case rule on case-sensitive filesystems (Linux).
+    $modContainmentComparison = Get-PortablePathComparison -Paths @(
+        [IO.Path]::GetFullPath([string]$State.worktreePath),
+        [IO.Path]::GetFullPath((Join-Path ([string]$State.worktreePath) ([string]$State.modRelativePath)))
+    )
     if ($plan.mode -eq 'none' -and $removedPaths.Count -ne 0) { throw 'Localization mode none cannot contain removed paths.' }
     foreach ($removedPath in $removedPaths) {
         $removedRelative = ([string]$removedPath).Replace('\', '/')
-        if (-not $removedRelative.StartsWith($State.modRelativePath + '/', [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $removedRelative.StartsWith($State.modRelativePath + '/', $modContainmentComparison)) {
             throw 'Removed localization target is outside the canonical MOD directory.'
         }
         $removedWorktreePath = Assert-ContainedPath -Candidate (Join-Path $State.worktreePath $removedRelative) -Root $State.worktreePath -Label 'Removed localization target'
@@ -3747,7 +3767,7 @@ function Invoke-Localization {
     $records = [Collections.Generic.List[object]]::new()
     foreach ($file in @($plan.files)) {
         $relative = ([string]$file.relativePath).Replace('\', '/')
-        if (-not $relative.StartsWith($State.modRelativePath + '/', [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $relative.StartsWith($State.modRelativePath + '/', $modContainmentComparison)) {
             throw 'Localization target is outside the canonical MOD directory.'
         }
         $worktreeFile = Assert-ContainedPath -Candidate (Join-Path $State.worktreePath $relative) -Root $State.worktreePath -Label 'Localization target'

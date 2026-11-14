@@ -185,7 +185,7 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $paths[$index] -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $paths[$index] -Label $Label) {
+            if (Test-PortableReparseItem -Path $paths[$index] -Label $Label -TrustedRoot $rootFull) {
                 throw "$Label path contains a symlink or reparse point."
             }
             if ($AllowMissingLeaf -and $index -eq ($paths.Count - 1)) { continue }
@@ -194,7 +194,7 @@ function Assert-NoReparsePath {
         catch {
             throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message))
         }
-        if (Test-PortableReparseItem -Path $paths[$index] -Item $item -Label $Label) {
+        if (Test-PortableReparseItem -Path $paths[$index] -Item $item -Label $Label -TrustedRoot $rootFull) {
             throw "$Label path contains a symlink or reparse point."
         }
     }
@@ -384,7 +384,7 @@ function Invoke-ApiDownload {
     $handler.AllowAutoRedirect = $false
     $client = [Net.Http.HttpClient]::new($handler, $true)
     $response = $null
-    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.3.13')
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.4.0')
     $apiKey = [Environment]::GetEnvironmentVariable($ApiKeyEnvironmentVariable)
     if (-not [string]::IsNullOrWhiteSpace($apiKey)) { $client.DefaultRequestHeaders.Add('apikey', $apiKey) }
     try {

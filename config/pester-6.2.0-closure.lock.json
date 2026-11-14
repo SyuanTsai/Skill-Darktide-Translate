@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "kind": "pester-module-closure",
+  "source": {
+    "packageId": "Pester",
+    "moduleName": "Pester",
+    "version": "6.2.0",
+    "packageUri": "https://www.powershellgallery.com/api/v2/package/Pester/6.2.0",
+    "sourceName": "PowerShell Gallery PSGallery official package endpoint",
+    "archiveDigest": "not-pinned; observed download SHA is evidence only and is not an independently published official digest"
+  },
+  "runtime": {
+    "moduleRelativePath": "Modules/Pester/6.2.0",
+    "manifestRelativePath": "Pester.psd1"
+  },
+  "packageInventory": {
+    "entryCount": 21,
+    "metadataEntries": [
+      "_rels/.rels",
+      "[Content_Types].xml",
+      "package/services/metadata/core-properties/nuget.psmdcp",
+      "Pester.nuspec"
+    ],
+    "payloadEntries": 17,
+    "payloadDirectory": "package root",
+    "generatedInstallMetadata": {
+      "path": "PSGetModuleInfo.xml",
+      "presentInOfficialPackage": false,
+      "presentInPreparedInstalledCopy": true,
+      "includedInClosure": false,
+      "handling": "Never copy installer metadata; stage exact archive payload only."
+    }
+  },
+  "modulePayload": [
+    {
+      "path": "bin/net462/Pester.dll",
+      "sha256": "7ffd9a3541ed1019900487bac25b2586b8000b066a1e621e9fb0f73344c4aaf0"
+    },
+    {
+      "path": "bin/net8.0/Pester.dll",
+      "sha256": "665e421670b0167e62a4c29c2464e30eced69e01f7a3993ec5e1e77ed5b75efd"
+    },
+    {
+      "path": "en-US/about_Pester.help.txt",
+      "sha256": "5eb70b28e54b1000cbd9e49dded8bd9c0a8fc29364c450a1b586a6f657e57b01"
+    },
+    {
+      "path": "en-US/about_PesterConfiguration.help.txt",
+      "sha256": "254623869fd078771e7f468f53412dc454abf3e73a988325b3617d987574c885"
+    },
+    {
+      "path": "Pester.Format.ps1xml",
+      "sha256": "b3f9d0e11cbd3ec6944ac37889510a0b70ed79ef56079088d3ee8a8558ad2260"
+    },
+    {
+      "path": "Pester.psd1",
+      "sha256": "ea8445218d46eeb69dd08827d38222f1d23c592966722ecfd0bdc419bf045543"
+    },
+    {
+      "path": "Pester.psm1",
+      "sha256": "04633d1fa5e2a28debc7b763b63adad7b477aeea88949fab9161cba04369eb5d"
+    },
+    {
+      "path": "Pester.ScriptScope.ps1",
+      "sha256": "e81800adbea80275c85defdc491411dc5fe664441e6397ea347ed43ca4e44535"
+    },
+    {
+      "path": "PesterConfiguration.Format.ps1xml",
+      "sha256": "f221b127fbca8ffbc0b065e97daf5376f5c058ceaa7f6f31242e7aec2a900e0c"
+    },
+    {
+      "path": "schemas/Cobertura/coverage-loose.dtd",
+      "sha256": "face94d4975a0e7d01b376f9fb2fba298be61a3ca3b108799749df408d4bfefc"
+    },
+    {
+      "path": "schemas/JaCoCo/report.dtd",
+      "sha256": "7effc41ffc755dbb2f4626653753ad7d533050f1685260e219951d6e9e5a2a94"
+    },
+    {
+      "path": "schemas/JUnit4/junit_schema_4.xsd",
+      "sha256": "db8a5fc7e72267f3983a3470d4fa532a0f9349df4dad699df9e2527b40690b94"
+    },
+    {
+      "path": "schemas/NUnit25/nunit_schema_2.5.xsd",
+      "sha256": "19baf3e207534c770ffb6c7d470e84f22a55271f684d29f4ec34c50308d98db7"
+    },
+    {
+      "path": "schemas/NUnit3/TestDefinitions.xsd",
+      "sha256": "67e39db6a3251ba20a1bbdec215168b50f95c8055801652f0f760553e6120a82"
+    },
+    {
+      "path": "schemas/NUnit3/TestFilterDefinitions.xsd",
+      "sha256": "fbe91c35957f34e3bb2b815edd0445e9cd92dfe5fd2dd734f38b13204f59175d"
+    },
+    {
+      "path": "schemas/NUnit3/TestResult.xsd",
+      "sha256": "ce31e0cbd6be23c01a253570cef92c10a5689b8d184d3f3a74f2097703d3fc5b"
+    },
+    {
+      "path": "ThirdPartyNotices.txt",
+      "sha256": "d4d74d4e613732974217af5d690b797b40608a4853453cdc538535a2e7026003"
+    }
+  ]
+}

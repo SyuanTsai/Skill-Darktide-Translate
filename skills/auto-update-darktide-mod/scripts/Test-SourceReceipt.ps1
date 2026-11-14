@@ -170,13 +170,13 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $current -Label $Label) {
+            if (Test-PortableReparseItem -Path $current -Label $Label -TrustedRoot $rootFull) {
                 throw "$Label path contains a symlink or reparse point."
             }
             throw "$Label path component is missing."
         }
         catch { throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message)) }
-        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label -TrustedRoot $rootFull) {
             throw "$Label path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, $comparison)) { return $pathFull }

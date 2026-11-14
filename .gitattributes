@@ -10,3 +10,5 @@
 *.yaml text eol=lf
 *.yml text eol=lf
 VERSION text eol=lf
+# Vendored authority platform runtime: hash-bound bytes must stay LF on every checkout.
+/skills/auto-update-darktide-mod/scripts/platform-runtime/** text eol=lf

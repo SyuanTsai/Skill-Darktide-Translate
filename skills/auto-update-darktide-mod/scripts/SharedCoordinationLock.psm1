@@ -82,12 +82,12 @@ function Assert-CoordinationPath {
     $current = $fullPath
     for ($depth = 0; $depth -lt 2048; $depth++) {
         if (Test-Path -LiteralPath $current) {
-            if (Test-PortableReparseItem -Path $current -Item (Get-Item -LiteralPath $current -Force) -Label 'Shared coordination') {
+            if (Test-PortableReparseItem -Path $current -Item (Get-Item -LiteralPath $current -Force) -Label 'Shared coordination' -TrustedRoot $repository) {
                 throw 'Shared coordination path contains a symlink or reparse point.'
             }
         }
         else {
-            if (Test-PortableReparseItem -Path $current -Label 'Shared coordination') {
+            if (Test-PortableReparseItem -Path $current -Label 'Shared coordination' -TrustedRoot $repository) {
                 throw 'Shared coordination path contains a symlink or reparse point.'
             }
             if (-not $AllowMissing) {
@@ -145,6 +145,28 @@ function Get-CoordinationProcessIdentity {
     }
 }
 
+function Get-CoordinationProcessStartToleranceTicks {
+    # Windows reports the kernel creation FILETIME, so the recorded value is
+    # exact. On Linux .NET derives StartTime from /proc starttime plus a boot
+    # time recomputed from the wall clock at every query, so NTP slew or clock
+    # adjustment makes later reads of the SAME live process drift. macOS uses
+    # the proc_pidinfo start timestamp but is treated the same way for safety.
+    # A tolerant match can only keep a lock held longer (the heartbeat still
+    # expires it); an exact match could steal a live owner's lock.
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { return [int64]0 }
+    [TimeSpan]::FromSeconds(10).Ticks
+}
+
+function Test-CoordinationProcessStartMatch {
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][int64] $ActualTicks,
+        [Parameter(Mandatory)][int64] $ExpectedTicks
+    )
+    if ($ActualTicks -le 0 -or $ExpectedTicks -le 0) { return $false }
+    [Math]::Abs([decimal]$ActualTicks - [decimal]$ExpectedTicks) -le [decimal](Get-CoordinationProcessStartToleranceTicks)
+}
+
 function Test-CoordinationProcessActive {
     param([Parameter(Mandatory)][Collections.IDictionary] $Owner)
     if ([string]$Owner.machineName -cne [Environment]::MachineName -or
@@ -153,23 +175,24 @@ function Test-CoordinationProcessActive {
     }
     try {
         $process = Get-Process -Id ([int]$Owner.processId) -ErrorAction Stop
-        $process.StartTime.ToUniversalTime().Ticks -eq [int64]$Owner.processStartTicks
+        Test-CoordinationProcessStartMatch -ActualTicks $process.StartTime.ToUniversalTime().Ticks -ExpectedTicks ([int64]$Owner.processStartTicks)
     }
     catch { $false }
 }
 
 function Enter-CoordinationOwnerGuard {
     param([Parameter(Mandatory)][string] $LockRoot, [Parameter(Mandatory)][string] $ResourceKey)
-    $guardPath = Join-Path $LockRoot "$ResourceKey.owner-update.guard"
+    $guardLeaf = "$ResourceKey.owner-update.guard"
+    $guardPath = Join-Path $LockRoot $guardLeaf
     $null = Assert-CoordinationPath -Path $guardPath -RepositoryRoot $LockRoot -AllowMissing
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
-    while ([DateTimeOffset]::UtcNow -lt $deadline) {
-        try {
-            return [IO.File]::Open($guardPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-        }
-        catch [IO.IOException] { [Threading.Thread]::Sleep(25) }
+    # The vendored authority lock is a Windows share-mode handle or a Unix
+    # flock on a fixed inode; it does not depend on .NET FileShare emulation.
+    try {
+        Enter-PortableFileLock -Root $LockRoot -Leaf $guardLeaf -TimeoutMilliseconds 15000 -Label "$ResourceKey owner update guard"
     }
-    throw "Unable to acquire the short $ResourceKey owner update guard."
+    catch [TimeoutException] {
+        throw "Unable to acquire the short $ResourceKey owner update guard."
+    }
 }
 
 function Assert-CoordinationOwner {
@@ -237,6 +260,8 @@ function Write-CoordinationReceipt {
         completedAt = if ($Lease.Contains('completedAt')) { $Lease.completedAt } else { Get-CoordinationUtcTimestamp }
         disposition = $Disposition
         staleEvidencePath = $Lease.staleEvidencePath
+        platform = $Lease.platform
+        lockPrimitive = $Lease.lockPrimitive
     }
     Write-CoordinationAtomicJson -Path $receiptPath -Value $receipt
     [ordered]@{
@@ -272,6 +297,8 @@ function New-CoordinationLeaseRecord {
         staleEvidencePath = $StaleEvidencePath
         waitingMilliseconds = $WaitingMilliseconds
         lastHeartbeatUtc = [DateTimeOffset]::UtcNow
+        platform = Get-PortablePlatformName
+        lockPrimitive = Get-PortableLockPrimitive
     }
 }
 
@@ -349,7 +376,19 @@ function Enter-SharedCoordinationLease {
                 $owner.heartbeat = $owner.acquiredAt
                 Write-CoordinationAtomicJson -Path (Join-Path $prepared 'owner.json') -Value $owner
                 try {
+                    # Unix rename(2) silently replaces an EMPTY destination
+                    # directory. Every participant publishes only while holding
+                    # the owner guard, so re-prove absence immediately before the
+                    # rename and prove the published owner token immediately
+                    # after it; any mismatch fails closed instead of double-holding.
+                    if (Test-Path -LiteralPath $lockPath) {
+                        throw [IO.IOException]::new('The coordination lease appeared before publication.')
+                    }
                     [IO.Directory]::Move($prepared, $lockPath)
+                    $published = Get-Content -LiteralPath (Join-Path $lockPath 'owner.json') -Raw | ConvertFrom-Json -AsHashtable
+                    if ([string]$published.token -cne $token -or [string]$published.runId -cne $RunId) {
+                        throw "Published $ResourceKey coordination lease does not carry this owner token."
+                    }
                     $waitingMilliseconds = if ($waitStartedMilliseconds -lt 0) {
                         [int64]0
                     }
@@ -441,4 +480,5 @@ function Exit-SharedCoordinationLease {
     Write-CoordinationReceipt -Lease $Lease -Disposition 'released'
 }
 
-Export-ModuleMember -Function Enter-SharedCoordinationLease, Update-SharedCoordinationLease, Exit-SharedCoordinationLease
+Export-ModuleMember -Function Enter-SharedCoordinationLease, Update-SharedCoordinationLease, Exit-SharedCoordinationLease,
+    Test-CoordinationProcessStartMatch

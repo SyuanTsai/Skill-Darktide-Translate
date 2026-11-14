@@ -318,4 +318,76 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         Set-Content -LiteralPath $metadataPath -Value $metadata -Encoding utf8NoBOM -NoNewline
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*unsafe asset path*'
     }
+
+    # Scenario: Core v2 runs the protected reader inside a tracked-only snapshot that has no .git metadata.
+    It 'UnitT60_ReadOnlySnapshotValidatesTheFilesystemInventoryWithoutGit' {
+        $snapshotRoot = Join-Path $TestDrive ('snapshot-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $snapshotRoot | Out-Null
+        foreach ($name in @('catalog', 'config', 'skills')) {
+            Copy-Item -LiteralPath (Join-Path $script:FixtureRoot $name) -Destination $snapshotRoot -Recurse
+        }
+        Test-Path -LiteralPath (Join-Path $snapshotRoot '.git') | Should -BeFalse
+        $outputPath = Join-Path $TestDrive ('snapshot-report-' + [guid]::NewGuid().ToString('N') + '.json')
+        { & $script:ValidatorPath -RepositoryRoot $snapshotRoot -OutputPath $outputPath -ReadOnlySnapshot } | Should -Not -Throw
+        $report = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json -Depth 30
+        $report.result | Should -BeExactly 'passed'
+        $report.activeSkillCount | Should -Be 1
+        $files = @($report.skills[0].files)
+        $files.Count | Should -BeGreaterThan 0
+        foreach ($file in $files) {
+            $file.sha256 | Should -MatchExactly '^[0-9a-f]{64}$'
+            $file.rawSha256 | Should -BeExactly $file.sha256
+            $expected = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $snapshotRoot "skills/$($script:SkillId)/$($file.path)")).Hash.ToLowerInvariant()
+            $file.sha256 | Should -BeExactly $expected
+        }
+        # The ordinary mode still requires the Git index binding.
+        { & $script:ValidatorPath -RepositoryRoot $snapshotRoot } | Should -Throw
+    }
+
+    It 'UnitT61_ReadOnlySnapshotRejectsGitOnlyModes_<Name>' -ForEach @(
+        @{ Name = 'BootstrapTransition'; Arguments = @{ BootstrapTransition = $true } }
+        @{ Name = 'NoFilters'; Arguments = @{ NoFilters = $true } }
+        @{ Name = 'TrustedGitPath'; Arguments = @{ TrustedGitPath = 'git' } }
+    ) {
+        $splat = @{ RepositoryRoot = $script:FixtureRoot; ReadOnlySnapshot = $true } + $Arguments
+        { & $script:ValidatorPath @splat } | Should -Throw '*-ReadOnlySnapshot cannot be combined*'
+    }
+
+    # Scenario: the protected reader accepts the current Windows declaration and the exact three-platform declaration.
+    It 'UnitT62_ProfileCompatibilityPlatforms_<Name>' -ForEach @(
+        @{ Name = 'windows'; Platforms = @('windows'); Valid = $true }
+        @{ Name = 'three-platform'; Platforms = @('windows', 'linux', 'macos'); Valid = $true }
+        @{ Name = 'reordered'; Platforms = @('linux', 'windows', 'macos'); Valid = $false }
+        @{ Name = 'linux-only'; Platforms = @('linux'); Valid = $false }
+        @{ Name = 'two-platform'; Platforms = @('windows', 'linux'); Valid = $false }
+        @{ Name = 'duplicate'; Platforms = @('windows', 'linux', 'macos', 'macos'); Valid = $false }
+        @{ Name = 'uppercase'; Platforms = @('Windows'); Valid = $false }
+    ) {
+        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
+        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -Depth 30
+        $catalog.skills[0].compatibility.platforms = @($Platforms)
+        [IO.File]::WriteAllText($profilePath, ($catalog | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($false))
+        if ($Valid) { { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw }
+        else { { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*platform compatibility is invalid*' }
+    }
+
+    # Scenario: the adoption change re-pins repository data to the prepared Core v2 tuple without editing this reader.
+    It 'UnitT63_AcceptsThePreparedCoreV2AuthorityInventoryAndRejectsMixedTuples' {
+        Import-Module -Name (Join-Path $script:RepositoryRoot 'scripts/StandardSourceDriver.psm1') -Force
+        $pin = Get-DarktideSourceAuthorityPin
+        $adapterPath = Join-Path $script:FixtureRoot 'config/standard-v1.json'
+        $adapter = Get-Content -LiteralPath $adapterPath -Raw | ConvertFrom-Json -Depth 30
+        $v1Files = @($adapter.authority.files)
+        $adapter.authority.commit = [string]$pin.commit
+        $adapter.authority.archiveUrl = [string]$pin.archiveUrl
+        $adapter.authority.archiveSha256 = [string]$pin.archiveSha256
+        $adapter.authority.files = @($pin.files.GetEnumerator() | ForEach-Object { [ordered]@{ path = [string]$_.Key; sha256 = [string]$_.Value } })
+        [IO.File]::WriteAllText($adapterPath, ($adapter | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($false))
+        & $script:GitPath -C $script:FixtureRoot add -- config
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
+
+        $adapter.authority.files = $v1Files
+        [IO.File]::WriteAllText($adapterPath, ($adapter | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($false))
+        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*authority file inventory is incomplete*'
+    }
 }

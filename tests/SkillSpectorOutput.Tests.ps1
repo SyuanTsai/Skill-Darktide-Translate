@@ -3,6 +3,7 @@
 
 Describe 'SkillSpector stdout report capture' {
     BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $repositoryRoot = Split-Path -Parent $PSScriptRoot
         $validatorPath = Join-Path $repositoryRoot 'scripts/Validate.ps1'
         $validatorSource = Get-Content -LiteralPath $validatorPath -Raw
@@ -53,13 +54,9 @@ if ($Mode -ceq 'invalid-json') {
 [Console]::Error.Write('fixture native failure stderr ' + ('x' * 5000))
 exit 17
 '@, [Text.UTF8Encoding]::new($false))
-        $pwshPath = (Get-Command pwsh.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path
-        $fixtureCommand = Join-Path $TestDrive 'native-skillspector-fixture.cmd'
-        $commandText = '@echo off' + "`r`n" +
-            '"' + $pwshPath + '" -NoLogo -NoProfile -NonInteractive -File "' + $fixtureScript + '" %*' + "`r`n" +
-            'exit /b %ERRORLEVEL%' + "`r`n"
-        [IO.File]::WriteAllText($fixtureCommand, $commandText, [Text.ASCIIEncoding]::new())
-        $script:FixtureCommand = $fixtureCommand
+        # The forwarding command is a .cmd file on Windows and an executable sh script elsewhere.
+        $fixtureCommandBase = Join-Path $TestDrive 'native-skillspector-fixture'
+        $script:FixtureCommand = New-TestPowerShellScriptCommand -Path $fixtureCommandBase -ScriptPath $fixtureScript
     }
 
     AfterAll {
@@ -77,7 +74,8 @@ exit 17
     }
 
     It 'InterT20_WritesNativeStdoutAndStderrToNewFiles' {
-        $caseRoot = Join-Path $TestDrive 'valid-case'
+        # Native output roots must not have link ancestors, so use the physical TestDrive path.
+        $caseRoot = Join-Path (Resolve-TestPhysicalPath -Path $TestDrive) 'valid-case'
         [void][IO.Directory]::CreateDirectory($caseRoot)
         $reportPath = Join-Path $caseRoot 'report.json'
         $stderrPath = Join-Path $caseRoot 'stderr.txt'
@@ -102,7 +100,8 @@ exit 17
     }
 
     It 'InterT30_IncludesBoundedNativeStderrWhenTheProcessFails' {
-        $caseRoot = Join-Path $TestDrive 'failure-case'
+        # Native output roots must not have link ancestors, so use the physical TestDrive path.
+        $caseRoot = Join-Path (Resolve-TestPhysicalPath -Path $TestDrive) 'failure-case'
         [void][IO.Directory]::CreateDirectory($caseRoot)
         $reportPath = Join-Path $caseRoot 'report.json'
         $stderrPath = Join-Path $caseRoot 'stderr.txt'
@@ -124,7 +123,8 @@ exit 17
     }
 
     It 'InterT40_IncludesBoundedStderrWhenStdoutIsInvalidJson' {
-        $caseRoot = Join-Path $TestDrive 'invalid-json-case'
+        # Native output roots must not have link ancestors, so use the physical TestDrive path.
+        $caseRoot = Join-Path (Resolve-TestPhysicalPath -Path $TestDrive) 'invalid-json-case'
         [void][IO.Directory]::CreateDirectory($caseRoot)
         $reportPath = Join-Path $caseRoot 'report.json'
         $stderrPath = Join-Path $caseRoot 'stderr.txt'

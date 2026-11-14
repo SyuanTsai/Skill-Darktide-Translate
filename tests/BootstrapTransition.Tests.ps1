@@ -160,7 +160,7 @@ Describe 'Darktide bootstrap transition' {
         $transport.Extent.Text | Should -Not -Match 'ReadToEndAsync'
         foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
 
-        $powerShellPath = [string](Join-Path $PSHOME 'pwsh.exe')
+        $powerShellPath = [string](Get-TestPowerShellExecutablePath)
         $normal = Invoke-TrustedPowerShellProcess -Command $powerShellPath `
             -Arguments @('-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write("normal")') `
             -WorkingDirectory $TestDrive -Context 'bounded child'

@@ -181,7 +181,17 @@ Describe 'Darktide Translate repository contract' {
                 'scripts/Invoke-PrePushValidation.ps1',
                 'tests/CanonicalValidation.Tests.ps1',
                 'tests/StandardV1Conformance.Tests.ps1',
-                'tests/Test-Repository.Tests.ps1'
+                'tests/Test-Repository.Tests.ps1',
+                'config/pester-6.2.0-closure.lock.json',
+                'scripts/StandardSourceDriver.psm1',
+                'scripts/StandardWorkflowLeg.psm1',
+                'scripts/Invoke-SourceChild.ps1',
+                'scripts/Invoke-CorePester.ps1',
+                'scripts/CorePesterIntegrity.psm1',
+                'scripts/Prepare-PesterRuntime.ps1',
+                'scripts/Prepare-WorkflowPowerShell.ps1',
+                'tests/CorePesterIntegrity.Tests.ps1',
+                'tests/StandardSourceDriver.Tests.ps1'
             )
         }
 
@@ -414,7 +424,7 @@ Describe 'Trusted filesystem contract' {
         $after | Should -Not -Be $before
     }
 
-    # Scenario: A Windows installed closure contains a junction.
+    # Scenario: An installed closure contains a junction (Windows) or a directory symlink (Linux/macOS).
     # Purpose: Reject reparse points before their contents can enter a trusted closure digest.
     It 'InterT80_RejectsWindowsReparsePointsInInstalledClosures' {
         $root = Join-Path $TestDrive 'linked-closure'
@@ -422,7 +432,7 @@ Describe 'Trusted filesystem contract' {
         [void](New-Item -ItemType Directory -Path $target -Force)
         [IO.File]::WriteAllText((Join-Path $target 'payload'), 'fixture')
         $link = Join-Path $root 'link'
-        [void](New-Item -ItemType Junction -Path $link -Target $target)
+        [void](New-TestReparsePoint -Path $link -Target $target)
         { & $script:FilesystemModules['scripts/Validate.ps1'] {
             param($root)
             Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Windows reparse fixture'

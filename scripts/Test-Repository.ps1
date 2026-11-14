@@ -8,7 +8,8 @@ param(
     [string] $OutputPath,
     [string] $TrustedGitPath,
     [switch] $BootstrapTransition,
-    [switch] $NoFilters
+    [switch] $NoFilters,
+    [switch] $ReadOnlySnapshot
 )
 
 Set-StrictMode -Version Latest
@@ -100,8 +101,10 @@ function Invoke-ProfileCatalogValidation {
     }
 
     Assert-ExactPropertySet -Value $skill.compatibility -Expected @('platforms', 'shells', 'requiredCapabilities', 'anyOfCapabilities') -Context 'catalog/profiles.json Skill compatibility'
-    if ($skill.compatibility.platforms -isnot [array] -or @($skill.compatibility.platforms).Count -ne 1 -or
-        [string]@($skill.compatibility.platforms)[0] -cne 'windows' -or
+    # Accept the current Windows-only declaration and the exact three-platform
+    # declaration that the cross-platform adoption publishes.
+    $platformDeclaration = if ($skill.compatibility.platforms -is [array]) { (@($skill.compatibility.platforms | ForEach-Object { if ($_ -is [string]) { [string]$_ } else { '<invalid>' } }) -join ',') } else { '<invalid>' }
+    if ($platformDeclaration -cnotin @('windows', 'windows,linux,macos') -or
         $skill.compatibility.shells -isnot [array] -or @($skill.compatibility.shells).Count -ne 1 -or
         [string]@($skill.compatibility.shells)[0] -cne 'pwsh>=7') {
         throw 'Profile catalog Skill platform compatibility is invalid.'
@@ -652,6 +655,32 @@ function Get-ContentInventory {
     }
     if ($pathToFile.Count -eq 0) { throw "Skill '$SkillId' has an empty package inventory." }
 
+    if ($script:ReadOnlySnapshot) {
+        # A Core v2 candidate snapshot is a tracked-only, .git-less export: the
+        # filesystem inventory is the tracked inventory and raw bytes are the
+        # committed bytes.
+        [string[]]$snapshotPaths = @($pathToFile.Keys)
+        [Array]::Sort($snapshotPaths, [StringComparer]::Ordinal)
+        $snapshotFiles = @()
+        $snapshotCanonical = [Text.StringBuilder]::new()
+        foreach ($path in $snapshotPaths) {
+            $rawSha256 = Get-RawFileSha256 -Path $pathToFile[$path].FullName
+            $snapshotFiles += [pscustomobject][ordered]@{ path = $path; sha256 = $rawSha256; rawSha256 = $rawSha256 }
+            [void]$snapshotCanonical.Append($path).Append("`t").Append($rawSha256).Append("`n")
+        }
+        $snapshotHasher = [Security.Cryptography.SHA256]::Create()
+        try {
+            $snapshotContentSha256 = ([BitConverter]::ToString($snapshotHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($snapshotCanonical.ToString()))) -replace '-', '').ToLowerInvariant()
+        }
+        finally { $snapshotHasher.Dispose() }
+        return [pscustomobject][ordered]@{
+            skillId = $SkillId
+            skillsRoot = $skillsRootRelative
+            contentSha256 = $snapshotContentSha256
+            files = $snapshotFiles
+        }
+    }
+
     $gitPath = $script:TrustedGitPath
     if ([string]::IsNullOrWhiteSpace($gitPath)) { throw 'Trusted Git executable was not bound before repository validation.' }
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
@@ -925,12 +954,20 @@ function Invoke-BootstrapTransitionRepositoryValidation {
     return Write-RepositoryValidationResult -Result $result -OutputPath $OutputPath -SuccessMessage 'Darktide Translate bootstrap transition repository validation passed.'
 }
 
-if ([string]::IsNullOrWhiteSpace($script:TrustedGitPath)) {
-    $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    $script:TrustedGitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+$script:ReadOnlySnapshot = [bool]$ReadOnlySnapshot
+if ($script:ReadOnlySnapshot) {
+    if ($BootstrapTransition -or $NoFilters -or -not [string]::IsNullOrWhiteSpace($TrustedGitPath)) {
+        throw '-ReadOnlySnapshot cannot be combined with -BootstrapTransition, -NoFilters or -TrustedGitPath.'
+    }
 }
-if (-not (Test-Path -LiteralPath $script:TrustedGitPath -PathType Leaf)) {
-    throw "Trusted Git executable is missing: $($script:TrustedGitPath)"
+else {
+    if ([string]::IsNullOrWhiteSpace($script:TrustedGitPath)) {
+        $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $script:TrustedGitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+    }
+    if (-not (Test-Path -LiteralPath $script:TrustedGitPath -PathType Leaf)) {
+        throw "Trusted Git executable is missing: $($script:TrustedGitPath)"
+    }
 }
 $repoRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
     [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -1052,7 +1089,7 @@ if ($adapter.authority.repository -isnot [string] -or $adapter.authority.reposit
     $adapter.authority.archiveSha256 -isnot [string] -or $adapter.authority.archiveSha256 -cnotmatch '^[0-9a-f]{64}$') {
     throw 'config/standard-v1.json authority binding is invalid.'
 }
-$requiredAuthorityPaths = @(
+$requiredAuthorityPathsV1 = @(
     'docs/standards/README.md',
     'docs/standards/managed-skill-lifecycle.md',
     'docs/standards/schemas/managed-skill-lifecycle-v1.schema.json',
@@ -1087,6 +1124,63 @@ $requiredAuthorityPaths = @(
     'scripts/platform/Linux.psm1',
     'scripts/platform/MacOS.psm1'
 )
+# The prepared Core v2 source tuple (fbdc793) binds the complete inventory the
+# central runner reads. Both tuples stay accepted so the adoption change only
+# edits repository data, never this protected reader.
+$requiredAuthorityPathsCoreV2 = @(
+    'docs/standards/README.md',
+    'docs/standards/managed-skill-lifecycle.md',
+    'docs/standards/schemas/managed-skill-lifecycle-v1.schema.json',
+    'docs/standards/schemas/openai-agent-metadata.schema.json',
+    'docs/standards/schemas/source-inventory-v2.schema.json',
+    'docs/standards/schemas/validation-security-gate-v1.schema.json',
+    'docs/standards/skill-repository-review-matrix.md',
+    'docs/standards/skill-repository-standard.md',
+    'docs/standards/upstream-interoperability.md',
+    'docs/standards/validation-security-gate.json',
+    'docs/standards/validation-toolchain.json',
+    'scripts/Invoke-StandardAuthorityGate.ps1',
+    'scripts/Resolve-PythonWheelClosure.py',
+    'scripts/Resolve-StandardValidationTool.ps1',
+    'docs/standards/schemas/standard-validation-adapter-v1.schema.json',
+    'docs/standards/schemas/standard-validation-evidence-v1.schema.json',
+    'docs/standards/standard-validation-contract-v1.json',
+    'docs/standards/pr12-source-merge-adoption.json',
+    'docs/standards/trust-anchors/human-approval-public-key.xml',
+    'docs/standards/trust-anchors/trusted-supervisor-public-key.xml',
+    'scripts/Invoke-StandardValidation.ps1',
+    'docs/standards/schemas/standard-semantic-consent-evidence-v2.schema.json',
+    'scripts/StandardSemanticBridge.psm1',
+    'docs/standards/schemas/upstream-adapter-v1.schema.json',
+    'docs/standards/upstream-adapter.json',
+    'scripts/Validate-UpstreamAdapter.ps1',
+    'docs/standards/standard-core-validation-v2.json',
+    'docs/standards/schemas/standard-core-adapter-v2.schema.json',
+    'docs/standards/schemas/standard-core-evidence-v2.schema.json',
+    'docs/standards/third-party-raw-skill-sources.md',
+    'docs/standards/schemas/third-party-raw-skill-source-v1.schema.json',
+    'docs/standards/examples/third-party-raw-skill-source-v1.json',
+    'docs/standards/skillspector-approved-sources.json',
+    'docs/standards/schemas/skillspector-approved-sources-v1.schema.json',
+    'docs/standards/static-parser-host-ownership.json',
+    'scripts/platform-runtime.psd1',
+    'scripts/platform-runtime.psm1',
+    'scripts/installer-safe-mutation.psm1',
+    'scripts/WindowsDacl.psm1',
+    'scripts/platform/PlatformNative.cs',
+    'scripts/platform/UnixNative.cs',
+    'scripts/platform/WindowsNative.cs',
+    'scripts/platform/WindowsInstallerMutation.cs',
+    'scripts/platform/OwnedProcess.cs',
+    'scripts/platform/UnixProcess.cs',
+    'scripts/platform/WindowsProcess.cs',
+    'scripts/platform/Unix.psm1',
+    'scripts/platform/RuntimePreparation.psm1',
+    'scripts/platform/Windows.psm1',
+    'scripts/platform/Linux.psm1',
+    'scripts/platform/MacOS.psm1'
+)
+$requiredAuthorityPaths = if ([string]$adapter.authority.commit -ceq 'fbdc793c1c439b15c6def97d53111f250d0ff4db') { $requiredAuthorityPathsCoreV2 } else { $requiredAuthorityPathsV1 }
 if ($adapter.authority.files -isnot [array] -or @($adapter.authority.files).Count -ne $requiredAuthorityPaths.Count) {
     throw 'config/standard-v1.json authority file inventory is incomplete.'
 }

@@ -220,4 +220,20 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $metadata | Should -Match '\$auto-update-darktide-mod'
         $metadata | Should -Not -Match 'allow_implicit_invocation: false'
     }
+
+    # Scenario: A caller selects a case alias of the installed Skill directory as the expansion destination.
+    # Purpose: Keep the outside-the-Skill exclusion case-insensitive on every host so a case alias cannot escape it.
+    It 'UnitT371_RefusesACaseVariantOutputInsideTheSkillSource' {
+        $fixtureParent = Join-Path $TestDrive 'case-variant-output'
+        New-Item -ItemType Directory -Path $fixtureParent | Out-Null
+        $fixtureRoot = Join-Path $fixtureParent 'CaseSkill'
+        Copy-Item -LiteralPath $skillRoot -Destination $fixtureRoot -Recurse
+        $caseOutput = Join-Path (Join-Path $fixtureParent 'caseskill') 'out'
+        New-Item -ItemType Directory -Path $caseOutput -Force | Out-Null
+        $fixtureExpander = Join-Path $fixtureRoot 'scripts/Expand-Schema14Reference.ps1'
+
+        { & $fixtureExpander -Document Workflow -OutputDirectory $caseOutput -PassThru } |
+            Should -Throw '*outside the Skill source*'
+        @(Get-ChildItem -LiteralPath $caseOutput -Force | Where-Object { $_.Name -like 'workflow-schema-14*' }).Count | Should -Be 0
+    }
 }

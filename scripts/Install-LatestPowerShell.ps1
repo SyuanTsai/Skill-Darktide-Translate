@@ -9,10 +9,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-if (-not $IsWindows) { throw 'Latest stable PowerShell installation requires Windows.' }
-
 $modulePath = Join-Path $PSScriptRoot 'PowerShellRelease.psm1'
 Import-Module -Name $modulePath -Force -ErrorAction Stop
+$hostPlatform = Get-PowerShellHostPlatform
+$hostArchitecture = Get-PowerShellHostArchitecture
 
 function Get-InstalledPowerShellVersion {
     [CmdletBinding()]
@@ -82,22 +82,20 @@ $release = Invoke-RestMethod `
 if ((Assert-PowerShellReleaseTagMatchesStableChannel -ExpectedTag $stableTag -Release $release) -cne $stableTag) {
     throw 'PowerShell release metadata did not match the verified Microsoft stable channel tag.'
 }
-$asset = Get-VerifiedPowerShellReleaseAsset -Release $release
+$asset = Get-VerifiedPowerShellReleaseAsset -Release $release -Platform $hostPlatform -Architecture $hostArchitecture
 if ($asset.tag -cne $stableTag) { throw 'Selected PowerShell archive does not match the verified Microsoft stable channel tag.' }
+
+$hashesManifestPath = Join-Path $installRootFullPath $asset.hashesManifest.name
+Invoke-WebRequest -Uri $asset.hashesManifest.browserDownloadUrl -OutFile $hashesManifestPath -TimeoutSec 60 -ErrorAction Stop
+$observedHashesManifestDigest = Assert-VerifiedPowerShellHashesManifest -Asset $asset -Path $hashesManifestPath
 
 $archivePath = Join-Path $installRootFullPath $asset.name
 Invoke-WebRequest -Uri $asset.browserDownloadUrl -OutFile $archivePath -TimeoutSec 180 -ErrorAction Stop
 $observedDigest = Assert-VerifiedPowerShellArchive -Asset $asset -Path $archivePath
 
 $runtimePath = Join-Path $installRootFullPath 'runtime'
-if (Test-Path -LiteralPath $runtimePath) { throw 'Run-owned PowerShell runtime extraction path already exists.' }
-Expand-Archive -LiteralPath $archivePath -DestinationPath $runtimePath -ErrorAction Stop
-$executablePath = Join-Path $runtimePath 'pwsh.exe'
-if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) { throw 'Verified PowerShell archive did not contain pwsh.exe at its root.' }
-$executable = Get-Item -LiteralPath $executablePath -Force -ErrorAction Stop
-if ($executable.PSIsContainer -or ($executable.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    throw 'Downloaded PowerShell executable is not a regular file.'
-}
+$executablePath = Expand-VerifiedPowerShellArchive -Asset $asset -ArchivePath $archivePath -DestinationPath $runtimePath
+$signature = Assert-PowerShellExecutableSignature -Path $executablePath -Platform $asset.platform
 $actualVersion = Get-InstalledPowerShellVersion -ExecutablePath $executablePath
 [void](Assert-PowerShellRuntimeVersion -Tag $asset.tag -ActualVersion $actualVersion)
 
@@ -112,8 +110,16 @@ $receipt = [pscustomobject][ordered]@{
     assetUrl = $asset.browserDownloadUrl
     publishedDigest = $asset.digest
     observedSha256 = $observedDigest
+    hashesManifestUrl = $asset.hashesManifest.browserDownloadUrl
+    hashesManifestPublishedDigest = $asset.hashesManifest.digest
+    hashesManifestObservedSha256 = $observedHashesManifestDigest
+    platform = $asset.platform
+    architecture = $asset.architecture
     executablePath = [IO.Path]::GetFullPath($executablePath)
     executableVersion = $actualVersion
+    executableAuthenticodeStatus = $signature.status
+    executableSignerSubject = $signature.signerSubject
+    executableSignerThumbprint = $signature.signerThumbprint
 }
 
 $receiptPath = Join-Path $installRootFullPath 'powershell-release.json'

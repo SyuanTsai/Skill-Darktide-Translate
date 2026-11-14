@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Run-owned workflow cleanup filesystem boundary' {
     BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $workflow = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $block = [regex]::Match($workflow,
             '(?ms)^      - name: Remove run-owned validation directory\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:|\z)')
@@ -65,7 +66,7 @@ Describe 'Run-owned workflow cleanup filesystem boundary' {
         [IO.File]::WriteAllText($sentinel, 'outside must survive')
         [IO.File]::SetAttributes($sentinel, [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Archive)
         $attributes = [IO.File]::GetAttributes($sentinel)
-        [void](New-Item -ItemType Junction -Path (Join-Path $fixture.owned 'linked') -Value $outside)
+        [void](New-TestReparsePoint -Path (Join-Path $fixture.owned 'linked') -Target $outside)
         Invoke-RunCleanupFixture -RunnerTemp $fixture.parent -RunDirectory $fixture.owned
         Test-Path -LiteralPath $fixture.owned | Should -BeFalse
         [IO.File]::ReadAllText($sentinel) | Should -BeExactly 'outside must survive'
@@ -90,7 +91,7 @@ Describe 'Run-owned workflow cleanup filesystem boundary' {
         }
         else {
             [IO.Directory]::Delete($fixture.owned)
-            [void](New-Item -ItemType Junction -Path $fixture.owned -Value $outside)
+            [void](New-TestReparsePoint -Path $fixture.owned -Target $outside)
         }
         { Invoke-RunCleanupFixture -RunnerTemp $fixture.parent -RunDirectory $run } | Should -Throw '*Refusing to remove*'
         Test-Path -LiteralPath $run | Should -BeTrue
@@ -100,6 +101,7 @@ Describe 'Run-owned workflow cleanup filesystem boundary' {
 
 Describe 'Trusted resolver API credential lifetime' {
     BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $source = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1') -Raw
         $tokens = $null; $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
@@ -159,7 +161,7 @@ Describe 'Trusted resolver API credential lifetime' {
                     $child = [Diagnostics.Process]::new()
                     try {
                         $child.StartInfo = [Diagnostics.ProcessStartInfo]::new()
-                        $child.StartInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+                        $child.StartInfo.FileName = Get-TestPowerShellExecutablePath
                         $child.StartInfo.UseShellExecute = $false
                         $child.StartInfo.CreateNoWindow = $true
                         $child.StartInfo.RedirectStandardOutput = $true
@@ -221,71 +223,113 @@ Describe 'Trusted resolver API credential lifetime' {
         }
     }
 
-    # Scenario: Preflight Git or transition validation starts a native child before the full credential sanitizer.
-    # Purpose: Exercise actual process inheritance after the validator's early body, exposing no credential value.
-    It 'UnitT05_RemovesApiCredentialsBeforePreflightNativeChildren' {
-        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true
-        $result.preflightChildCredentialFree | Should -BeTrue
-        $result.calls[0].hasGitHubToken | Should -BeTrue
-        $result.cleanAfterResolution | Should -BeTrue
+    # The v1 canonical validator is Windows-only (its early body refuses other
+    # hosts), so its credential lifetime is exercised on the native host only.
+    # Linux/macOS register the equivalent v1 refusal and the Core v2 credential
+    # scoping contract instead.
+    if ($IsWindows) {
+        # Scenario: Preflight Git or transition validation starts a native child before the full credential sanitizer.
+        # Purpose: Exercise actual process inheritance after the validator's early body, exposing no credential value.
+        It 'UnitT05_RemovesApiCredentialsBeforePreflightNativeChildren' {
+            $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true
+            $result.preflightChildCredentialFree | Should -BeTrue
+            $result.calls[0].hasGitHubToken | Should -BeTrue
+            $result.cleanAfterResolution | Should -BeTrue
+        }
+
+        # Scenario: The trusted SkillSpector resolver succeeds but leaves the API token in its parent environment.
+        # Purpose: Authenticate that API only, while retaining sanitization and excluding subsequent tool acquisitions.
+        It 'UnitT10_AuthenticatesOnlyTheTrustedSkillSpectorResolver' {
+            $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true
+            $result.failure | Should -BeNullOrEmpty
+            $result.cleanAfterSanitizer | Should -BeTrue
+            $result.calls.Count | Should -Be 4
+            $result.calls[0].tool | Should -BeExactly 'skillspector'
+            $result.calls[0].hasGitHubToken | Should -BeTrue
+            @($result.calls | Select-Object -Skip 1 | Where-Object hasGitHubToken).Count | Should -Be 0
+            @($result.calls | Where-Object hasGhToken).Count | Should -Be 0
+            $result.cleanAfterResolution | Should -BeTrue
+            $result.capturedTokenCleared | Should -BeTrue
+            $result.semanticCredentialCount | Should -Be 0
+        }
+
+        # Scenario: The trusted API resolver throws before performing its own credential removal.
+        # Purpose: Require the parent finally path to remove both environment and captured credentials.
+        It 'UnitT20_CleansCredentialsAfterAnEarlySkillSpectorResolverFailure' {
+            $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true -FailTool 'skillspector'
+            $result.failure | Should -BeExactly 'fixture resolver failure before its own cleanup'
+            $result.calls.Count | Should -Be 1
+            $result.calls[0].hasGitHubToken | Should -BeTrue
+            $result.cleanAfterSanitizer | Should -BeTrue
+            $result.cleanAfterResolution | Should -BeTrue
+            $result.capturedTokenCleared | Should -BeTrue
+        }
+
+        # Scenario: A later tool acquisition fails after the trusted API resolver returned.
+        # Purpose: Prevent a successful API request from leaking credentials into another installer or failure path.
+        It 'UnitT30_KeepsLaterResolverFailuresCredentialFree' {
+            $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true -FailTool 'skill-validator'
+            $result.failure | Should -BeExactly 'fixture resolver failure before its own cleanup'
+            $result.calls.Count | Should -Be 2
+            $result.calls[0].hasGitHubToken | Should -BeTrue
+            $result.calls[1].hasGitHubToken | Should -BeFalse
+            $result.cleanAfterResolution | Should -BeTrue
+            $result.capturedTokenCleared | Should -BeTrue
+        }
+
+        # Scenario: A fork or local validation has no read-only GitHub token.
+        # Purpose: Preserve anonymous resolution without introducing a secret or new authorization prerequisite.
+        It 'UnitT40_PreservesAnonymousResolutionWhenTheTokenIsAbsent' {
+            $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $false
+            $result.failure | Should -BeNullOrEmpty
+            $result.calls.Count | Should -Be 4
+            @($result.calls | Where-Object hasGitHubToken).Count | Should -Be 0
+            @($result.calls | Where-Object hasGhToken).Count | Should -Be 0
+            $result.cleanAfterSanitizer | Should -BeTrue
+            $result.cleanAfterResolution | Should -BeTrue
+            $result.capturedTokenCleared | Should -BeTrue
+        }
     }
 
-    # Scenario: The trusted SkillSpector resolver succeeds but leaves the API token in its parent environment.
-    # Purpose: Authenticate that API only, while retaining sanitization and excluding subsequent tool acquisitions.
-    It 'UnitT10_AuthenticatesOnlyTheTrustedSkillSpectorResolver' {
-        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true
-        $result.failure | Should -BeNullOrEmpty
-        $result.cleanAfterSanitizer | Should -BeTrue
-        $result.calls.Count | Should -Be 4
-        $result.calls[0].tool | Should -BeExactly 'skillspector'
-        $result.calls[0].hasGitHubToken | Should -BeTrue
-        @($result.calls | Select-Object -Skip 1 | Where-Object hasGitHubToken).Count | Should -Be 0
-        @($result.calls | Where-Object hasGhToken).Count | Should -Be 0
-        $result.cleanAfterResolution | Should -BeTrue
-        $result.capturedTokenCleared | Should -BeTrue
-        $result.semanticCredentialCount | Should -Be 0
-    }
+    if (-not $IsWindows) {
+        # Scenario: the v1 early body runs on a non-Windows host.
+        # Purpose: refuse before any native child, resolver, or credential handoff can start.
+        It 'UnitT05U_V1EarlyBodyRefusesNonWindowsHostsBeforeAnyCredentialUse' {
+            $module = New-Module -ScriptBlock ([scriptblock]::Create($script:CredentialFunctions))
+            $failure = & $module {
+                param($earlyBody)
+                $before = [Environment]::GetEnvironmentVariable('GITHUB_TOKEN', 'Process')
+                try {
+                    [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', 'fixture-read-only-api-token', 'Process')
+                    $toolResolutionGitHubToken = $null
+                    try { . ([scriptblock]::Create($earlyBody)); return $null } catch { return $_.Exception.Message }
+                }
+                finally { [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $before, 'Process') }
+            } $script:CredentialEarlyBody
+            $failure | Should -BeExactly 'Standard v1 validation requires Windows with PowerShell 7.'
+        }
 
-    # Scenario: The trusted API resolver throws before performing its own credential removal.
-    # Purpose: Require the parent finally path to remove both environment and captured credentials.
-    It 'UnitT20_CleansCredentialsAfterAnEarlySkillSpectorResolverFailure' {
-        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true -FailTool 'skillspector'
-        $result.failure | Should -BeExactly 'fixture resolver failure before its own cleanup'
-        $result.calls.Count | Should -Be 1
-        $result.calls[0].hasGitHubToken | Should -BeTrue
-        $result.cleanAfterSanitizer | Should -BeTrue
-        $result.cleanAfterResolution | Should -BeTrue
-        $result.capturedTokenCleared | Should -BeTrue
-    }
-
-    # Scenario: A later tool acquisition fails after the trusted API resolver returned.
-    # Purpose: Prevent a successful API request from leaking credentials into another installer or failure path.
-    It 'UnitT30_KeepsLaterResolverFailuresCredentialFree' {
-        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $true -FailTool 'skill-validator'
-        $result.failure | Should -BeExactly 'fixture resolver failure before its own cleanup'
-        $result.calls.Count | Should -Be 2
-        $result.calls[0].hasGitHubToken | Should -BeTrue
-        $result.calls[1].hasGitHubToken | Should -BeFalse
-        $result.cleanAfterResolution | Should -BeTrue
-        $result.capturedTokenCleared | Should -BeTrue
-    }
-
-    # Scenario: A fork or local validation has no read-only GitHub token.
-    # Purpose: Preserve anonymous resolution without introducing a secret or new authorization prerequisite.
-    It 'UnitT40_PreservesAnonymousResolutionWhenTheTokenIsAbsent' {
-        $result = Invoke-CredentialLifetimeFixture -Root $TestDrive -WithToken $false
-        $result.failure | Should -BeNullOrEmpty
-        $result.calls.Count | Should -Be 4
-        @($result.calls | Where-Object hasGitHubToken).Count | Should -Be 0
-        @($result.calls | Where-Object hasGhToken).Count | Should -Be 0
-        $result.cleanAfterSanitizer | Should -BeTrue
-        $result.cleanAfterResolution | Should -BeTrue
-        $result.capturedTokenCleared | Should -BeTrue
+        # Scenario: the Core v2 source setup receives a GitHub API token on Linux or macOS.
+        # Purpose: confine it to the resolver environment and remove every ambient credential.
+        It 'UnitT10U_CoreV2SetupConfinesTheApiTokenToTheResolverEnvironment' {
+            Import-Module -Name (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/StandardSourceDriver.psm1') -Force
+            $previous = @{}
+            foreach ($name in @('DT_SOURCE_SETUP_GITHUB_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN')) { $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+            try {
+                $env:DT_SOURCE_SETUP_GITHUB_TOKEN = 'fixture-read-only-api-token'; $env:GITHUB_TOKEN = 'job'; $env:GH_TOKEN = 'gh'
+                $environment = Get-DarktideSourceResolverEnvironment -IncludeSetupToken
+                $environment['STANDARD_VALIDATION_GITHUB_API_TOKEN'] | Should -BeExactly 'fixture-read-only-api-token'
+                foreach ($name in $previous.Keys) { [Environment]::GetEnvironmentVariable($name, 'Process') | Should -BeNullOrEmpty }
+            }
+            finally {
+                foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process') }
+            }
+        }
     }
 }
-
 Describe 'Workflow resolver credential handoff' {
     BeforeAll {
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $workflow = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $block = [regex]::Match($workflow,
             '(?ms)^      - name: Validate exact commit with verified PowerShell\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:)')
@@ -328,7 +372,7 @@ Describe 'Workflow resolver credential handoff' {
                     $child = [Diagnostics.Process]::new()
                     try {
                         $child.StartInfo = [Diagnostics.ProcessStartInfo]::new()
-                        $child.StartInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+                        $child.StartInfo.FileName = Get-TestPowerShellExecutablePath
                         $child.StartInfo.UseShellExecute = $false
                         $child.StartInfo.CreateNoWindow = $true
                         $child.StartInfo.RedirectStandardOutput = $true
@@ -354,7 +398,7 @@ exit ([int]$env:WORKFLOW_FIXTURE_EXIT)
                     [IO.File]::WriteAllText((Join-Path $repositoryRoot 'scripts/Validate.ps1'), $fixture,
                         [Text.UTF8Encoding]::new($false))
                     [Environment]::SetEnvironmentVariable('WORKFLOW_FIXTURE_EXIT', [string]$validatorExit, 'Process')
-                    $powerShellPath = Join-Path $PSHOME 'pwsh.exe'
+                    $powerShellPath = Get-TestPowerShellExecutablePath
                     $runDirectory = $root; $reportPath = Join-Path $root 'credential-booleans.json'
                     $baseCommit = ('a' * 40); $checkoutHead = ('b' * 40); $expectedGoRuntimeVersion = 'fixture-runtime'
                     . ([scriptblock]::Create($invocation))

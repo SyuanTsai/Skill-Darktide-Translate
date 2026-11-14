@@ -11,6 +11,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $resolvedRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 
+function Resolve-PhysicalRepositoryPath {
+    param([Parameter(Mandatory = $true)] [string] $Path)
+
+    # Resolve every existing link component on both sides so that a logical
+    # alias (for example macOS /var -> /private/var) compares equal to the
+    # physical path Git reports.
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $current = [IO.Path]::GetPathRoot($fullPath)
+    $segments = @($fullPath.Substring($current.Length).Split([IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries))
+    foreach ($segment in $segments) {
+        $candidate = Join-Path $current $segment
+        $target = [IO.Directory]::ResolveLinkTarget($candidate, $true)
+        $current = if ($null -eq $target) { $candidate } else { [IO.Path]::GetFullPath($target.FullName) }
+    }
+    if ($current.Length -gt [IO.Path]::GetPathRoot($current).Length) {
+        $current = $current.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    }
+    return $current
+}
+
 function Invoke-GitText {
     param([Parameter(Mandatory = $true)] [string[]] $Arguments)
 
@@ -22,8 +42,10 @@ function Invoke-GitText {
 }
 
 $gitRoot = @(Invoke-GitText -Arguments @('rev-parse', '--show-toplevel'))[0].Trim()
-$resolvedGitRoot = (Resolve-Path -LiteralPath $gitRoot).Path
-if (-not $resolvedGitRoot.Equals($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+$physicalGitRoot = Resolve-PhysicalRepositoryPath -Path (Resolve-Path -LiteralPath $gitRoot).Path
+$physicalRoot = Resolve-PhysicalRepositoryPath -Path $resolvedRoot
+$pathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+if (-not $physicalGitRoot.Equals($physicalRoot, $pathComparison)) {
     throw 'RepositoryRoot must be the Git repository root.'
 }
 

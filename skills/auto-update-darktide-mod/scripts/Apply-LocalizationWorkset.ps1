@@ -174,7 +174,7 @@ function Assert-NoReparsePath {
             $current = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $currentPath -Label 'Workset NEW localization') {
+            if (Test-PortableReparseItem -Path $currentPath -Label 'Workset NEW localization' -TrustedRoot $rootFull) {
                 throw 'Workset NEW localization path contains a symlink or reparse point.'
             }
             throw
@@ -182,7 +182,7 @@ function Assert-NoReparsePath {
         catch {
             throw ('Unable to inspect Workset NEW localization physical containment component: {0}' -f $_.Exception.Message)
         }
-        if (Test-PortableReparseItem -Path $currentPath -Item $current -Label 'Workset NEW localization') {
+        if (Test-PortableReparseItem -Path $currentPath -Item $current -Label 'Workset NEW localization' -TrustedRoot $rootFull) {
             throw 'Workset NEW localization path contains a symlink or reparse point.'
         }
         if ($currentPath.Equals($rootFull, $comparison)) { return }

@@ -56,10 +56,10 @@ if ($resolvedCommit -notmatch '^[0-9a-f]{40}$') {
     throw "Ref '$Ref' did not resolve to a full commit SHA."
 }
 
-$treeLines = @(
-    Invoke-GitText -Arguments @('ls-tree', '-r', '--full-tree', $resolvedCommit) |
-        Sort-Object -CaseSensitive
-)
+# Order tree records by ordinal UTF-16 code units so the content hash does not
+# depend on the host culture or platform collation.
+[string[]]$treeLines = @(Invoke-GitText -Arguments @('ls-tree', '-r', '--full-tree', $resolvedCommit))
+[Array]::Sort($treeLines, [StringComparer]::Ordinal)
 if ($treeLines.Count -eq 0) {
     throw "Ref '$Ref' contains no tracked files."
 }

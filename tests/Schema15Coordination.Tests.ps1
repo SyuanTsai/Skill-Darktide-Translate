@@ -383,4 +383,40 @@ finally {
             }
         }
     }
+
+    # Scenario: A coordination lease is published and released, then an unowned empty lease directory appears at the lease name.
+    # Purpose: Record the actual platform and lock primitive as evidence, and never publish over an unowned directory that Unix rename could replace.
+    It 'InterT370_RecordsLockEvidenceAndRefusesAnUnownedEmptyLeaseDirectory' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'lock-evidence-repository'
+        $receiptRoot = Join-Path $repository 'receipts'
+        New-Item -ItemType Directory -Path $receiptRoot -Force | Out-Null
+        $expectedPlatform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+        $expectedPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'evidence-run' -ReceiptRoot $receiptRoot -TimeoutSeconds 10
+        $lease.platform | Should -BeExactly $expectedPlatform
+        $lease.lockPrimitive | Should -BeExactly $expectedPrimitive
+        $receipt = Exit-SharedCoordinationLease -Lease $lease
+        $receiptValue = Get-Content -LiteralPath $receipt.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $receiptValue.platform | Should -BeExactly $expectedPlatform
+        $receiptValue.lockPrimitive | Should -BeExactly $expectedPrimitive
+        $receiptValue.disposition | Should -BeExactly 'released'
+
+        $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks'
+        $guardPath = Join-Path $lockRoot 'git-coordination.owner-update.guard'
+        Test-Path -LiteralPath $guardPath -PathType Leaf | Should -BeTrue -Because 'the vendored lock keeps a fixed guard inode'
+        $emptyLease = Join-Path $lockRoot 'git-coordination.lock'
+        New-Item -ItemType Directory -Path $emptyLease | Out-Null
+        { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'second-run' -TimeoutSeconds 2 } |
+            Should -Throw '*Shared coordination path is missing*'
+        Test-Path -LiteralPath $emptyLease -PathType Container | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $emptyLease -Force).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath $lockRoot -Force -Directory | Where-Object { $_.Name -like '.pending-*' }).Count | Should -Be 0
+
+        $coordination = Get-Content -LiteralPath $coordinationModule -Raw
+        $coordination | Should -Match '(?s)if \(Test-Path -LiteralPath \$lockPath\) \{\s*throw \[IO\.IOException\]::new\(''The coordination lease appeared before publication\.''\)\s*\}\s*\[IO\.Directory\]::Move\(\$prepared, \$lockPath\)\s*\$published = Get-Content -LiteralPath \(Join-Path \$lockPath ''owner\.json''\)'
+        $coordination | Should -Match '\[string\]\$published\.token -cne \$token'
+        $coordination | Should -Not -Match 'FileShare\]::None'
+    }
 }

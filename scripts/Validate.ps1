@@ -34,12 +34,32 @@ param(
     [string] $PesterProxyWorkingDirectory,
     [string] $PesterProxyDiagnosticRoot,
     [string] $PesterProxyChildWritableRoot,
-    [string] $PesterProxyReadOnlyPathsJson
+    [string] $PesterProxyReadOnlyPathsJson,
+    [int] $AdapterVersion = 1,
+    [switch] $PrepareSourceTools,
+    [switch] $SourceValidation,
+    [string] $SourceToolsPath,
+    [string] $AuthorityRepositoryRoot,
+    [string] $TrustedToolRoot,
+    [int] $TimeoutSeconds = 900
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:IsWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+# Core v2 source purposes are dispatched before the v1 Windows-only gate and
+# before any v1 native type is compiled, so they load on Linux and macOS.
+if (@($PSBoundParameters.Keys | Where-Object {
+            $_ -cin @('AdapterVersion', 'PrepareSourceTools', 'SourceValidation', 'SourceToolsPath', 'AuthorityRepositoryRoot', 'TrustedToolRoot', 'TimeoutSeconds')
+        }).Count -gt 0) {
+    Import-Module -Name (Join-Path $PSScriptRoot 'StandardSourceDriver.psm1') -Force -ErrorAction Stop
+    if (-not ($PrepareSourceTools -or $SourceValidation)) {
+        [void](Resolve-DarktideSourceRoute -AdapterVersion $AdapterVersion -BoundParameters $PSBoundParameters)
+        throw 'Core v2 parameters require -PrepareSourceTools or -SourceValidation.'
+    }
+    $sourceResult = @(Invoke-DarktideSourceEntryPoint -BoundParameters $PSBoundParameters -DefaultArtifactsRoot $ArtifactsRoot)
+    if ($sourceResult.Count -eq 0 -or $sourceResult[-1] -isnot [int]) { throw 'Core v2 source purpose did not return an exit code.' }
+    exit [int]$sourceResult[-1]
+}$script:IsWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 if (-not $script:IsWindowsHost) {
     throw 'Standard v1 validation requires Windows with PowerShell 7.'
 }
