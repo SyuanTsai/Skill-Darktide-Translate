@@ -119,7 +119,7 @@ jobs:
           foreach ($path in @($ownedRoot, $artifactsRoot)) {
             if (Test-Path -LiteralPath $path) { throw "Run-owned root unexpectedly exists: $path" }
           }
-          foreach ($path in @($ownedRoot, $artifactsRoot, $runtimeRoot, $powerShellCacheRoot,
+          foreach ($path in @($ownedRoot, $artifactsRoot, $powerShellCacheRoot,
               $pesterCacheRoot, $pesterResultsRoot, $sourceArtifactsRoot)) {
             [void](New-Item -ItemType Directory -Path $path -ErrorAction Stop)
           }
@@ -190,6 +190,7 @@ jobs:
           S8_MATRIX_ARCHITECTURE: ${{ matrix.architecture }}
           S8_MATRIX_EXECUTABLE: ${{ matrix.executable }}
           S8_MATRIX_ASSET_TEMPLATE: ${{ matrix.assetTemplate }}
+          DT_GITHUB_API_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           & (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-WorkflowPowerShell.ps1') -Mode Resolve `
