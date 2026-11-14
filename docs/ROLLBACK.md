@@ -23,6 +23,12 @@ Version 0.2.x cannot resume a Schema 15 state. Restore an exact compatible 0.3.x
 
 Create a new commit that restores the previous behavior and publish a new patch version. Never move or overwrite an existing release tag.
 
+## K1 coordination-lease rollback
+
+Version 0.4.0 changes shared coordination and MOD reservation leases from the legacy `.locks/<id>/` directory layout to immutable-receipt single-file leases with token-bound acquire, heartbeat, and release operations. The runtime deliberately treats an existing legacy lease directory as held with unknown ownership and fails closed; it never deletes, converts, or reuses that directory automatically.
+
+Before rolling back or forward across this format boundary, stop every process that can use the affected Skill state. Preserve the legacy directory as evidence, verify independently that no owner is active, and have an operator move it to a separately retained migration archive outside the live `.locks` namespace. Do not rename its contents into the new lease file or synthesize a released receipt. Resume only after the live lease path is absent and all participants run the same pinned Skill version. If ownership cannot be established, leave the state stopped and retain the directory for manual recovery.
+
 ## Safe fallback
 
 If the pinned Workflow, Review Baseline, Schema 15 extension, package binding, source commit, or content hash cannot be verified, treat the Skill as unavailable for new claims. Preserve existing run state, source archives, receipts, acquisition records, reservations, worktrees, branches, PRs, and evidence until the original tuple can be restored.

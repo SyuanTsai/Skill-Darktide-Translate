@@ -216,6 +216,7 @@ Rolling back the Skill itself means restoring a previous immutable `darktide-tra
 
 ## Known limitations
 
+- The vendored platform runtime is loaded by path after its registry-bound bytes have been hashed, so replacement remains theoretically possible between verification and module loading. An actor able to exploit that interval can already modify the Skill installation's verifiers (`PathSafety.psm1` or `mod-update.ps1`), so the interval grants no additional capability within this threat model. Immediately after loading, the runtime inventory and every source file are revalidated with `SingleLink` identity checks; any mismatch fails closed. Keep the Skill installation directory writable only by its owning user.
 - Only ZIP archives are accepted by the deterministic extractor.
 - Nexus identity remains receipt-verified. Translation wording is Agent-supplied only for Schema 15 `AI_REQUIRED` units or Schema 14 approved spans; scripts do not log in, bypass CAPTCHA, scrape credentials, or invent translations.
 - The runner assumes one canonical MOD directory and one repository-local `main` base. Conflicting or multi-root archives stop.

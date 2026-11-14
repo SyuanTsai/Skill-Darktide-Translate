@@ -118,6 +118,11 @@ function Get-Sha256Bytes {
     finally { $hasher.Dispose() }
 }
 
+function Get-ModReservationActorToken {
+    param([Parameter(Mandatory)][string] $Value)
+    (Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($Value))).Substring(0, 32)
+}
+
 function Get-FileSha256 {
     param([Parameter(Mandatory)][string] $Path)
     Update-ActiveReservationHeartbeat -Force
@@ -570,7 +575,7 @@ function Assert-NoReparsePath {
     $testReparse = {
         param([string] $CandidatePath, [AllowNull()][object] $CandidateItem)
         if ($null -ne $reparseCommand) {
-            return [bool](Test-PortableReparseItem -Path $CandidatePath -Item $CandidateItem -Label $Label)
+            return [bool](Test-PortableReparseItem -Path $CandidatePath -Item $CandidateItem -Label $Label -TrustedRoot $rootFull)
         }
         # The immutable legacy tests extract this function without its module
         # scope.  Preserve the same fail-closed provider/link inspection here
@@ -588,6 +593,11 @@ function Assert-NoReparsePath {
             }
             return $false
         }
+        # Same rule as PathSafety: on Unix-like hosts the raw ancestor walk
+        # stops at the trusted root, so operating-system aliases above it
+        # (for example macOS /var -> /private/var) are not managed-path links.
+        $fallbackIsWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+        $fallbackStopComparison = if ($fallbackIsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
         $probe = [IO.Path]::GetFullPath($CandidatePath)
         for ($probeDepth = 0; $probeDepth -lt 2048; $probeDepth++) {
             foreach ($info in @([IO.FileInfo]::new($probe), [IO.DirectoryInfo]::new($probe))) {
@@ -599,8 +609,9 @@ function Assert-NoReparsePath {
                     throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]($_.Exception.Message)))
                 }
             }
+            if (-not $fallbackIsWindows -and $probe.Equals($rootFull, $fallbackStopComparison)) { break }
             $parent = [IO.DirectoryInfo]::new($probe).Parent
-            if ($null -eq $parent -or $parent.FullName.Equals($probe, [StringComparison]::OrdinalIgnoreCase)) { break }
+            if ($null -eq $parent -or $parent.FullName.Equals($probe, $fallbackStopComparison)) { break }
             $probe = $parent.FullName
         }
         $false
@@ -651,7 +662,7 @@ function Assert-NoReparseTree {
     Update-ActiveReservationHeartbeat -Force
     Get-ChildItem -LiteralPath $treeFull -Recurse -Force | ForEach-Object {
         $item = $_
-        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label $Label) {
+        if (Test-PortableReparseItem -Path $item.FullName -Item $item -Label $Label -TrustedRoot $treeFull) {
             throw "$Label contains a symlink or reparse point."
         }
         Update-ActiveReservationHeartbeat
@@ -740,10 +751,28 @@ function Get-ModReservationOwnerPath {
     )
     $lockFull = [IO.Path]::GetFullPath($ModLockPath)
     $repositoryFull = [IO.Path]::GetFullPath($Repository)
-    $null = Assert-NoReparsePath -Path $lockFull -Root $repositoryFull -Label 'MOD reservation'
-    $ownerPath = Join-Path $lockFull 'owner.json'
-    $null = Assert-NoReparsePath -Path $ownerPath -Root $repositoryFull -Label 'MOD reservation owner' -AllowMissing:$AllowMissingOwner
-    $ownerPath
+    $null = Assert-NoReparsePath -Path $lockFull -Root $repositoryFull -Label 'MOD reservation owner' -AllowMissing:$AllowMissingOwner
+    $lockFull
+}
+
+function Get-ModReservationSnapshot {
+    param(
+        [Parameter(Mandatory)][string] $ModLockPath,
+        [Parameter(Mandatory)][string] $Repository
+    )
+    $ownerPath = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository -AllowMissingOwner
+    $lockRoot = Split-Path -Parent $ownerPath
+    $leaf = [IO.Path]::GetFileName($ownerPath)
+    $migration = "Legacy MOD reservation directory format detected at '$ownerPath'. Stop all workers, move this directory to a preserved evidence location outside .locks, verify the original path is absent, then rerun. Automatic deletion or migration is forbidden."
+    $snapshot = Get-PortableLeaseFileState -ParentPath $lockRoot -Leaf $leaf -AllowMissing -LegacyDirectoryMessage $migration
+    if ([bool]$snapshot.exists) {
+        try {
+            $snapshot['value'] = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$snapshot.bytes) |
+                ConvertFrom-Json -AsHashtable
+        }
+        catch { throw 'MOD identity lock owner is unreadable.' }
+    }
+    $snapshot
 }
 
 function Read-ModReservationOwner {
@@ -751,9 +780,9 @@ function Read-ModReservationOwner {
         [Parameter(Mandatory)][string] $ModLockPath,
         [Parameter(Mandatory)][string] $Repository
     )
-    $ownerPath = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository
-    if (-not (Test-Path -LiteralPath $ownerPath -PathType Leaf)) { throw 'MOD identity lock owner is missing.' }
-    Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+    $snapshot = Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository
+    if (-not [bool]$snapshot.exists) { throw 'MOD identity lock owner is missing.' }
+    $snapshot.value
 }
 
 function Write-ModReservationOwner {
@@ -765,22 +794,33 @@ function Write-ModReservationOwner {
         [AllowNull()][string] $ExpectedWorkerToken
     )
     $ownerPath = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository -AllowMissingOwner
-    $ownerExists = Test-Path -LiteralPath $ownerPath -PathType Leaf
+    $snapshot = Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository
+    $ownerExists = [bool]$snapshot.exists
     $guardStream = $null
     try {
+        $guardRepository = [IO.Path]::GetFullPath($Repository)
+        $lockRoot = Split-Path -Parent $ownerPath
+        $guardRelativeDirectory = [IO.Path]::GetRelativePath($guardRepository, $lockRoot)
+        $guardLeaf = ([IO.Path]::GetFileName($ownerPath) + '.owner-update.guard')
+        try {
+            $guardParameters = @{
+                Root = $guardRepository
+                RelativeDirectory = $guardRelativeDirectory
+                Leaf = $guardLeaf
+                TimeoutMilliseconds = 2000
+                Label = 'MOD owner update guard'
+            }
+            $guardStream = Enter-PortableFileLock @guardParameters
+        }
+        catch [TimeoutException] { $guardStream = $null }
+        if (-not $guardStream) { throw 'Unable to acquire the short MOD owner update guard.' }
+        $snapshot = Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository
+        $ownerExists = [bool]$snapshot.exists
         if ($ownerExists) {
             if ([string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
                 throw 'Updating an existing MOD reservation requires its current reservation token.'
             }
-            $guardPath = Join-Path ([IO.Path]::GetFullPath($ModLockPath)) 'owner-update.guard'
-            for ($attempt = 0; $attempt -lt 80 -and -not $guardStream; $attempt++) {
-                try {
-                    $guardStream = [IO.File]::Open($guardPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-                }
-                catch [IO.IOException] { [Threading.Thread]::Sleep(25) }
-            }
-            if (-not $guardStream) { throw 'Unable to acquire the short MOD owner update guard.' }
-            $current = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+            $current = $snapshot.value
             if ([string]$current.reservationToken -cne $ExpectedReservationToken -or
                 [string]$current.workerToken -cne [string]$ExpectedWorkerToken) {
                 throw 'MOD reservation ownership changed before its owner update.'
@@ -789,9 +829,11 @@ function Write-ModReservationOwner {
         elseif (-not [string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
             throw 'MOD reservation owner disappeared before its guarded update.'
         }
-        Write-AtomicJson -Path $ownerPath -Value $Value -SkipReservationCheck
-        $null = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository
-        $written = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 30 -Compress) + "`n")
+        $transactionId = ([IO.Path]::GetFileNameWithoutExtension($ownerPath) -replace '[^0-9a-f]', '').PadRight(32, '0').Substring(0, 32)
+        $null = Publish-PortableLeaseFile -ParentPath (Split-Path -Parent $ownerPath) -Leaf ([IO.Path]::GetFileName($ownerPath)) `
+            -Bytes $bytes -ExpectedState $snapshot -TransactionId $transactionId -NoReplace:(-not $ownerExists)
+        $written = (Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository).value
         if ([string]$written.reservationToken -cne [string]$Value.reservationToken -or
             [string]$written.workerToken -cne [string]$Value.workerToken) {
             throw 'MOD reservation owner write did not preserve its guarded token tuple.'
@@ -800,6 +842,36 @@ function Write-ModReservationOwner {
     finally {
         if ($guardStream) { $guardStream.Dispose() }
     }
+}
+
+function Get-ModReservationReleaseReceipt {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string] $OwnerToken,
+        [switch] $Publish
+    )
+    $ownerPath = Get-ModReservationOwnerPath -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) -AllowMissingOwner
+    $parent = Split-Path -Parent $ownerPath
+    $leaf = ([IO.Path]::GetFileName($ownerPath) + ".released-$OwnerToken.json")
+    $value = [ordered]@{
+        schemaVersion = 1
+        disposition = 'released'
+        runId = [string]$State.runId
+        modLockKey = [string]$State.modLockKey
+        ownerToken = $OwnerToken
+    }
+    [byte[]]$bytes = [Text.UTF8Encoding]::new($false).GetBytes(($value | ConvertTo-Json -Depth 10 -Compress) + "`n")
+    $snapshot = Get-PortableLeaseFileState -ParentPath $parent -Leaf $leaf -AllowMissing
+    if ([bool]$snapshot.exists) {
+        if ([Convert]::ToHexString([byte[]]$snapshot.bytes) -cne [Convert]::ToHexString($bytes)) {
+            throw 'MOD reservation terminal receipt belongs to another owner token or tuple.'
+        }
+        return [ordered]@{ path = Join-Path $parent $leaf; sha256 = [string]$snapshot.sha256; value = $value }
+    }
+    if (-not $Publish) { throw 'MOD reservation terminal receipt is missing.' }
+    $transactionId = (Get-ModReservationActorToken -Value "release-receipt:$leaf")
+    $result = Publish-PortableLeaseFile -ParentPath $parent -Leaf $leaf -Bytes $bytes -ExpectedState $snapshot -TransactionId $transactionId -NoReplace
+    [ordered]@{ path = Join-Path $parent $leaf; sha256 = [string]$result.state.sha256; value = $value }
 }
 
 function Get-CurrentProcessIdentity {
@@ -820,7 +892,7 @@ function Test-ProcessIdentityActive {
     }
     try {
         $process = Get-Process -Id ([int]$Owner[$ProcessIdField]) -ErrorAction Stop
-        $process.StartTime.ToUniversalTime().Ticks -eq [int64]$Owner[$ProcessStartField]
+        Test-CoordinationProcessStartMatch -ActualTicks $process.StartTime.ToUniversalTime().Ticks -ExpectedTicks ([int64]$Owner[$ProcessStartField])
     }
     catch { $false }
 }
@@ -1813,7 +1885,7 @@ function Assert-LockOwner {
         throw 'MOD identity lock path differs from the canonical reservation tuple.'
     }
     $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository $repository
-    foreach ($field in @('runId', 'canonicalModRelativePath', 'modLockKey', 'plannedStatePath', 'statePath', 'reservationToken', 'leaseMode')) {
+    foreach ($field in @('runId', 'canonicalModRelativePath', 'modLockKey', 'plannedStatePath', 'statePath', 'reservationToken', 'leaseMode', 'state', 'expiresAt', 'platform', 'lockPrimitive')) {
         if (-not $owner.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$owner[$field])) { throw "MOD identity lock owner is missing $field." }
     }
     $statePathFull = [IO.Path]::GetFullPath([string]$State.statePath)
@@ -1824,7 +1896,11 @@ function Assert-LockOwner {
         [IO.Path]::GetFullPath([string]$owner.statePath) -cne $statePathFull) {
         throw 'MOD identity lock does not belong to this same run tuple.'
     }
-    if ([int]$owner.schemaVersion -ne 2 -or [string]$owner.reservationToken -notmatch '^[0-9a-f]{32}$' -or
+    if ([int]$owner.schemaVersion -ne 3 -or [string]$owner.state -cne 'held' -or
+        [string]$owner.platform -notin @('windows', 'linux', 'macos') -or
+        ([string]$owner.platform -ceq 'windows' -and [string]$owner.lockPrimitive -cne 'windows-fileshare') -or
+        ([string]$owner.platform -in @('linux', 'macos') -and [string]$owner.lockPrimitive -cne 'flock') -or
+        [string]$owner.reservationToken -notmatch '^[0-9a-f]{32}$' -or
         [string]$owner.leaseMode -notin @('active', 'reserved')) {
         throw 'MOD identity lock owner contract is invalid.'
     }
@@ -1868,7 +1944,21 @@ function Enter-ModReservationWorker {
     $reservationToken = [string]$owner.reservationToken
     $previousWorkerToken = [string]$owner.workerToken
     $identity = Get-CurrentProcessIdentity
+    $intendedWorkerToken = Get-ModReservationActorToken -Value ("worker:{0}:{1}:{2}:{3}" -f $reservationToken, $identity.machineName, $identity.processId, $identity.processStartTicks)
     $sameWorker = Test-ReservationLeaseMatchesOwner -Lease $script:activeReservationLease -Owner $owner
+
+    if ([string]$owner.leaseMode -ceq 'active' -and [string]$owner.workerToken -ceq $intendedWorkerToken -and
+        [string]$owner.machineName -ceq [string]$identity.machineName -and [int]$owner.workerId -eq [int]$identity.processId -and
+        [int64]$owner.workerProcessStartTicks -eq [int64]$identity.processStartTicks) {
+        $script:activeReservationLease = [ordered]@{
+            modLockPath = [string]$State.modLockPath; repositoryRoot = [string]$State.repositoryRoot
+            runId = [string]$State.runId; reservationToken = $reservationToken; workerToken = $intendedWorkerToken
+            machineName = $identity.machineName; workerId = $identity.processId; workerProcessStartTicks = $identity.processStartTicks
+            lastHeartbeatUtc = [DateTimeOffset]$owner.heartbeat
+        }
+        $script:activeReservationState = $State
+        return
+    }
 
     if ([string]$owner.leaseMode -ceq 'active' -and -not $sameWorker) {
         foreach ($field in @('machineName', 'workerId', 'workerProcessStartTicks', 'workerToken', 'heartbeat')) {
@@ -1889,7 +1979,8 @@ function Enter-ModReservationWorker {
         if (-not $heartbeatValid -or $sameMachineWorkerActive -or ([DateTimeOffset]::UtcNow - $heartbeat).TotalMinutes -le 30) {
             throw 'The same run reservation still has an active worker; reattachment requires a stale heartbeat and a dead process identity.'
         }
-        $historyRoot = Join-Path ([string]$State.modLockPath) 'owner-history'
+        $historyRoot = Join-Path (Split-Path -Parent ([string]$State.modLockPath)) `
+            ('.owner-history/' + [IO.Path]::GetFileNameWithoutExtension([string]$State.modLockPath))
         New-Item -ItemType Directory -Path $historyRoot -Force | Out-Null
         $historyPath = Join-Path $historyRoot ("stale-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))-$([guid]::NewGuid().ToString('N')).json")
         Write-AtomicJson -Path $historyPath -Value $owner
@@ -1901,13 +1992,16 @@ function Enter-ModReservationWorker {
         }
     }
 
-    if (-not $sameWorker) { $owner.workerToken = [guid]::NewGuid().ToString('N') }
+    if (-not $sameWorker) {
+        $owner.workerToken = $intendedWorkerToken
+    }
     $owner.machineName = $identity.machineName
     $owner.workerId = $identity.processId
     $owner.workerProcessStartTicks = $identity.processStartTicks
     $owner.leaseMode = 'active'
     $owner.reservationState = 'running'
     $owner.heartbeat = Get-UtcTimestamp
+    $owner.expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
     Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) -Value $owner -ExpectedReservationToken $reservationToken -ExpectedWorkerToken $previousWorkerToken
     $script:activeReservationLease = [ordered]@{
         modLockPath = [string]$State.modLockPath
@@ -1975,9 +2069,24 @@ function Update-ActiveReservationHeartbeat {
     if (-not (Test-ReservationLeaseMatchesOwner -Lease $lease -Owner $owner)) {
         throw 'MOD reservation ownership changed after this worker acquired its immutable lease.'
     }
-    $owner.heartbeat = Get-UtcTimestamp
+    if (-not $lease.Contains('pendingHeartbeat')) {
+        $lease.pendingHeartbeat = Get-UtcTimestamp
+        $lease.pendingExpiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
+    }
+    $observedHeartbeat = [DateTimeOffset]::ParseExact([string]$owner.heartbeat, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    $targetHeartbeat = [DateTimeOffset]::ParseExact([string]$lease.pendingHeartbeat, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    if ($observedHeartbeat -ge $targetHeartbeat) {
+        $lease.Remove('pendingHeartbeat')
+        $lease.Remove('pendingExpiresAt')
+        $lease.lastHeartbeatUtc = $observedHeartbeat
+        return
+    }
+    $owner.heartbeat = [string]$lease.pendingHeartbeat
+    $owner.expiresAt = [string]$lease.pendingExpiresAt
     Write-ModReservationOwner -ModLockPath ([string]$lease.modLockPath) -Repository ([string]$lease.repositoryRoot) -Value $owner -ExpectedReservationToken ([string]$lease.reservationToken) -ExpectedWorkerToken ([string]$lease.workerToken)
-    $lease.lastHeartbeatUtc = [DateTimeOffset]::UtcNow
+    $lease.lastHeartbeatUtc = $targetHeartbeat
+    $lease.Remove('pendingHeartbeat')
+    $lease.Remove('pendingExpiresAt')
 }
 
 function Suspend-ModReservationWorker {
@@ -1992,9 +2101,139 @@ function Suspend-ModReservationWorker {
     $owner.workerProcessStartTicks = $null
     $owner.workerToken = $null
     $owner.heartbeat = Get-UtcTimestamp
+    $owner.expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
     Write-ActiveReservationOwner -Value $owner -ReleaseWorker
     $script:activeReservationLease = $null
     $script:activeReservationState = $null
+}
+
+function Release-ModReservation {
+    param([Collections.IDictionary] $State)
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+    $expectedOwnerToken = if ($State.Contains('reservationToken')) { [string]$State.reservationToken } else { $null }
+    if ([string]$owner.state -ceq 'released') {
+        if ([string]::IsNullOrWhiteSpace($expectedOwnerToken) -or -not $owner.Contains('releasedByOwnerToken') -or
+            [string]$owner.releasedByOwnerToken -cne $expectedOwnerToken -or [string]$owner.reservationToken -cne $expectedOwnerToken) {
+            throw 'Reservation was released by another or legacy owner token.'
+        }
+        $null = Get-ModReservationReleaseReceipt -State $State -OwnerToken $expectedOwnerToken
+        return
+    }
+    if ([string]$owner.state -cne 'held' -or [string]$owner.runId -cne [string]$State.runId -or
+        [string]$owner.modLockKey -cne [string]$State.modLockKey) {
+        throw 'Reservation owner changed before terminal release.'
+    }
+    if ([string]$owner.leaseMode -cne 'reserved' -or -not [string]::IsNullOrWhiteSpace([string]$owner.workerToken)) {
+        throw 'Reservation worker must be suspended before terminal release.'
+    }
+    if ([string]$owner.reservationState -cne 'cleanup-pending' -or
+        -not $owner.Contains('cleanup') -or $owner.cleanup -isnot [Collections.IDictionary] -or
+        -not [bool]$owner.cleanup.writerLockReleased -or
+        -not [bool]$owner.cleanup.claimDirectoryPreserved -or
+        -not [bool]$owner.cleanup.runRootPreserved) {
+        throw 'Reservation cleanup must complete every persisted boundary before terminal release.'
+    }
+    $expectedReservationToken = [string]$owner.reservationToken
+    if (-not [string]::IsNullOrWhiteSpace($expectedOwnerToken) -and $expectedReservationToken -cne $expectedOwnerToken) {
+        throw 'Reservation owner token changed before terminal release.'
+    }
+    $expectedWorkerToken = [string]$owner.workerToken
+    $terminal = Get-ModReservationReleaseReceipt -State $State -OwnerToken $expectedReservationToken -Publish
+    $now = Get-UtcTimestamp
+    $owner.state = 'released'
+    $owner.reservationState = 'released'
+    $owner.releasedByOwnerToken = $expectedReservationToken
+    $owner.releaseReceiptPath = [string]$terminal.path
+    $owner.releaseReceiptSha256 = [string]$terminal.sha256
+    $owner.heartbeat = $now
+    $owner.expiresAt = $now
+    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
+        -Value $owner -ExpectedReservationToken $expectedReservationToken -ExpectedWorkerToken $expectedWorkerToken
+}
+
+function Assert-ModReservationCleanupOwner {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][Collections.IDictionary] $Owner
+    )
+    if ([string]$Owner.state -cne 'held' -or [string]$Owner.runId -cne [string]$State.runId -or
+        [string]$Owner.modLockKey -cne [string]$State.modLockKey -or
+        [string]$Owner.leaseMode -cne 'reserved' -or
+        -not [string]::IsNullOrWhiteSpace([string]$Owner.workerToken)) {
+        throw 'Reservation owner changed before terminal cleanup.'
+    }
+}
+
+function Start-ModReservationCleanup {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][string] $EvidencePath,
+        [Parameter(Mandatory)][string] $ClaimDirectory,
+        [Parameter(Mandatory)][string] $RunRoot
+    )
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+    Assert-ModReservationCleanupOwner -State $State -Owner $owner
+    $tuple = [ordered]@{
+        schemaVersion = 1
+        runId = [string]$State.runId
+        evidencePath = [IO.Path]::GetFullPath($EvidencePath)
+        claimDirectory = [IO.Path]::GetFullPath($ClaimDirectory)
+        runRoot = [IO.Path]::GetFullPath($RunRoot)
+    }
+    if ($owner.Contains('cleanup') -and $owner.cleanup -is [Collections.IDictionary]) {
+        foreach ($field in @('schemaVersion', 'runId', 'evidencePath', 'claimDirectory', 'runRoot')) {
+            if ([string]$owner.cleanup[$field] -cne [string]$tuple[$field]) {
+                throw 'Persisted reservation cleanup tuple changed before recovery.'
+            }
+        }
+        if ([string]$owner.reservationState -cne 'cleanup-pending') {
+            $owner.reservationState = 'cleanup-pending'
+            Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
+                -Value $owner -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
+            $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+        }
+        return $owner
+    }
+    $owner.reservationState = 'cleanup-pending'
+    $owner['cleanup'] = [ordered]@{
+        schemaVersion = $tuple.schemaVersion
+        runId = $tuple.runId
+        evidencePath = $tuple.evidencePath
+        claimDirectory = $tuple.claimDirectory
+        runRoot = $tuple.runRoot
+        startedAt = Get-UtcTimestamp
+        writerLockReleased = $false
+        claimDirectoryPreserved = $false
+        runRootPreserved = $false
+    }
+    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
+        -Value $owner -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
+    Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+}
+
+function Get-ModReservationCleanupState {
+    param([Parameter(Mandatory)][Collections.IDictionary] $State)
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+    Assert-ModReservationCleanupOwner -State $State -Owner $owner
+    if ([string]$owner.reservationState -cne 'cleanup-pending' -or
+        -not $owner.Contains('cleanup') -or $owner.cleanup -isnot [Collections.IDictionary]) {
+        throw 'Reservation does not contain a recoverable cleanup-pending tuple.'
+    }
+    $owner
+}
+
+function Set-ModReservationCleanupStep {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][ValidateSet('writerLockReleased', 'claimDirectoryPreserved', 'runRootPreserved')][string] $Step
+    )
+    $owner = Get-ModReservationCleanupState -State $State
+    if ([bool]$owner.cleanup[$Step]) { return $owner }
+    $owner.cleanup[$Step] = $true
+    $owner.cleanup["${Step}At"] = Get-UtcTimestamp
+    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
+        -Value $owner -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
+    Get-ModReservationCleanupState -State $State
 }
 
 function Test-RunWriterOwnerActive {
@@ -2004,7 +2243,7 @@ function Test-RunWriterOwnerActive {
     }
     try {
         $process = Get-Process -Id ([int]$Owner.processId) -ErrorAction Stop
-        return $process.StartTime.ToUniversalTime().Ticks -eq [int64]$Owner.processStartTicks
+        return (Test-CoordinationProcessStartMatch -ActualTicks $process.StartTime.ToUniversalTime().Ticks -ExpectedTicks ([int64]$Owner.processStartTicks))
     }
     catch { return $false }
 }
@@ -2142,49 +2381,60 @@ function Enter-ModReservation {
     $null = Assert-NoReparsePath -Path $lockRoot -Root ([string]$Plan.repositoryRoot) -Label 'MOD reservation path'
     $expectedStatePath = [IO.Path]::GetFullPath($PlannedStatePath)
     $publishedPreparedOwner = $null
-    if (-not (Test-Path -LiteralPath ([string]$Plan.modLockPath) -PathType Container)) {
-        $preparedLockPath = Join-Path $lockRoot ('.pending-' + [IO.Path]::GetFileName([string]$Plan.modLockPath) + '-' + $ActualRunId + '-' + [guid]::NewGuid().ToString('N'))
-        $null = Assert-NoReparsePath -Path $preparedLockPath -Root ([string]$Plan.repositoryRoot) -Label 'Prepared MOD reservation' -AllowMissing
-        New-Item -ItemType Directory -Path $preparedLockPath -ErrorAction Stop | Out-Null
-        $identity = Get-CurrentProcessIdentity
+    $identity = Get-CurrentProcessIdentity
+    $actorToken = Get-ModReservationActorToken -Value ("reservation:{0}" -f $ActualRunId)
+    $initialSnapshot = Get-ModReservationSnapshot -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot)
+    if ([bool]$initialSnapshot.exists -and [string]$initialSnapshot.value.state -ceq 'held') {
+        $existingOwner = $initialSnapshot.value
+        if ([string]$existingOwner.runId -cne $ActualRunId -or [string]$existingOwner.modLockKey -cne [string]$Plan.lockKey -or
+            [IO.Path]::GetFullPath([string]$existingOwner.plannedStatePath) -cne $expectedStatePath) {
+            throw 'Existing canonical MOD reservation owner tuple changed.'
+        }
+        if ([string]$existingOwner.reservationToken -cne $actorToken) {
+            throw 'Another owner token already holds this canonical MOD reservation.'
+        }
+        $intendedWorkerToken = Get-ModReservationActorToken -Value ("worker:{0}:{1}:{2}:{3}" -f $actorToken, $identity.machineName, $identity.processId, $identity.processStartTicks)
+        if ([string]$existingOwner.reservationToken -ceq $actorToken -and
+            [string]$existingOwner.workerToken -ceq $intendedWorkerToken -and
+            [string]$existingOwner.machineName -ceq [string]$identity.machineName -and [int]$existingOwner.workerId -eq [int]$identity.processId -and
+            [int64]$existingOwner.workerProcessStartTicks -eq [int64]$identity.processStartTicks) {
+            $script:activeReservationLease = [ordered]@{
+                modLockPath = [string]$Plan.modLockPath; repositoryRoot = [string]$Plan.repositoryRoot
+                runId = $ActualRunId; reservationToken = $actorToken; workerToken = [string]$existingOwner.workerToken
+                machineName = [string]$existingOwner.machineName; workerId = [int]$existingOwner.workerId
+                workerProcessStartTicks = [int64]$existingOwner.workerProcessStartTicks; lastHeartbeatUtc = [DateTimeOffset]$existingOwner.heartbeat
+            }
+            return $existingOwner
+        }
+    }
+    if (-not [bool]$initialSnapshot.exists -or [string]$initialSnapshot.value.state -ceq 'released') {
+        $now = [DateTimeOffset]::UtcNow
         $preparedOwner = [ordered]@{
-            schemaVersion = 2
+            schemaVersion = 3
+            state = 'held'
             runId = $ActualRunId
             canonicalModRelativePath = $Plan.modRelativePath
             modLockKey = $Plan.lockKey
             plannedStatePath = $expectedStatePath
             statePath = $expectedStatePath
-            reservationToken = [guid]::NewGuid().ToString('N')
-            workerToken = [guid]::NewGuid().ToString('N')
+            reservationToken = $actorToken
+            workerToken = Get-ModReservationActorToken -Value ("worker:{0}:{1}:{2}:{3}" -f $actorToken, $identity.machineName, $identity.processId, $identity.processStartTicks)
             machineName = $identity.machineName
             workerId = $identity.processId
             workerProcessStartTicks = $identity.processStartTicks
             leaseMode = 'active'
             reservationState = 'claiming'
-            acquiredAt = Get-UtcTimestamp
-            heartbeat = Get-UtcTimestamp
+            acquiredAt = $now.ToString('o')
+            heartbeat = $now.ToString('o')
+            expiresAt = $now.AddMinutes(30).ToString('o')
+            platform = Get-PortablePlatformName
+            lockPrimitive = Get-PortableLockPrimitive
         }
-        Write-ModReservationOwner -ModLockPath $preparedLockPath -Repository ([string]$Plan.repositoryRoot) -Value $preparedOwner
-        try {
-            $null = Assert-NoReparsePath -Path $preparedLockPath -Root ([string]$Plan.repositoryRoot) -Label 'Prepared MOD reservation'
-            [IO.Directory]::Move($preparedLockPath, [string]$Plan.modLockPath)
-            $publishedPreparedOwner = $preparedOwner
-        }
-        catch {
-            if (-not (Test-Path -LiteralPath ([string]$Plan.modLockPath) -PathType Container)) { throw }
-        }
-        finally {
-            if (Test-Path -LiteralPath $preparedLockPath -PathType Container) {
-                $null = Assert-NoReparsePath -Path $preparedLockPath -Root ([string]$Plan.repositoryRoot) -Label 'Unpublished prepared MOD reservation'
-                $preparedItems = @(Get-ChildItem -LiteralPath $preparedLockPath -Force)
-                if ($preparedItems.Count -eq 1 -and -not $preparedItems[0].PSIsContainer -and
-                    $preparedItems[0].Name -ceq 'owner.json' -and
-                    -not (Test-PortableReparseItem -Path $preparedItems[0].FullName -Item $preparedItems[0] -Label 'Prepared MOD reservation owner')) {
-                    [IO.File]::Delete($preparedItems[0].FullName)
-                    [IO.Directory]::Delete($preparedLockPath)
-                }
-            }
-        }
+        $expectedToken = if ([bool]$initialSnapshot.exists) { [string]$initialSnapshot.value.reservationToken } else { $null }
+        $expectedWorker = if ([bool]$initialSnapshot.exists) { [string]$initialSnapshot.value.workerToken } else { $null }
+        Write-ModReservationOwner -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot) `
+            -Value $preparedOwner -ExpectedReservationToken $expectedToken -ExpectedWorkerToken $expectedWorker
+        $publishedPreparedOwner = $preparedOwner
     }
     $null = Assert-NoReparsePath -Path ([string]$Plan.modLockPath) -Root ([string]$Plan.repositoryRoot) -Label 'MOD reservation'
     try { $owner = Read-ModReservationOwner -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot) }
@@ -2196,7 +2446,8 @@ function Enter-ModReservation {
         -not $owner.Contains('statePath') -or [IO.Path]::GetFullPath([string]$owner.statePath) -cne $expectedStatePath) {
         throw 'Existing canonical MOD reservation owner tuple changed.'
     }
-    if ([int]$owner.schemaVersion -ne 2 -or [string]$owner.reservationToken -notmatch '^[0-9a-f]{32}$') {
+    if ([int]$owner.schemaVersion -ne 3 -or [string]$owner.state -cne 'held' -or
+        [string]$owner.reservationToken -notmatch '^[0-9a-f]{32}$') {
         throw 'Existing canonical MOD reservation owner token contract is invalid.'
     }
     $expectedReservationToken = [string]$owner.reservationToken
@@ -2229,7 +2480,7 @@ function Enter-ModReservation {
         if ($workerActive -or -not $heartbeatValid -or ([DateTimeOffset]::UtcNow - $heartbeat).TotalMinutes -le 30) {
             throw 'The same run reservation still has an active worker; only a stale same-run owner may reattach.'
         }
-        $historyRoot = Join-Path ([string]$Plan.modLockPath) 'owner-history'
+        $historyRoot = Join-Path $lockRoot ('.owner-history/' + [IO.Path]::GetFileNameWithoutExtension([string]$Plan.modLockPath))
         New-Item -ItemType Directory -Path $historyRoot -Force | Out-Null
         $historyPath = Join-Path $historyRoot ("stale-$([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))-$([guid]::NewGuid().ToString('N')).json")
         Write-AtomicJson -Path $historyPath -Value $owner
@@ -2242,13 +2493,16 @@ function Enter-ModReservation {
     $owner.modLockKey = $Plan.lockKey
     $owner.plannedStatePath = [IO.Path]::GetFullPath($PlannedStatePath)
     $owner.statePath = [IO.Path]::GetFullPath($PlannedStatePath)
-    $owner.workerToken = if ($sameWorker) { $owner.workerToken } else { [guid]::NewGuid().ToString('N') }
+    $owner.workerToken = if ($sameWorker) { $owner.workerToken } else {
+        Get-ModReservationActorToken -Value ("worker:{0}:{1}:{2}:{3}" -f $expectedReservationToken, $identity.machineName, $identity.processId, $identity.processStartTicks)
+    }
     $owner.machineName = $identity.machineName
     $owner.workerId = $identity.processId
     $owner.workerProcessStartTicks = $identity.processStartTicks
     $owner.leaseMode = 'active'
     $owner.reservationState = 'claiming'
     $owner.heartbeat = Get-UtcTimestamp
+    $owner.expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
     Write-ModReservationOwner -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot) -Value $owner -ExpectedReservationToken $expectedReservationToken -ExpectedWorkerToken $expectedWorkerToken
     $script:activeReservationLease = [ordered]@{
         modLockPath = [string]$Plan.modLockPath
@@ -3099,6 +3353,7 @@ function Invoke-Claim {
         modRelativePath = $modRelativePath
         modLockKey = $lockKey
         modLockPath = [IO.Path]::GetFullPath($modLockPath)
+        reservationToken = [string]$plannedOwner.reservationToken
         claimPath = [IO.Path]::GetFullPath($claimPath)
         claimCoordinatorArchivePath = [IO.Path]::GetFullPath($coordinatorArchive)
         branch = $branch
@@ -3733,10 +3988,16 @@ function Invoke-Localization {
     if ($plan.mode -eq 'none' -and @($plan.files).Count -ne 0) { throw 'Localization mode none cannot contain files.' }
     $removedPaths = @()
     if ($plan.Contains('removedPaths')) { $removedPaths = @($plan.removedPaths) }
+    # Containment inside the canonical MOD directory must not be widened by a
+    # fixed ignore-case rule on case-sensitive filesystems (Linux).
+    $modContainmentComparison = Get-PortablePathComparison -Paths @(
+        [IO.Path]::GetFullPath([string]$State.worktreePath),
+        [IO.Path]::GetFullPath((Join-Path ([string]$State.worktreePath) ([string]$State.modRelativePath)))
+    )
     if ($plan.mode -eq 'none' -and $removedPaths.Count -ne 0) { throw 'Localization mode none cannot contain removed paths.' }
     foreach ($removedPath in $removedPaths) {
         $removedRelative = ([string]$removedPath).Replace('\', '/')
-        if (-not $removedRelative.StartsWith($State.modRelativePath + '/', [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $removedRelative.StartsWith($State.modRelativePath + '/', $modContainmentComparison)) {
             throw 'Removed localization target is outside the canonical MOD directory.'
         }
         $removedWorktreePath = Assert-ContainedPath -Candidate (Join-Path $State.worktreePath $removedRelative) -Root $State.worktreePath -Label 'Removed localization target'
@@ -3747,7 +4008,7 @@ function Invoke-Localization {
     $records = [Collections.Generic.List[object]]::new()
     foreach ($file in @($plan.files)) {
         $relative = ([string]$file.relativePath).Replace('\', '/')
-        if (-not $relative.StartsWith($State.modRelativePath + '/', [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $relative.StartsWith($State.modRelativePath + '/', $modContainmentComparison)) {
             throw 'Localization target is outside the canonical MOD directory.'
         }
         $worktreeFile = Assert-ContainedPath -Candidate (Join-Path $State.worktreePath $relative) -Root $State.worktreePath -Label 'Localization target'

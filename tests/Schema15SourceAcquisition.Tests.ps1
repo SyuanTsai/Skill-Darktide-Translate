@@ -128,7 +128,7 @@ Describe 'Schema 15 source acquisition contract' {
             -RunId $runId -SourceRequestPath $requestPath -SkillSourcePinPath $script:skillSourcePinPath `
             -Provider browser -PassThru
         $first.status | Should -Be 'waiting-user'
-        $ownerPath = Join-Path $first.modLockPath 'owner.json'
+        $ownerPath = [string]$first.modLockPath
         $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
         $owner.leaseMode | Should -Be 'reserved'
         $owner.reservationState | Should -Be 'waiting-user'
@@ -144,8 +144,8 @@ Describe 'Schema 15 source acquisition contract' {
                 -Provider browser -PassThru } | Should -Throw '*owner tuple changed*'
     }
 
-    # Scenario: The process stops while preparing a new canonical MOD reservation before its owner tuple is published.
-    # Purpose: Publish the fixed reservation only as one atomic directory rename so a crash cannot leave an ownerless lock that permanently blocks same-run recovery.
+    # Scenario: The process stops while publishing a new canonical MOD reservation.
+    # Purpose: Publish one complete owner file with create-only/CAS semantics and never expose an ownerless directory.
     It 'UnitT28A_PublishesOnlyCompleteModReservationsAtomically' {
         $runner = Get-Content -LiteralPath (Join-Path $scriptRoot 'mod-update.ps1') -Raw
         $start = $runner.IndexOf('function Enter-ModReservation')
@@ -154,10 +154,51 @@ Describe 'Schema 15 source acquisition contract' {
         $end | Should -BeGreaterThan $start
         $reservation = $runner.Substring($start, $end - $start)
 
-        $reservation | Should -Match '\$preparedLockPath'
-        $reservation | Should -Match 'Write-ModReservationOwner\s+-ModLockPath\s+\$preparedLockPath'
-        $reservation | Should -Match '\[IO\.Directory\]::Move\(\$preparedLockPath, \[string\]\$Plan\.modLockPath\)'
+        $reservation | Should -Match 'Get-ModReservationSnapshot'
+        $reservation | Should -Match 'Write-ModReservationOwner\s+-ModLockPath\s+\(\[string\]\$Plan\.modLockPath\)'
+        $reservation | Should -Not -Match '\$preparedLockPath'
+        $runner | Should -Match 'Publish-PortableLeaseFile'
+        $runner | Should -Match '-NoReplace:\(-not \$ownerExists\)'
+        $reservation | Should -Not -Match '\[IO\.Directory\]::Move'
         $reservation | Should -Not -Match 'New-Item\s+-ItemType\s+Directory\s+-Path\s+\(\[string\]\$Plan\.modLockPath\)'
+    }
+
+    # Scenario: An upgrade encounters the former .locks/mod/<key>.lock/owner.json directory layout.
+    # Purpose: Preserve every legacy byte and fail with explicit manual migration guidance before reservation or claim mutation.
+    It 'InterT28B_PreservesLegacyModReservationDirectoryAndRequiresManualMigration' {
+        $repository = Join-Path $TestDrive 'legacy-mod-reservation-repository'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $requestPath = Join-Path $TestDrive 'legacy-mod-reservation-request.json'
+        [ordered]@{
+            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
+            version = '2.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+        } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
+
+        $modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $lockKey = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))
+        ).ToLowerInvariant()
+        $legacyDirectory = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
+        New-Item -ItemType Directory -Path $legacyDirectory -Force | Out-Null
+        $legacyOwnerPath = Join-Path $legacyDirectory 'owner.json'
+        [byte[]]$legacyBytes = [Text.UTF8Encoding]::new($false).GetBytes('{"schemaVersion":2,"state":"held","runId":"legacy-run"}')
+        [IO.File]::WriteAllBytes($legacyOwnerPath, $legacyBytes)
+        $beforeEntries = @(Get-ChildItem -LiteralPath $legacyDirectory -Force | ForEach-Object Name)
+
+        { & (Join-Path $scriptRoot 'mod-update.ps1') acquire-source `
+                -RepositoryRoot $repository -ModDirectory 'ExampleMod' `
+                -RunId '47474747-5555-4666-8777-888888888888' `
+                -SourceRequestPath $requestPath -SkillSourcePinPath $script:skillSourcePinPath `
+                -Provider browser -PassThru } |
+            Should -Throw '*Legacy MOD reservation directory format*move this directory*outside .locks*Automatic deletion or migration is forbidden*'
+
+        Test-Path -LiteralPath $legacyDirectory -PathType Container | Should -BeTrue
+        Test-Path -LiteralPath $legacyOwnerPath -PathType Leaf | Should -BeTrue
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($legacyOwnerPath)) |
+            Should -BeExactly ([Convert]::ToHexString($legacyBytes))
+        @(Get-ChildItem -LiteralPath $legacyDirectory -Force | ForEach-Object Name) |
+            Should -BeExactly $beforeEntries
+        @(Get-ChildItem -LiteralPath (Split-Path -Parent $legacyDirectory) -Force -File).Count | Should -Be 0
     }
 
     # Scenario: Untrusted orchestration supplies a path-like MOD identity or an off-domain source page.
@@ -409,7 +450,7 @@ Describe 'Schema 15 source acquisition contract' {
         Test-Path -LiteralPath $first.receiptPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath $first.acquisitionPath -PathType Leaf | Should -Be $true
         [IO.File]::Delete($first.acquisitionPath)
-        $ownerPath = Join-Path $first.modLockPath 'owner.json'
+        $ownerPath = [string]$first.modLockPath
         $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
         $owner.leaseMode = 'active'
         $owner.machineName = [Environment]::MachineName
@@ -418,6 +459,7 @@ Describe 'Schema 15 source acquisition contract' {
         $owner.workerToken = [guid]::NewGuid().ToString('N')
         $owner.reservationState = 'running'
         $owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-31).ToString('o')
+        $owner.expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(-1).ToString('o')
         $null = $owner.Remove('waitingReason')
         $owner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
 
@@ -1055,7 +1097,7 @@ Describe 'Schema 15 source acquisition contract' {
         $state.sourceTuple.contractSha256 | Should -Match '^[0-9a-f]{64}$'
         @($state.completedStages) | Should -Contain 'acquire-source'
         @($state.completedStages) | Should -Contain 'claim'
-        (Get-Content -LiteralPath (Join-Path $state.modLockPath 'owner.json') -Raw | ConvertFrom-Json).runId | Should -Be $runId
+        (Get-Content -LiteralPath $state.modLockPath -Raw | ConvertFrom-Json).runId | Should -Be $runId
     }
 
     # Scenario: A Schema 15 candidate reaches the independent Final Candidate Gate after the claimed archive has been copied into run ownership.

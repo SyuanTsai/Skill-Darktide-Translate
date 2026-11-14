@@ -39,3 +39,9 @@ path = "NOTICE"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 SyuanTsai"
 SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "skills/auto-update-darktide-mod/scripts/platform-runtime/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 SyuanTsai"
+SPDX-License-Identifier = "Apache-2.0"

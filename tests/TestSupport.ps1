@@ -36,6 +36,72 @@ function New-TestReparsePoint {
     New-Item -ItemType $itemType -Path $Path -Target $Target
 }
 
+function New-TestHardLink {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Target
+    )
+
+    New-Item -ItemType HardLink -Path $Path -Target $Target
+}
+
+function Resolve-TestPhysicalPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path)
+
+    # Resolves every existing link component, for example macOS /var -> /private/var,
+    # so fixtures under a symlinked temporary root are passed as physical paths.
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $current = [IO.Path]::GetPathRoot($fullPath)
+    foreach ($segment in @($fullPath.Substring($current.Length).Split([IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries))) {
+        $candidate = Join-Path $current $segment
+        $target = if (Test-Path -LiteralPath $candidate) { [IO.Directory]::ResolveLinkTarget($candidate, $true) } else { $null }
+        $current = if ($null -eq $target) { $candidate } else { [IO.Path]::GetFullPath($target.FullName) }
+    }
+    return $current
+}
+
+function Get-TestPowerShellExecutablePath {
+    [CmdletBinding()]
+    param()
+
+    $executableName = if ([OperatingSystem]::IsWindows()) { 'pwsh.exe' } else { 'pwsh' }
+    $executablePath = Join-Path $PSHOME $executableName
+    if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+        throw "The running PowerShell executable is missing: $executablePath"
+    }
+    return $executablePath
+}
+
+function New-TestPowerShellScriptCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $ScriptPath
+    )
+
+    # Returns a directly executable native command that forwards its arguments
+    # to ScriptPath: a .cmd file on Windows and a mode 0755 sh script elsewhere.
+    $powerShellPath = Get-TestPowerShellExecutablePath
+    if ([OperatingSystem]::IsWindows()) {
+        $commandPath = "$Path.cmd"
+        $commandText = '@echo off' + "`r`n" +
+            '"' + $powerShellPath + '" -NoLogo -NoProfile -NonInteractive -File "' + $ScriptPath + '" %*' + "`r`n" +
+            'exit /b %ERRORLEVEL%' + "`r`n"
+        [IO.File]::WriteAllText($commandPath, $commandText, [Text.ASCIIEncoding]::new())
+        return $commandPath
+    }
+
+    $commandPath = "$Path.sh"
+    $quote = { param([string] $Value) "'" + $Value.Replace("'", "'\''") + "'" }
+    $commandText = '#!/bin/sh' + "`n" +
+        'exec ' + (& $quote $powerShellPath) + ' -NoLogo -NoProfile -NonInteractive -File ' + (& $quote $ScriptPath) + ' "$@"' + "`n"
+    [IO.File]::WriteAllText($commandPath, $commandText, [Text.UTF8Encoding]::new($false))
+    [IO.File]::SetUnixFileMode($commandPath, [IO.UnixFileMode]'UserRead, UserWrite, UserExecute, GroupRead, GroupExecute, OtherRead, OtherExecute')
+    return $commandPath
+}
+
 function ConvertFrom-TestJson {
     [CmdletBinding()]
     param(

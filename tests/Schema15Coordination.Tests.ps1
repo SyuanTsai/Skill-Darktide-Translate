@@ -32,6 +32,80 @@ Describe 'Schema 15 multi-process coordination contract' {
         }
     }
 
+    # Scenario: Lease publication reports either an authority-defined create/CAS race or an unrelated storage failure.
+    # Purpose: Retry only genuine publication contention while surfacing every other failure immediately with its cause intact.
+    It 'UnitT20_WaitsOnlyForAuthorityPublicationContention_<Case>' -ForEach @(
+        @{ Case = 'NoReplaceEexist'; Competition = $true }
+        @{ Case = 'NoReplaceWin32'; Competition = $true }
+        @{ Case = 'CasExpectedStateMismatchUnix'; Competition = $true }
+        @{ Case = 'CasExpectedStateMismatchWindows'; Competition = $true }
+        @{ Case = 'IoFailure'; Competition = $false }
+    ) {
+        Import-Module -Name $coordinationModule -Force
+        $coordinationModuleObject = Get-Module -Name SharedCoordinationLock | Select-Object -First 1
+        $coordinationModuleObject | Should -Not -BeNullOrEmpty
+        InModuleScope $coordinationModuleObject -Parameters @{ Case = $Case; Competition = $Competition } {
+            Mock Enter-CoordinationOwnerGuard {
+                $guard = [pscustomobject]@{}
+                $guard | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+                $guard
+            }
+            Mock Get-CoordinationLeaseSnapshot {
+                [ordered]@{ exists = $false; bytes = $null; sha256 = $null; length = $null; identity = $null }
+            }
+            Mock Publish-CoordinationLeaseSnapshot {
+                switch ($Case) {
+                    'NoReplaceEexist' {
+                        throw [SyuanTsai.AIInstructions.PlatformRuntime.PlatformErrnoException]::new(
+                            'publication-create-target', 17, 'EEXIST')
+                    }
+                    'NoReplaceWin32' {
+                        throw [SyuanTsai.AIInstructions.PlatformRuntime.PlatformWin32Exception]::new(
+                            'SetFileInformationByHandle(FileRenameInfo NoReplace)', 183)
+                    }
+                    'CasExpectedStateMismatchUnix' {
+                        throw [SyuanTsai.AIInstructions.PlatformRuntime.PlatformVerificationException]::new(
+                            'publication-target', 'linux',
+                            'identity, type, link count, length, or SHA-256 differs from expected state')
+                    }
+                    'CasExpectedStateMismatchWindows' {
+                        throw [SyuanTsai.AIInstructions.PlatformRuntime.PlatformVerificationException]::new(
+                            'publication', 'windows',
+                            'The target identity, hash, or length differs from ExpectedState.')
+                    }
+                    default { throw [IO.IOException]::new('injected coordination storage failure') }
+                }
+            }
+
+            $repository = Join-Path $TestDrive ("publication-contention-$Case")
+            [void][IO.Directory]::CreateDirectory($repository)
+            $script:coordinationWaitHeartbeatCount = 0
+            $heartbeat = {
+                $script:coordinationWaitHeartbeatCount++
+                if ($script:coordinationWaitHeartbeatCount -ge 2) {
+                    throw [InvalidOperationException]::new('observed coordination retry wait')
+                }
+            }
+
+            if ($Competition) {
+                { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
+                        -RunId "contention-$Case" -WaitHeartbeatAction $heartbeat -TimeoutSeconds 10 } |
+                    Should -Throw '*observed coordination retry wait*'
+                $script:coordinationWaitHeartbeatCount | Should -Be 2
+            }
+            else {
+                $failure = { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
+                        -RunId "contention-$Case" -WaitHeartbeatAction $heartbeat -TimeoutSeconds 10 } |
+                    Should -Throw '*injected coordination storage failure*' -PassThru
+                $script:coordinationWaitHeartbeatCount | Should -Be 1
+                $failure.Exception | Should -BeOfType ([IO.IOException])
+                $failure.Exception.InnerException.Message | Should -BeExactly 'injected coordination storage failure'
+            }
+            Should -Invoke Publish-CoordinationLeaseSnapshot -Times 1 -Exactly
+            Remove-Variable -Name coordinationWaitHeartbeatCount -Scope Script -ErrorAction SilentlyContinue
+        }
+    }
+
     # Scenario: Two mods compete with a duplicate generation in a long run-owned Windows fixture path.
     # Purpose: Preserve cross-process serialization and competing-generation rejection after verified Git fixture setup.
     It 'InterT180_SerializesTwoModsAndRejectsACompetingGenerationAcrossProcesses' -Tag 'MultiProcess' {
@@ -161,7 +235,8 @@ Describe 'Schema 15 multi-process coordination contract' {
                 Test-Path -LiteralPath ([string]$state.archive.path) -PathType Leaf | Should -BeTrue
                 [string]$state.prNumber | Should -BeNullOrEmpty
                 [bool]$state.published | Should -BeFalse
-                $owner = Get-Content -LiteralPath (Join-Path ([string]$state.modLockPath) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
+                $owner = Get-Content -LiteralPath ([string]$state.modLockPath) -Raw | ConvertFrom-TestJson -AsHashtable
+                [string]$owner.state | Should -Be 'held'
                 [string]$owner.leaseMode | Should -Be 'reserved'
                 [string]$owner.workerToken | Should -BeNullOrEmpty
                 $owner.workerId | Should -BeNullOrEmpty
@@ -170,7 +245,7 @@ Describe 'Schema 15 multi-process coordination contract' {
                 @($state.coordinationReceipts.resourceKey) | Should -Contain 'git-coordination'
             }
             @(Get-ChildItem -LiteralPath (Join-Path $queueRoot '.claims') -Directory).Count | Should -Be 2
-            @(Get-ChildItem -LiteralPath (Join-Path $queueRoot 'In Progress/.locks/mod') -Directory).Count | Should -Be 2
+            @(Get-ChildItem -LiteralPath (Join-Path $queueRoot 'In Progress/.locks/mod') -File -Filter '*.lock').Count | Should -Be 2
 
             $receipts = @($states.coordinationReceipts | ForEach-Object {
                 Get-Content -LiteralPath ([string]$_.path) -Raw | ConvertFrom-TestJson -AsHashtable
@@ -190,7 +265,9 @@ Describe 'Schema 15 multi-process coordination contract' {
         }
     }
 
-    It 'InterT181_RetainsStaleEvidenceAndPreventsAnOldTokenFromDeletingTheNewOwner' {
+    # Scenario: A crashed owner expires and a new owner replaces the same long-lived file by CAS.
+    # Purpose: Recover stale ownership without deleting the lease name and keep old tokens unable to release the successor.
+    It 'InterT181_ReclaimsAnExpiredSingleFileLeaseAndRejectsTheOldToken' {
         Import-Module -Name $coordinationModule -Force
         $repository = Join-Path $TestDrive 'stale-shared-lock-repository'
         New-Item -ItemType Directory -Path $repository -Force | Out-Null
@@ -224,32 +301,48 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
         $crashProcess.ExitCode | Should -Be 91 -Because ($crashError.Result + $crashOutput.Result)
         $crashProcess.Dispose()
         $oldLease = Get-Content -LiteralPath $oldLeasePath -Raw | ConvertFrom-TestJson -AsHashtable
-        $ownerPath = Join-Path ([string]$oldLease.path) 'owner.json'
+        $ownerPath = [string]$oldLease.path
         $oldOwner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-TestJson -AsHashtable
-        $oldOwner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+        [string]$oldOwner.platform | Should -BeExactly ([string]$oldLease.platform)
+        [string]$oldOwner.lockPrimitive | Should -BeExactly ([string]$oldLease.lockPrimitive)
+        [string]$oldOwner.state | Should -Be 'held'
+        $oldOwner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+        $oldOwner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
         $oldOwner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
+        [byte[]]$staleOwnerBytes = [IO.File]::ReadAllBytes($ownerPath)
 
         $newLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' `
             -RunId '18181818-5555-4555-8555-555555555555' -ReceiptRoot $receiptRoot
         try {
-            [string]$newLease.staleEvidencePath | Should -Not -BeNullOrEmpty
-            Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Container | Should -BeTrue
             { Exit-SharedCoordinationLease -Lease $oldLease } | Should -Throw '*ownership changed*'
-            Test-Path -LiteralPath ([string]$newLease.path) -PathType Container | Should -BeTrue
-            $newOwner = Get-Content -LiteralPath (Join-Path ([string]$newLease.path) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
-            [string]$newOwner.token | Should -Be ([string]$newLease.token)
-            $beforeHeartbeat = [DateTimeOffset]$newOwner.heartbeat
+            Test-Path -LiteralPath ([string]$newLease.path) -PathType Leaf | Should -BeTrue
+            $newOwner = Get-Content -LiteralPath ([string]$newLease.path) -Raw | ConvertFrom-TestJson -AsHashtable
+            [string]$newOwner.owner.token | Should -Be ([string]$newLease.token)
+            [string]$newOwner.platform | Should -BeExactly ([string]$newLease.platform)
+            [string]$newOwner.lockPrimitive | Should -BeExactly ([string]$newLease.lockPrimitive)
+            $beforeHeartbeat = [DateTimeOffset]$newOwner.owner.heartbeat
             Start-Sleep -Milliseconds 20
             Update-SharedCoordinationLease -Lease $newLease -Force
-            $refreshedOwner = Get-Content -LiteralPath (Join-Path ([string]$newLease.path) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
-            [DateTimeOffset]$refreshedOwner.heartbeat | Should -BeGreaterThan $beforeHeartbeat
+            $refreshedOwner = Get-Content -LiteralPath ([string]$newLease.path) -Raw | ConvertFrom-TestJson -AsHashtable
+            [DateTimeOffset]$refreshedOwner.owner.heartbeat | Should -BeGreaterThan $beforeHeartbeat
+            [DateTimeOffset]$refreshedOwner.expiresAt | Should -BeGreaterThan ([DateTimeOffset]$refreshedOwner.owner.heartbeat)
         }
         finally {
             $receipt = Exit-SharedCoordinationLease -Lease $newLease
         }
-        Test-Path -LiteralPath ([string]$newLease.path) | Should -BeFalse
+        Test-Path -LiteralPath ([string]$newLease.path) -PathType Leaf | Should -BeTrue
+        $releasedOwner = Get-Content -LiteralPath ([string]$newLease.path) -Raw | ConvertFrom-TestJson -AsHashtable
+        [string]$releasedOwner.state | Should -Be 'released'
         $receiptRecord = Get-Content -LiteralPath ([string]$receipt.path) -Raw | ConvertFrom-TestJson -AsHashtable
+        [string]$newLease.staleEvidencePath | Should -Not -BeNullOrEmpty
         [string]$receiptRecord.staleEvidencePath | Should -Be ([string]$newLease.staleEvidencePath)
+        [string]$newLease.staleEvidencePath | Should -Match '[\\/]\.ai-instructions-txn[\\/][0-9a-f]{32}[\\/]previous-[0-9a-f]{32}$'
+        Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Leaf | Should -BeTrue
+        [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$newLease.staleEvidencePath)) |
+            Should -BeExactly ([Convert]::ToHexString($staleOwnerBytes))
+        $staleOwner = Get-Content -LiteralPath ([string]$newLease.staleEvidencePath) -Raw |
+            ConvertFrom-TestJson -AsHashtable
+        [string]$staleOwner.owner.token | Should -BeExactly ([string]$oldLease.token)
     }
 
     It 'InterT182_HeartbeatsWhileWaitingAndRejectsMalformedStaleProcessIdentity' {
@@ -266,17 +359,18 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
                 -WaitHeartbeatAction $waitHeartbeat } | Should -Throw '*Timed out*'
             $counter.Value | Should -BeGreaterThan 1
 
-            $ownerPath = Join-Path ([string]$lease.path) 'owner.json'
+            $ownerPath = [string]$lease.path
             $validOwnerJson = Get-Content -LiteralPath $ownerPath -Raw
             try {
                 $malformedOwner = $validOwnerJson | ConvertFrom-TestJson -AsHashtable
-                $malformedOwner.processStartTicks = 'not-a-number'
-                $malformedOwner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+                $malformedOwner.owner.processStartTicks = 'not-a-number'
+                $malformedOwner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+                $malformedOwner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
                 $malformedOwner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
                 { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
                     -RunId '18218218-4182-4182-8182-182182182182' -TimeoutSeconds 1 } |
                     Should -Throw '*owner contract is invalid*'
-                Test-Path -LiteralPath ([string]$lease.path) -PathType Container | Should -BeTrue
+                Test-Path -LiteralPath ([string]$lease.path) -PathType Leaf | Should -BeTrue
             }
             finally {
                 [IO.File]::WriteAllText($ownerPath, $validOwnerJson, [Text.UTF8Encoding]::new($false))
@@ -382,5 +476,168 @@ finally {
                 $worker.Dispose()
             }
         }
+    }
+
+    # Scenario: A lease is released and reacquired from its persistent file, then a legacy directory is placed at that name.
+    # Purpose: Prove released-file reuse and fail-closed migration guidance without automatic legacy conversion.
+    It 'InterT370_ReacquiresAReleasedFileAndRejectsALegacyDirectoryWithMigrationSteps' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'lock-evidence-repository'
+        $receiptRoot = Join-Path $repository 'receipts'
+        New-Item -ItemType Directory -Path $receiptRoot -Force | Out-Null
+        $expectedPlatform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+        $expectedPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'evidence-run' -ReceiptRoot $receiptRoot -TimeoutSeconds 10
+        $lease.platform | Should -BeExactly $expectedPlatform
+        $lease.lockPrimitive | Should -BeExactly $expectedPrimitive
+        $receipt = Exit-SharedCoordinationLease -Lease $lease
+        $receiptValue = Get-Content -LiteralPath $receipt.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $receiptValue.platform | Should -BeExactly $expectedPlatform
+        $receiptValue.lockPrimitive | Should -BeExactly $expectedPrimitive
+        $receiptValue.disposition | Should -BeExactly 'released'
+
+        Test-Path -LiteralPath $lease.path -PathType Leaf | Should -BeTrue
+        $releasedValue = Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $releasedValue.state | Should -BeExactly 'released'
+        $secondLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'second-run' -TimeoutSeconds 10
+        try { [string]$secondLease.token | Should -Not -BeExactly ([string]$lease.token) }
+        finally { $null = Exit-SharedCoordinationLease -Lease $secondLease }
+
+        $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks'
+        $guardPath = Join-Path $lockRoot 'git-coordination.owner-update.guard'
+        Test-Path -LiteralPath $guardPath -PathType Leaf | Should -BeTrue -Because 'the vendored lock keeps a fixed guard inode'
+        $emptyLease = Join-Path $lockRoot 'git-coordination.lock'
+        [IO.File]::Delete($emptyLease)
+        New-Item -ItemType Directory -Path $emptyLease | Out-Null
+        { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'legacy-run' -TimeoutSeconds 2 } |
+            Should -Throw '*Legacy coordination lease directory format*move this directory*outside .locks*Automatic deletion or migration is forbidden*'
+        Test-Path -LiteralPath $emptyLease -PathType Container | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $emptyLease -Force).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath $lockRoot -Force -Directory | Where-Object { $_.Name -like '.pending-*' }).Count | Should -Be 0
+
+        $coordination = Get-Content -LiteralPath $coordinationModule -Raw
+        $coordination | Should -Match 'Publish-PortableLeaseFile'
+        $coordination | Should -Match "state = 'held'"
+        $coordination | Should -Match "state = 'released'"
+        $coordination | Should -Not -Match '\[IO\.Directory\]::Move'
+        $coordination | Should -Not -Match '\[IO\.File\]::Delete\(\$ownerPath\)'
+        $coordination | Should -Not -Match '\[IO\.Directory\]::Delete\(\[string\]\$Lease\.path\)'
+        $coordination | Should -Not -Match 'FileShare\]::None'
+    }
+
+    # Scenario: A writer reads one file identity, another CAS replaces it, and the first writer retries with stale evidence.
+    # Purpose: Prove replacement requires the exact observed identity/hash/length tuple and rejects a lost race.
+    It 'InterT380_RejectsAStaleExpectedIdentityDuringCasReplacement' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-cas-race-repository'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'cas-owner'
+        try {
+            $coordinationModuleObject = Get-Module -Name SharedCoordinationLock | Select-Object -First 1
+            $coordinationModuleObject | Should -Not -BeNullOrEmpty
+            InModuleScope $coordinationModuleObject -Parameters @{ Repository = $repository } {
+                $lockRoot = Join-Path $Repository 'AI Auto Update/In Progress/.locks'
+                $stale = Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey 'source-acquisition'
+                $replacement = $stale.value
+                $replacement.owner.heartbeat = [DateTimeOffset]::UtcNow.AddSeconds(1).ToString('o')
+                $replacement.expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(3).ToString('o')
+                $null = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey 'source-acquisition' -Value $replacement -ExpectedState $stale
+                { Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey 'source-acquisition' -Value $replacement -ExpectedState $stale } |
+                    Should -Throw
+            }
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $lease }
+    }
+
+    # Scenario: Acquisition publication completed, but the caller retries before observing the return value.
+    # Purpose: The same actor token must recognize its held target state without rewriting it.
+    It 'InterT381_RepeatsPublishedAcquisitionForTheSameOwnerTokenWithoutRewrite' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-acquire-retry'
+        New-Item -ItemType Directory -Path $repository | Out-Null
+        $first = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'same-acquirer'
+        try {
+            $before = (Get-FileHash -LiteralPath $first.path -Algorithm SHA256).Hash
+            $retry = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'same-acquirer'
+            $retry.token | Should -BeExactly $first.token
+            (Get-FileHash -LiteralPath $first.path -Algorithm SHA256).Hash | Should -BeExactly $before
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $first }
+    }
+
+    # Scenario: A different actor token attempts acquisition while the target state is already held.
+    # Purpose: Never treat another owner's completed acquisition as this caller's success.
+    It 'InterT382_RejectsPublishedAcquisitionByAnotherOwnerToken' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-acquire-other'
+        New-Item -ItemType Directory -Path $repository | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'first-acquirer'
+        try {
+            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'other-acquirer' } |
+                Should -Throw '*Another owner token*'
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $lease }
+    }
+
+    # Scenario: A heartbeat target was published before an interrupted caller retried the same transition.
+    # Purpose: A non-regressing heartbeat from the same token is idempotent and remains byte-identical.
+    It 'InterT383_RepeatsPublishedHeartbeatForTheSameOwnerTokenWithoutRewrite' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-heartbeat-retry'
+        New-Item -ItemType Directory -Path $repository | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'heartbeat-owner'
+        try {
+            Update-SharedCoordinationLease -Lease $lease -Force
+            $owner = Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable
+            $before = (Get-FileHash -LiteralPath $lease.path -Algorithm SHA256).Hash
+            $lease.pendingHeartbeat = [string]$owner.owner.heartbeat
+            $lease.pendingExpiresAt = [string]$owner.expiresAt
+            Update-SharedCoordinationLease -Lease $lease -Force
+            (Get-FileHash -LiteralPath $lease.path -Algorithm SHA256).Hash | Should -BeExactly $before
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $lease }
+    }
+
+    # Scenario: A heartbeat caller presents a token different from the persisted held owner.
+    # Purpose: Heartbeat idempotence must never cross actor-token ownership.
+    It 'InterT384_RejectsHeartbeatByAnotherOwnerToken' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-heartbeat-other'
+        New-Item -ItemType Directory -Path $repository | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'heartbeat-first'
+        try {
+            $other = [ordered]@{}; foreach ($entry in $lease.GetEnumerator()) { $other[$entry.Key] = $entry.Value }
+            $other.token = 'f' * 32
+            { Update-SharedCoordinationLease -Lease $other -Force } | Should -Throw '*ownership changed*'
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $lease }
+    }
+
+    # Scenario: Release and its immutable terminal receipt were published before the return was observed.
+    # Purpose: Retrying the same release succeeds without rewriting the released owner file.
+    It 'InterT385_RepeatsPublishedReleaseForTheSameOwnerTokenWithoutRewrite' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-release-retry'
+        New-Item -ItemType Directory -Path $repository | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'release-owner'
+        $null = Exit-SharedCoordinationLease -Lease $lease
+        $before = (Get-FileHash -LiteralPath $lease.path -Algorithm SHA256).Hash
+        $retry = Exit-SharedCoordinationLease -Lease $lease
+        $retry.path | Should -Match ([regex]::Escape([string]$lease.token))
+        (Get-FileHash -LiteralPath $lease.path -Algorithm SHA256).Hash | Should -BeExactly $before
+    }
+
+    # Scenario: A different token attempts to claim another owner's released target state.
+    # Purpose: Legacy or foreign release state always fails closed.
+    It 'InterT386_RejectsPublishedReleaseByAnotherOwnerToken' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-release-other'
+        New-Item -ItemType Directory -Path $repository | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'release-first'
+        $null = Exit-SharedCoordinationLease -Lease $lease
+        $other = [ordered]@{}; foreach ($entry in $lease.GetEnumerator()) { $other[$entry.Key] = $entry.Value }
+        $other.token = 'e' * 32
+        { Exit-SharedCoordinationLease -Lease $other } | Should -Throw '*another owner token*'
     }
 }

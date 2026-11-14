@@ -1165,7 +1165,10 @@ return localization
         }
 
         $expander = Get-Content -LiteralPath (Join-Path $scriptRoot 'Expand-Schema14Reference.ps1') -Raw
-        $expander | Should -Match '(?s)\$pathComparison = if \(\[Environment\]::OSVersion\.Platform.*?\[StringComparison\]::OrdinalIgnoreCase.*?\[StringComparison\]::Ordinal'
+        # The expander's outside-the-Skill check is an exclusion: it must ignore case on every host,
+        # so a case alias on a case-insensitive Unix volume cannot escape it.
+        $expander | Should -Match '\$pathComparison = Get-PortablePathComparison -Paths @\(\$resolvedSkillRoot, \$resolvedOutputRoot\) -Purpose Exclusion'
+        $expander | Should -Not -Match '\[StringComparison\]::Ordinal(?!IgnoreCase)'
     }
 
     # Scenario: review-artifacts is swapped for a junction after validation and before transient workset deletion.
