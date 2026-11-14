@@ -334,6 +334,7 @@ jobs:
           }
 
       - name: Run diagnostic Pester in checkout
+        if: ${{ !cancelled() }}
         continue-on-error: true
         shell: pwsh
         run: |
@@ -358,6 +359,13 @@ jobs:
             foreach ($failure in @($block.ErrorRecord)) { Write-Error $failure.Exception.Message -ErrorAction Continue }
           }
           foreach ($test in @($result.Failed)) {
+            $firstFailure = @($test.ErrorRecord) | Select-Object -First 1
+            $firstErrorLine = if ($null -ne $firstFailure -and $null -ne $firstFailure.Exception) {
+              ([string]$firstFailure.Exception.Message -split '\r?\n', 2)[0]
+            } else {
+              '<no error message>'
+            }
+            Write-Host "Pester failed case: name=$($test.ExpandedPath) error=$firstErrorLine"
             Write-Error "Pester test failed: $($test.ExpandedPath)" -ErrorAction Continue
             foreach ($failure in @($test.ErrorRecord)) { Write-Error $failure.Exception.Message -ErrorAction Continue }
           }
@@ -367,6 +375,8 @@ jobs:
           }
 
       - name: Prepare candidate source tools
+        id: prepare_source_tools
+        if: ${{ !cancelled() }}
         shell: pwsh
         env:
           # The candidate driver consumes this protected intake, deletes it, and
@@ -395,6 +405,7 @@ jobs:
           [IO.File]::AppendAllText($env:GITHUB_ENV, "S8_SOURCE_RUN_ID=$($prepared.runId)`n", [Text.UTF8Encoding]::new($false))
 
       - name: Run candidate Core v2 source validation
+        if: ${{ !cancelled() && steps.prepare_source_tools.outcome == 'success' }}
         shell: pwsh
         env:
           npm_config_prefix: ''
