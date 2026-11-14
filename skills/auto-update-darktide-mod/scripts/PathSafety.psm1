@@ -423,7 +423,8 @@ function Publish-PortableLeaseFile {
         [Parameter(Mandatory)][Collections.IDictionary] $ExpectedState,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId,
         [switch] $NoReplace,
-        [switch] $PreserveDisplaced
+        [switch] $PreserveDisplaced,
+        [ValidatePattern('^previous-[0-9a-f]{32}$')][string] $DisplacedLeaf
     )
     if ($PreserveDisplaced -and -not [bool]$ExpectedState.exists) {
         throw [ArgumentException]::new('A displaced file can be preserved only for an existing expected state.')
@@ -434,7 +435,14 @@ function Publish-PortableLeaseFile {
     $transactionLease = $null
     $stageLease = $null
     $stageLeaf = 'stage-' + [guid]::NewGuid().ToString('N')
-    $displacedLeaf = if ([bool]$ExpectedState.exists) { 'previous-' + [guid]::NewGuid().ToString('N') } else { $null }
+    $displacedLeaf = if ([bool]$ExpectedState.exists) {
+        if ([string]::IsNullOrWhiteSpace($DisplacedLeaf)) { 'previous-' + [guid]::NewGuid().ToString('N') }
+        else { $DisplacedLeaf }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($DisplacedLeaf)) {
+        throw [ArgumentException]::new('DisplacedLeaf requires an existing expected state.')
+    }
+    else { $null }
     $transactionRootPath = Join-Path $physicalParentPath '.ai-instructions-txn'
     $stageState = $null
     $published = $false
@@ -786,7 +794,21 @@ function Get-PortableUnixObservation {
     if ([string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($leaf)) {
         throw "Physical identity requires a path below a filesystem root: $full"
     }
-    $physicalParent = Resolve-PortableTrustedRoot -Path $parent
+    try { $physicalParent = Resolve-PortableTrustedRoot -Path $parent }
+    catch {
+        $failure = $_.Exception
+        for ($depth = 0; $depth -lt 16 -and $null -ne $failure; $depth++) {
+            if ($failure -is [Management.Automation.ItemNotFoundException] -or
+                $failure -is [IO.DirectoryNotFoundException] -or
+                $failure -is [IO.FileNotFoundException]) {
+                # A missing parent proves that the candidate currently has no
+                # physical identity. Creation is separately containment-checked.
+                return $null
+            }
+            $failure = $failure.InnerException
+        }
+        throw
+    }
     $lease = $null
     try { $lease = Open-PlatformDirectory -Root $physicalParent -RelativePath $leaf }
     catch {

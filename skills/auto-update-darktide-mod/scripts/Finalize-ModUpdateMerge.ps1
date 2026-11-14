@@ -562,11 +562,12 @@ function Invoke-ModUpdateTerminalCleanup {
         [Parameter(Mandatory)][string] $ClaimDirectory,
         [Parameter(Mandatory)][string] $ClaimRoot,
         [Parameter(Mandatory)][string] $RunRoot,
-        [Parameter(Mandatory)][string] $InProgressRoot
+        [Parameter(Mandatory)][string] $InProgressRoot,
+        [Parameter(Mandatory)][Collections.IDictionary] $FinalizationResult
     )
     Suspend-ModReservationWorker -State $State
     $owner = Start-ModReservationCleanup -State $State -EvidencePath $EvidencePath `
-        -ClaimDirectory $ClaimDirectory -RunRoot $RunRoot
+        -ClaimDirectory $ClaimDirectory -RunRoot $RunRoot -FinalizationResult $FinalizationResult
     Invoke-ModUpdateCleanupFaultInjection -Point 'cleanup-pending-persisted'
 
     # A recovery invocation may have reacquired a fresh writer lease even when
@@ -778,11 +779,7 @@ function Invoke-ModUpdateReviewedHeadFinalization {
     if ([string]$owner.runId -cne $runId -or [string]$owner.modLockKey -cne [string]$State.modLockKey) {
         throw 'Reservation owner changed before terminal release.'
     }
-    Invoke-ModUpdateTerminalCleanup -State $State -EvidencePath $evidenceFinal `
-        -ClaimDirectory $claimDirectory -ClaimRoot $claimRoot `
-        -RunRoot ([string]$State.runRoot) -InProgressRoot $inProgressRoot
-
-    [ordered]@{
+    $finalizationResult = [ordered]@{
         result = 'passed'
         runId = $runId
         stage = 'finalize-merge'
@@ -806,6 +803,77 @@ function Invoke-ModUpdateReviewedHeadFinalization {
             reservationReleased = $true
         }
     }
+    Invoke-ModUpdateTerminalCleanup -State $State -EvidencePath $evidenceFinal `
+        -ClaimDirectory $claimDirectory -ClaimRoot $claimRoot `
+        -RunRoot ([string]$State.runRoot) -InProgressRoot $inProgressRoot `
+        -FinalizationResult $finalizationResult
+    $finalizationResult
+}
+
+function Get-ReleasedModUpdateFinalizationResult {
+    param([Parameter(Mandatory)][Collections.IDictionary] $State)
+    if (-not $State.Contains('reservationToken') -or [string]$State.reservationToken -notmatch '^[0-9a-f]{32}$') {
+        throw 'Released finalization recovery requires the caller reservation token.'
+    }
+    Assert-LockOwner -State $State -AllowReleased
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+    if ([string]$owner.state -ceq 'held') { return $null }
+    $ownerToken = [string]$State.reservationToken
+    if ([string]$owner.state -cne 'released' -or [string]$owner.reservationToken -cne $ownerToken -or
+        [string]$owner.releasedByOwnerToken -cne $ownerToken) {
+        throw 'Released finalization reservation belongs to another owner token.'
+    }
+    $terminal = Get-ModReservationReleaseReceipt -State $State -OwnerToken $ownerToken
+    if ([IO.Path]::GetFullPath([string]$owner.releaseReceiptPath) -cne [IO.Path]::GetFullPath([string]$terminal.path) -or
+        [string]$owner.releaseReceiptSha256 -cne [string]$terminal.sha256) {
+        throw 'Released finalization terminal receipt differs from the owner tuple.'
+    }
+    if ([string]$owner.reservationState -cne 'released' -or
+        -not $owner.Contains('cleanup') -or $owner.cleanup -isnot [Collections.IDictionary] -or
+        -not [bool]$owner.cleanup.writerLockReleased -or -not [bool]$owner.cleanup.claimDirectoryPreserved -or
+        -not [bool]$owner.cleanup.runRootPreserved -or
+        $owner.cleanup.finalizationResult -isnot [Collections.IDictionary]) {
+        throw 'Released finalization lacks the completed cleanup tuple and result.'
+    }
+    $archiveLocations = Get-ModUpdateArchiveLocations -State $State
+    $expectedEvidence = [IO.Path]::GetFullPath((Join-Path (Join-Path ([string]$archiveLocations.finishedRoot) '.evidence') ([string]$State.runId)))
+    $expectedClaimDirectory = [IO.Path]::GetFullPath((Split-Path -Parent ([string]$State.claimPath)))
+    if ([string]$owner.cleanup.runId -cne [string]$State.runId -or
+        [IO.Path]::GetFullPath([string]$owner.cleanup.evidencePath) -cne $expectedEvidence -or
+        [IO.Path]::GetFullPath([string]$owner.cleanup.claimDirectory) -cne $expectedClaimDirectory -or
+        [IO.Path]::GetFullPath([string]$owner.cleanup.runRoot) -cne [IO.Path]::GetFullPath([string]$State.runRoot)) {
+        throw 'Released finalization cleanup tuple differs from the immutable run paths.'
+    }
+    $null = Assert-ModUpdateFinalEvidence -EvidencePath $expectedEvidence -RunId ([string]$State.runId)
+    $result = $owner.cleanup.finalizationResult
+    $artifactPath = Join-Path $expectedEvidence 'artifacts/merge-finalization.json'
+    $fingerprintPath = Join-Path $expectedEvidence 'artifacts/merge-fingerprint.json'
+    $fingerprint = Get-Content -LiteralPath $fingerprintPath -Raw | ConvertFrom-Json -AsHashtable
+    if ((@($result.Keys) -join ',') -cne 'result,runId,stage,status,statePath,stageTimings,artifactSha256,data' -or
+        (@($result.data.Keys) -join ',') -cne 'prUrl,mergeCommitOid,reviewedOid,originMainOid,fingerprintPath,fingerprintBlobOid,fingerprintArtifactSha256,fingerprintBlobSha256,archiveSha256,finishedArchive,archiveDisposition,evidencePath,reservationReleased' -or
+        [string]$result.result -cne 'passed' -or [string]$result.runId -cne [string]$State.runId -or
+        [string]$result.stage -cne 'finalize-merge' -or [string]$result.status -cne 'merged-and-finalized' -or
+        [IO.Path]::GetFullPath([string]$result.statePath) -cne [IO.Path]::GetFullPath([string]$State.statePath) -or
+        [string]$result.artifactSha256 -cne (Get-FileSha256 -Path $artifactPath) -or
+        ($result.stageTimings | ConvertTo-Json -Depth 30 -Compress) -cne
+            ($State.stageTimings['finalize-merge'] | ConvertTo-Json -Depth 30 -Compress) -or
+        [string]$result.data.prUrl -cne [string]$State.prUrl -or
+        [string]$result.data.mergeCommitOid -cne [string]$State.mergeCommitOid -or
+        [string]$result.data.reviewedOid -cne [string]$State.reviewedOid -or
+        [string]$result.data.originMainOid -cne [string]$State.originMainOid -or
+        [string]$result.data.fingerprintPath -cne [string]$fingerprint.repositoryPath -or
+        [string]$result.data.fingerprintBlobOid -cne [string]$fingerprint.fingerprintBlobOid -or
+        [string]$result.data.fingerprintArtifactSha256 -cne [string]$State.mergeFingerprintSha256 -or
+        [string]$State.mergeFingerprintSha256 -cne (Get-FileSha256 -Path $fingerprintPath) -or
+        [string]$result.data.fingerprintBlobSha256 -cne [string]$fingerprint.fingerprintBlobSha256 -or
+        [string]$result.data.archiveSha256 -cne [string]$State.archive.sha256 -or
+        [IO.Path]::GetFullPath([string]$result.data.finishedArchive) -cne [IO.Path]::GetFullPath([string]$archiveLocations.finishedPath) -or
+        [string]$result.data.archiveDisposition -notin @('moved-to-finished', 'deduplicated-same-name-same-sha', 'already-in-finished') -or
+        [IO.Path]::GetFullPath([string]$result.data.evidencePath) -cne $expectedEvidence -or
+        -not [bool]$result.data.reservationReleased) {
+        throw 'Released finalization result differs from the verified final evidence and state tuple.'
+    }
+    $result
 }
 
 function Invoke-ModUpdateMergeFinalization {

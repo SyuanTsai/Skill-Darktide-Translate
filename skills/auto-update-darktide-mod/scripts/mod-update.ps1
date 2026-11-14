@@ -1868,7 +1868,7 @@ function Get-CompletedStageResult {
 }
 
 function Assert-LockOwner {
-    param([Collections.IDictionary] $State)
+    param([Collections.IDictionary] $State, [switch] $AllowReleased)
     foreach ($field in @('repositoryRoot', 'repoModDirectory', 'mod', 'modRelativePath', 'runId', 'runRoot', 'artifactsRoot', 'statePath', 'modLockKey', 'modLockPath')) {
         if (-not $State.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$State[$field])) { throw "Run state is missing $field." }
     }
@@ -1896,7 +1896,8 @@ function Assert-LockOwner {
         [IO.Path]::GetFullPath([string]$owner.statePath) -cne $statePathFull) {
         throw 'MOD identity lock does not belong to this same run tuple.'
     }
-    if ([int]$owner.schemaVersion -ne 3 -or [string]$owner.state -cne 'held' -or
+    $allowedOwnerState = [string]$owner.state -ceq 'held' -or ($AllowReleased -and [string]$owner.state -ceq 'released')
+    if ([int]$owner.schemaVersion -ne 3 -or -not $allowedOwnerState -or
         [string]$owner.platform -notin @('windows', 'linux', 'macos') -or
         ([string]$owner.platform -ceq 'windows' -and [string]$owner.lockPrimitive -cne 'windows-fileshare') -or
         ([string]$owner.platform -in @('linux', 'macos') -and [string]$owner.lockPrimitive -cne 'flock') -or
@@ -2109,10 +2110,17 @@ function Suspend-ModReservationWorker {
 
 function Release-ModReservation {
     param([Collections.IDictionary] $State)
+    if (-not $State.Contains('reservationToken') -or
+        [string]$State.reservationToken -notmatch '^[0-9a-f]{32}$') {
+        throw 'Reservation release requires the caller reservation token.'
+    }
     $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
-    $expectedOwnerToken = if ($State.Contains('reservationToken')) { [string]$State.reservationToken } else { $null }
+    $expectedOwnerToken = [string]$State.reservationToken
+    if ([string]$owner.reservationToken -cne $expectedOwnerToken) {
+        throw 'Reservation owner token changed before terminal release.'
+    }
     if ([string]$owner.state -ceq 'released') {
-        if ([string]::IsNullOrWhiteSpace($expectedOwnerToken) -or -not $owner.Contains('releasedByOwnerToken') -or
+        if (-not $owner.Contains('releasedByOwnerToken') -or
             [string]$owner.releasedByOwnerToken -cne $expectedOwnerToken -or [string]$owner.reservationToken -cne $expectedOwnerToken) {
             throw 'Reservation was released by another or legacy owner token.'
         }
@@ -2134,9 +2142,7 @@ function Release-ModReservation {
         throw 'Reservation cleanup must complete every persisted boundary before terminal release.'
     }
     $expectedReservationToken = [string]$owner.reservationToken
-    if (-not [string]::IsNullOrWhiteSpace($expectedOwnerToken) -and $expectedReservationToken -cne $expectedOwnerToken) {
-        throw 'Reservation owner token changed before terminal release.'
-    }
+    if ($expectedReservationToken -cne $expectedOwnerToken) { throw 'Reservation owner token changed before terminal release.' }
     $expectedWorkerToken = [string]$owner.workerToken
     $terminal = Get-ModReservationReleaseReceipt -State $State -OwnerToken $expectedReservationToken -Publish
     $now = Get-UtcTimestamp
@@ -2169,7 +2175,8 @@ function Start-ModReservationCleanup {
         [Parameter(Mandatory)][Collections.IDictionary] $State,
         [Parameter(Mandatory)][string] $EvidencePath,
         [Parameter(Mandatory)][string] $ClaimDirectory,
-        [Parameter(Mandatory)][string] $RunRoot
+        [Parameter(Mandatory)][string] $RunRoot,
+        [Parameter(Mandatory)][Collections.IDictionary] $FinalizationResult
     )
     $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
     Assert-ModReservationCleanupOwner -State $State -Owner $owner
@@ -2179,12 +2186,17 @@ function Start-ModReservationCleanup {
         evidencePath = [IO.Path]::GetFullPath($EvidencePath)
         claimDirectory = [IO.Path]::GetFullPath($ClaimDirectory)
         runRoot = [IO.Path]::GetFullPath($RunRoot)
+        finalizationResult = $FinalizationResult
     }
     if ($owner.Contains('cleanup') -and $owner.cleanup -is [Collections.IDictionary]) {
         foreach ($field in @('schemaVersion', 'runId', 'evidencePath', 'claimDirectory', 'runRoot')) {
             if ([string]$owner.cleanup[$field] -cne [string]$tuple[$field]) {
                 throw 'Persisted reservation cleanup tuple changed before recovery.'
             }
+        }
+        if (($owner.cleanup.finalizationResult | ConvertTo-Json -Depth 40 -Compress) -cne
+            ($FinalizationResult | ConvertTo-Json -Depth 40 -Compress)) {
+            throw 'Persisted reservation finalization result changed before recovery.'
         }
         if ([string]$owner.reservationState -cne 'cleanup-pending') {
             $owner.reservationState = 'cleanup-pending'
@@ -2201,6 +2213,7 @@ function Start-ModReservationCleanup {
         evidencePath = $tuple.evidencePath
         claimDirectory = $tuple.claimDirectory
         runRoot = $tuple.runRoot
+        finalizationResult = $tuple.finalizationResult
         startedAt = Get-UtcTimestamp
         writerLockReleased = $false
         claimDirectoryPreserved = $false
@@ -5468,9 +5481,16 @@ try {
     else {
         $state = Resolve-InitialState
         $null = Assert-RunLocalSkillPackage -State $state
-        Ensure-RunWriterLock -State $state
-        $state = Read-State -Path $state.statePath
-        Invoke-StageCommand -StageName $Command -State $state
+        $releasedFinalization = if ($Command -ceq 'finalize-merge') {
+            Get-ReleasedModUpdateFinalizationResult -State $state
+        }
+        else { $null }
+        if ($null -ne $releasedFinalization) { $releasedFinalization }
+        else {
+            Ensure-RunWriterLock -State $state
+            $state = Read-State -Path $state.statePath
+            Invoke-StageCommand -StageName $Command -State $state
+        }
     }
 
     if ($PassThru) { $result } else { $result | ConvertTo-Json -Depth 40 -Compress }

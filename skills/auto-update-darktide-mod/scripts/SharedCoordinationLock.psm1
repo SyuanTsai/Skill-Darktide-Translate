@@ -197,15 +197,19 @@ function Test-CoordinationProcessStartMatch {
 
 function Test-CoordinationProcessActive {
     param([Parameter(Mandatory)][Collections.IDictionary] $Owner)
-    if ([string]$Owner.machineName -cne [Environment]::MachineName -or
-        -not $Owner.processId -or -not $Owner.processStartTicks) {
-        return $false
+    if ([string]$Owner.machineName -cne [Environment]::MachineName) {
+        throw 'Cannot verify a stale coordination owner process on another machine.'
     }
-    try {
-        $process = Get-Process -Id ([int]$Owner.processId) -ErrorAction Stop
-        Test-CoordinationProcessStartMatch -ActualTicks $process.StartTime.ToUniversalTime().Ticks -ExpectedTicks ([int64]$Owner.processStartTicks)
+    $process = Get-Process -Id ([int]$Owner.processId) -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $false }
+    try { $actualStartTicks = $process.StartTime.ToUniversalTime().Ticks }
+    catch {
+        throw 'Cannot verify the stale coordination owner process identity.'
     }
-    catch { $false }
+    if (-not (Test-CoordinationProcessStartMatch -ActualTicks $actualStartTicks -ExpectedTicks ([int64]$Owner.processStartTicks))) {
+        throw 'Stale coordination owner process identity contradicts the live process.'
+    }
+    $true
 }
 
 function Enter-CoordinationOwnerGuard {
@@ -304,9 +308,20 @@ function Assert-CoordinationOwner {
             [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed
         )) { throw "Existing $ResourceKey coordination lock timestamp is invalid." }
     }
-    if ([string]$Owner.state -ceq 'released' -and
-        (-not $Owner.Contains('releasedByOwnerToken') -or [string]$Owner.releasedByOwnerToken -cne [string]$Owner.owner.token)) {
-        throw "Existing $ResourceKey released coordination lock lacks the matching releasing owner token."
+    if ([string]$Owner.state -ceq 'released') {
+        foreach ($field in @('releasedByOwnerToken', 'releaseReceiptPath', 'releaseReceiptSha256', 'coordinationReceiptId', 'coordinationCompletedAt')) {
+            if (-not $Owner.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$Owner[$field])) {
+                throw "Existing $ResourceKey released coordination lock is missing $field."
+            }
+        }
+        $completedAt = [DateTimeOffset]::MinValue
+        if ([string]$Owner.releasedByOwnerToken -cne [string]$Owner.owner.token -or
+            [string]$Owner.releaseReceiptSha256 -notmatch '^[0-9a-f]{64}$' -or
+            [string]$Owner.coordinationReceiptId -notmatch '^[0-9a-f]{32}$' -or
+            -not [DateTimeOffset]::TryParseExact([string]$Owner.coordinationCompletedAt, 'o', [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind, [ref]$completedAt)) {
+            throw "Existing $ResourceKey released coordination lock receipt tuple is invalid."
+        }
     }
 }
 
@@ -348,16 +363,59 @@ function Publish-CoordinationLeaseSnapshot {
         [Collections.IDictionary] $Value,
         [Collections.IDictionary] $ExpectedState,
         [switch] $NoReplace,
-        [switch] $PreserveDisplaced
+        [switch] $PreserveDisplaced,
+        [ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId,
+        [ValidatePattern('^previous-[0-9a-f]{32}$')][string] $DisplacedLeaf
     )
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 30 -Compress) + "`n")
     $idBytes = [Text.UTF8Encoding]::new($false).GetBytes("coordination:$ResourceKey")
-    $sha256 = [Security.Cryptography.SHA256]::Create()
-    try { $transactionId = ([BitConverter]::ToString($sha256.ComputeHash($idBytes))).Replace('-', '').ToLowerInvariant().Substring(0, 32) }
-    finally { $sha256.Dispose() }
-    Publish-PortableLeaseFile -ParentPath $LockRoot -Leaf "$ResourceKey.lock" -Bytes $bytes `
-        -ExpectedState $ExpectedState -TransactionId $transactionId -NoReplace:$NoReplace `
-        -PreserveDisplaced:$PreserveDisplaced
+    if ([string]::IsNullOrWhiteSpace($TransactionId)) {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $TransactionId = ([BitConverter]::ToString($sha256.ComputeHash($idBytes))).Replace('-', '').ToLowerInvariant().Substring(0, 32) }
+        finally { $sha256.Dispose() }
+    }
+    $publicationParameters = @{
+        ParentPath = $LockRoot
+        Leaf = "$ResourceKey.lock"
+        Bytes = $bytes
+        ExpectedState = $ExpectedState
+        TransactionId = $TransactionId
+        NoReplace = [bool]$NoReplace
+        PreserveDisplaced = [bool]$PreserveDisplaced
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DisplacedLeaf)) { $publicationParameters.DisplacedLeaf = $DisplacedLeaf }
+    Publish-PortableLeaseFile @publicationParameters
+}
+
+function Get-CoordinationTakeoverEvidence {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $Owner,
+        [Parameter(Mandatory)][string] $LockRoot
+    )
+    if (-not $Owner.Contains('takeover') -or $Owner.takeover -isnot [Collections.IDictionary]) {
+        return [ordered]@{ path = $null; waitingMilliseconds = 0 }
+    }
+    $takeover = $Owner.takeover
+    if ([string]$takeover.staleSha256 -notmatch '^[0-9a-f]{64}$' -or
+        [int64]$takeover.staleLength -lt 1 -or
+        [string]$takeover.transactionId -notmatch '^[0-9a-f]{32}$' -or
+        [string]$takeover.displacedLeaf -notmatch '^previous-[0-9a-f]{32}$' -or
+        [int64]$takeover.waitingMilliseconds -lt 0) {
+        throw 'Persisted coordination takeover metadata is invalid.'
+    }
+    $path = [IO.Path]::GetFullPath((Join-Path (Join-Path (Join-Path $LockRoot '.ai-instructions-txn') ([string]$takeover.transactionId)) ([string]$takeover.displacedLeaf)))
+    $evidence = Get-PortableLeaseFileState -ParentPath (Split-Path -Parent $path) -Leaf (Split-Path -Leaf $path)
+    if ([string]$evidence.sha256 -cne [string]$takeover.staleSha256 -or
+        [int64]$evidence.length -ne [int64]$takeover.staleLength) {
+        throw 'Stale coordination evidence differs from the persisted takeover metadata.'
+    }
+    [ordered]@{ path = $path; waitingMilliseconds = [int64]$takeover.waitingMilliseconds }
+}
+
+function Invoke-CoordinationFaultInjection {
+    param([Parameter(Mandatory)][string] $Point)
+    $hook = Get-Variable -Name CoordinationFaultInjectionHook -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($hook -is [scriptblock]) { & $hook $Point }
 }
 
 function Write-CoordinationReceipt {
@@ -390,7 +448,14 @@ function Write-CoordinationReceipt {
         platform = $Lease.platform
         lockPrimitive = $Lease.lockPrimitive
     }
-    Write-CoordinationAtomicJson -Path $receiptPath -Value $receipt
+    [byte[]]$expectedBytes = [Text.UTF8Encoding]::new($false).GetBytes(($receipt | ConvertTo-Json -Depth 30))
+    $receiptSnapshot = Get-PortableLeaseFileState -ParentPath $receiptDirectory -Leaf ([IO.Path]::GetFileName($receiptPath)) -AllowMissing
+    if ([bool]$receiptSnapshot.exists) {
+        if ([Convert]::ToHexString([byte[]]$receiptSnapshot.bytes) -cne [Convert]::ToHexString($expectedBytes)) {
+            throw 'Existing coordination receipt differs from the immutable release tuple.'
+        }
+    }
+    else { Write-CoordinationAtomicJson -Path $receiptPath -Value $receipt }
     [ordered]@{
         path = [IO.Path]::GetFullPath($receiptPath)
         sha256 = Get-CoordinationFileSha256 -Path $receiptPath
@@ -525,22 +590,57 @@ function Enter-SharedCoordinationLease {
                         processId = [int]$existing.owner.processId
                         processStartTicks = [int64]$existing.owner.processStartTicks
                     }
+                    $takeoverEvidence = Get-CoordinationTakeoverEvidence -Owner $existing -LockRoot $lockRoot
                     return New-CoordinationLeaseRecord -LockPath $lockPath -Token $token -RunId $RunId -ResourceKey $ResourceKey `
-                        -Identity $existingIdentity -Owner $existing -ReceiptRoot $receiptRootFull -StaleEvidencePath $staleEvidencePath
+                        -Identity $existingIdentity -Owner $existing -ReceiptRoot $receiptRootFull `
+                        -StaleEvidencePath ([string]$takeoverEvidence.path) -WaitingMilliseconds ([int64]$takeoverEvidence.waitingMilliseconds)
                 }
                 $expiresAt = [DateTimeOffset]::ParseExact(
                     [string]$existing.expiresAt, 'o', [Globalization.CultureInfo]::InvariantCulture,
                     [Globalization.DateTimeStyles]::RoundtripKind)
-                if ([string]$existing.state -ceq 'held' -and [DateTimeOffset]::UtcNow -lt $expiresAt) {
-                    $waitForOwner = $true
+                if ([string]$existing.state -ceq 'held') {
+                    if ([DateTimeOffset]::UtcNow -lt $expiresAt -or (Test-CoordinationProcessActive -Owner $existing.owner)) {
+                        $waitForOwner = $true
+                    }
                 }
             }
             if (-not $waitForOwner) {
                 $preserveStaleEvidence = [bool]$snapshot.exists -and [string]$existing.state -ceq 'held'
                 try {
-                    $publication = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey $ResourceKey -Value $owner `
-                        -ExpectedState $snapshot -NoReplace:(-not [bool]$snapshot.exists) `
-                        -PreserveDisplaced:$preserveStaleEvidence
+                    $publicationNow = [DateTimeOffset]::UtcNow
+                    $owner.owner.acquiredAt = $publicationNow.ToString('o')
+                    $owner.owner.heartbeat = $publicationNow.ToString('o')
+                    $owner.expiresAt = $publicationNow.AddMinutes(3).ToString('o')
+                    $waitingMilliseconds = if ($waitStartedMilliseconds -lt 0) { [int64]0 } else {
+                        [Math]::Max([int64]0, [Environment]::TickCount64 - $waitStartedMilliseconds)
+                    }
+                    $takeoverTransactionId = $null
+                    $takeoverDisplacedLeaf = $null
+                    if ($preserveStaleEvidence) {
+                        $takeoverTransactionId = Get-CoordinationActorToken -RunId $token -ResourceKey ("takeover-$ResourceKey-$([string]$snapshot.sha256)")
+                        $takeoverDisplacedLeaf = 'previous-' + ([string]$snapshot.sha256).Substring(0, 32)
+                        $owner['takeover'] = [ordered]@{
+                            transactionId = $takeoverTransactionId
+                            displacedLeaf = $takeoverDisplacedLeaf
+                            staleSha256 = [string]$snapshot.sha256
+                            staleLength = [int64]$snapshot.length
+                            waitingMilliseconds = $waitingMilliseconds
+                        }
+                    }
+                    $publicationParameters = @{
+                        LockRoot = $lockRoot
+                        ResourceKey = $ResourceKey
+                        Value = $owner
+                        ExpectedState = $snapshot
+                        NoReplace = -not [bool]$snapshot.exists
+                        PreserveDisplaced = $preserveStaleEvidence
+                    }
+                    if ($takeoverTransactionId) {
+                        $publicationParameters.TransactionId = $takeoverTransactionId
+                        $publicationParameters.DisplacedLeaf = $takeoverDisplacedLeaf
+                    }
+                    $publication = Publish-CoordinationLeaseSnapshot @publicationParameters
+                    Invoke-CoordinationFaultInjection -Point 'acquire-published-before-evidence-verification'
                     if ($preserveStaleEvidence) {
                         $staleEvidencePath = [string]$publication.displacedPath
                         if ([string]::IsNullOrWhiteSpace($staleEvidencePath)) {
@@ -553,12 +653,6 @@ function Enter-SharedCoordinationLease {
                             [Convert]::ToHexString([byte[]]$evidence.bytes) -cne [Convert]::ToHexString([byte[]]$snapshot.bytes)) {
                             throw 'Stale coordination evidence differs from the displaced owner snapshot.'
                         }
-                    }
-                    $waitingMilliseconds = if ($waitStartedMilliseconds -lt 0) {
-                        [int64]0
-                    }
-                    else {
-                        [Math]::Max([int64]0, [Environment]::TickCount64 - $waitStartedMilliseconds)
                     }
                     return New-CoordinationLeaseRecord -LockPath $lockPath -Token $token -RunId $RunId -ResourceKey $ResourceKey -Identity $identity -Owner $owner -ReceiptRoot $receiptRootFull -StaleEvidencePath $staleEvidencePath -WaitingMilliseconds $waitingMilliseconds
                 }
@@ -649,12 +743,24 @@ function Exit-SharedCoordinationLease {
             if ([string]$owner.releasedByOwnerToken -cne [string]$Lease.token) {
                 throw 'Shared coordination lease was released by another owner token.'
             }
-            return Get-CoordinationTerminalReceipt -Lease $Lease -LockRoot $lockRoot
+            $terminal = Get-CoordinationTerminalReceipt -Lease $Lease -LockRoot $lockRoot
+            if ([IO.Path]::GetFullPath([string]$owner.releaseReceiptPath) -cne [IO.Path]::GetFullPath([string]$terminal.path) -or
+                [string]$owner.releaseReceiptSha256 -cne [string]$terminal.sha256) {
+                throw 'Released coordination owner differs from its immutable terminal receipt.'
+            }
+            if (-not $owner.Contains('coordinationReceiptId') -or -not $owner.Contains('coordinationCompletedAt')) {
+                throw 'Released coordination owner lacks its operational receipt tuple.'
+            }
+            $Lease.receiptId = [string]$owner.coordinationReceiptId
+            $Lease.completedAt = [string]$owner.coordinationCompletedAt
+            return Write-CoordinationReceipt -Lease $Lease -Disposition 'released'
         }
         if (-not (Test-CoordinationLeaseMatchesOwner -Lease $Lease -Owner $owner)) {
             throw 'Shared coordination lock ownership changed before release.'
         }
         $Lease.completedAt = Get-CoordinationUtcTimestamp
+        $owner.coordinationReceiptId = [string]$Lease.receiptId
+        $owner.coordinationCompletedAt = [string]$Lease.completedAt
         $terminal = Get-CoordinationTerminalReceipt -Lease $Lease -LockRoot $lockRoot -Publish
         $owner.state = 'released'
         $owner.releasedByOwnerToken = [string]$Lease.token
@@ -666,6 +772,7 @@ function Exit-SharedCoordinationLease {
             -Value $owner -ExpectedState $snapshot
     }
     finally { $guard.Dispose() }
+    Invoke-CoordinationFaultInjection -Point 'release-published-before-operational-receipt'
     Write-CoordinationReceipt -Lease $Lease -Disposition 'released'
 }
 

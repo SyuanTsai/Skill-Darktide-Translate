@@ -251,9 +251,13 @@ Describe 'Schema 15 multi-process coordination contract' {
                 Get-Content -LiteralPath ([string]$_.path) -Raw | ConvertFrom-TestJson -AsHashtable
             })
             foreach ($resourceKey in @('source-acquisition', 'git-coordination')) {
-                $timeline = @($receipts | Where-Object { $_.resourceKey -ceq $resourceKey } | Sort-Object { [DateTimeOffset]$_.acquiredAt })
+                $timeline = @($receipts | Where-Object { $_.resourceKey -ceq $resourceKey } | Sort-Object {
+                    [DateTimeOffset]::ParseExact([string]$_.acquiredAt, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+                })
                 for ($index = 1; $index -lt $timeline.Count; $index++) {
-                    [DateTimeOffset]$timeline[$index].acquiredAt | Should -BeGreaterOrEqual ([DateTimeOffset]$timeline[$index - 1].completedAt)
+                    $acquiredAt = [DateTimeOffset]::ParseExact([string]$timeline[$index].acquiredAt, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+                    $priorCompletedAt = [DateTimeOffset]::ParseExact([string]$timeline[$index - 1].completedAt, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+                    $acquiredAt | Should -BeGreaterOrEqual $priorCompletedAt
                 }
             }
         }
@@ -621,10 +625,22 @@ finally {
         $repository = Join-Path $TestDrive 'coordination-release-retry'
         New-Item -ItemType Directory -Path $repository | Out-Null
         $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'release-owner'
-        $null = Exit-SharedCoordinationLease -Lease $lease
+        $coordinationModuleObject = Get-Module -Name SharedCoordinationLock | Select-Object -First 1
+        & $coordinationModuleObject {
+            $script:CoordinationFaultInjectionHook = {
+                param($point)
+                if ($point -ceq 'release-published-before-operational-receipt') { throw 'injected release return interruption' }
+            }
+        }
+        { Exit-SharedCoordinationLease -Lease $lease } | Should -Throw '*injected release return interruption*'
         $before = (Get-FileHash -LiteralPath $lease.path -Algorithm SHA256).Hash
+        & $coordinationModuleObject { $script:CoordinationFaultInjectionHook = $null }
         $retry = Exit-SharedCoordinationLease -Lease $lease
-        $retry.path | Should -Match ([regex]::Escape([string]$lease.token))
+        @($retry.Keys) | Should -Be @('path', 'sha256', 'resourceKey')
+        $retry.resourceKey | Should -BeExactly 'source-acquisition'
+        $retry.path | Should -Match '[\\/]coordination-locks[\\/]source-acquisition-[0-9a-f]{32}\.json$'
+        $sameResult = Exit-SharedCoordinationLease -Lease $lease
+        ($sameResult | ConvertTo-Json -Compress) | Should -BeExactly ($retry | ConvertTo-Json -Compress)
         (Get-FileHash -LiteralPath $lease.path -Algorithm SHA256).Hash | Should -BeExactly $before
     }
 
@@ -639,5 +655,91 @@ finally {
         $other = [ordered]@{}; foreach ($entry in $lease.GetEnumerator()) { $other[$entry.Key] = $entry.Value }
         $other.token = 'e' * 32
         { Exit-SharedCoordinationLease -Lease $other } | Should -Throw '*another owner token*'
+    }
+
+    # Scenario: A child process remains alive while its persisted expiry is forced into the past.
+    # Purpose: Expiry alone must not permit takeover of a verifiably live same-machine owner.
+    It 'InterT387_WaitsForALiveExpiredOwnerWithoutChangingLeaseBytes' -Tag 'MultiProcess' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'live-expired-owner'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $leaseRecord = Join-Path $TestDrive 'live-expired-lease.json'
+        $stopSignal = Join-Path $TestDrive 'live-expired-stop.signal'
+        $workerScript = Join-Path $TestDrive 'live-expired-worker.ps1'
+        @'
+param($ModulePath,$Repository,$LeaseRecord,$StopSignal)
+Import-Module $ModulePath -Force
+$lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey 'git-coordination' -RunId 'live-expired-child'
+$lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeaseRecord -NoNewline
+$deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+while (-not [IO.File]::Exists($StopSignal) -and [DateTimeOffset]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+$null = Exit-SharedCoordinationLease -Lease $lease
+'@ | Set-Content -LiteralPath $workerScript -NoNewline
+        $start = [Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
+        $start.UseShellExecute = $false
+        foreach ($argument in @('-NoLogo','-NoProfile','-NonInteractive','-File',$workerScript,
+            '-ModulePath',$coordinationModule,'-Repository',$repository,'-LeaseRecord',$leaseRecord,'-StopSignal',$stopSignal)) {
+            $start.ArgumentList.Add($argument)
+        }
+        $child = [Diagnostics.Process]::Start($start)
+        try {
+            $deadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
+            while (-not [IO.File]::Exists($leaseRecord) -and [DateTimeOffset]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 25 }
+            [IO.File]::Exists($leaseRecord) | Should -BeTrue
+            $lease = Get-Content -LiteralPath $leaseRecord -Raw | ConvertFrom-TestJson -AsHashtable
+            $owner = Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable
+            $owner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
+            $owner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+            [IO.File]::WriteAllText([string]$lease.path, ($owner | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+            [byte[]]$expiredBytes = [IO.File]::ReadAllBytes([string]$lease.path)
+            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
+                    -RunId 'live-expired-contender' -TimeoutSeconds 1 } | Should -Throw '*Timed out*'
+            [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$lease.path)) |
+                Should -BeExactly ([Convert]::ToHexString($expiredBytes))
+            (Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable).owner.token |
+                Should -BeExactly ([string]$lease.token)
+        }
+        finally {
+            [IO.File]::WriteAllText($stopSignal, '', [Text.UTF8Encoding]::new($false))
+            if (-not $child.WaitForExit(10000)) { $child.Kill($true) }
+            $child.Dispose()
+        }
+    }
+
+    # Scenario: Stale-owner CAS publishes, then the acquiring caller is interrupted before displaced evidence verification.
+    # Purpose: Same-token retry must recover the exact persisted evidence and reject later tampering.
+    It 'InterT388_RecoversPublishedStaleTakeoverEvidenceForTheSameToken' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'stale-takeover-retry'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $dead = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'dead-owner'
+        $owner = Get-Content -LiteralPath $dead.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $owner.owner.processId = 2147483000
+        $owner.owner.processStartTicks = 1
+        $owner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+        $owner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
+        [IO.File]::WriteAllText([string]$dead.path, ($owner | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+        [byte[]]$displacedBytes = [IO.File]::ReadAllBytes([string]$dead.path)
+        $coordinationModuleObject = Get-Module -Name SharedCoordinationLock | Select-Object -First 1
+        & $coordinationModuleObject {
+            $script:CoordinationFaultInjectionHook = {
+                param($point)
+                if ($point -ceq 'acquire-published-before-evidence-verification') { throw 'injected stale takeover interruption' }
+            }
+        }
+        { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner' } |
+            Should -Throw '*injected stale takeover interruption*'
+        & $coordinationModuleObject { $script:CoordinationFaultInjectionHook = $null }
+        $retry = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner'
+        try {
+            $retry.staleEvidencePath | Should -Not -BeNullOrEmpty
+            [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$retry.staleEvidencePath)) |
+                Should -BeExactly ([Convert]::ToHexString($displacedBytes))
+            $retry.waitingMilliseconds | Should -BeGreaterOrEqual 0
+            [IO.File]::WriteAllText([string]$retry.staleEvidencePath, 'tampered', [Text.UTF8Encoding]::new($false))
+            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner' } |
+                Should -Throw '*differs from the persisted takeover metadata*'
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $retry }
     }
 }
