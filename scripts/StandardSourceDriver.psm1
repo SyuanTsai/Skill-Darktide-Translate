@@ -7,8 +7,8 @@
 # The PR-B workflow executes this module from the exact event-base `driver/`
 # checkout. It binds only the prepared target authority tuple below (commit,
 # codeload archive SHA-256 and the complete runner-read inventory). The active
-# v1 pin in config/standard-v1.json is intentionally independent: explicit
-# source purposes require the candidate config to name this exact tuple.
+# v1 pin in config/standard-v1.json is intentionally independent and remains
+# ead467c; explicit v2 source purposes use only the prepared tuple below.
 #
 # This module never loads Windows-only APIs. Process ownership, isolation and
 # environment filtering for the tools it starts are delegated to the pinned
@@ -17,16 +17,15 @@
 
 Set-StrictMode -Version Latest
 
-$script:DarktidePathSafetyModule = Import-Module -Name (Join-Path $PSScriptRoot '../skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru -ErrorAction Stop
-$script:DarktideBootstrapPlatformRuntimeModule = & $script:DarktidePathSafetyModule { $script:VendoredPlatformRuntimeModule }
-if ($script:DarktideBootstrapPlatformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Vendored authority platform runtime was not registry-bound.' }
-Import-Module -ModuleInfo $script:DarktideBootstrapPlatformRuntimeModule -Force -ErrorAction Stop
+$script:DarktideAuthorityPlatformRuntimeModule = $null
 $script:DarktideExecutableBindings = [Collections.Generic.List[object]]::new()
+$script:DarktideProcessCaptureRoot = $null
 
 $script:DarktideSourceRepository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
 $script:DarktidePreparedAuthorityRepository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
 $script:DarktidePreparedAuthorityCommit = 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
 $script:DarktidePreparedAuthorityArchiveSha256 = 'c6bf36892d419c6751aeb2fde678e71975e2cec5448350e3700c337cd7a10c3d'
+$script:DarktideActiveV1AuthorityCommit = 'ead467c3488c103546f316d137196b447a1ff58a'
 $script:DarktidePreparedAuthorityFiles = [ordered]@{
     'docs/standards/README.md' = 'c7aa1fc7f42d3c5017ff8a79752b83149056b6c8f3e0b7d2fc04c6a54bdfb265'
     'docs/standards/managed-skill-lifecycle.md' = '4e3f8595072d663f51d18aa28f42293fda5456362b49c0ea3f0157ae3dcf56dd'
@@ -92,6 +91,9 @@ $script:DarktideSetupTokenVariable = 'DT_SOURCE_SETUP_GITHUB_TOKEN'
 
 function Open-DarktideFileBinding {
     param([Parameter(Mandatory)][string] $Path, [string] $Access = 'Read', [string] $CreateMode = 'OpenExisting')
+    if ($script:DarktideAuthorityPlatformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) {
+        throw 'The reviewed authority platform runtime must be imported before protected file access.'
+    }
     $full = [IO.Path]::GetFullPath($Path)
     $parent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($full)) -RootOnly
     try {
@@ -205,8 +207,22 @@ function Read-DarktideJsonFile {
     finally { if ($null -ne $binding) { Close-DarktideFileBinding -Binding $binding } }
 }
 
+function Read-DarktideTextFile {
+    param([Parameter(Mandatory)][string] $Path, [int] $Limit = 1048576)
+    $binding = Open-DarktideFileBinding -Path $Path
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($binding.File.ReadAllBytes($Limit))
+        [void](Assert-PlatformFileIdentity -Lease $binding.File -Expected $binding.Identity -SingleLink -VerifyPath)
+        return $text
+    }
+    finally { Close-DarktideFileBinding -Binding $binding }
+}
+
 function Get-DarktideFileSha256 {
     param([Parameter(Mandatory = $true)][string] $Path)
+    if ($script:DarktideAuthorityPlatformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) {
+        return Get-DarktideBootstrapFileSha256 -Path $Path
+    }
     $binding = Open-DarktideFileBinding -Path $Path
     try {
         $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($binding.File.ReadAllBytes(268435456))).ToLowerInvariant()
@@ -214,6 +230,15 @@ function Get-DarktideFileSha256 {
         return $hash
     }
     finally { Close-DarktideFileBinding -Binding $binding }
+}
+
+function Get-DarktideBootstrapFileSha256 {
+    # Bootstrap is limited to exact-byte verification of the reviewed authority
+    # runtime itself. No candidate module is imported to cross this boundary.
+    param([Parameter(Mandatory = $true)][string] $Path)
+    $stream = [IO.FileStream]::new([IO.Path]::GetFullPath($Path), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try { return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
+    finally { $stream.Dispose() }
 }
 
 function Get-DarktidePathComparison {
@@ -348,6 +373,71 @@ function Get-DarktideCurrentPowerShellPath {
     return $path
 }
 
+function Get-DarktideOwnedProcessEnvironment {
+    $environment = @{}
+    foreach ($entry in Get-ChildItem Env:) {
+        if ($null -ne $entry.Value) { $environment[[string]$entry.Name] = [string]$entry.Value }
+    }
+    return $environment
+}
+
+function Invoke-DarktideOwnedProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ExecutablePath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $Arguments,
+        [Parameter(Mandatory)][string] $WorkingDirectory,
+        [Parameter(Mandatory)][string] $CaptureRoot,
+        [ValidateRange(1, 86400)][int] $TimeoutSeconds = 300,
+        [int[]] $AllowedExitCodes = @(0),
+        [hashtable] $Environment = (Get-DarktideOwnedProcessEnvironment)
+    )
+
+    $physicalExecutable = Resolve-DarktidePhysicalPath -Path $ExecutablePath
+    $executable = Open-DarktideFileBinding -Path $physicalExecutable
+    $workingLease = $null
+    $process = $null
+    $cleanup = $null
+    $exitCode = $null
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+    $captureId = [guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $CaptureRoot "process-$captureId.stdout"
+    $stderrPath = Join-Path $CaptureRoot "process-$captureId.stderr"
+    try {
+        $workingLease = Open-PlatformDirectory -Root ([IO.Path]::GetFullPath($WorkingDirectory)) -RootOnly
+        $process = Start-PlatformOwnedProcess -ExecutableLease $executable.File -ArgumentZero $physicalExecutable `
+            -ArgumentList $Arguments -Environment $Environment -WorkingDirectoryLease $workingLease -Deadline $deadline `
+            -StdoutPath $stdoutPath -StderrPath $stderrPath -OutputLimitCharacters 1048576
+        while (-not $process.HasExited -and [DateTimeOffset]::UtcNow -lt $deadline) {
+            [void]$process.WaitForExit([TimeSpan]::FromMilliseconds(50))
+        }
+        $timedOut = -not $process.HasExited
+        if (-not $timedOut) { $exitCode = [int]$process.ExitCode }
+    }
+    finally {
+        if ($null -ne $process) {
+            try {
+                $cleanup = Stop-PlatformOwnedProcess -Lease $process -ExpectedStartIdentity $process.StartIdentity -Deadline ([DateTimeOffset]::UtcNow.AddSeconds(10))
+                if ($null -eq $exitCode -and $process.HasExited) { $exitCode = [int]$process.ExitCode }
+            }
+            finally { $process.Dispose() }
+        }
+        if ($null -ne $workingLease) { $workingLease.Dispose() }
+        Close-DarktideFileBinding -Binding $executable
+    }
+    if ($null -eq $cleanup -or -not [bool]$cleanup.CleanedUp) { throw 'Owned process cleanup could not be verified.' }
+    if ($timedOut) { throw "Owned process exceeded its $TimeoutSeconds second deadline." }
+    $stdout = if (Test-DarktidePlatformFile -Path $stdoutPath) { Read-DarktideTextFile -Path $stdoutPath } else { '' }
+    $stderr = if (Test-DarktidePlatformFile -Path $stderrPath) { Read-DarktideTextFile -Path $stderrPath } else { '' }
+    if ($AllowedExitCodes -notcontains $exitCode) { throw "Owned process exited with code $exitCode. $stderr" }
+    return [pscustomobject]@{ exitCode=$exitCode; stdout=$stdout; stderr=$stderr; cleanup=$cleanup; stdoutPath=$stdoutPath; stderrPath=$stderrPath }
+}
+
+function Get-DarktideOwnedProcessLines {
+    param([AllowEmptyString()][string] $Text)
+    return @($Text -split '\r?\n' | Where-Object { $_ -ne '' })
+}
+
 function Resolve-DarktideGitRevision {
     param(
         [Parameter(Mandatory = $true)][string] $GitPath,
@@ -355,8 +445,10 @@ function Resolve-DarktideGitRevision {
         [Parameter(Mandatory = $true)][string] $Revision,
         [Parameter(Mandatory = $true)][string] $Context
     )
-    $output = @(& $GitPath -C $Root rev-parse --verify --end-of-options "$Revision^{commit}" 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1 -or ([string]$output[0]).Trim() -cnotmatch '^[0-9a-f]{40}$') {
+    $result = Invoke-DarktideOwnedProcess -ExecutablePath $GitPath -Arguments @('-C',$Root,'rev-parse','--verify','--end-of-options',"$Revision^{commit}") `
+        -WorkingDirectory $Root -CaptureRoot $script:DarktideProcessCaptureRoot -AllowedExitCodes @(0,1,128)
+    $output = @(Get-DarktideOwnedProcessLines -Text $result.stdout)
+    if ($result.exitCode -ne 0 -or $output.Count -ne 1 -or ([string]$output[0]).Trim() -cnotmatch '^[0-9a-f]{40}$') {
         throw "$Context '$Revision' does not resolve to one immutable commit."
     }
     return ([string]$output[0]).Trim()
@@ -369,8 +461,11 @@ function Resolve-DarktideGoRuntimeVersion {
         return $Expected
     }
     $go = Get-Command go -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    $output = @(& $go.Path version)
-    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1 -or [string]$output[0] -notmatch '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+)\s') {
+    $goPath = [IO.Path]::GetFullPath([string]$go.Path)
+    $result = Invoke-DarktideOwnedProcess -ExecutablePath $goPath -Arguments @('version') -WorkingDirectory $script:DarktideProcessCaptureRoot `
+        -CaptureRoot $script:DarktideProcessCaptureRoot
+    $output = @(Get-DarktideOwnedProcessLines -Text $result.stdout)
+    if ($output.Count -ne 1 -or [string]$output[0] -notmatch '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+)\s') {
         throw 'Could not resolve the current stable Go runtime version.'
     }
     return [string]$Matches.version
@@ -450,7 +545,7 @@ function Import-DarktideAuthorityPlatformRuntime {
     $manifestRelativePath = 'scripts/platform-runtime.psd1'
     $manifestPath = [IO.Path]::GetFullPath((Join-Path $root $manifestRelativePath))
     if (-not $pin.files.Contains($manifestRelativePath) -or
-        (Get-DarktideFileSha256 -Path $manifestPath) -cne [string]$pin.files[$manifestRelativePath]) {
+        (Get-DarktideBootstrapFileSha256 -Path $manifestPath) -cne [string]$pin.files[$manifestRelativePath]) {
         throw 'Authority platform runtime manifest differs from the selected reviewed tuple.'
     }
 
@@ -464,7 +559,7 @@ function Import-DarktideAuthorityPlatformRuntime {
         $tuplePath = 'scripts/' + $relative.Replace('\', '/')
         $fullPath = [IO.Path]::GetFullPath((Join-Path $root ($tuplePath -replace '/', [IO.Path]::DirectorySeparatorChar)))
         if (-not $pin.files.Contains($tuplePath) -or
-            (Get-DarktideFileSha256 -Path $fullPath) -cne [string]$pin.files[$tuplePath]) {
+            (Get-DarktideBootstrapFileSha256 -Path $fullPath) -cne [string]$pin.files[$tuplePath]) {
             throw "Authority platform runtime file differs from the selected reviewed tuple: $tuplePath"
         }
     }
@@ -481,6 +576,7 @@ function Import-DarktideAuthorityPlatformRuntime {
         Remove-Module -ModuleInfo $module -Force -ErrorAction SilentlyContinue
         throw
     }
+    $script:DarktideAuthorityPlatformRuntimeModule = $module
     return $module
 }
 
@@ -530,6 +626,26 @@ function Assert-DarktideSourceAuthorityConfig {
         throw 'config/standard-v1.json identity or deviation contract is invalid.'
     }
     return Assert-DarktideSourceAuthorityTuple -Authority $Config.authority
+}
+
+function Assert-DarktideActiveV1AuthorityConfig {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()] $Config)
+
+    Assert-DarktideExactPropertySet -Value $Config -Expected @('schemaVersion', 'standardVersion', 'authority', 'deviations') -Context 'active config/standard-v1.json'
+    if ($Config.schemaVersion -ne 1 -or [string]$Config.standardVersion -cne 'v1' -or
+        $Config.deviations -isnot [string] -or [string]$Config.deviations -cne 'None') {
+        throw 'Active config/standard-v1.json identity or deviation contract is invalid.'
+    }
+    Assert-DarktideExactPropertySet -Value $Config.authority -Expected @('repository', 'commit', 'archiveUrl', 'archiveSha256', 'files') -Context 'active v1 authority'
+    if ([string]$Config.authority.repository -cne $script:DarktidePreparedAuthorityRepository -or
+        [string]$Config.authority.commit -cne $script:DarktideActiveV1AuthorityCommit -or
+        [string]$Config.authority.archiveUrl -cne "https://codeload.github.com/SyuanTsai/SyuanTsai-AI-Instructions/zip/$($script:DarktideActiveV1AuthorityCommit)" -or
+        [string]$Config.authority.archiveSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $Config.authority.files -isnot [array] -or @($Config.authority.files).Count -ne 33) {
+        throw 'Active v1 authority does not match the independently approved ead467c tuple.'
+    }
+    return $Config.authority
 }
 
 function Resolve-DarktideSourceRoute {
@@ -614,23 +730,31 @@ function Assert-DarktidePreparedAuthorityCheckout {
     $fullRoot = Resolve-DarktidePhysicalPath -Path $AuthorityRoot
     if (-not (Test-DarktidePlatformDirectory -Path $fullRoot)) { throw "Prepared authority Git checkout is missing: $fullRoot" }
     Assert-DarktideNoReparseAncestors -Path $fullRoot -Context 'Prepared authority checkout' -TrustedRoot $fullRoot
-    $top = @(& $GitPath -C $fullRoot rev-parse --show-toplevel 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $top.Count -ne 1 -or -not (Test-DarktidePathEqual -Left ([string]$top[0]) -Right $fullRoot)) {
+    $gitResult = Invoke-DarktideOwnedProcess -ExecutablePath $GitPath -Arguments @('-C',$fullRoot,'rev-parse','--show-toplevel') `
+        -WorkingDirectory $fullRoot -CaptureRoot $script:DarktideProcessCaptureRoot -AllowedExitCodes @(0,128)
+    $top = @(Get-DarktideOwnedProcessLines $gitResult.stdout)
+    if ($gitResult.exitCode -ne 0 -or $top.Count -ne 1 -or -not (Test-DarktidePathEqual -Left ([string]$top[0]) -Right $fullRoot)) {
         throw 'Prepared authority path is not the root of a Git checkout.'
     }
-    $head = @(& $GitPath -C $fullRoot rev-parse --verify --end-of-options 'HEAD^{commit}' 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $head.Count -ne 1 -or ([string]$head[0]).Trim() -cne [string]$AuthorityPin.commit) {
+    $gitResult = Invoke-DarktideOwnedProcess -ExecutablePath $GitPath -Arguments @('-C',$fullRoot,'rev-parse','--verify','--end-of-options','HEAD^{commit}') `
+        -WorkingDirectory $fullRoot -CaptureRoot $script:DarktideProcessCaptureRoot -AllowedExitCodes @(0,128)
+    $head = @(Get-DarktideOwnedProcessLines $gitResult.stdout)
+    if ($gitResult.exitCode -ne 0 -or $head.Count -ne 1 -or ([string]$head[0]).Trim() -cne [string]$AuthorityPin.commit) {
         throw 'Prepared authority checkout HEAD does not match the exact approved revision.'
     }
-    $origins = @(& $GitPath -C $fullRoot config --local --get-all remote.origin.url 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $origins.Count -ne 1) { throw 'Prepared authority checkout must have exactly one origin URL.' }
+    $gitResult = Invoke-DarktideOwnedProcess -ExecutablePath $GitPath -Arguments @('-C',$fullRoot,'config','--local','--get-all','remote.origin.url') `
+        -WorkingDirectory $fullRoot -CaptureRoot $script:DarktideProcessCaptureRoot -AllowedExitCodes @(0,1)
+    $origins = @(Get-DarktideOwnedProcessLines $gitResult.stdout)
+    if ($gitResult.exitCode -ne 0 -or $origins.Count -ne 1) { throw 'Prepared authority checkout must have exactly one origin URL.' }
     $origin = ([string]$origins[0]).Trim().TrimEnd('/') -replace '\.git$', ''
     $expectedOrigin = ([string]$AuthorityPin.repository).Trim().TrimEnd('/') -replace '\.git$', ''
     if (-not $origin.Equals($expectedOrigin, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Prepared authority checkout origin does not match the pinned authority repository.'
     }
-    $dirty = @(& $GitPath -C $fullRoot status --porcelain=v1 --untracked-files=all)
-    if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { throw 'Prepared authority checkout must be clean and immutable.' }
+    $gitResult = Invoke-DarktideOwnedProcess -ExecutablePath $GitPath -Arguments @('-C',$fullRoot,'status','--porcelain=v1','--untracked-files=all') `
+        -WorkingDirectory $fullRoot -CaptureRoot $script:DarktideProcessCaptureRoot
+    $dirty = @(Get-DarktideOwnedProcessLines $gitResult.stdout)
+    if ($dirty.Count -ne 0) { throw 'Prepared authority checkout must be clean and immutable.' }
     $headRevision = ([string]$head[0]).Trim()
 
     foreach ($entry in $AuthorityPin.files.GetEnumerator()) {
@@ -640,56 +764,22 @@ function Assert-DarktidePreparedAuthorityCheckout {
         if (-not (Test-DarktidePlatformFile -Path $filePath) -or (Get-DarktideFileSha256 -Path $filePath) -cne [string]$entry.Value) {
             throw "Prepared authority file identity mismatch: $($entry.Key)"
         }
-        $treeEntry = @(& $GitPath -C $fullRoot ls-tree $headRevision -- ([string]$entry.Key) 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $treeEntry.Count -ne 1 -or
+        $gitResult = Invoke-DarktideOwnedProcess -ExecutablePath $GitPath -Arguments @('-C',$fullRoot,'ls-tree',$headRevision,'--',[string]$entry.Key) `
+            -WorkingDirectory $fullRoot -CaptureRoot $script:DarktideProcessCaptureRoot
+        $treeEntry = @(Get-DarktideOwnedProcessLines $gitResult.stdout)
+        if ($treeEntry.Count -ne 1 -or
             [string]$treeEntry[0] -cnotmatch ('^(?<mode>100644|100755) blob (?<objectId>[0-9a-f]{40})\t' + [regex]::Escape([string]$entry.Key) + '$')) {
             throw "Prepared authority path is not a regular Git blob: $($entry.Key)"
         }
         $expectedBlob = [string]$Matches.objectId
-        $actualBlob = @(& $GitPath -C $fullRoot hash-object --no-filters -- ([string]$entry.Key) 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $actualBlob.Count -ne 1 -or ([string]$actualBlob[0]).Trim() -cne $expectedBlob) {
+        $gitResult = Invoke-DarktideOwnedProcess -ExecutablePath $GitPath -Arguments @('-C',$fullRoot,'hash-object','--no-filters','--',[string]$entry.Key) `
+            -WorkingDirectory $fullRoot -CaptureRoot $script:DarktideProcessCaptureRoot
+        $actualBlob = @(Get-DarktideOwnedProcessLines $gitResult.stdout)
+        if ($actualBlob.Count -ne 1 -or ([string]$actualBlob[0]).Trim() -cne $expectedBlob) {
             throw "Prepared authority file bytes differ from its immutable Git blob: $($entry.Key)"
         }
     }
     return [pscustomobject]@{ root = $fullRoot; revision = [string]$AuthorityPin.commit; runnerPath = (Join-Path $fullRoot 'scripts/Invoke-StandardValidation.ps1') }
-}
-
-function Remove-DarktideOwnedCoreAdapterRoot {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][string] $OwnedRoot,
-        [Parameter(Mandatory = $true)][string] $ArtifactsRoot,
-        [Parameter(Mandatory = $true)][string] $RunId,
-        [Parameter(Mandatory = $true)][string] $OwnerToken,
-        [Parameter(Mandatory = $true)][string[]] $ProtectedRoots
-    )
-
-    if ($RunId -cnotmatch '^[0-9a-f]{32}$' -or $OwnerToken -cnotmatch '^[0-9a-f]{32}$') { throw 'Core adapter cleanup identity is invalid.' }
-    $expectedRoot = [IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".core-v2-adapter-$RunId"))
-    $ownedFull = [IO.Path]::GetFullPath($OwnedRoot)
-    if (-not (Test-DarktidePathEqual -Left $ownedFull -Right $expectedRoot) -or
-        -not (Test-DarktidePathEqual -Left (Split-Path -Parent $ownedFull) -Right $ArtifactsRoot)) {
-        throw 'Core adapter cleanup path is not the exact run-owned sibling.'
-    }
-    if (-not (Test-DarktidePlatformDirectory -Path $ownedFull)) { return }
-    foreach ($root in $ProtectedRoots) { Assert-DarktideOutsideRoot -Path $ownedFull -Root $root -Context 'Core adapter cleanup root' }
-    Assert-DarktideNoReparseAncestors -Path $ownedFull -Context 'Core adapter cleanup root' -TrustedRoot $ArtifactsRoot
-
-    $markerPath = Join-Path $ownedFull '.source-owned.json'
-    if (-not (Test-DarktidePlatformFile -Path $markerPath)) { throw 'Core adapter cleanup ownership marker is missing.' }
-    $marker = Read-DarktideJsonFile -Path $markerPath -Context 'Core adapter cleanup marker'
-    Assert-DarktideExactPropertySet -Value $marker -Expected @('owner', 'runId', 'token') -Context 'Core adapter cleanup marker'
-    if ([string]$marker.owner -cne 'darktide-translate-source-core-adapter' -or
-        [string]$marker.runId -cne $RunId -or [string]$marker.token -cne $OwnerToken) {
-        throw 'Core adapter cleanup marker does not match this source run.'
-    }
-    $parentLease = Open-PlatformDirectory -Root $ArtifactsRoot -RootOnly
-    try {
-        $state = Get-PlatformDirectoryState -ParentLease $parentLease -Leaf ([IO.Path]::GetFileName($ownedFull))
-        Remove-PlatformOwnedDirectoryTree -TransactionRootLease $parentLease -Leaf ([IO.Path]::GetFileName($ownedFull)) -ExpectedIdentity $state.Identity
-    }
-    finally { $parentLease.Dispose() }
-    if (Test-DarktidePlatformDirectory -Path $ownedFull) { throw 'Core adapter cleanup did not remove its exact run-owned root.' }
 }
 
 function Get-DarktideCoreAdapterLayout {
@@ -712,12 +802,29 @@ function Get-DarktideCoreAdapterLayout {
     }
 }
 
+function New-DarktideSourceAttemptLayout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ArtifactsRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string] $SetupRunId
+    )
+    $attemptId = [guid]::NewGuid().ToString('N')
+    $root = [IO.Path]::GetFullPath($ArtifactsRoot)
+    return [pscustomobject][ordered]@{
+        attemptId = $attemptId
+        artifactsRoot = Join-Path $root "source-validation-$SetupRunId-$attemptId"
+        adapter = Get-DarktideCoreAdapterLayout -ArtifactsRoot $root -RunId $attemptId
+    }
+}
+
 function New-DarktideSourceCoreAdapter {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string] $PowerShell,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] $ActiveSkillIds,
-        [Parameter(Mandatory = $true)] $SourceValidation
+        [Parameter(Mandatory = $true)] $SourceValidation,
+        [Parameter(Mandatory = $true)][string] $AuthorityRepositoryRoot,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision
     )
 
     $fullPowerShell = [IO.Path]::GetFullPath($PowerShell)
@@ -734,7 +841,7 @@ function New-DarktideSourceCoreAdapter {
         activeSkills = @($ActiveSkillIds)
         checks = @(
             [ordered]@{ id = 'repository-general'; kind = 'general'; executable = $fullPowerShell; executableSha256 = $powerShellSha256; arguments = @('-NoProfile', '-NonInteractive', '-File', 'scripts/Test-Repository.ps1', '-ReadOnlySnapshot') }
-            [ordered]@{ id = 'repository-pester'; kind = 'pester'; executable = $fullPowerShell; executableSha256 = $powerShellSha256; arguments = @('-NoProfile', '-NonInteractive', '-File', 'scripts/Invoke-CorePester.ps1') }
+            [ordered]@{ id = 'repository-pester'; kind = 'pester'; executable = $fullPowerShell; executableSha256 = $powerShellSha256; arguments = @('-NoProfile', '-NonInteractive', '-File', 'scripts/Invoke-CorePester.ps1', '-AuthorityRepositoryRoot', [IO.Path]::GetFullPath($AuthorityRepositoryRoot), '-AuthorityRevision', $AuthorityRevision) }
         )
         sourceValidation = $SourceValidation
     }
@@ -745,10 +852,21 @@ function Get-DarktideSourceDispatchArguments {
     param(
         [Parameter(Mandatory = $true)][string] $ChildPath,
         [Parameter(Mandatory = $true)][string] $ToolchainPath,
-        [Parameter(Mandatory = $true)][string] $ToolchainSha256
+        [Parameter(Mandatory = $true)][string] $ToolchainSha256,
+        [Parameter(Mandatory = $true)][string] $DriverModulePath,
+        [Parameter(Mandatory = $true)][string] $DriverModuleSha256,
+        [Parameter(Mandatory = $true)][string] $AuthorityRepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $AuthorityRevision,
+        [ValidateRange(1, 86400)][int] $TimeoutSeconds = 900
     )
 
-    $base = @('-NoProfile', '-NonInteractive', '-File', $ChildPath, '-ToolchainPath', $ToolchainPath, '-ToolchainSha256', $ToolchainSha256)
+    $base = @(
+        '-NoProfile', '-NonInteractive', '-File', $ChildPath,
+        '-ToolchainPath', $ToolchainPath, '-ToolchainSha256', $ToolchainSha256,
+        '-DriverModulePath', $DriverModulePath, '-DriverModuleSha256', $DriverModuleSha256,
+        '-AuthorityRepositoryRoot', $AuthorityRepositoryRoot, '-AuthorityRevision', $AuthorityRevision,
+        '-TimeoutSeconds', [string]$TimeoutSeconds
+    )
     return [ordered]@{
         packageAdapter = @($base + @('-Mode', 'package-adapter'))
         skillValidator = @($base + @('-Mode', 'skill-validator'))
@@ -892,9 +1010,19 @@ function New-DarktideSourceToolSetup {
     if ((Get-DarktideFileSha256 -Path $child) -cne (Get-DarktideFileSha256 -Path (Get-DarktideSourceChildRunnerPath))) {
         throw 'Source setup child runner copy differs from the protected driver.'
     }
+    $protectedDriverSource = Join-Path (Get-DarktideProtectedDriverRoot) 'scripts/StandardSourceDriver.psm1'
+    $protectedDriverCopy = Join-Path $owned 'ProtectedSourceDriver.psm1'
+    Copy-DarktidePlatformFile -Source $protectedDriverSource -Destination $protectedDriverCopy
+    $protectedDriverSha256 = Get-DarktideFileSha256 -Path $protectedDriverSource
+    if ((Get-DarktideFileSha256 -Path $protectedDriverCopy) -cne $protectedDriverSha256) {
+        throw 'Run-owned protected source driver copy differs from the executing driver bytes.'
+    }
     $ownedLease.Dispose()
-    $dispatchArguments = Get-DarktideSourceDispatchArguments -ChildPath $child -ToolchainPath $toolchainPath -ToolchainSha256 (Get-DarktideFileSha256 -Path $toolchainPath)
-    $frozenPaths = @($PowerShell, $child, $toolchainPath, $runner, $toolchain.skillValidatorPath, $toolchain.skillToolsNodePath, $toolchain.skillToolsEntryPointPath, $toolchain.skillSpectorPath) + @($receiptBindings | ForEach-Object { [string]$_.path })
+    $dispatchArguments = Get-DarktideSourceDispatchArguments -ChildPath $child -ToolchainPath $toolchainPath `
+        -ToolchainSha256 (Get-DarktideFileSha256 -Path $toolchainPath) -DriverModulePath $protectedDriverCopy `
+        -DriverModuleSha256 $protectedDriverSha256 -AuthorityRepositoryRoot $AuthorityRoot `
+        -AuthorityRevision ([string]$AuthorityPin.commit) -TimeoutSeconds $LimitSeconds
+    $frozenPaths = @($PowerShell, $child, $protectedDriverCopy, $toolchainPath, $runner, $toolchain.skillValidatorPath, $toolchain.skillToolsNodePath, $toolchain.skillToolsEntryPointPath, $toolchain.skillSpectorPath) + @($receiptBindings | ForEach-Object { [string]$_.path })
     $frozen = @(foreach ($file in @($frozenPaths | Select-Object -Unique)) {
         [pscustomobject]@{ path = [IO.Path]::GetFullPath($file); sha256 = Get-DarktideFileSha256 -Path $file }
     })
@@ -916,6 +1044,7 @@ function New-DarktideSourceToolSetup {
         runId = $setupId
         sourceRevision = $CandidateRevision
         authorityRevision = [string]$AuthorityPin.commit
+        timeoutSeconds = $LimitSeconds
         ownedRoot = $owned
         sourceValidation = $dispatch
     }
@@ -995,10 +1124,10 @@ function Read-DarktideSourceToolSetup {
     $setupRoot = Split-Path -Parent $fullPath
     Assert-DarktideNoReparseAncestors -Path $fullPath -Context 'Prepared source setup' -TrustedRoot $setupRoot
     $prepared = Read-DarktideJsonFile -Path $fullPath -Context 'Prepared source setup'
-    Assert-DarktideExactPropertySet -Value $prepared -Expected @('schemaVersion', 'preparation', 'runId', 'sourceRevision', 'authorityRevision', 'ownedRoot', 'sourceValidation') -Context 'Prepared source setup'
+    Assert-DarktideExactPropertySet -Value $prepared -Expected @('schemaVersion', 'preparation', 'runId', 'sourceRevision', 'authorityRevision', 'timeoutSeconds', 'ownedRoot', 'sourceValidation') -Context 'Prepared source setup'
     if ([int]$prepared.schemaVersion -ne 1 -or [string]$prepared.preparation -cne 'darktide-translate-source-tools' -or
         [string]$prepared.runId -cnotmatch '^[0-9a-f]{32}$' -or [string]$prepared.sourceRevision -cne $SourceRevision -or
-        [string]$prepared.authorityRevision -cne $AuthorityRevision) {
+        [string]$prepared.authorityRevision -cne $AuthorityRevision -or [int]$prepared.timeoutSeconds -lt 1 -or [int]$prepared.timeoutSeconds -gt 86400) {
         throw 'Prepared source tools do not bind this candidate and authority.'
     }
     Assert-DarktideExactPropertySet -Value $prepared.sourceValidation -Expected @('packageAdapter', 'skillValidator', 'skillTools', 'staticAnalyzer', 'frozenFiles', 'toolReceipts') -Context 'Prepared source dispatch'
@@ -1014,6 +1143,11 @@ function Read-DarktideSourceToolSetup {
     $child = Join-Path $expectedOwned $script:DarktideChildRunnerName
     if ((Get-DarktideFileSha256 -Path $child) -cne (Get-DarktideFileSha256 -Path (Get-DarktideSourceChildRunnerPath))) {
         throw 'Prepared source child runner differs from the protected driver.'
+    }
+    $protectedDriverCopy = Join-Path $expectedOwned 'ProtectedSourceDriver.psm1'
+    $protectedDriverSource = Join-Path (Get-DarktideProtectedDriverRoot) 'scripts/StandardSourceDriver.psm1'
+    if ((Get-DarktideFileSha256 -Path $protectedDriverCopy) -cne (Get-DarktideFileSha256 -Path $protectedDriverSource)) {
+        throw 'Prepared protected source driver differs from the executing driver bytes.'
     }
     $toolchain = Join-Path $expectedOwned 'toolchain.json'
     Assert-StandardCoreFrozenFiles -Files @($prepared.sourceValidation.frozenFiles)
@@ -1048,7 +1182,10 @@ function Read-DarktideSourceToolSetup {
         throw 'Prepared source Static receipt differs.'
     }
 
-    $expectedArguments = Get-DarktideSourceDispatchArguments -ChildPath $child -ToolchainPath $toolchain -ToolchainSha256 (Get-DarktideFileSha256 -Path $toolchain)
+    $expectedArguments = Get-DarktideSourceDispatchArguments -ChildPath $child -ToolchainPath $toolchain `
+        -ToolchainSha256 (Get-DarktideFileSha256 -Path $toolchain) -DriverModulePath $protectedDriverCopy `
+        -DriverModuleSha256 (Get-DarktideFileSha256 -Path $protectedDriverCopy) -AuthorityRepositoryRoot $AuthorityRoot `
+        -AuthorityRevision $AuthorityRevision -TimeoutSeconds ([int]$prepared.timeoutSeconds)
     foreach ($slot in @('packageAdapter', 'skillValidator', 'skillTools', 'staticAnalyzer')) {
         if ((ConvertTo-Json -InputObject @($prepared.sourceValidation.$slot.arguments) -Compress) -cne (ConvertTo-Json -InputObject @($expectedArguments[$slot]) -Compress)) {
             throw 'Prepared source dispatch differs from the protected driver.'
@@ -1081,9 +1218,11 @@ function Assert-DarktideCandidateWhitespace {
         [Parameter(Mandatory = $true)][string] $BaseRevision,
         [Parameter(Mandatory = $true)][string] $CandidateRevision
     )
-    $output = @(& $GitPath -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab -C $RepositoryRoot diff --check "$BaseRevision...$CandidateRevision" 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Whitespace validation failed for the candidate event range.`n$($output -join [Environment]::NewLine)"
+    $result = Invoke-DarktideOwnedProcess -ExecutablePath $GitPath `
+        -Arguments @('-c','core.whitespace=blank-at-eol,blank-at-eof,space-before-tab','-C',$RepositoryRoot,'diff','--check',"$BaseRevision...$CandidateRevision") `
+        -WorkingDirectory $RepositoryRoot -CaptureRoot $script:DarktideProcessCaptureRoot -AllowedExitCodes @(0,2)
+    if ($result.exitCode -ne 0) {
+        throw "Whitespace validation failed for the candidate event range.`n$($result.stdout)$($result.stderr)"
     }
 }
 
@@ -1103,14 +1242,37 @@ function Invoke-DarktideSourcePurpose {
     )
 
     $resolverEnvironment = Get-DarktideSourceResolverEnvironment -IncludeSetupToken:($Mode -ceq 'prepare-source-tools')
+    $authorityPin = Get-DarktideSourceAuthorityPin
+    # Bootstrap only the exact reviewed authority runtime closure. All protected
+    # path, process, and mutation work after this point uses that module.
+    $authorityRuntime = Import-DarktideAuthorityPlatformRuntime -AuthorityRoot $AuthorityRepositoryRoot -AuthorityRevision ([string]$authorityPin.commit)
+    Import-Module -ModuleInfo $authorityRuntime -Force -ErrorAction Stop
     $repoRoot = [IO.Path]::GetFullPath($RepositoryRoot)
     if (-not (Test-DarktidePlatformDirectory -Path $repoRoot)) { throw "RepositoryRoot does not exist: $repoRoot" }
-    $authorityPin = Assert-DarktideSourceAuthorityConfig -Config (Read-DarktideJsonFile -Path (Join-Path $repoRoot 'config/standard-v1.json') -Context 'candidate config/standard-v1.json')
+    [void](Assert-DarktideActiveV1AuthorityConfig -Config (Read-DarktideJsonFile -Path (Join-Path $repoRoot 'config/standard-v1.json') -Context 'candidate config/standard-v1.json'))
+    $artifactsRequested = [IO.Path]::GetFullPath($ArtifactsRoot)
+    foreach ($root in @($repoRoot, [IO.Path]::GetFullPath($AuthorityRepositoryRoot), [IO.Path]::GetFullPath($TrustedToolRoot), (Get-DarktideProtectedDriverRoot))) {
+        if ((Test-DarktidePathOverlap -Path $artifactsRequested -Root $root) -or (Test-DarktidePathOverlap -Path $root -Root $artifactsRequested)) {
+            throw "Source artifacts root must not overlap '$root'."
+        }
+    }
+    $artifactsLease = if (Test-DarktidePlatformDirectory -Path $artifactsRequested) {
+        Open-PlatformDirectory -Root $artifactsRequested -RootOnly
+    }
+    else { New-DarktidePrivateDirectory -Path $artifactsRequested }
+    $artifactsRootFull = Resolve-DarktidePhysicalPath -Path $artifactsRequested
+    Assert-DarktideNoReparseAncestors -Path $artifactsRootFull -Context 'Source artifacts root' -TrustedRoot $artifactsRootFull
+    $processCaptureRoot = Join-Path $artifactsRootFull ('driver-processes-' + [guid]::NewGuid().ToString('N'))
+    $processCaptureLease = New-DarktidePrivateDirectory -Path $processCaptureRoot
+    $processCaptureLease.Dispose()
+    $script:DarktideProcessCaptureRoot = $processCaptureRoot
     $gitPath = Get-DarktideResolvedGitPath
     $pwshPath = Get-DarktideCurrentPowerShellPath
     $candidateCommit = Resolve-DarktideGitRevision -GitPath $gitPath -Root $repoRoot -Revision 'HEAD' -Context 'Candidate revision'
-    $dirty = @(& $gitPath -C $repoRoot status --porcelain=v1 --untracked-files=all)
-    if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { throw 'Explicit source purposes require a clean immutable candidate commit.' }
+    $gitResult = Invoke-DarktideOwnedProcess -ExecutablePath $gitPath -Arguments @('-C',$repoRoot,'status','--porcelain=v1','--untracked-files=all') `
+        -WorkingDirectory $repoRoot -CaptureRoot $script:DarktideProcessCaptureRoot
+    $dirty = @(Get-DarktideOwnedProcessLines $gitResult.stdout)
+    if ($dirty.Count -ne 0) { throw 'Explicit source purposes require a clean immutable candidate commit.' }
     $protectedReaders = @(Assert-DarktideSourceProtectedReaders -ProtectedBaseRoot (Get-DarktideProtectedDriverRoot) -CandidateRoot $repoRoot)
 
     $baseRevision = $null
@@ -1119,14 +1281,13 @@ function Invoke-DarktideSourcePurpose {
         # the driver never falls back to HEAD^.
         if ([string]::IsNullOrWhiteSpace($BaseCommit)) { throw 'SourceValidation requires an explicit BaseCommit.' }
         $baseRevision = Resolve-DarktideGitRevision -GitPath $gitPath -Root $repoRoot -Revision $BaseCommit -Context 'Base commit'
-        & $gitPath -C $repoRoot merge-base --is-ancestor $baseRevision $candidateCommit
-        if ($LASTEXITCODE -ne 0 -or $baseRevision -ceq $candidateCommit) { throw 'Base commit must be a distinct ancestor of the immutable source candidate.' }
+        $gitResult = Invoke-DarktideOwnedProcess -ExecutablePath $gitPath -Arguments @('-C',$repoRoot,'merge-base','--is-ancestor',$baseRevision,$candidateCommit) `
+            -WorkingDirectory $repoRoot -CaptureRoot $script:DarktideProcessCaptureRoot -AllowedExitCodes @(0,1)
+        if ($gitResult.exitCode -ne 0 -or $baseRevision -ceq $candidateCommit) { throw 'Base commit must be a distinct ancestor of the immutable source candidate.' }
         Assert-DarktideCandidateWhitespace -GitPath $gitPath -RepositoryRoot $repoRoot -BaseRevision $baseRevision -CandidateRevision $candidateCommit
     }
 
     $authorityCheckout = Assert-DarktidePreparedAuthorityCheckout -GitPath $gitPath -AuthorityRoot $AuthorityRepositoryRoot -AuthorityPin $authorityPin
-    $authorityRuntime = Import-DarktideAuthorityPlatformRuntime -AuthorityRoot $authorityCheckout.root -AuthorityRevision ([string]$authorityPin.commit)
-    Import-Module -ModuleInfo $authorityRuntime -Force -ErrorAction Stop
     if (-not (Test-DarktidePlatformDirectory -Path $TrustedToolRoot)) { throw "Trusted PowerShell root is missing: $TrustedToolRoot" }
     $trustedRoot = Resolve-DarktidePhysicalPath -Path $TrustedToolRoot
     $pwshPath = Resolve-DarktidePhysicalPath -Path $pwshPath
@@ -1135,21 +1296,10 @@ function Invoke-DarktideSourcePurpose {
         throw 'Trusted PowerShell executable must be within TrustedToolRoot.'
     }
 
-    foreach ($root in @($repoRoot, $authorityCheckout.root, $TrustedToolRoot, (Get-DarktideProtectedDriverRoot))) {
-        if ((Test-DarktidePathOverlap -Path $ArtifactsRoot -Root $root) -or (Test-DarktidePathOverlap -Path $root -Root $ArtifactsRoot)) {
-            throw "Source artifacts root must not overlap '$root'."
-        }
-    }
-    $artifactsLease = if (Test-DarktidePlatformDirectory -Path $ArtifactsRoot) {
-        Open-PlatformDirectory -Root ([IO.Path]::GetFullPath($ArtifactsRoot)) -RootOnly
-    }
-    else { New-DarktidePrivateDirectory -Path $ArtifactsRoot }
-    $artifactsRootFull = Resolve-DarktidePhysicalPath -Path $ArtifactsRoot
     foreach ($root in @($repoRoot, $authorityCheckout.root, $trustedRoot, (Get-DarktideProtectedDriverRoot))) {
         Assert-DarktideOutsideRoot -Path $artifactsRootFull -Root $root -Context 'Source artifacts root'
         if (Test-DarktidePathOverlap -Path $root -Root $artifactsRootFull) { throw "Source artifacts root must not contain '$root'." }
     }
-    Assert-DarktideNoReparseAncestors -Path $artifactsRootFull -Context 'Source artifacts root' -TrustedRoot $artifactsRootFull
 
     if ($Mode -ceq 'prepare-source-tools') {
         $sourceToolsParent = Split-Path -Parent ([IO.Path]::GetFullPath($SourceToolsPath))
@@ -1167,6 +1317,7 @@ function Invoke-DarktideSourcePurpose {
         $artifactsLease.Dispose()
         foreach ($binding in @($script:DarktideExecutableBindings)) { Close-DarktideFileBinding -Binding $binding }
         $script:DarktideExecutableBindings.Clear()
+        $script:DarktideProcessCaptureRoot = $null
         Remove-Module -ModuleInfo $authorityRuntime -Force -ErrorAction SilentlyContinue
         return 0
     }
@@ -1185,8 +1336,13 @@ function Invoke-DarktideSourcePurpose {
     $eventName = Get-DarktideEventName
     $activeSkills = @(Get-DarktideActiveSkillIds -Root $repoRoot)
     $runId = [string]$prepared.runId
-    $coreArtifactsRoot = Join-Path $artifactsRootFull "source-validation-$runId"
-    $adapterLayout = Get-DarktideCoreAdapterLayout -ArtifactsRoot $artifactsRootFull -RunId $runId
+    # Every attempt gets fresh create-only evidence roots. Failed attempts are
+    # deliberately retained and never reused; runner-owned cleanup removes the
+    # enclosing run root after the job. No cleanup journal is needed.
+    $attemptLayout = New-DarktideSourceAttemptLayout -ArtifactsRoot $artifactsRootFull -SetupRunId $runId
+    $attemptId = [string]$attemptLayout.attemptId
+    $coreArtifactsRoot = [string]$attemptLayout.artifactsRoot
+    $adapterLayout = $attemptLayout.adapter
     $adapterRoot = [string]$adapterLayout.adapterRoot
     if ((Test-DarktidePlatformDirectory -Path $coreArtifactsRoot) -or (Test-DarktidePlatformDirectory -Path $adapterRoot)) { throw 'Source validation run-owned path unexpectedly exists.' }
     $coreArtifactsLease = New-DarktidePrivateDirectory -Path $coreArtifactsRoot
@@ -1204,7 +1360,8 @@ function Invoke-DarktideSourcePurpose {
         $ownerMarker = [ordered]@{ owner = 'darktide-translate-source-core-adapter'; runId = $runId; token = $adapterOwnerToken }
         Write-DarktideUtf8CreateNew -Path ([string]$adapterLayout.ownerMarkerPath) -Text (($ownerMarker | ConvertTo-Json -Compress) + [Environment]::NewLine)
         $adapterPath = [string]$adapterLayout.adapterPath
-        $adapter = New-DarktideSourceCoreAdapter -PowerShell $pwshPath -ActiveSkillIds $activeSkills -SourceValidation $prepared.sourceValidation
+        $adapter = New-DarktideSourceCoreAdapter -PowerShell $pwshPath -ActiveSkillIds $activeSkills -SourceValidation $prepared.sourceValidation `
+            -AuthorityRepositoryRoot $authorityCheckout.root -AuthorityRevision ([string]$authorityPin.commit)
         Write-DarktideUtf8CreateNew -Path $adapterPath -Text (($adapter | ConvertTo-Json -Depth 30) + [Environment]::NewLine)
 
         $centralRunnerPath = [string]$authorityCheckout.runnerPath
@@ -1232,10 +1389,14 @@ function Invoke-DarktideSourcePurpose {
             '-SourceValidation',
             '-RunId', $runId
         )
-        $centralOutput = @(& $pwshPath -NoProfile -NonInteractive -File $centralRunnerPath @arguments 2>&1)
-        $centralExitCode = $LASTEXITCODE
+        $centralProcess = Invoke-DarktideOwnedProcess -ExecutablePath $pwshPath `
+            -Arguments (@('-NoProfile','-NonInteractive','-File',$centralRunnerPath) + $arguments) `
+            -WorkingDirectory $repoRoot -CaptureRoot $script:DarktideProcessCaptureRoot `
+            -TimeoutSeconds $TimeoutSeconds -AllowedExitCodes @(0..255)
+        $centralOutput = @((Get-DarktideOwnedProcessLines $centralProcess.stdout) + (Get-DarktideOwnedProcessLines $centralProcess.stderr))
+        $centralExitCode = [int]$centralProcess.exitCode
         $centralOutput | Out-Host
-        $timingSidecarPath = Join-Path $artifactsRootFull "source-validation-timing-$runId.json"
+        $timingSidecarPath = Join-Path $artifactsRootFull "source-validation-timing-$runId-$attemptId.json"
         [void](Write-DarktideSourceTimingSidecar -Path $timingSidecarPath -OutputLines @($centralOutput | ForEach-Object { [string]$_ }) `
             -RunId $runId -SourceRevision $candidateCommit -BaseRevision $baseRevision -AuthorityRevision ([string]$authorityPin.commit) `
             -RequireCoreEvidence:($centralExitCode -eq 0))
@@ -1255,12 +1416,11 @@ function Invoke-DarktideSourcePurpose {
         if ($null -ne $adapterLease) { $adapterLease.Dispose() }
         if ($null -ne $coreArtifactsLease) { $coreArtifactsLease.Dispose() }
         if ($null -ne $artifactsLease) { $artifactsLease.Dispose() }
-        if ($adapterOwned) {
-            Remove-DarktideOwnedCoreAdapterRoot -OwnedRoot $adapterRoot -ArtifactsRoot $artifactsRootFull -RunId $runId `
-                -OwnerToken $adapterOwnerToken -ProtectedRoots @($repoRoot, $authorityCheckout.root, $trustedRoot, $coreArtifactsRoot)
-        }
+        # Attempt directories are evidence and intentionally remain under the
+        # run-owned root, including on failure. A retry always uses a new ID.
         foreach ($binding in @($script:DarktideExecutableBindings)) { Close-DarktideFileBinding -Binding $binding }
         $script:DarktideExecutableBindings.Clear()
+        $script:DarktideProcessCaptureRoot = $null
         if ($null -ne $authorityRuntime) { Remove-Module -ModuleInfo $authorityRuntime -Force -ErrorAction SilentlyContinue }
     }
 }
@@ -1288,4 +1448,4 @@ function Invoke-DarktideSourceEntryPoint {
         -OutputPath ([string](& $get 'OutputPath' '')) -TimeoutSeconds ([int](& $get 'TimeoutSeconds' 900))
 }
 
-Export-ModuleMember -Function Get-DarktideSourceAuthorityPin, Import-DarktideAuthorityPlatformRuntime, Assert-DarktideSourceAuthorityTuple, Assert-DarktideSourceAuthorityConfig, Resolve-DarktideSourceRoute, Get-DarktideSourceChildRunnerPath, Assert-DarktideSourceProtectedReaders, Assert-DarktidePreparedAuthorityCheckout, Get-DarktideCoreAdapterLayout, New-DarktideSourceCoreAdapter, Get-DarktideSourceDispatchArguments, Assert-DarktideSourceReceiptClosureFrozen, Write-DarktideSourceTimingSidecar, Get-DarktideSourceResolverEnvironment, Assert-DarktideCandidateWhitespace, Get-DarktideActiveSkillIds, Invoke-DarktideSourcePurpose, Invoke-DarktideSourceEntryPoint, Test-DarktidePathOverlap
+Export-ModuleMember -Function Get-DarktideSourceAuthorityPin, Import-DarktideAuthorityPlatformRuntime, Invoke-DarktideOwnedProcess, Get-DarktideOwnedProcessLines, Assert-DarktideSourceAuthorityTuple, Assert-DarktideSourceAuthorityConfig, Assert-DarktideActiveV1AuthorityConfig, Resolve-DarktideSourceRoute, Get-DarktideSourceChildRunnerPath, Assert-DarktideSourceProtectedReaders, Assert-DarktidePreparedAuthorityCheckout, Get-DarktideCoreAdapterLayout, New-DarktideSourceAttemptLayout, New-DarktideSourceCoreAdapter, Get-DarktideSourceDispatchArguments, Assert-DarktideSourceReceiptClosureFrozen, Write-DarktideSourceTimingSidecar, Get-DarktideSourceResolverEnvironment, Assert-DarktideCandidateWhitespace, Get-DarktideActiveSkillIds, Invoke-DarktideSourcePurpose, Invoke-DarktideSourceEntryPoint, Test-DarktidePathOverlap

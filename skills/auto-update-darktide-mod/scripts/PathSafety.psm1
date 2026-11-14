@@ -205,7 +205,7 @@ $script:VendoredPlatformRuntimeAuthority = [ordered]@{
     repository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
     commit = 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
     sourceDirectory = 'scripts'
-    hashMode = 'sha256-utf8-lf'
+    hashMode = 'sha256-raw-bytes'
     manifestPath = 'platform-runtime.psd1'
     manifestSha256 = 'd3d8eef434484b3b2449cd4762e60b94afc314d9beb91481538c7f57207a11c9'
 }
@@ -236,10 +236,8 @@ function Get-VendoredPlatformRuntimeSha256 {
     if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) {
         throw [IO.InvalidDataException]::new('Vendored platform runtime files must be UTF-8 without BOM.')
     }
-    $utf8 = [Text.UTF8Encoding]::new($false, $true)
-    $canonicalText = $utf8.GetString($bytes).Replace("`r`n", "`n")
     $sha256 = [Security.Cryptography.SHA256]::Create()
-    try { ([BitConverter]::ToString($sha256.ComputeHash($utf8.GetBytes($canonicalText)))).Replace('-', '').ToLowerInvariant() }
+    try { ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
     finally { $sha256.Dispose() }
 }
 
@@ -297,6 +295,206 @@ function Assert-VendoredPlatformRuntime {
     }
 }
 
+function Assert-VendoredPlatformRuntimePostLoad {
+    param([Parameter(Mandatory)][string] $Root)
+
+    $manifestPath = Join-Path $Root ([string]$script:VendoredPlatformRuntimeAuthority.manifestPath)
+    $null = Assert-PlatformRuntimeInventory -Root $Root -ManifestPath $manifestPath
+    foreach ($relative in @($script:VendoredPlatformRuntimeFiles.Keys)) {
+        $parentLease = $null
+        $fileLease = $null
+        try {
+            $parentRelative = [IO.Path]::GetDirectoryName([string]$relative)
+            $parentLease = if ([string]::IsNullOrWhiteSpace($parentRelative)) {
+                Open-PlatformDirectory -Root $Root -RootOnly
+            }
+            else {
+                Open-PlatformDirectory -Root $Root -RelativePath $parentRelative.Replace('\', '/')
+            }
+            $fileLease = Open-PlatformFile -ParentLease $parentLease -Leaf ([IO.Path]::GetFileName([string]$relative)) `
+                -Access Read -CreateMode OpenExisting
+            $null = Assert-PlatformFileIdentity -Lease $fileLease -Expected $fileLease.Observation -SingleLink -VerifyPath
+        }
+        finally {
+            if ($null -ne $fileLease) { $fileLease.Dispose() }
+            if ($null -ne $parentLease) { $parentLease.Dispose() }
+        }
+    }
+}
+
+function ConvertTo-PortablePlatformFileIdentity {
+    param([Parameter(Mandatory)] $Observation)
+    if ((Get-PortablePlatformName) -ceq 'windows') {
+        return [pscustomobject][ordered]@{
+            kind = 'windows-file-id'
+            device = ('0x{0:x}' -f [uint64]$Observation.Device)
+            fileId = ('0x{0:x}' -f [uint64]$Observation.Inode)
+        }
+    }
+    [pscustomobject][ordered]@{
+        kind = 'unix-device-inode'
+        device = ('0x{0:x}' -f [uint64]$Observation.Device)
+        fileId = ('0x{0:x}' -f [uint64]$Observation.Inode)
+    }
+}
+
+function Get-PortableLeaseFileState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ParentPath,
+        [Parameter(Mandatory)][string] $Leaf,
+        [ValidateRange(1, 16777216)][int] $MaximumBytes = 1048576,
+        [switch] $AllowMissing,
+        [string] $LegacyDirectoryMessage
+    )
+    $parentLease = $null
+    $fileLease = $null
+    try {
+        $parentLease = Open-PlatformDirectory -Root $ParentPath -RootOnly
+        try {
+            $fileLease = Open-PlatformFile -ParentLease $parentLease -Leaf $Leaf -Access Read -CreateMode OpenExisting
+        }
+        catch {
+            $fileFailure = $_
+            $legacyDirectory = $null
+            try { $legacyDirectory = Open-PlatformDirectory -Root $ParentPath -RelativePath $Leaf }
+            catch { }
+            if ($null -ne $legacyDirectory) {
+                $legacyDirectory.Dispose()
+                if ([string]::IsNullOrWhiteSpace($LegacyDirectoryMessage)) {
+                    throw [IO.InvalidDataException]::new("The lease path is a legacy directory: $Leaf")
+                }
+                throw [IO.InvalidDataException]::new($LegacyDirectoryMessage)
+            }
+            if ($AllowMissing) {
+                return [ordered]@{
+                    exists = $false
+                    bytes = $null
+                    sha256 = $null
+                    length = $null
+                    identity = $null
+                }
+            }
+            throw $fileFailure
+        }
+        [byte[]]$bytes = $fileLease.ReadAllBytes($MaximumBytes)
+        $observation = Assert-PlatformFileIdentity -Lease $fileLease -Expected $fileLease.Observation -SingleLink -VerifyPath
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $digest = ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+        finally { $sha256.Dispose() }
+        [ordered]@{
+            exists = $true
+            bytes = $bytes
+            sha256 = $digest
+            length = [int64]$bytes.Length
+            identity = ConvertTo-PortablePlatformFileIdentity -Observation $observation
+        }
+    }
+    finally {
+        if ($null -ne $fileLease) { $fileLease.Dispose() }
+        if ($null -ne $parentLease) { $parentLease.Dispose() }
+    }
+}
+
+function Remove-PortableTransactionFile {
+    param(
+        [Parameter(Mandatory)] $TransactionLease,
+        [Parameter(Mandatory)][string] $Leaf,
+        [Parameter(Mandatory)] $ExpectedState
+    )
+    $null = Remove-PlatformOwnedFile -ParentLease $TransactionLease -Leaf $Leaf -ExpectedState $ExpectedState
+}
+
+function Publish-PortableLeaseFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ParentPath,
+        [Parameter(Mandatory)][string] $Leaf,
+        [Parameter(Mandatory)][byte[]] $Bytes,
+        [Parameter(Mandatory)][Collections.IDictionary] $ExpectedState,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId,
+        [switch] $NoReplace
+    )
+    $parentLease = $null
+    $transactionRootLease = $null
+    $transactionLease = $null
+    $stageLease = $null
+    $stageLeaf = 'stage-' + [guid]::NewGuid().ToString('N')
+    $displacedLeaf = if ([bool]$ExpectedState.exists) { 'previous-' + [guid]::NewGuid().ToString('N') } else { $null }
+    $transactionRootPath = Join-Path $ParentPath '.ai-instructions-txn'
+    $stageState = $null
+    $published = $false
+    try {
+        $parentLease = Open-PlatformDirectory -Root $ParentPath -RootOnly
+        try { $transactionRootLease = Open-PlatformDirectory -Root $ParentPath -RelativePath '.ai-instructions-txn' -CreatePrivate }
+        catch { $transactionRootLease = Open-PlatformDirectory -Root $ParentPath -RelativePath '.ai-instructions-txn' }
+        try { $transactionLease = Open-PlatformDirectory -Root $transactionRootPath -RelativePath $TransactionId -CreatePrivate }
+        catch { $transactionLease = Open-PlatformDirectory -Root $transactionRootPath -RelativePath $TransactionId }
+        $stageLease = Open-PlatformFile -ParentLease $transactionLease -Leaf $stageLeaf -Access ReadWrite -CreateMode CreateNew
+        $stageLease.WriteNewBytes($Bytes)
+        $stageObservation = Assert-PlatformFileIdentity -Lease $stageLease -Expected $stageLease.Observation -SingleLink -VerifyPath
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $digest = ([BitConverter]::ToString($sha256.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+        finally { $sha256.Dispose() }
+        $stageState = [ordered]@{
+            exists = $true
+            sha256 = $digest
+            length = [int64]$Bytes.Length
+            identity = ConvertTo-PortablePlatformFileIdentity -Observation $stageObservation
+        }
+        $parameters = @{
+            ParentLease = $parentLease
+            Leaf = $Leaf
+            TransactionLease = $transactionLease
+            StageLease = $stageLease
+            ExpectedState = $ExpectedState
+            ExpectedStage = $stageState
+        }
+        if ($NoReplace) { $parameters.NoReplace = $true }
+        if ($null -ne $displacedLeaf) { $parameters.DisplacedLeaf = $displacedLeaf }
+        $receipt = Publish-PlatformFile @parameters
+        $published = $true
+        if ([string]$receipt.durability -cne 'confirmed') {
+            throw [IO.IOException]::new('Lease publication durability was not confirmed.')
+        }
+        if ($null -ne $displacedLeaf) {
+            $displacedState = [ordered]@{
+                exists = $true
+                sha256 = [string]$ExpectedState.sha256
+                length = [int64]$ExpectedState.length
+                identity = $receipt.displacedIdentity
+            }
+            Remove-PortableTransactionFile -TransactionLease $transactionLease -Leaf $displacedLeaf -ExpectedState $displacedState
+        }
+        [ordered]@{
+            receipt = $receipt
+            state = [ordered]@{
+                exists = $true
+                sha256 = $digest
+                length = [int64]$Bytes.Length
+                identity = $receipt.appliedIdentity
+            }
+        }
+    }
+    catch {
+        $publicationFailure = $_
+        if (-not $published -and $null -ne $stageState) {
+            try {
+                if ($null -ne $stageLease) { $stageLease.Dispose(); $stageLease = $null }
+                Remove-PortableTransactionFile -TransactionLease $transactionLease -Leaf $stageLeaf -ExpectedState $stageState
+            }
+            catch { }
+        }
+        throw $publicationFailure
+    }
+    finally {
+        if ($null -ne $stageLease) { $stageLease.Dispose() }
+        if ($null -ne $transactionLease) { $transactionLease.Dispose() }
+        if ($null -ne $transactionRootLease) { $transactionRootLease.Dispose() }
+        if ($null -ne $parentLease) { $parentLease.Dispose() }
+    }
+}
+
 try {
     $script:VendoredPlatformRuntimeBinding = Assert-VendoredPlatformRuntime
     $vendoredManifestPath = Join-Path $script:VendoredPlatformRuntimeRoot 'platform-runtime.psd1'
@@ -310,6 +508,7 @@ try {
         -not $platformRuntimePathComparer.Equals([IO.Path]::GetFullPath([string]$loadedPlatformRuntime[0].Path), $expectedPlatformRuntimePath)) {
         throw [IO.InvalidDataException]::new('The vendored platform runtime did not load from its registry-bound path.')
     }
+    Assert-VendoredPlatformRuntimePostLoad -Root $script:VendoredPlatformRuntimeRoot
     $script:VendoredPlatformRuntimeModule = $loadedPlatformRuntime[0]
 }
 catch {
@@ -417,12 +616,20 @@ function Resolve-PortableTrustedRoot {
     # such as macOS /var -> /private/var or /tmp -> /private/tmp, are resolved
     # here instead of being reported as managed-path symlinks.
     $full = [IO.Path]::GetFullPath($Path)
-    if (-not (Test-Path -LiteralPath $full -PathType Container)) {
-        throw "Trusted root is not an existing directory: $full"
-    }
     $physical = [string](Resolve-PlatformPhysicalPath -Path $full)
     if ([string]::IsNullOrWhiteSpace($physical) -or -not [IO.Path]::IsPathFullyQualified($physical)) {
         throw "Trusted root could not be physically canonicalized: $full"
+    }
+    $rootLease = $null
+    try {
+        $rootLease = Open-PlatformDirectory -Root $physical -RootOnly
+        $observation = Assert-PlatformFileIdentity -Lease $rootLease -Expected $rootLease.Observation -VerifyPath
+        if ([string]$observation.Kind -cne 'directory') {
+            throw "Trusted root is not an existing directory: $full"
+        }
+    }
+    finally {
+        if ($null -ne $rootLease) { $rootLease.Dispose() }
     }
     $physical
 }
@@ -484,8 +691,8 @@ function Test-PortableReparseItem {
         # root the walk covers the entry and its parent directory; callers that
         # prove containment walk every component up to their own root.
         $stopRoot = if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
-            $parentInfo = [IO.DirectoryInfo]::new($probe).Parent
-            if ($null -eq $parentInfo) { $probe } else { $parentInfo.FullName }
+            $parentPath = [IO.Path]::GetDirectoryName($probe)
+            if ([string]::IsNullOrWhiteSpace($parentPath)) { $probe } else { $parentPath }
         }
         else {
             $candidateRoot = [IO.Path]::GetFullPath($TrustedRoot)
@@ -540,8 +747,15 @@ function Get-PortableUnixObservation {
         throw "Physical identity requires a path below a filesystem root: $full"
     }
     $physicalParent = Resolve-PortableTrustedRoot -Path $parent
-    if (Test-Path -LiteralPath $full -PathType Container) {
+    $lease = $null
+    try {
         $lease = Open-PlatformDirectory -Root $physicalParent -RelativePath $leaf
+    }
+    catch [SyuanTsai.AIInstructions.PlatformRuntime.PlatformErrnoException] {
+        if ($_.Exception.Errno -eq 2) { return $null }
+        if ($_.Exception.Errno -ne 20) { throw }
+    }
+    if ($null -ne $lease) {
         try {
             $observation = Assert-PlatformFileIdentity -Lease $lease -Expected $lease.Observation
         }
@@ -552,7 +766,13 @@ function Get-PortableUnixObservation {
     try {
         # Open-PlatformFile rejects symlinks, non-regular files, and any managed
         # regular file whose link count is not exactly one (hard-link aliases).
-        $file = Open-PlatformFile -ParentLease $directory -Leaf $leaf -Access Read -CreateMode OpenExisting
+        try {
+            $file = Open-PlatformFile -ParentLease $directory -Leaf $leaf -Access Read -CreateMode OpenExisting
+        }
+        catch [SyuanTsai.AIInstructions.PlatformRuntime.PlatformErrnoException] {
+            if ($_.Exception.Errno -eq 2) { return $null }
+            throw
+        }
         try {
             $observation = Assert-PlatformFileIdentity -Lease $file -Expected $file.Observation -SingleLink
         }
@@ -586,9 +806,6 @@ function Test-PortablePhysicalIdentity {
 
     # Unix physical identity is the kernel (st_dev, st_ino) pair from the
     # vendored authority runtime. A missing path has no identity.
-    if (-not (Test-Path -LiteralPath $PathA) -or -not (Test-Path -LiteralPath $PathB)) {
-        return $false
-    }
     try {
         $observationA = Get-PortableUnixObservation -Path $PathA
         $observationB = Get-PortableUnixObservation -Path $PathB
@@ -596,6 +813,7 @@ function Test-PortablePhysicalIdentity {
     catch {
         throw ('Unable to prove Unix physical identity: {0}' -f $_.Exception.Message)
     }
+    if ($null -eq $observationA -or $null -eq $observationB) { return $false }
     [uint64]$observationA.Device -eq [uint64]$observationB.Device -and
         [uint64]$observationA.Inode -eq [uint64]$observationB.Inode -and
         [string]$observationA.Kind -ceq [string]$observationB.Kind
@@ -662,4 +880,5 @@ function Enter-PortableFileLock {
 
 Export-ModuleMember -Function Get-PortablePathComparison, Test-PortableReparseItem, Test-PortablePhysicalIdentity,
     Resolve-PortableTrustedRoot, Enter-PortableFileLock, Get-PortableLockPrimitive, Get-PortablePlatformName,
-    Assert-VendoredPlatformRuntime, Get-VendoredPlatformRuntimeBinding
+    Assert-VendoredPlatformRuntime, Get-VendoredPlatformRuntimeBinding, Get-PortableLeaseFileState,
+    Publish-PortableLeaseFile

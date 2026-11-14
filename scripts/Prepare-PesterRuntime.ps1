@@ -8,7 +8,10 @@ param(
     [Parameter(Mandatory)][string] $OwnedRoot,
     [string] $PackageCacheRoot = $env:DT_PESTER_PACKAGE_CACHE,
     [Parameter(Mandatory)][string] $AuthorityRepositoryRoot,
-    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision,
+    [string] $FixturePackagePath,
+    [string] $FixtureDestinationModuleRoot,
+    [switch] $FixtureFailAfterDestination
 )
 
 Set-StrictMode -Version Latest
@@ -31,20 +34,30 @@ function Open-PesterRelativeDirectory {
     param(
         [Parameter(Mandatory)] $RootLease,
         [Parameter(Mandatory)][string] $RootPath,
-        [Parameter(Mandatory)][string] $RelativePath
+        [Parameter(Mandatory)][string] $RelativePath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][Collections.Generic.HashSet[string]] $KnownDirectories,
+        [switch] $CreateFinal
     )
 
     $currentLease = $RootLease
     $ownsCurrent = $false
     $currentPath = $RootPath
     try {
-        foreach ($segment in @($RelativePath.Replace('\', '/').Split('/', [StringSplitOptions]::RemoveEmptyEntries))) {
-            $state = Get-PlatformDirectoryState -ParentLease $currentLease -Leaf $segment
-            $nextLease = if ($state.exists) {
-                Open-PlatformDirectory -Root $currentPath -RelativePath $segment
+        $segments = @($RelativePath.Replace('\', '/').Split('/', [StringSplitOptions]::RemoveEmptyEntries))
+        $relativeKey = ''
+        for ($index = 0; $index -lt $segments.Count; $index++) {
+            $segment = $segments[$index]
+            $relativeKey = if ($relativeKey) { "$relativeKey/$segment" } else { $segment }
+            if ($CreateFinal -and $index -eq ($segments.Count - 1)) {
+                $nextLease = Open-PlatformDirectory -Root $currentPath -RelativePath $segment -CreatePrivate
+                [void]$KnownDirectories.Add($relativeKey)
+            }
+            elseif ($KnownDirectories.Contains($relativeKey)) {
+                $nextLease = Open-PlatformDirectory -Root $currentPath -RelativePath $segment
             }
             else {
-                Open-PlatformDirectory -Root $currentPath -RelativePath $segment -CreatePrivate
+                $nextLease = Open-PlatformDirectory -Root $currentPath -RelativePath $segment -CreatePrivate
+                [void]$KnownDirectories.Add($relativeKey)
             }
             if ($ownsCurrent) { $currentLease.Dispose() }
             $currentLease = $nextLease
@@ -86,8 +99,7 @@ function Copy-PesterLeasedFile {
 
 $helperPath = Join-Path $PSScriptRoot 'CorePesterIntegrity.psm1'
 Import-Module -Name $helperPath -Force -ErrorAction Stop
-$driverModule = Import-Module -Name (Join-Path $PSScriptRoot 'StandardSourceDriver.psm1') -Force -PassThru -ErrorAction Stop
-$platformRuntimeModule = Import-DarktideAuthorityPlatformRuntime -AuthorityRoot $AuthorityRepositoryRoot -AuthorityRevision $AuthorityRevision
+$platformRuntimeModule = Import-CorePesterAuthorityPlatformRuntime -AuthorityRoot $AuthorityRepositoryRoot -AuthorityRevision $AuthorityRevision
 Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
 $cacheRootLease = $null
 $cacheFileLease = $null
@@ -113,17 +125,27 @@ if ([string]::IsNullOrWhiteSpace($registeredOwnedRoot) -or
     -not ([IO.Path]::GetFullPath($registeredOwnedRoot)).Equals($ownedRoot, $pathComparison)) {
     throw 'Pester setup root does not match the workflow-registered run-owned root.'
 }
-$setupRoot = Join-Path $ownedRoot 'pester-setup'
-$setupBoundary = Test-CorePesterPathBoundary -Path $setupRoot -Boundary $ownedRoot
-if (-not $setupBoundary.IsValid) { throw ('Pester setup evidence path is unsafe: ' + (@($setupBoundary.Errors) -join '; ')) }
-$setupRootLease = Open-PlatformDirectory -Root $ownedRoot -RelativePath 'pester-setup' -CreatePrivate
+$fixtureMode = -not [string]::IsNullOrWhiteSpace($FixturePackagePath) -or -not [string]::IsNullOrWhiteSpace($FixtureDestinationModuleRoot) -or $FixtureFailAfterDestination
+if ($fixtureMode) {
+    if ([Environment]::GetEnvironmentVariable('DT_PREPARE_PESTER_TEST_MODE', 'Process') -cne '1' -or
+        [string]::IsNullOrWhiteSpace($FixturePackagePath) -or [string]::IsNullOrWhiteSpace($FixtureDestinationModuleRoot)) {
+        throw 'Pester runtime fixture injection is available only to the explicit offline test harness.'
+    }
+    foreach ($fixturePath in @($FixturePackagePath, $FixtureDestinationModuleRoot)) {
+        $fixtureFull = [IO.Path]::GetFullPath($fixturePath)
+        $ownedPrefix = $ownedRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        if (-not $fixtureFull.StartsWith($ownedPrefix, $pathComparison)) { throw 'Pester runtime fixture paths must stay below the run-owned root.' }
+    }
+}
+$setupLeaf = 'pester-setup-' + [guid]::NewGuid().ToString('N')
+$setupRoot = Join-Path $ownedRoot $setupLeaf
+$setupRootLease = Open-PlatformDirectory -Root $ownedRoot -RelativePath $setupLeaf -CreatePrivate
 $setupBoundary = Test-CorePesterPathBoundary -Path $setupRoot -Boundary $ownedRoot
 if (-not $setupBoundary.IsValid) { throw ('Pester setup evidence path became unsafe: ' + (@($setupBoundary.Errors) -join '; ')) }
 $archivePath = Join-Path $setupRoot 'Pester.6.2.0.nupkg'
 $stageRoot = Join-Path $setupRoot 'staging'
 $destinationCreated = $false
-$destinationModuleRoot = $runtimeModuleRoot
-$cleanupFailed = $false
+$destinationModuleRoot = if ($fixtureMode) { [IO.Path]::GetFullPath($FixtureDestinationModuleRoot) } else { $runtimeModuleRoot }
 $successMessage = $null
 
 try {
@@ -170,11 +192,18 @@ try {
         }
     }
     if (-not $cacheWasUsed) {
-        $downloadResponse = Invoke-WebRequest -Uri $sourceUri -OutFile $archivePath -PassThru -MaximumRedirection 3 -TimeoutSec 180 -ErrorAction Stop
-        if ($null -ne $downloadResponse -and $null -ne $downloadResponse.BaseResponse -and
-            $null -ne $downloadResponse.BaseResponse.RequestMessage -and
-            $null -ne $downloadResponse.BaseResponse.RequestMessage.RequestUri) {
-            $observedFinalPackageUri = [string]$downloadResponse.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
+        if ($fixtureMode) {
+            $fixtureParent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($FixturePackagePath))) -RootOnly
+            try { Copy-PesterLeasedFile -SourceParentLease $fixtureParent -SourceLeaf ([IO.Path]::GetFileName($FixturePackagePath)) -DestinationParentLease $setupRootLease -DestinationLeaf 'Pester.6.2.0.nupkg' }
+            finally { $fixtureParent.Dispose() }
+        }
+        else {
+            $downloadResponse = Invoke-WebRequest -Uri $sourceUri -OutFile $archivePath -PassThru -MaximumRedirection 3 -TimeoutSec 180 -ErrorAction Stop
+            if ($null -ne $downloadResponse -and $null -ne $downloadResponse.BaseResponse -and
+                $null -ne $downloadResponse.BaseResponse.RequestMessage -and
+                $null -ne $downloadResponse.BaseResponse.RequestMessage.RequestUri) {
+                $observedFinalPackageUri = [string]$downloadResponse.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
+            }
         }
     }
     if ($null -ne $observedFinalPackageUri -and $observedFinalPackageUri -cnotmatch '^https://') {
@@ -185,30 +214,11 @@ try {
     $archivePayloadLease = Open-PlatformFile -ParentLease $setupRootLease -Leaf 'Pester.6.2.0.nupkg' -Access Read -CreateMode OpenExisting
     $archivePayloadIdentity = Assert-PlatformFileIdentity -Lease $archivePayloadLease -Expected $archivePayloadLease.Observation -SingleLink -VerifyPath
     $runtimeRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $destinationModuleRoot))
-    $runtimeRootLease = Open-PlatformDirectory -Root $runtimeRoot -RootOnly
-    try {
-        $destinationState = Get-PlatformDirectoryState -ParentLease $runtimeRootLease -Leaf 'Modules'
-        if ($destinationState.exists) {
-            $modulesProbe = Open-PlatformDirectory -Root $runtimeRoot -RelativePath 'Modules'
-            try {
-                $pesterState = Get-PlatformDirectoryState -ParentLease $modulesProbe -Leaf 'Pester'
-                if ($pesterState.exists) { throw 'The verified PowerShell runtime already contains a Pester destination; setup refuses overwrite.' }
-            }
-            finally { $modulesProbe.Dispose() }
-        }
-    }
-    finally { $runtimeRootLease.Dispose() }
-    $destinationBoundary = Test-CorePesterPathBoundary -Path $destinationModuleRoot -Boundary $runtimeRoot
-    if (-not $destinationBoundary.IsValid) {
-        throw ('Pester destination is outside the verified runtime or has a reparse-point ancestor: ' + (@($destinationBoundary.Errors) -join '; '))
-    }
-
-    $stageBoundary = Test-CorePesterPathBoundary -Path $stageRoot -Boundary $setupRoot
-    if (-not $stageBoundary.IsValid) { throw ('Pester staging path is unsafe: ' + (@($stageBoundary.Errors) -join '; ')) }
     $stageRootLease = Open-PlatformDirectory -Root $setupRoot -RelativePath 'staging' -CreatePrivate
     $stageBoundary = Test-CorePesterPathBoundary -Path $stageRoot -Boundary $setupRoot
     if (-not $stageBoundary.IsValid) { throw ('Pester staging path became unsafe: ' + (@($stageBoundary.Errors) -join '; ')) }
     $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
+    $stageDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     try {
         foreach ($payload in $lockRecord.Value.modulePayload) {
             $relative = [string]$payload.path
@@ -219,7 +229,7 @@ try {
             if (-not $targetPath.StartsWith($stagePrefix, $pathComparison)) { throw "Package path escaped owned staging: $relative" }
             $targetRelativeDirectory = Split-Path -Parent ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))
             $targetDirectoryLease = if ([string]::IsNullOrWhiteSpace($targetRelativeDirectory)) { $null }
-                else { Open-PesterRelativeDirectory -RootLease $stageRootLease -RootPath $stageRoot -RelativePath $targetRelativeDirectory }
+                else { Open-PesterRelativeDirectory -RootLease $stageRootLease -RootPath $stageRoot -RelativePath $targetRelativeDirectory -KnownDirectories $stageDirectories }
             $inputStream = $archiveEntry[0].Open()
             $outputParentLease = if ($null -eq $targetDirectoryLease) { $stageRootLease } else { $targetDirectoryLease }
             $outputLease = Open-PlatformFile -ParentLease $outputParentLease -Leaf ([IO.Path]::GetFileName($targetPath)) -Access ReadWrite -CreateMode CreateNew
@@ -242,16 +252,23 @@ try {
     $stagedClosure = Test-CorePesterClosure -ModuleRoot $stageRoot -Lock $lockRecord.Value
     if (-not $stagedClosure.IsValid) { throw ('Staged Pester package closure failed: ' + (@($stagedClosure.Errors) -join '; ')) }
     $runtimeRootLease = Open-PlatformDirectory -Root $runtimeRoot -RootOnly
-    $destinationModuleLease = Open-PesterRelativeDirectory -RootLease $runtimeRootLease -RootPath $runtimeRoot -RelativePath 'Modules/Pester/6.2.0'
+    $destinationDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    [void]$destinationDirectories.Add('Modules')
+    $destinationModuleLease = Open-PesterRelativeDirectory -RootLease $runtimeRootLease -RootPath $runtimeRoot -RelativePath 'Modules/Pester/6.2.0' -KnownDirectories $destinationDirectories -CreateFinal
     $destinationCreated = $true
+    $destinationBoundary = Test-CorePesterPathBoundary -Path $destinationModuleRoot -Boundary $runtimeRoot
+    if (-not $destinationBoundary.IsValid) {
+        throw ('Pester destination is outside the verified runtime or has a reparse-point ancestor: ' + (@($destinationBoundary.Errors) -join '; '))
+    }
     try {
+        if ($FixtureFailAfterDestination) { throw 'Injected post-destination failure for offline cleanup-retention verification.' }
         foreach ($payload in $lockRecord.Value.modulePayload) {
             $relative = [string]$payload.path
             $relativeDirectory = Split-Path -Parent ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))
             $sourceParent = if ([string]::IsNullOrWhiteSpace($relativeDirectory)) { $stageRootLease }
                 else { Open-PlatformDirectory -Root $stageRoot -RelativePath $relativeDirectory }
             $destinationParent = if ([string]::IsNullOrWhiteSpace($relativeDirectory)) { $destinationModuleLease }
-                else { Open-PesterRelativeDirectory -RootLease $destinationModuleLease -RootPath $destinationModuleRoot -RelativePath $relativeDirectory }
+                else { Open-PesterRelativeDirectory -RootLease $destinationModuleLease -RootPath $destinationModuleRoot -RelativePath $relativeDirectory -KnownDirectories $destinationDirectories }
             try {
                 Copy-PesterLeasedFile -SourceParentLease $sourceParent -SourceLeaf ([IO.Path]::GetFileName($relative)) `
                     -DestinationParentLease $destinationParent -DestinationLeaf ([IO.Path]::GetFileName($relative))
@@ -306,28 +323,8 @@ try {
 }
 catch {
     [Console]::Error.WriteLine("Pester runtime setup failed: $($_.Exception.Message)")
-    if ($destinationCreated) {
-        try {
-            $runtimeRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $destinationModuleRoot))
-            $destinationBoundary = Test-CorePesterPathBoundary -Path $destinationModuleRoot -Boundary $runtimeRoot
-            if (-not $destinationBoundary.IsValid) { throw ('Refusing unsafe recursive runtime cleanup: ' + (@($destinationBoundary.Errors) -join '; ')) }
-            $pesterParentLease = Open-PlatformDirectory -Root $runtimeRoot -RelativePath 'Modules/Pester'
-            try {
-                $destinationState = Get-PlatformDirectoryState -ParentLease $pesterParentLease -Leaf '6.2.0'
-                if ($destinationState.exists) {
-                    Remove-PlatformOwnedDirectoryTree -TransactionRootLease $pesterParentLease -Leaf '6.2.0' -ExpectedIdentity $destinationState.identity
-                }
-                if ((Get-PlatformDirectoryState -ParentLease $pesterParentLease -Leaf '6.2.0').exists) {
-                    throw 'Owned runtime destination cleanup did not remove the Pester directory.'
-                }
-            }
-            finally { $pesterParentLease.Dispose() }
-        }
-        catch {
-            $cleanupFailed = $true
-            [Console]::Error.WriteLine("Pester runtime cleanup failed closed: $($_.Exception.Message)")
-        }
-    }
+    if ($fixtureMode) { [Console]::Error.WriteLine("Pester runtime fixture trace: $($_.ScriptStackTrace)") }
+    if ($destinationCreated) { [Console]::Error.WriteLine('Pester runtime destination is retained as failed run evidence and must not be reused.') }
     exit 1
 }
 finally {
@@ -336,23 +333,8 @@ finally {
     if ($null -ne $cacheArchiveParentLease) { $cacheArchiveParentLease.Dispose(); $cacheArchiveParentLease = $null }
     if ($null -ne $cacheFileLease) { $cacheFileLease.Dispose(); $cacheFileLease = $null }
     if ($null -ne $cacheRootLease) { $cacheRootLease.Dispose(); $cacheRootLease = $null }
-    try {
-        $stageBoundary = Test-CorePesterPathBoundary -Path $stageRoot -Boundary $setupRoot
-        if (-not $stageBoundary.IsValid) { throw ('Refusing unsafe recursive staging cleanup: ' + (@($stageBoundary.Errors) -join '; ')) }
-        if ($null -ne $stageRootLease) { $stageRootLease.Dispose(); $stageRootLease = $null }
-        $stageState = Get-PlatformDirectoryState -ParentLease $setupRootLease -Leaf 'staging'
-        if ($stageState.exists) {
-            Remove-PlatformOwnedDirectoryTree -TransactionRootLease $setupRootLease -Leaf 'staging' -ExpectedIdentity $stageState.identity
-        }
-        if ((Get-PlatformDirectoryState -ParentLease $setupRootLease -Leaf 'staging').exists) { throw 'Owned staging cleanup did not remove the staging directory.' }
-    }
-    catch {
-        $cleanupFailed = $true
-        [Console]::Error.WriteLine("Pester staging cleanup failed closed: $($_.Exception.Message)")
-    }
+    if ($null -ne $stageRootLease) { $stageRootLease.Dispose(); $stageRootLease = $null }
     if ($null -ne $setupRootLease) { $setupRootLease.Dispose(); $setupRootLease = $null }
     if ($null -ne $platformRuntimeModule) { Remove-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction SilentlyContinue; $platformRuntimeModule = $null }
-    if ($null -ne $driverModule) { Remove-Module -ModuleInfo $driverModule -Force -ErrorAction SilentlyContinue; $driverModule = $null }
 }
-if ($cleanupFailed) { exit 1 }
 if ($null -ne $successMessage) { Write-Output $successMessage }

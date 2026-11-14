@@ -684,7 +684,6 @@ function Invoke-ModUpdateReviewedHeadFinalization {
     $remoteAfter = Invoke-Git -WorkingDirectory $repository -Arguments @('ls-remote', '--heads', [string]$State.remote, $remoteRef)
     if (-not [string]::IsNullOrWhiteSpace($remoteAfter.output)) { throw 'Remote run branch remains after deletion.' }
 
-    $lockRoot = Split-Path -Parent ([string]$State.modLockPath)
     $claimRoot = Join-Path $repository 'AI Auto Update/.claims'
     $inProgressRoot = Join-Path $repository 'AI Auto Update/In Progress'
     $claimDirectory = Split-Path -Parent ([string]$State.claimPath)
@@ -693,15 +692,12 @@ function Invoke-ModUpdateReviewedHeadFinalization {
         throw 'Reservation owner changed before terminal release.'
     }
     Suspend-ModReservationWorker -State $State
+    Release-ModReservation -State $State
     Exit-RunWriterLock -Lease $script:writerLease
     $script:writerLease = $null
     if (Test-Path -LiteralPath $claimDirectory -PathType Container) {
         Remove-ModUpdateOwnedTree -Path $claimDirectory -Root $claimRoot -Label 'Finalized claim directory'
     }
-    $releasedTombstone = Join-Path $lockRoot ('.released-{0}-{1}' -f ([string]($State.modLockKey)), ([string]$runId))
-    if (Test-Path -LiteralPath $releasedTombstone) { throw 'Reservation release tombstone already exists.' }
-    [IO.Directory]::Move([string]$State.modLockPath, $releasedTombstone)
-    Remove-ModUpdateOwnedTree -Path $releasedTombstone -Root $lockRoot -Label 'Released reservation tombstone'
     if (Test-Path -LiteralPath ([string]$State.runRoot) -PathType Container) {
         Remove-ModUpdateOwnedTree -Path ([string]$State.runRoot) -Root $inProgressRoot -Label 'Finalized run root'
     }

@@ -4,10 +4,49 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:CorePesterPathSafetyModule = Import-Module -Name (Join-Path $PSScriptRoot '../skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru -ErrorAction Stop
-$script:CorePesterPlatformRuntimeModule = & $script:CorePesterPathSafetyModule { $script:VendoredPlatformRuntimeModule }
-if ($script:CorePesterPlatformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Vendored authority platform runtime was not registry-bound.' }
-Import-Module -ModuleInfo $script:CorePesterPlatformRuntimeModule -Force -ErrorAction Stop
+$script:CorePesterPlatformRuntimeModule = $null
+$script:CorePesterAuthorityRevision = 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
+$script:CorePesterAuthorityRuntimeFiles = [ordered]@{
+    'scripts/platform-runtime.psd1'='d3d8eef434484b3b2449cd4762e60b94afc314d9beb91481538c7f57207a11c9'
+    'scripts/platform-runtime.psm1'='ad051b2794ce4dc10108404201735d02f7b032ed0e633c5f22f73c884fb10370'
+    'scripts/installer-safe-mutation.psm1'='dc031edcc2f48968df83cd68ad52eacb7f7b05d3ca6a0cc622658cf6151c8293'
+    'scripts/WindowsDacl.psm1'='ffa1f85d94bb6bce9bf8353f8c7733bdbe59880a3d0d075191938cc28aebb5f6'
+    'scripts/platform/PlatformNative.cs'='f9da23bf3e6e3c8960b26d534e14873f6b4fc98b3d13f5b6cdfdd5f7716a4514'
+    'scripts/platform/UnixNative.cs'='171da4acded889da89ab4e7af2729e9bbf4f3639cf1e63fe08a4c046f7545c74'
+    'scripts/platform/WindowsNative.cs'='6eea8ca2701b6a6de88ee4a3348f053d07a0543d607832e667335c838bb7d433'
+    'scripts/platform/WindowsInstallerMutation.cs'='b88b4b09c7bb5c3e71b762ddc6ebe72007ed0cca99977ab7a7272529c3ff9218'
+    'scripts/platform/OwnedProcess.cs'='097061ad5902f896ff74b3f60b0ecaf63f3d58f357aed8fdbf80a8586564de58'
+    'scripts/platform/UnixProcess.cs'='125d2b3eecdad6a6c201d5f5d61a6efd0ad55ba93822c7b83a679a5397005db1'
+    'scripts/platform/WindowsProcess.cs'='7b8a0cddd3b9809b861801fe1d6a618684e2ca6fa13f9334825c5c9da5b2d8d6'
+    'scripts/platform/Unix.psm1'='ec3b3bb0b39e1ce84d4c8f60a78c44fb40cb9d58c13ed88a6b9d9db978fcc147'
+    'scripts/platform/RuntimePreparation.psm1'='dc254c04e7e2caf280726e66f67434776bc7df12a210a38c80596e41344fd077'
+    'scripts/platform/Windows.psm1'='9b7442178083a9b165ed3bf53367d5c3ce1b1f09d56f0f6efe964b524e17be0b'
+    'scripts/platform/Linux.psm1'='52c261d577ee7b3946771d1112030996896fdd119e06ac3849e430a3d56fb38c'
+    'scripts/platform/MacOS.psm1'='8f25edfbee5ab36b5e1c42eb55c6dbab44db0bc29896c180612b1248920c7c47'
+}
+
+function Import-CorePesterAuthorityPlatformRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $AuthorityRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision
+    )
+    if ($AuthorityRevision -cne $script:CorePesterAuthorityRevision) { throw 'Core Pester authority revision differs from the reviewed tuple.' }
+    $root = [IO.Path]::GetFullPath($AuthorityRoot)
+    foreach ($entry in $script:CorePesterAuthorityRuntimeFiles.GetEnumerator()) {
+        $path = [IO.Path]::GetFullPath((Join-Path $root ($entry.Key -replace '/', [IO.Path]::DirectorySeparatorChar)))
+        $stream = [IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        try { $hash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
+        finally { $stream.Dispose() }
+        if ($hash -cne [string]$entry.Value) { throw "Core Pester authority runtime file differs from the reviewed tuple: $($entry.Key)" }
+    }
+    $manifestPath = Join-Path $root 'scripts/platform-runtime.psd1'
+    $module = Import-Module -Name $manifestPath -Force -PassThru -ErrorAction Stop
+    & $module { param($RuntimeRoot,$Manifest) Assert-PlatformRuntimeInventory -Root $RuntimeRoot -ManifestPath $Manifest | Out-Null } (Split-Path -Parent $manifestPath) $manifestPath
+    $script:CorePesterPlatformRuntimeModule = $module
+    Import-Module -ModuleInfo $module -Force -ErrorAction Stop
+    return $module
+}
 
 $script:expectedMetadataEntries = @(
     '_rels/.rels',
@@ -233,9 +272,9 @@ function Test-CorePesterPathBoundary {
         $relative = $fullPath.Substring($fullBoundary.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
         $currentPath = $fullBoundary
         foreach ($segment in @($relative.Split([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar), [StringSplitOptions]::RemoveEmptyEntries))) {
-            $state = Get-PlatformDirectoryState -ParentLease $currentLease -Leaf $segment
-            if (-not $state.exists) { break }
-            $nextLease = Open-PlatformDirectory -Root $currentPath -RelativePath $segment
+            try { $nextLease = Open-PlatformDirectory -Root $currentPath -RelativePath $segment }
+            catch [IO.DirectoryNotFoundException] { break }
+            catch [IO.FileNotFoundException] { break }
             if ($currentLease -ne $boundaryLease) { $currentLease.Dispose() }
             $currentLease = $nextLease
             $currentPath = Join-Path $currentPath $segment
@@ -277,12 +316,8 @@ function Test-CorePesterClosure {
     $actual = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
     $rows = [System.Collections.Generic.List[object]]::new()
     $rootLease = $null
-    $rootParentLease = $null
     try {
-        $rootParentLease = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($root)) -RootOnly
         $rootLease = Open-PlatformDirectory -Root $root -RootOnly
-        try { $rootStateBefore = Get-PlatformDirectoryState -ParentLease $rootParentLease -Leaf ([IO.Path]::GetFileName($root)) }
-        catch { $rootStateBefore = $null }
     }
     catch { $rootLease = $null }
     if ($null -eq $rootLease) {
@@ -314,20 +349,13 @@ function Test-CorePesterClosure {
                 $errors.Add("Pester closure contains unpinned file: $relativePath")
                 continue
             }
-            $hash = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData((Get-CorePesterLeasedBytes -Path $fullPath))).ToLowerInvariant()
             $wantedHash = [string]$expected[$relativePath].sha256
             $rows.Add([pscustomobject]@{ path = $relativePath; sha256 = $hash })
             if ($hash -cne $wantedHash) { $errors.Add("Pester closure hash mismatch: $relativePath") }
         }
-        if ($null -ne $rootStateBefore) {
-            $rootStateAfter = Get-PlatformDirectoryState -ParentLease $rootParentLease -Leaf ([IO.Path]::GetFileName($root))
-            if ($rootStateAfter.inventorySha256 -cne $rootStateBefore.inventorySha256 -or $rootStateAfter.entryCount -ne $rootStateBefore.entryCount) {
-                $errors.Add('Pester module closure changed while it was inventoried.')
-            }
-        }
     }
     if ($null -ne $rootLease) { $rootLease.Dispose() }
-    if ($null -ne $rootParentLease) { $rootParentLease.Dispose() }
     foreach ($path in $expected.Keys) {
         if (-not $actual.ContainsKey($path)) { $errors.Add("Pester closure payload is missing: $path") }
     }
@@ -556,6 +584,27 @@ function Test-CorePesterShardUnion {
     return [pscustomobject]@{ IsValid = $errors.Count -eq 0; Errors = @($errors.ToArray()); DiscoveryCount = $discovered.Count; UnionCount = $union.Count }
 }
 
+function Test-CorePesterAcceptance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool] $CaseInventoryLedgerWritten,
+        [Parameter(Mandatory)][bool] $CaseInventoryComplete,
+        [Parameter(Mandatory)][int] $Total,
+        [Parameter(Mandatory)][int] $Passed,
+        [Parameter(Mandatory)][int] $Failed,
+        [Parameter(Mandatory)][int] $FailedBlocks,
+        [Parameter(Mandatory)][int] $FailedContainers,
+        [Parameter(Mandatory)][int] $Inconclusive,
+        [Parameter(Mandatory)][int] $Skipped,
+        [Parameter(Mandatory)][int] $NotRun
+    )
+    return $CaseInventoryLedgerWritten -and $CaseInventoryComplete -and
+        $Total -gt 0 -and $Passed -gt 0 -and $Failed -eq 0 -and
+        $FailedBlocks -eq 0 -and $FailedContainers -eq 0 -and
+        $Inconclusive -eq 0 -and $Skipped -eq 0 -and $NotRun -eq 0 -and
+        $Passed -eq $Total
+}
+
 function Get-CorePesterTreeSnapshot {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string] $Root)
@@ -564,16 +613,12 @@ function Get-CorePesterTreeSnapshot {
     $errors = [System.Collections.Generic.List[string]]::new()
     $files = [System.Collections.Generic.List[object]]::new()
     $fileKeys = [System.Collections.Generic.HashSet[string]]::new((Get-CorePesterPathComparer))
-    $rootParentLease = $null
     $rootLease = $null
     try {
-        $rootParentLease = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($fullRoot)) -RootOnly
-        $rootStateBefore = Get-PlatformDirectoryState -ParentLease $rootParentLease -Leaf ([IO.Path]::GetFileName($fullRoot))
-        if ($rootStateBefore.exists) { $rootLease = Open-PlatformDirectory -Root $fullRoot -RootOnly }
+        $rootLease = Open-PlatformDirectory -Root $fullRoot -RootOnly
     }
     catch { $rootLease = $null }
     if ($null -eq $rootLease) {
-        if ($null -ne $rootParentLease) { $rootParentLease.Dispose() }
         return [pscustomobject]@{ IsValid = $false; Root = $fullRoot; Sha256 = $null; Files = @(); Errors = @('Candidate snapshot root is missing.') }
     }
     foreach ($item in @(Get-ChildItem -LiteralPath $fullRoot -Force -Recurse -ErrorAction Stop)) {
@@ -592,15 +637,18 @@ function Get-CorePesterTreeSnapshot {
         try { Assert-CorePesterSafeRelativePath -Path $relative -Context 'candidate snapshot file' }
         catch { $errors.Add($_.Exception.Message); continue }
         if (-not $fileKeys.Add($relative)) { $errors.Add("Candidate snapshot contains a duplicate or case-ambiguous file path: $relative"); continue }
-        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-        $files.Add([pscustomobject]@{ path = $relative; sha256 = $hash })
-    }
-    $rootStateAfter = Get-PlatformDirectoryState -ParentLease $rootParentLease -Leaf ([IO.Path]::GetFileName($fullRoot))
-    if ($rootStateAfter.inventorySha256 -cne $rootStateBefore.inventorySha256 -or $rootStateAfter.entryCount -ne $rootStateBefore.entryCount) {
-        $errors.Add('Candidate snapshot changed while it was inventoried.')
+        try {
+            $binding = Open-CorePesterFileBinding -Path $path
+            try {
+                $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($binding.File.ReadAllBytes(268435456))).ToLowerInvariant()
+                [void](Assert-PlatformFileIdentity -Lease $binding.File -Expected $binding.Identity -SingleLink -VerifyPath)
+                $files.Add([pscustomobject]@{ path = $relative; sha256 = $hash })
+            }
+            finally { Close-CorePesterFileBinding -Binding $binding }
+        }
+        catch { $errors.Add("Candidate snapshot file identity could not be bound: $relative. $($_.Exception.Message)") }
     }
     $rootLease.Dispose()
-    $rootParentLease.Dispose()
     $ordered = @($files.ToArray() | Sort-Object -Property path -CaseSensitive)
     $canonical = ConvertTo-Json -InputObject $ordered -Depth 3 -Compress
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($canonical)
@@ -716,4 +764,4 @@ function Test-CorePesterPackageArchive {
     }
 }
 
-Export-ModuleMember -Function Open-CorePesterFileBinding, Close-CorePesterFileBinding, Get-CorePesterLeasedBytes, Read-CorePesterClosureLock, Get-CorePesterRuntimeModuleRoot, Assert-NoLegacyCorePesterBootstrapEnvironment, Test-CorePesterPathBoundary, Test-CorePesterClosure, Test-CorePesterModuleCandidates, Get-CorePesterExpectedLoadedModulePath, Test-CorePesterLoadedModuleIdentity, Get-CorePesterCaseIdentity, ConvertFrom-CorePesterProgressLine, Test-CorePesterCaseIdentityPartition, Test-CorePesterShardUnion, Get-CorePesterTreeSnapshot, Test-CorePesterPackageArchive
+Export-ModuleMember -Function Import-CorePesterAuthorityPlatformRuntime, Open-CorePesterFileBinding, Close-CorePesterFileBinding, Get-CorePesterLeasedBytes, Read-CorePesterClosureLock, Get-CorePesterRuntimeModuleRoot, Assert-NoLegacyCorePesterBootstrapEnvironment, Test-CorePesterPathBoundary, Test-CorePesterClosure, Test-CorePesterModuleCandidates, Get-CorePesterExpectedLoadedModulePath, Test-CorePesterLoadedModuleIdentity, Get-CorePesterCaseIdentity, ConvertFrom-CorePesterProgressLine, Test-CorePesterCaseIdentityPartition, Test-CorePesterShardUnion, Test-CorePesterAcceptance, Get-CorePesterTreeSnapshot, Test-CorePesterPackageArchive

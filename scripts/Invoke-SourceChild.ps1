@@ -9,15 +9,30 @@
 param(
     [Parameter(Mandatory = $true)][ValidateSet('package-adapter', 'skill-validator', 'skill-tools', 'static')][string] $Mode,
     [Parameter(Mandatory = $true)][string] $ToolchainPath,
-    [Parameter(Mandatory = $true)][string] $ToolchainSha256
+    [Parameter(Mandatory = $true)][string] $ToolchainSha256,
+    [Parameter(Mandatory = $true)][string] $DriverModulePath,
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string] $DriverModuleSha256,
+    [Parameter(Mandatory = $true)][string] $AuthorityRepositoryRoot,
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision,
+    [ValidateRange(1, 86400)][int] $TimeoutSeconds = 900
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$candidateRootForRuntime = [IO.Path]::GetFullPath([string]$env:STANDARD_VALIDATION_CANDIDATE_ROOT)
-$pathSafetyModule = Import-Module -Name (Join-Path $candidateRootForRuntime 'skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru -ErrorAction Stop
-$platformRuntimeModule = & $pathSafetyModule { $script:VendoredPlatformRuntimeModule }
-if ($platformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Vendored authority platform runtime was not registry-bound.' }
+# The driver writes a protected-base copy into the run-owned setup root and
+# binds its exact bytes in the adapter frozen-file inventory. Load those bytes
+# as a dynamic module so no candidate pathname is ever imported and pathname
+# replacement after the read cannot change the executed module.
+$driverStream = [IO.FileStream]::new([IO.Path]::GetFullPath($DriverModulePath), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+try { $driverBytes = [byte[]]::new($driverStream.Length); $driverStream.ReadExactly($driverBytes) }
+finally { $driverStream.Dispose() }
+if ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($driverBytes)).ToLowerInvariant() -cne $DriverModuleSha256) {
+    throw 'Frozen protected source driver bytes changed.'
+}
+$driverText = [Text.UTF8Encoding]::new($false, $true).GetString($driverBytes)
+$driverModule = New-Module -Name 'DarktideFrozenSourceDriver' -ScriptBlock ([scriptblock]::Create($driverText))
+Import-Module -ModuleInfo $driverModule -Force -ErrorAction Stop
+$platformRuntimeModule = Import-DarktideAuthorityPlatformRuntime -AuthorityRoot $AuthorityRepositoryRoot -AuthorityRevision $AuthorityRevision
 Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
 
 function Open-ChildFile {
@@ -221,14 +236,59 @@ function Add-NativeReport {
         sha256 = Get-FileSha256 -Path $fullPath
     }
 }
+function Invoke-ChildOwnedCommand {
+    param([Parameter(Mandatory)][string] $Command, [Parameter(Mandatory)][string[]] $Arguments)
+    $commandBinding=$null; $executableBinding=$null; $workingLease=$null; $process=$null; $cleanup=$null; $exitCode=$null; $timedOut=$false
+    $captureId=[guid]::NewGuid().ToString('N')
+    $stdoutPath=Join-Path (Get-Location) "$captureId.stdout"
+    $stderrPath=Join-Path (Get-Location) "$captureId.stderr"
+    $deadline=[DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+    try {
+        $commandBinding=Open-ChildFile -Path $Command
+        $extension=[IO.Path]::GetExtension($commandBinding.Path).ToLowerInvariant()
+        if($extension -eq '.ps1'){
+            $hostPath=[IO.Path]::GetFullPath([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+            $executableBinding=Open-ChildFile -Path $hostPath
+            $launchArguments=@('-NoProfile','-NonInteractive','-File',$commandBinding.Path)+$Arguments
+            $argumentZero=$hostPath
+        } else {
+            $executableBinding=$commandBinding
+            $launchArguments=$Arguments
+            $argumentZero=$commandBinding.Path
+        }
+        $environment=@{}; foreach($entry in Get-ChildItem Env:){if($null-ne$entry.Value){$environment[[string]$entry.Name]=[string]$entry.Value}}
+        $workingLease=Open-PlatformDirectory -Root ([IO.Path]::GetFullPath((Get-Location).Path)) -RootOnly
+        $process=Start-PlatformOwnedProcess -ExecutableLease $executableBinding.File -ArgumentZero $argumentZero -ArgumentList $launchArguments `
+            -Environment $environment -WorkingDirectoryLease $workingLease -Deadline $deadline -StdoutPath $stdoutPath -StderrPath $stderrPath -OutputLimitCharacters 1048576
+        while(-not $process.HasExited -and [DateTimeOffset]::UtcNow -lt $deadline){[void]$process.WaitForExit([TimeSpan]::FromMilliseconds(50))}
+        $timedOut=-not $process.HasExited
+        if(-not $timedOut){$exitCode=[int]$process.ExitCode}
+    }
+    finally {
+        if($null-ne$process){
+            try{$cleanup=Stop-PlatformOwnedProcess -Lease $process -ExpectedStartIdentity $process.StartIdentity -Deadline ([DateTimeOffset]::UtcNow.AddSeconds(10)); if($null -eq $exitCode -and $process.HasExited){$exitCode=[int]$process.ExitCode}}
+            finally{$process.Dispose()}
+        }
+        if($null-ne$workingLease){$workingLease.Dispose()}
+        if($null-ne$commandBinding){[void](Assert-PlatformFileIdentity -Lease $commandBinding.File -Expected $commandBinding.Identity -SingleLink -VerifyPath)}
+        if($null-ne$executableBinding-and$executableBinding-ne$commandBinding){Close-ChildFile $executableBinding}
+        if($null-ne$commandBinding){Close-ChildFile $commandBinding}
+    }
+    if($null-eq$cleanup-or-not[bool]$cleanup.CleanedUp){throw 'Native tool cleanup could not be verified.'}
+    if($timedOut){throw "Native tool exceeded its $TimeoutSeconds second deadline."}
+    $stdout=if(Test-ChildFile $stdoutPath){Read-ChildText $stdoutPath}else{''}
+    $stderr=if(Test-ChildFile $stderrPath){Read-ChildText $stderrPath}else{''}
+    # Captures are run-owned evidence. Keep them create-only; the enclosing CI
+    # run root owns eventual cleanup, so no P11 directory mutation is needed.
+    return [pscustomobject]@{exitCode=[int]$exitCode;stdout=$stdout;stderr=$stderr}
+}
 function Invoke-NativeJson {
     param([Parameter(Mandatory = $true)][string] $Command, [Parameter(Mandatory = $true)][string[]] $Arguments, [Parameter(Mandatory = $true)][string] $Context)
-    $stderrPath = Join-Path (Get-Location) (([guid]::NewGuid().ToString('N')) + '.stderr')
     try {
-        $lines = @(& $Command @Arguments 2> $stderrPath)
-        $exitCode = $LASTEXITCODE
-        $stderr = if (Test-ChildFile -Path $stderrPath) { Read-ChildText -Path $stderrPath } else { '' }
-        $json = ($lines -join "`n").Trim()
+        $process = Invoke-ChildOwnedCommand -Command $Command -Arguments $Arguments
+        $exitCode = [int]$process.exitCode
+        $stderr = [string]$process.stderr
+        $json = ([string]$process.stdout).Trim()
         $nativePath = Join-Path (Get-Location) ("native-$Mode-$($env:STANDARD_VALIDATION_SKILL_ID).json")
         Write-ChildUtf8CreateNew -Path $nativePath -Text $json
         Add-NativeReport -Command $Command -Arguments $Arguments -ExitCode $exitCode -Path $nativePath -SkillId ([string]$env:STANDARD_VALIDATION_SKILL_ID)
@@ -236,9 +296,7 @@ function Invoke-NativeJson {
         if ([string]::IsNullOrWhiteSpace($json)) { throw "$Context produced no JSON output." }
         return ($json | ConvertFrom-Json -Depth 100)
     }
-    finally {
-        Remove-ChildOwnedFile -Path $stderrPath
-    }
+    finally { }
 }
 function Invoke-DomainJson {
     param(
@@ -247,12 +305,11 @@ function Invoke-DomainJson {
         [Parameter(Mandatory = $true)][string] $Context,
         [Parameter(Mandatory = $true)][string] $ReportName
     )
-    $stderrPath = Join-Path (Get-Location) ((([guid]::NewGuid().ToString('N')) + '.stderr'))
     try {
-        $lines = @(& $Command @Arguments 2> $stderrPath)
-        $exitCode = $LASTEXITCODE
-        $stderr = if (Test-ChildFile -Path $stderrPath) { Read-ChildText -Path $stderrPath } else { '' }
-        $json = ($lines -join "`n").Trim()
+        $process = Invoke-ChildOwnedCommand -Command $Command -Arguments $Arguments
+        $exitCode = [int]$process.exitCode
+        $stderr = [string]$process.stderr
+        $json = ([string]$process.stdout).Trim()
         $reportPath = Join-Path (Get-Location) $ReportName
         if (Test-ChildFile -Path $reportPath) { throw "$Context report path already exists." }
         Write-ChildUtf8CreateNew -Path $reportPath -Text $json
@@ -260,9 +317,7 @@ function Invoke-DomainJson {
         if ([string]::IsNullOrWhiteSpace($json)) { throw "$Context produced no JSON output." }
         return ($json | ConvertFrom-Json -Depth 100)
     }
-    finally {
-        Remove-ChildOwnedFile -Path $stderrPath
-    }
+    finally { }
 }
 function Assert-SkillValidatorReport {
     param([Parameter(Mandatory = $true)] $Report, [Parameter(Mandatory = $true)][string] $SkillRoot, [Parameter(Mandatory = $true)][string[]] $Inventory, [Parameter(Mandatory = $true)][string] $SkillId)
@@ -343,7 +398,10 @@ function Assert-SkillSpectorReport {
         $path = [string](Get-Property -Object $component -Name 'path' -Context 'SkillSpector component')
         if (-not ($Inventory -ccontains $path) -or -not $observed.Add($path)) { throw "SkillSpector did not cover the exact inventory for '$SkillId'." }
     }
-    $issues = @(Get-Property -Object $Report -Name 'issues' -Context 'SkillSpector report')
+    $issuesProperty = $Report.PSObject.Properties['issues']
+    if ($null -eq $issuesProperty -or $issuesProperty.Value -isnot [array]) { throw "SkillSpector issues must be an array for '$SkillId'." }
+    $issuesValue = $issuesProperty.Value
+    $issues = @($issuesValue)
     $findings = @()
     foreach ($issue in $issues) { $findings += New-Finding -Issue $issue -SkillId $SkillId -Stage 'skillspector-static' }
     return ,$findings
@@ -352,11 +410,6 @@ function Assert-SkillSpectorReport {
 try {
     $toolchain = Read-Json -Path $ToolchainPath -Context 'run-owned validation toolchain'
     Assert-FileIdentity -Path $ToolchainPath -Sha256 $ToolchainSha256 -Context 'run-owned validation toolchain'
-    $centralRunnerFullPath = [IO.Path]::GetFullPath([string]$toolchain.centralRunnerPath)
-    $authorityRoot = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($centralRunnerFullPath))
-    $driverModule = Import-Module -Name (Join-Path $candidateRootForRuntime 'scripts/StandardSourceDriver.psm1') -Force -PassThru -ErrorAction Stop
-    $authorityRuntimeModule = Import-DarktideAuthorityPlatformRuntime -AuthorityRoot $authorityRoot -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
-    Import-Module -ModuleInfo $authorityRuntimeModule -Force -ErrorAction Stop
     $candidateRoot = [IO.Path]::GetFullPath([string]$env:STANDARD_VALIDATION_CANDIDATE_ROOT)
     if ($Mode -cin @('skill-validator', 'package-adapter')) {
         Assert-FileIdentity -Path ([string]$toolchain.centralRunnerPath) -Sha256 ([string]$toolchain.centralRunnerSha256) -Context 'central validation runner'
@@ -455,11 +508,11 @@ try {
                 $inventory = Get-InventoryPaths -SkillRoot $skillRoot
                 $reportPath = Join-Path (Get-Location) ("skillspector-$skillId.json")
                 if (Test-ChildFile -Path $reportPath) { throw "SkillSpector stdout report path already exists for '$skillId'." }
-                $staticStderrPath = Join-Path (Get-Location) ("skillspector-$skillId.stderr")
                 $nativeArguments = @('scan', $skillRoot, '--no-llm', '--format', 'json')
-                & ([string]$toolchain.skillSpectorPath) @nativeArguments 1> $reportPath 2> $staticStderrPath
-                $nativeExit = $LASTEXITCODE
-                $staticStderr = if (Test-ChildFile -Path $staticStderrPath) { Read-ChildText -Path $staticStderrPath } else { [string]::Empty }
+                $nativeProcess = Invoke-ChildOwnedCommand -Command ([string]$toolchain.skillSpectorPath) -Arguments $nativeArguments
+                $nativeExit = [int]$nativeProcess.exitCode
+                $staticStderr = [string]$nativeProcess.stderr
+                Write-ChildUtf8CreateNew -Path $reportPath -Text ([string]$nativeProcess.stdout).Trim()
                 if (-not [string]::IsNullOrEmpty($staticStderr) -and $staticStderr.Length -gt 4096) { $staticStderr = $staticStderr.Substring(0, 4096) + '[truncated]' }
                 $staticStderrDiagnostic = if ([string]::IsNullOrWhiteSpace($staticStderr)) { '' } else { " SkillSpector stderr: $staticStderr" }
                 Add-NativeReport -Command ([string]$toolchain.skillSpectorPath) -Arguments $nativeArguments -ExitCode $nativeExit -Path $reportPath -SkillId $skillId

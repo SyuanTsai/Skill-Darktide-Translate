@@ -200,28 +200,40 @@ function Assert-CoordinationOwner {
         [Parameter(Mandatory)][Collections.IDictionary] $Owner,
         [Parameter(Mandatory)][string] $ResourceKey
     )
-    foreach ($field in @('schemaVersion', 'runId', 'resourceKey', 'machineName', 'processId', 'processStartTicks', 'token', 'acquiredAt', 'heartbeat')) {
+    foreach ($field in @('schemaVersion', 'state', 'resourceKey', 'owner', 'expiresAt', 'platform', 'lockPrimitive')) {
         if (-not $Owner.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$Owner[$field])) {
+            throw "Existing $ResourceKey coordination lock owner is missing $field."
+        }
+    }
+    if ($Owner.owner -isnot [Collections.IDictionary]) {
+        throw "Existing $ResourceKey coordination lock owner contract is invalid."
+    }
+    foreach ($field in @('runId', 'machineName', 'processId', 'processStartTicks', 'token', 'acquiredAt', 'heartbeat')) {
+        if (-not $Owner.owner.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$Owner.owner[$field])) {
             throw "Existing $ResourceKey coordination lock owner is missing $field."
         }
     }
     $parsedSchemaVersion = 0
     $parsedProcessId = 0
     $parsedProcessStartTicks = [int64]0
-    if (-not [int]::TryParse([string]$Owner.schemaVersion, [ref]$parsedSchemaVersion) -or $parsedSchemaVersion -ne 1 -or
-        -not [int]::TryParse([string]$Owner.processId, [ref]$parsedProcessId) -or $parsedProcessId -le 0 -or
-        -not [int64]::TryParse([string]$Owner.processStartTicks, [ref]$parsedProcessStartTicks) -or $parsedProcessStartTicks -le 0 -or
-        [string]$Owner.runId -notmatch '^[A-Za-z0-9._-]+$' -or
+    if (-not [int]::TryParse([string]$Owner.schemaVersion, [ref]$parsedSchemaVersion) -or $parsedSchemaVersion -ne 2 -or
+        [string]$Owner.state -notin @('held', 'released') -or
+        -not [int]::TryParse([string]$Owner.owner.processId, [ref]$parsedProcessId) -or $parsedProcessId -le 0 -or
+        -not [int64]::TryParse([string]$Owner.owner.processStartTicks, [ref]$parsedProcessStartTicks) -or $parsedProcessStartTicks -le 0 -or
+        [string]$Owner.owner.runId -notmatch '^[A-Za-z0-9._-]+$' -or
         [string]$Owner.resourceKey -cne $ResourceKey -or
-        [string]$Owner.token -notmatch '^[0-9a-f]{32}$') {
+        [string]$Owner.platform -notin @('windows', 'linux', 'macos') -or
+        ([string]$Owner.platform -ceq 'windows' -and [string]$Owner.lockPrimitive -cne 'windows-fileshare') -or
+        ([string]$Owner.platform -in @('linux', 'macos') -and [string]$Owner.lockPrimitive -cne 'flock') -or
+        [string]$Owner.owner.token -notmatch '^[0-9a-f]{32}$') {
         throw "Existing $ResourceKey coordination lock owner contract is invalid."
     }
-    foreach ($timestampField in @('acquiredAt', 'heartbeat')) {
+    foreach ($timestampValue in @($Owner.owner.acquiredAt, $Owner.owner.heartbeat, $Owner.expiresAt)) {
         $parsed = [DateTimeOffset]::MinValue
         if (-not [DateTimeOffset]::TryParseExact(
-            [string]$Owner[$timestampField], 'o', [Globalization.CultureInfo]::InvariantCulture,
+            [string]$timestampValue, 'o', [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed
-        )) { throw "Existing $ResourceKey coordination lock $timestampField is invalid." }
+        )) { throw "Existing $ResourceKey coordination lock timestamp is invalid." }
     }
 }
 
@@ -230,12 +242,47 @@ function Test-CoordinationLeaseMatchesOwner {
         [Parameter(Mandatory)][Collections.IDictionary] $Lease,
         [Parameter(Mandatory)][Collections.IDictionary] $Owner
     )
-    [string]$Owner.runId -ceq [string]$Lease.runId -and
+    [string]$Owner.state -ceq 'held' -and
+        [string]$Owner.owner.runId -ceq [string]$Lease.runId -and
         [string]$Owner.resourceKey -ceq [string]$Lease.resourceKey -and
-        [string]$Owner.token -ceq [string]$Lease.token -and
-        [string]$Owner.machineName -ceq [string]$Lease.machineName -and
-        [int]$Owner.processId -eq [int]$Lease.processId -and
-        [int64]$Owner.processStartTicks -eq [int64]$Lease.processStartTicks
+        [string]$Owner.owner.token -ceq [string]$Lease.token -and
+        [string]$Owner.owner.machineName -ceq [string]$Lease.machineName -and
+        [int]$Owner.owner.processId -eq [int]$Lease.processId -and
+        [int64]$Owner.owner.processStartTicks -eq [int64]$Lease.processStartTicks -and
+        [string]$Owner.platform -ceq [string]$Lease.platform -and
+        [string]$Owner.lockPrimitive -ceq [string]$Lease.lockPrimitive
+}
+
+function Get-CoordinationLeaseSnapshot {
+    param([string] $LockRoot, [string] $ResourceKey)
+    $leaf = "$ResourceKey.lock"
+    $lockPath = Join-Path $LockRoot $leaf
+    $migration = "Legacy coordination lease directory format detected at '$lockPath'. Stop all owners, move this directory to a preserved evidence location outside .locks, verify the original path is absent, then rerun. Automatic deletion or migration is forbidden."
+    $snapshot = Get-PortableLeaseFileState -ParentPath $LockRoot -Leaf $leaf -AllowMissing -LegacyDirectoryMessage $migration
+    if (-not [bool]$snapshot.exists) { return $snapshot }
+    try {
+        $snapshot['value'] = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$snapshot.bytes) |
+            ConvertFrom-Json -AsHashtable
+    }
+    catch { throw "Existing $ResourceKey coordination lock owner is unreadable; preserve it for explicit recovery." }
+    $snapshot
+}
+
+function Publish-CoordinationLeaseSnapshot {
+    param(
+        [string] $LockRoot,
+        [string] $ResourceKey,
+        [Collections.IDictionary] $Value,
+        [Collections.IDictionary] $ExpectedState,
+        [switch] $NoReplace
+    )
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 30 -Compress) + "`n")
+    $idBytes = [Text.UTF8Encoding]::new($false).GetBytes("coordination:$ResourceKey")
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { $transactionId = ([BitConverter]::ToString($sha256.ComputeHash($idBytes))).Replace('-', '').ToLowerInvariant().Substring(0, 32) }
+    finally { $sha256.Dispose() }
+    Publish-PortableLeaseFile -ParentPath $LockRoot -Leaf "$ResourceKey.lock" -Bytes $bytes `
+        -ExpectedState $ExpectedState -TransactionId $transactionId -NoReplace:$NoReplace
 }
 
 function Write-CoordinationReceipt {
@@ -291,14 +338,14 @@ function New-CoordinationLeaseRecord {
         machineName = $Identity.machineName
         processId = $Identity.processId
         processStartTicks = $Identity.processStartTicks
-        acquiredAt = $Owner.acquiredAt
+        acquiredAt = $Owner.owner.acquiredAt
         receiptRoot = $ReceiptRoot
         receiptId = [guid]::NewGuid().ToString('N')
         staleEvidencePath = $StaleEvidencePath
         waitingMilliseconds = $WaitingMilliseconds
         lastHeartbeatUtc = [DateTimeOffset]::UtcNow
-        platform = Get-PortablePlatformName
-        lockPrimitive = Get-PortableLockPrimitive
+        platform = $Owner.platform
+        lockPrimitive = $Owner.lockPrimitive
     }
 }
 
@@ -330,65 +377,42 @@ function Enter-SharedCoordinationLease {
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
         if ($WaitHeartbeatAction) { $null = & $WaitHeartbeatAction }
-        $prepared = Join-Path $lockRoot ('.pending-{0}-{1}-{2}' -f ([string]$ResourceKey), ([string]$RunId), ([string]([guid]::NewGuid().ToString('N'))))
-        New-Item -ItemType Directory -Path $prepared -ErrorAction Stop | Out-Null
+        $now = [DateTimeOffset]::UtcNow
         $owner = [ordered]@{
-            schemaVersion = 1
-            runId = $RunId
+            schemaVersion = 2
+            state = 'held'
             resourceKey = $ResourceKey
-            machineName = $identity.machineName
-            processId = $identity.processId
-            processStartTicks = $identity.processStartTicks
-            token = $token
-            acquiredAt = Get-CoordinationUtcTimestamp
-            heartbeat = Get-CoordinationUtcTimestamp
+            owner = [ordered]@{
+                runId = $RunId
+                machineName = $identity.machineName
+                processId = $identity.processId
+                processStartTicks = $identity.processStartTicks
+                token = $token
+                acquiredAt = $now.ToString('o')
+                heartbeat = $now.ToString('o')
+            }
+            expiresAt = $now.AddMinutes(3).ToString('o')
+            platform = Get-PortablePlatformName
+            lockPrimitive = Get-PortableLockPrimitive
         }
-        Write-CoordinationAtomicJson -Path (Join-Path $prepared 'owner.json') -Value $owner
         $waitForOwner = $false
         $guard = Enter-CoordinationOwnerGuard -LockRoot $lockRoot -ResourceKey $ResourceKey
         try {
-            if (Test-Path -LiteralPath $lockPath -PathType Container) {
-                $null = Assert-CoordinationPath -Path $lockPath -RepositoryRoot $repository
-                $existingOwnerPath = Join-Path $lockPath 'owner.json'
-                $null = Assert-CoordinationPath -Path $existingOwnerPath -RepositoryRoot $lockRoot
-                try { $existing = Get-Content -LiteralPath $existingOwnerPath -Raw | ConvertFrom-Json -AsHashtable }
-                catch { throw ('Existing {0} coordination lock owner is unreadable; preserve it for explicit recovery.' -f ([string]$ResourceKey)) }
+            $snapshot = Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey $ResourceKey
+            if ([bool]$snapshot.exists) {
+                $existing = $snapshot.value
                 Assert-CoordinationOwner -Owner $existing -ResourceKey $ResourceKey
-                $existingHeartbeat = [DateTimeOffset]::ParseExact(
-                    [string]$existing.heartbeat, 'o', [Globalization.CultureInfo]::InvariantCulture,
-                    [Globalization.DateTimeStyles]::RoundtripKind
-                )
-                if ((Test-CoordinationProcessActive -Owner $existing) -or
-                    ([DateTimeOffset]::UtcNow - $existingHeartbeat).TotalMinutes -le 3) {
+                $expiresAt = [DateTimeOffset]::ParseExact(
+                    [string]$existing.expiresAt, 'o', [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind)
+                if ([string]$existing.state -ceq 'held' -and [DateTimeOffset]::UtcNow -lt $expiresAt) {
                     $waitForOwner = $true
-                }
-                else {
-                    $stalePath = Join-Path $lockRoot ('.stale-{0}-{1}-{2}' -f ([string]$ResourceKey), ([string]([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))), ([string]([guid]::NewGuid().ToString('N'))))
-                    try {
-                        [IO.Directory]::Move($lockPath, $stalePath)
-                        $staleEvidencePath = [IO.Path]::GetFullPath($stalePath)
-                    }
-                    catch [IO.IOException] { $waitForOwner = $true }
                 }
             }
             if (-not $waitForOwner) {
-                $owner.acquiredAt = Get-CoordinationUtcTimestamp
-                $owner.heartbeat = $owner.acquiredAt
-                Write-CoordinationAtomicJson -Path (Join-Path $prepared 'owner.json') -Value $owner
                 try {
-                    # Unix rename(2) silently replaces an EMPTY destination
-                    # directory. Every participant publishes only while holding
-                    # the owner guard, so re-prove absence immediately before the
-                    # rename and prove the published owner token immediately
-                    # after it; any mismatch fails closed instead of double-holding.
-                    if (Test-Path -LiteralPath $lockPath) {
-                        throw [IO.IOException]::new('The coordination lease appeared before publication.')
-                    }
-                    [IO.Directory]::Move($prepared, $lockPath)
-                    $published = Get-Content -LiteralPath (Join-Path $lockPath 'owner.json') -Raw | ConvertFrom-Json -AsHashtable
-                    if ([string]$published.token -cne $token -or [string]$published.runId -cne $RunId) {
-                        throw "Published $ResourceKey coordination lease does not carry this owner token."
-                    }
+                    $null = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey $ResourceKey -Value $owner `
+                        -ExpectedState $snapshot -NoReplace:(-not [bool]$snapshot.exists)
                     $waitingMilliseconds = if ($waitStartedMilliseconds -lt 0) {
                         [int64]0
                     }
@@ -397,18 +421,11 @@ function Enter-SharedCoordinationLease {
                     }
                     return New-CoordinationLeaseRecord -LockPath $lockPath -Token $token -RunId $RunId -ResourceKey $ResourceKey -Identity $identity -Owner $owner -ReceiptRoot $receiptRootFull -StaleEvidencePath $staleEvidencePath -WaitingMilliseconds $waitingMilliseconds
                 }
-                catch [IO.IOException] { $waitForOwner = $true }
+                catch { $waitForOwner = $true }
             }
         }
         finally {
             $guard.Dispose()
-            if (Test-Path -LiteralPath $prepared -PathType Container) {
-                $preparedItems = @(Get-ChildItem -LiteralPath $prepared -Force)
-                if ($preparedItems.Count -eq 1 -and $preparedItems[0].Name -ceq 'owner.json' -and -not $preparedItems[0].PSIsContainer) {
-                    [IO.File]::Delete($preparedItems[0].FullName)
-                    [IO.Directory]::Delete($prepared)
-                }
-            }
         }
         if ($waitForOwner) {
             if ($waitStartedMilliseconds -lt 0) { $waitStartedMilliseconds = [Environment]::TickCount64 }
@@ -431,19 +448,19 @@ function Update-SharedCoordinationLease {
     $lockRoot = Split-Path -Parent ([string]$Lease.path)
     $guard = Enter-CoordinationOwnerGuard -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey)
     try {
-        $ownerPath = Join-Path ([string]$Lease.path) 'owner.json'
-        $null = Assert-CoordinationPath -Path $ownerPath -RepositoryRoot $lockRoot
-        if (-not (Test-Path -LiteralPath $ownerPath -PathType Leaf)) {
-            throw 'Shared coordination owner disappeared before heartbeat refresh.'
-        }
-        $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        $snapshot = Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey)
+        if (-not [bool]$snapshot.exists) { throw 'Shared coordination owner disappeared before heartbeat refresh.' }
+        $owner = $snapshot.value
         Assert-CoordinationOwner -Owner $owner -ResourceKey ([string]$Lease.resourceKey)
         if (-not (Test-CoordinationLeaseMatchesOwner -Lease $Lease -Owner $owner)) {
             throw 'Shared coordination ownership changed before heartbeat refresh.'
         }
-        $owner.heartbeat = Get-CoordinationUtcTimestamp
-        Write-CoordinationAtomicJson -Path $ownerPath -Value $owner
-        $verified = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        $now = [DateTimeOffset]::UtcNow
+        $owner.owner.heartbeat = $now.ToString('o')
+        $owner.expiresAt = $now.AddMinutes(3).ToString('o')
+        $null = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey) `
+            -Value $owner -ExpectedState $snapshot
+        $verified = (Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey)).value
         if (-not (Test-CoordinationLeaseMatchesOwner -Lease $Lease -Owner $verified)) {
             throw 'Shared coordination ownership changed during heartbeat refresh.'
         }
@@ -458,23 +475,19 @@ function Exit-SharedCoordinationLease {
     $lockRoot = Split-Path -Parent ([string]$Lease.path)
     $guard = Enter-CoordinationOwnerGuard -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey)
     try {
-        if (-not (Test-Path -LiteralPath ([string]$Lease.path) -PathType Container)) {
-            throw 'Shared coordination lock disappeared before owner-checked release.'
-        }
-        $ownerPath = Join-Path ([string]$Lease.path) 'owner.json'
-        $null = Assert-CoordinationPath -Path $ownerPath -RepositoryRoot $lockRoot
-        $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
+        $snapshot = Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey)
+        if (-not [bool]$snapshot.exists) { throw 'Shared coordination lock disappeared before owner-checked release.' }
+        $owner = $snapshot.value
         Assert-CoordinationOwner -Owner $owner -ResourceKey ([string]$Lease.resourceKey)
         if (-not (Test-CoordinationLeaseMatchesOwner -Lease $Lease -Owner $owner)) {
             throw 'Shared coordination lock ownership changed before release.'
         }
-        $lockItems = @(Get-ChildItem -LiteralPath ([string]$Lease.path) -Force)
-        if ($lockItems.Count -ne 1 -or $lockItems[0].Name -cne 'owner.json' -or $lockItems[0].PSIsContainer) {
-            throw 'Shared coordination lock contains unexpected entries; preserving it for recovery.'
-        }
         $Lease.completedAt = Get-CoordinationUtcTimestamp
-        [IO.File]::Delete($ownerPath)
-        [IO.Directory]::Delete([string]$Lease.path)
+        $owner.state = 'released'
+        $owner.owner.heartbeat = $Lease.completedAt
+        $owner.expiresAt = $Lease.completedAt
+        $null = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey) `
+            -Value $owner -ExpectedState $snapshot
     }
     finally { $guard.Dispose() }
     Write-CoordinationReceipt -Lease $Lease -Disposition 'released'

@@ -142,9 +142,21 @@ Describe 'Latest stable PowerShell release evidence' {
         function New-PowerShellHashesManifestFixture {
             param(
                 [Parameter(Mandatory)][string] $Path,
-                [Parameter(Mandatory)][string[]] $Lines
+                [Parameter(Mandatory)][string[]] $Lines,
+                [ValidateSet('Utf8', 'Utf8Bom', 'Utf16LeBom')][string] $Encoding = 'Utf8'
             )
-            [IO.File]::WriteAllText($Path, (($Lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+            $text = ($Lines -join "`n") + "`n"
+            $encoder = switch ($Encoding) {
+                'Utf8' { [Text.UTF8Encoding]::new($false, $true) }
+                'Utf8Bom' { [Text.UTF8Encoding]::new($true, $true) }
+                'Utf16LeBom' { [Text.UnicodeEncoding]::new($false, $true, $true) }
+            }
+            [byte[]]$body = $encoder.GetBytes($text)
+            [byte[]]$preamble = $encoder.GetPreamble()
+            [byte[]]$bytes = [byte[]]::new($preamble.Length + $body.Length)
+            [Array]::Copy($preamble, 0, $bytes, 0, $preamble.Length)
+            [Array]::Copy($body, 0, $bytes, $preamble.Length, $body.Length)
+            [IO.File]::WriteAllBytes($Path, $bytes)
             $item = Get-Item -LiteralPath $Path
             [pscustomobject]@{
                 Digest = 'sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
@@ -378,6 +390,37 @@ Describe 'Latest stable PowerShell release evidence' {
         { Assert-VerifiedPowerShellHashesManifest -Asset $asset -Path $manifestPath } | Should -Throw
     }
 
+    # Scenario: Microsoft's manifest is published with any supported, explicitly identified encoding.
+    # Purpose: Decode BOMs strictly while continuing to hash the exact downloaded bytes.
+    It 'UnitT105A_StrictlyDecodesSupportedHashManifestEncodings' -ForEach @(
+        @{ Encoding = 'Utf8' }
+        @{ Encoding = 'Utf8Bom' }
+        @{ Encoding = 'Utf16LeBom' }
+    ) {
+        $archiveHash = 'e' * 64
+        $manifestPath = Join-Path $TestDrive "hashes-$Encoding.sha256"
+        $manifest = New-PowerShellHashesManifestFixture -Path $manifestPath -Encoding $Encoding -Lines @(
+            "$archiveHash *PowerShell-7.6.6-win-x64.zip"
+        )
+        $release = New-LatestPowerShellReleaseFixture -Digest "sha256:$archiveHash" `
+            -HashesDigest $manifest.Digest -HashesSize $manifest.Size
+        $asset = Get-VerifiedPowerShellReleaseAsset -Release $release -Platform windows -Architecture x64
+
+        (Assert-VerifiedPowerShellHashesManifest -Asset $asset -Path $manifestPath) |
+            Should -BeExactly $manifest.Digest.Substring(7)
+        Get-OfficialPowerShellManifestDigest -Path $manifestPath -ArchiveName $asset.name |
+            Should -BeExactly $archiveHash
+    }
+
+    # Scenario: A manifest has no BOM and contains an invalid UTF-8 sequence.
+    # Purpose: Fail closed instead of replacing invalid bytes during digest parsing.
+    It 'UnitT105B_RejectsInvalidManifestBytes' {
+        $manifestPath = Join-Path $TestDrive 'hashes-invalid.sha256'
+        [IO.File]::WriteAllBytes($manifestPath, [byte[]](0xC3, 0x28, 0x0A))
+        { Get-OfficialPowerShellManifestDigest -Path $manifestPath -ArchiveName 'PowerShell-7.6.6-win-x64.zip' } |
+            Should -Throw
+    }
+
     # Scenario: A Unix tar listing contains links or other special entries whose targets could escape after extraction.
     # Purpose: Reject every non-file/non-directory member before extraction, independently of the host running this unit test.
     It 'UnitT106_RejectsUnixTarLinksAndSpecialEntriesBeforeExtraction' {
@@ -402,6 +445,8 @@ Describe 'Latest stable PowerShell release evidence' {
     # Purpose: Keep release selection, archive/manifest verification, and extraction in the shared repository module.
     It 'UnitT107_DelegatesWorkflowReleaseVerificationAndExtractionToTheSharedModule' {
         $workflowHelper = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Prepare-WorkflowPowerShell.ps1') -Raw
+        $installer = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Install-LatestPowerShell.ps1') -Raw
+        $releaseModule = Get-Content -LiteralPath $script:releaseModulePath -Raw
         $workflowHelper | Should -Match "Import-Module -Name \(Join-Path \`$PSScriptRoot 'PowerShellRelease\.psm1'\)"
         foreach ($functionName in @(
             'Get-VerifiedPowerShellReleaseAsset', 'Assert-VerifiedPowerShellArchive',
@@ -409,6 +454,12 @@ Describe 'Latest stable PowerShell release evidence' {
             $workflowHelper | Should -Match ([regex]::Escape($functionName))
         }
         $workflowHelper | Should -Not -Match '\bExpand-Archive\b|&\s+(?:\$\w+|tar)\s+-x'
+        $workflowHelper | Should -Match 'Invoke-PowerShellReleaseOwnedProcess'
+        $installer | Should -Match 'Invoke-PowerShellReleaseOwnedProcess'
+        $installer | Should -Not -Match 'Diagnostics\.ProcessStartInfo|Diagnostics\.Process\]::new|&\s+\$ExecutablePath'
+        $releaseModule | Should -Match 'Start-PlatformOwnedProcess -ExecutableLease'
+        $releaseModule | Should -Match 'Stop-PlatformOwnedProcess -Lease'
+        $releaseModule | Should -Not -Match '&\s+\$tarPath|&\s+tar\b'
     }
 
     # Register only on the native host: Windows archives are zip files whose pwsh.exe carries an Authenticode signature.
@@ -419,6 +470,8 @@ Describe 'Latest stable PowerShell release evidence' {
             $stagingRoot = Join-Path $TestDrive 'windows-staging'
             New-Item -ItemType Directory -Path $stagingRoot | Out-Null
             [IO.File]::WriteAllText((Join-Path $stagingRoot 'pwsh.exe'), 'unsigned executable fixture', [Text.UTF8Encoding]::new($false))
+            [void][IO.Directory]::CreateDirectory((Join-Path $stagingRoot 'Modules'))
+            [IO.File]::WriteAllText((Join-Path $stagingRoot 'Modules/README.txt'), 'module fixture', [Text.UTF8Encoding]::new($false))
             $archivePath = Join-Path $TestDrive 'windows-runtime.zip'
             Compress-Archive -Path (Join-Path $stagingRoot '*') -DestinationPath $archivePath
             $asset = New-HostPowerShellArchiveAsset -ArchivePath $archivePath
@@ -427,6 +480,7 @@ Describe 'Latest stable PowerShell release evidence' {
             $executablePath = Expand-VerifiedPowerShellArchive -Asset $asset -ArchivePath $archivePath -DestinationPath $runtimeRoot
             $executablePath | Should -BeExactly ([IO.Path]::GetFullPath((Join-Path $runtimeRoot 'pwsh.exe')))
             [IO.File]::ReadAllText($executablePath) | Should -BeExactly 'unsigned executable fixture'
+            [IO.File]::ReadAllText((Join-Path $runtimeRoot 'Modules/README.txt')) | Should -BeExactly 'module fixture'
             { Expand-VerifiedPowerShellArchive -Asset $asset -ArchivePath $archivePath -DestinationPath $runtimeRoot } | Should -Throw '*already exists*'
             { Assert-PowerShellExecutableSignature -Path $executablePath -Platform windows } | Should -Throw '*Authenticode*'
 
@@ -444,6 +498,13 @@ Describe 'Latest stable PowerShell release evidence' {
             $missingRuntime = Join-Path $TestDrive 'windows-missing-runtime'
             { Expand-VerifiedPowerShellArchive -Asset $missingAsset -ArchivePath $missingArchive -DestinationPath $missingRuntime } |
                 Should -Throw '*did not contain pwsh.exe*'
+            Test-Path -LiteralPath $missingRuntime -PathType Container | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $missingRuntime '.powershell-runtime-unusable.json') -PathType Leaf | Should -BeTrue
+
+            $retryRuntime = Join-Path $TestDrive 'windows-retry-runtime'
+            $retryExecutable = Expand-VerifiedPowerShellArchive -Asset $asset -ArchivePath $archivePath -DestinationPath $retryRuntime
+            $retryExecutable | Should -BeExactly ([IO.Path]::GetFullPath((Join-Path $retryRuntime 'pwsh.exe')))
+            $retryRuntime | Should -Not -BeExactly $missingRuntime
         }
     }
 
@@ -491,8 +552,19 @@ Describe 'Latest stable PowerShell release evidence' {
             $traversalRuntime = Join-Path $TestDrive 'unix-traversal-runtime'
             { Expand-VerifiedPowerShellArchive -Asset $traversalAsset -ArchivePath $traversalArchive -DestinationPath $traversalRuntime } |
                 Should -Throw '*escapes the run-owned runtime directory*'
-            Test-Path -LiteralPath $traversalRuntime | Should -BeFalse
+            Test-Path -LiteralPath $traversalRuntime -PathType Container | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $traversalRuntime '.powershell-runtime-unusable.json') -PathType Leaf | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $TestDrive 'escaped.txt') | Should -BeFalse
+
+            $retryArchive = Join-Path $TestDrive 'unix-retry.tar.gz'
+            New-TestTarGzArchive -Path $retryArchive -Entries @(
+                @{ Name = 'pwsh'; Mode = 'UserRead, UserWrite, UserExecute'; Content = 'retry fixture' }
+            )
+            $retryAsset = New-HostPowerShellArchiveAsset -ArchivePath $retryArchive
+            $retryRuntime = Join-Path $TestDrive 'unix-retry-runtime'
+            $retryExecutable = Expand-VerifiedPowerShellArchive -Asset $retryAsset -ArchivePath $retryArchive -DestinationPath $retryRuntime
+            $retryExecutable | Should -BeExactly ([IO.Path]::GetFullPath((Join-Path $retryRuntime 'pwsh')))
+            $retryRuntime | Should -Not -BeExactly $traversalRuntime
 
             $windowsNameArchive = Join-Path $TestDrive 'unix-windows-name.tar.gz'
             New-TestTarGzArchive -Path $windowsNameArchive -Entries @(
