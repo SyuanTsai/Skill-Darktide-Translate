@@ -246,13 +246,44 @@ jobs:
           & (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-WorkflowPowerShell.ps1') -Mode Verify `
             -Platform ([string]$env:S8_MATRIX_PLATFORM) -ExpectedArchitecture ([string]$env:S8_MATRIX_ARCHITECTURE) `
             -ExecutableName ([string]$env:S8_MATRIX_EXECUTABLE)
-          & $env:DT_POWERSHELL_EXECUTABLE -NoProfile -NonInteractive -File `
+          $setupOutput = @(& $env:DT_POWERSHELL_EXECUTABLE -NoProfile -NonInteractive -File `
             (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-PesterRuntime.ps1') `
             -RuntimeExecutable $env:DT_POWERSHELL_EXECUTABLE -OwnedRoot $env:S8_OWNED_ROOT `
             -PackageCacheRoot $env:S8_PESTER_CACHE_ROOT -AuthorityRepositoryRoot $env:S8_AUTHORITY_ROOT `
-            -AuthorityRevision $env:S8_AUTHORITY_COMMIT
-          if ($LASTEXITCODE -ne 0) { throw "Pester closure preparation failed with exit code $LASTEXITCODE." }
-          Copy-Item -LiteralPath (Join-Path $env:S8_OWNED_ROOT 'pester-setup/setup-receipt.json') `
+            -AuthorityRevision $env:S8_AUTHORITY_COMMIT 2>&1)
+          $setupExit = $LASTEXITCODE
+          $setupLines = @($setupOutput | ForEach-Object { [string]$_ })
+          $setupLines | Out-Host
+          if ($setupExit -ne 0) { throw "Pester closure preparation failed with exit code $setupExit." }
+
+          $setupPattern = '^Verified Pester setup: path="(?<path>[^"]+)" sha256=(?<sha256>[0-9a-f]{64}) archiveSha256=(?<archiveSha256>[0-9a-f]{64}) payloads=(?<payloads>[1-9][0-9]*) closureSha256=(?<closureSha256>[0-9a-f]{64})$'
+          $regexOptions = [Text.RegularExpressions.RegexOptions]::CultureInvariant
+          $setupEvidence = @($setupLines | Where-Object { [Text.RegularExpressions.Regex]::IsMatch($_, $setupPattern, $regexOptions) })
+          if ($setupEvidence.Count -ne 1) {
+            throw "Pester closure preparation must emit one exact verified setup evidence line; found $($setupEvidence.Count)."
+          }
+          $setupMatch = [Text.RegularExpressions.Regex]::Match($setupEvidence[0], $setupPattern, $regexOptions)
+          $receiptPath = [IO.Path]::GetFullPath([string]$setupMatch.Groups['path'].Value)
+          $expectedReceiptSha256 = [string]$setupMatch.Groups['sha256'].Value
+          $ownedRoot = [IO.Path]::GetFullPath($env:S8_OWNED_ROOT)
+          $relativeReceiptPath = [IO.Path]::GetRelativePath($ownedRoot, $receiptPath).Replace([IO.Path]::DirectorySeparatorChar, '/')
+          if ($relativeReceiptPath -cnotmatch '^pester-setup-[0-9a-f]{32}/setup-receipt\.json$') {
+            throw "Verified Pester setup receipt is outside the unique run-owned setup layout: $receiptPath"
+          }
+          $setupDirectories = @(Get-ChildItem -LiteralPath $ownedRoot -Directory -Force -ErrorAction Stop |
+            Where-Object { $_.Name -cmatch '^pester-setup-[0-9a-f]{32}$' })
+          if ($setupDirectories.Count -ne 1 -or
+              [IO.Path]::GetFullPath($setupDirectories[0].FullName) -cne [IO.Path]::GetDirectoryName($receiptPath)) {
+            throw "Pester closure preparation must create exactly one matching setup directory; found $($setupDirectories.Count)."
+          }
+          if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+            throw "Verified Pester setup receipt is missing: $receiptPath"
+          }
+          $actualReceiptSha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+          if ($actualReceiptSha256 -cne $expectedReceiptSha256) {
+            throw "Verified Pester setup receipt SHA256 mismatch: expected $expectedReceiptSha256, observed $actualReceiptSha256."
+          }
+          Copy-Item -LiteralPath $receiptPath `
             -Destination (Join-Path $env:S8_PESTER_RESULTS_ROOT 'setup-receipt.json') -ErrorAction Stop
 
       - name: Run CorePester in tracked-only no-git snapshot
@@ -277,7 +308,8 @@ jobs:
           Push-Location $snapshotRoot
           try {
             $coreOutput = @(& $env:DT_POWERSHELL_EXECUTABLE -NoProfile -NonInteractive -File `
-              (Join-Path $snapshotRoot 'scripts/Invoke-CorePester.ps1') 2>&1)
+              (Join-Path $snapshotRoot 'scripts/Invoke-CorePester.ps1') `
+              -AuthorityRepositoryRoot $env:S8_AUTHORITY_ROOT -AuthorityRevision $env:S8_AUTHORITY_COMMIT 2>&1)
             $coreExit = $LASTEXITCODE
           }
           finally { Pop-Location }
