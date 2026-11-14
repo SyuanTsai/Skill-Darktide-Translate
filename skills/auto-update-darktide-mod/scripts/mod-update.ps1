@@ -5481,6 +5481,7 @@ try {
     else {
         $state = Resolve-InitialState
         $null = Assert-RunLocalSkillPackage -State $state
+        $script:activeReservationState = $state
         $releasedFinalization = if ($Command -ceq 'finalize-merge') {
             Get-ReleasedModUpdateFinalizationResult -State $state
         }

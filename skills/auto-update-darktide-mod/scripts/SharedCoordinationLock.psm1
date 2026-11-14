@@ -364,14 +364,39 @@ function Publish-CoordinationLeaseSnapshot {
         [Collections.IDictionary] $ExpectedState,
         [switch] $NoReplace,
         [switch] $PreserveDisplaced,
-        [ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId,
-        [ValidatePattern('^previous-[0-9a-f]{32}$')][string] $DisplacedLeaf
+        $TransactionId,
+        $DisplacedLeaf
     )
+    $requestedTransactionId = $null
+    if ($null -ne $TransactionId) {
+        if ($TransactionId -isnot [string]) {
+            throw [ArgumentException]::new('TransactionId must be a string when provided.')
+        }
+        if (-not [string]::IsNullOrWhiteSpace($TransactionId)) {
+            if ($TransactionId -notmatch '^[0-9a-f]{32}$') {
+                throw [ArgumentException]::new('TransactionId must match ^[0-9a-f]{32}$ when provided.')
+            }
+            $requestedTransactionId = $TransactionId
+        }
+    }
+    $requestedDisplacedLeaf = $null
+    if ($null -ne $DisplacedLeaf) {
+        if ($DisplacedLeaf -isnot [string]) {
+            throw [ArgumentException]::new('DisplacedLeaf must be a string when provided.')
+        }
+        if (-not [string]::IsNullOrWhiteSpace($DisplacedLeaf)) {
+            if ($DisplacedLeaf -notmatch '^previous-[0-9a-f]{32}$') {
+                throw [ArgumentException]::new('DisplacedLeaf must match ^previous-[0-9a-f]{32}$ when provided.')
+            }
+            $requestedDisplacedLeaf = $DisplacedLeaf
+        }
+    }
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 30 -Compress) + "`n")
     $idBytes = [Text.UTF8Encoding]::new($false).GetBytes("coordination:$ResourceKey")
-    if ([string]::IsNullOrWhiteSpace($TransactionId)) {
+    $effectiveTransactionId = $requestedTransactionId
+    if ($null -eq $effectiveTransactionId) {
         $sha256 = [Security.Cryptography.SHA256]::Create()
-        try { $TransactionId = ([BitConverter]::ToString($sha256.ComputeHash($idBytes))).Replace('-', '').ToLowerInvariant().Substring(0, 32) }
+        try { $effectiveTransactionId = ([BitConverter]::ToString($sha256.ComputeHash($idBytes))).Replace('-', '').ToLowerInvariant().Substring(0, 32) }
         finally { $sha256.Dispose() }
     }
     $publicationParameters = @{
@@ -379,11 +404,11 @@ function Publish-CoordinationLeaseSnapshot {
         Leaf = "$ResourceKey.lock"
         Bytes = $bytes
         ExpectedState = $ExpectedState
-        TransactionId = $TransactionId
+        TransactionId = $effectiveTransactionId
         NoReplace = [bool]$NoReplace
         PreserveDisplaced = [bool]$PreserveDisplaced
     }
-    if (-not [string]::IsNullOrWhiteSpace($DisplacedLeaf)) { $publicationParameters.DisplacedLeaf = $DisplacedLeaf }
+    if ($null -ne $requestedDisplacedLeaf) { $publicationParameters.DisplacedLeaf = $requestedDisplacedLeaf }
     Publish-PortableLeaseFile @publicationParameters
 }
 

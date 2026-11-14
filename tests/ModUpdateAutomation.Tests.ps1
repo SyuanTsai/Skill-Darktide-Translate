@@ -1168,113 +1168,167 @@ catch [TimeoutException] { 'TIMEOUT' }
         finally { Remove-Module $module -Force }
     }
 
-    # Scenario: finalize-merge is retried after its terminal receipt and released owner were published but before the result returned.
-    # Purpose: Exercise the pre-writer formal-entry recovery with a real immutable terminal receipt and keep every other stage on held-only validation.
-    It 'UnitT131_RecoversReleasedFinalizationBeforeTheFormalEntryAcquiresAWorker' {
-        $runnerSource = Get-Content -LiteralPath $runnerPath -Raw
-        $recoveryIndex = $runnerSource.IndexOf("Get-ReleasedModUpdateFinalizationResult -State `$state", [StringComparison]::Ordinal)
-        $writerIndex = $runnerSource.IndexOf("Ensure-RunWriterLock -State `$state", $recoveryIndex, [StringComparison]::Ordinal)
-        $recoveryIndex | Should -BeGreaterOrEqual 0
-        $writerIndex | Should -BeGreaterThan $recoveryIndex
-        $runnerSource | Should -Match 'if \(\$Command -ceq ''finalize-merge''\)'
-        $runnerSource | Should -Match 'function Assert-LockOwner[\s\S]+?\$AllowReleased[\s\S]+?state -ceq ''held'''
+    Context 'Released finalization through the formal command entry' {
+        BeforeAll {
+            $releasedRepository = Join-Path $TestDrive 'released-finalization-entry'
+            $releasedModRoot = Join-Path $releasedRepository 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+            $releasedQueueRoot = Join-Path $releasedRepository 'AI Auto Update'
+            New-Item -ItemType Directory -Path $releasedModRoot, $releasedQueueRoot -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $releasedModRoot 'baseline.txt'), "baseline`n", [Text.UTF8Encoding]::new($false))
+            & git -C $releasedRepository init --quiet --initial-branch=main
+            & git -C $releasedRepository config user.name 'Fixture User'
+            & git -C $releasedRepository config user.email 'fixture@example.invalid'
+            & git -C $releasedRepository add --all
+            & git -C $releasedRepository commit --quiet -m 'released finalization fixture'
+            $LASTEXITCODE | Should -Be 0
+            $releasedRemote = Join-Path $TestDrive 'released-finalization-remote.git'
+            & git init --bare --quiet $releasedRemote
+            & git -C $releasedRepository remote add origin $releasedRemote
+            & git -C $releasedRepository push --quiet --set-upstream origin main
+            $LASTEXITCODE | Should -Be 0
 
-        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
-        $tokens = $null
-        $parseErrors = $null
-        $finalizerAst = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
-        @($parseErrors).Count | Should -Be 0
-        $recoveryFunction = @($finalizerAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-                $node.Name -eq 'Get-ReleasedModUpdateFinalizationResult'
-        }, $true))[0]
-        $runnerAst = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
-        $receiptFunction = @($runnerAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-                $node.Name -eq 'Get-ModReservationReleaseReceipt'
-        }, $true))[0]
-        $pathSafetyPath = Join-Path (Join-Path $skillRoot 'scripts') 'PathSafety.psm1'
-        $module = New-Module -ArgumentList ($receiptFunction.Extent.Text + "`n" + $recoveryFunction.Extent.Text), $pathSafetyPath -ScriptBlock {
-            param($source, $pathSafety)
-            Import-Module $pathSafety -Force
-            function Assert-LockOwner { param($State,[switch]$AllowReleased) if (-not $AllowReleased) { throw 'held-only owner required' } }
-            function Get-ModReservationOwnerPath { param($ModLockPath,$Repository,[switch]$AllowMissingOwner) Join-Path $Repository 'owner.json' }
-            function Read-ModReservationOwner { param($ModLockPath,$Repository) $script:owner }
-            function Get-ModUpdateArchiveLocations { param($State) $script:archiveLocations }
-            function Assert-ModUpdateFinalEvidence { param($EvidencePath,$RunId) if (-not [IO.Directory]::Exists($EvidencePath)) { throw 'missing final evidence' } }
-            function Get-FileSha256 { param($Path) (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
-            . ([scriptblock]::Create($source))
-        }
-        try {
-            $repository = Join-Path $TestDrive 'released-finalization-entry'
-            $finishedRoot = Join-Path $repository 'AI Auto Update/Finished'
-            $runId = '13113113-1131-4131-8131-131131131131'
-            $token = '1' * 32
-            $evidence = Join-Path (Join-Path $finishedRoot '.evidence') $runId
-            $artifactRoot = Join-Path $evidence 'artifacts'
-            New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
-            $artifactPath = Join-Path $artifactRoot 'merge-finalization.json'
-            [IO.File]::WriteAllText($artifactPath, '{"schemaVersion":1}', [Text.UTF8Encoding]::new($false))
-            $fingerprintPath = Join-Path $artifactRoot 'merge-fingerprint.json'
-            $fingerprint = [ordered]@{
-                repositoryPath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/.hash/examplemod.hash'
-                fingerprintBlobOid = 'a' * 40
-                fingerprintBlobSha256 = 'b' * 64
-            }
-            [IO.File]::WriteAllText($fingerprintPath, ($fingerprint | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-            $finishedArchive = Join-Path $finishedRoot 'ExampleMod.zip'
-            New-Item -ItemType Directory -Path $finishedRoot -Force | Out-Null
-            [IO.File]::WriteAllText($finishedArchive, 'archive', [Text.UTF8Encoding]::new($false))
-            $state = [ordered]@{
-                repositoryRoot = $repository; modLockPath = (Join-Path $repository 'owner.lock'); modLockKey = 'lock-key'
-                reservationToken = $token; runId = $runId; claimPath = (Join-Path $repository 'AI Auto Update/.claims/run/claim.json')
-                runRoot = (Join-Path $repository 'AI Auto Update/In Progress/run'); statePath = (Join-Path $repository 'state.json')
-                prUrl = 'https://example.invalid/pr/1'; mergeCommitOid = 'c' * 40; reviewedOid = 'd' * 40; originMainOid = 'e' * 40
-                mergeFingerprintSha256 = (Get-FileHash $fingerprintPath -Algorithm SHA256).Hash.ToLowerInvariant()
-                archive = [ordered]@{ filename = 'ExampleMod.zip'; sha256 = 'f' * 64 }
-                stageTimings = [ordered]@{ 'finalize-merge' = [ordered]@{ result = 'passed'; wallMilliseconds = 10 } }
-            }
-            $result = [ordered]@{
-                result = 'passed'; runId = $runId; stage = 'finalize-merge'; status = 'merged-and-finalized'; statePath = $state.statePath
-                stageTimings = $state.stageTimings['finalize-merge']
-                artifactSha256 = (Get-FileHash $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
-                data = [ordered]@{
-                    prUrl = $state.prUrl; mergeCommitOid = $state.mergeCommitOid; reviewedOid = $state.reviewedOid; originMainOid = $state.originMainOid
-                    fingerprintPath = $fingerprint.repositoryPath; fingerprintBlobOid = $fingerprint.fingerprintBlobOid
-                    fingerprintArtifactSha256 = $state.mergeFingerprintSha256; fingerprintBlobSha256 = $fingerprint.fingerprintBlobSha256
-                    archiveSha256 = $state.archive.sha256; finishedArchive = $finishedArchive; archiveDisposition = 'already-in-finished'
-                    evidencePath = $evidence; reservationReleased = $true
+            $releasedArchivePath = Join-Path $releasedQueueRoot 'ExampleMod.zip'
+            $archiveStream = [IO.File]::Open($releasedArchivePath, [IO.FileMode]::CreateNew)
+            $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+            try {
+                $entry = $archive.CreateEntry('ExampleMod/baseline.txt')
+                $entryStream = $entry.Open()
+                try {
+                    [byte[]]$entryBytes = [Text.UTF8Encoding]::new($false).GetBytes("updated`n")
+                    $entryStream.Write($entryBytes, 0, $entryBytes.Length)
                 }
+                finally { $entryStream.Dispose() }
             }
-            $terminalValue = [ordered]@{ schemaVersion = 1; disposition = 'released'; runId = $runId; modLockKey = 'lock-key'; ownerToken = $token }
-            $terminalPath = Join-Path $repository ("owner.json.released-$token.json")
-            [IO.File]::WriteAllText($terminalPath, (($terminalValue | ConvertTo-Json -Depth 10 -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
-            $terminalSha = (Get-FileHash $terminalPath -Algorithm SHA256).Hash.ToLowerInvariant()
-            $owner = [ordered]@{
-                state = 'released'; reservationState = 'released'; reservationToken = $token; releasedByOwnerToken = $token
-                releaseReceiptPath = $terminalPath; releaseReceiptSha256 = $terminalSha
-                cleanup = [ordered]@{
-                    runId = $runId; evidencePath = $evidence; claimDirectory = (Split-Path -Parent $state.claimPath); runRoot = $state.runRoot
-                    writerLockReleased = $true; claimDirectoryPreserved = $true; runRootPreserved = $true; finalizationResult = $result
+            finally { $archive.Dispose(); $archiveStream.Dispose() }
+            $releasedRequestPath = Join-Path $TestDrive 'released-finalization-source-request.json'
+            [ordered]@{
+                schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 131; mainFileId = 131
+                version = '1.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/131'
+                pageVersion = '1.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
+            } | ConvertTo-Json | Set-Content -LiteralPath $releasedRequestPath -NoNewline
+            $claim = & $runnerPath claim -RepositoryRoot $releasedRepository -ArchivePath $releasedArchivePath `
+                -ModDirectory 'ExampleMod' -SourceRequestPath $releasedRequestPath `
+                -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD -WorktreeParent $TestDrive -PassThru
+            $claim.result | Should -BeExactly 'passed'
+            $releasedStatePath = [string]$claim.statePath
+            $releasedState = Get-Content -LiteralPath $releasedStatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $fingerprintRelative = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/.hash/examplemod.hash'
+            $fingerprintPath = Join-Path ([string]$releasedState.worktreePath) $fingerprintRelative
+            New-Item -ItemType Directory -Path (Split-Path -Parent $fingerprintPath) -Force | Out-Null
+            @(
+                "filename=$($releasedState.archive.filename)"
+                "size_bytes=$($releasedState.archive.size)"
+                "sha256=$($releasedState.archive.sha256)"
+            ) -join "`n" | Set-Content -LiteralPath $fingerprintPath -NoNewline
+            & git -C $releasedState.worktreePath add -- $fingerprintRelative
+            & git -C $releasedState.worktreePath commit --quiet -m 'fixture reviewed F'
+            $reviewedOid = (& git -C $releasedState.worktreePath rev-parse HEAD).Trim()
+            $reviewedTree = (& git -C $releasedState.worktreePath rev-parse 'HEAD^{tree}').Trim()
+            & git -C $releasedState.worktreePath push --quiet --set-upstream origin ([string]$releasedState.branch)
+            & git -C $releasedRepository merge --quiet --no-ff ([string]$releasedState.branch) -m 'fixture merge'
+            $mergeCommitOid = (& git -C $releasedRepository rev-parse HEAD).Trim()
+            & git -C $releasedRepository push --quiet origin main
+            & git --git-dir=$releasedRemote update-ref refs/pull/131/head $reviewedOid
+            $LASTEXITCODE | Should -Be 0
+
+            $releasedState.status = 'awaiting-user-merge'
+            $releasedState.published = $true
+            $releasedState.completedStages = @($releasedState.completedStages + @('validate', 'publish', 'review-snapshot') | Sort-Object -Unique)
+            $releasedState.prUrl = 'https://example.invalid/pr/131'
+            $releasedState.prNumber = 131
+            $releasedState.reviewedOid = $reviewedOid
+            $releasedState.evidenceChain.fOid = $reviewedOid
+            $releasedState.evidenceChain.fTreeOid = $reviewedTree
+            $releasedState.candidateGate = [ordered]@{ status = 'passed'; fOid = $reviewedOid }
+            $releasedState.localReview = [ordered]@{ result = 'passed' }
+            $releasedState.metadataPaths = @('README.md', $fingerprintRelative)
+            [IO.File]::WriteAllText($releasedStatePath, ($releasedState | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+
+            $fakeBin = Join-Path $TestDrive 'released-finalization-bin'
+            New-Item -ItemType Directory -Path $fakeBin | Out-Null
+            if ($IsWindows) {
+                $fakeGhPath = Join-Path $fakeBin 'gh.exe'
+                $fakeGhSourcePath = Join-Path $fakeBin 'FakeGh.cs'
+                [IO.File]::WriteAllText($fakeGhSourcePath, @'
+using System;
+public static class S8ReleasedFinalizationFakeGh {
+    public static int Main(string[] args) {
+        Console.Out.Write(Environment.GetEnvironmentVariable("S8_TEST_GH_JSON"));
+        return 0;
+    }
+}
+'@, [Text.UTF8Encoding]::new($false))
+                $frameworkRoot = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319'
+                if (-not [IO.File]::Exists((Join-Path $frameworkRoot 'csc.exe'))) {
+                    $frameworkRoot = Join-Path $env:WINDIR 'Microsoft.NET/Framework/v4.0.30319'
                 }
+                & (Join-Path $frameworkRoot 'csc.exe') /nologo /target:exe "/out:$fakeGhPath" $fakeGhSourcePath
+                $LASTEXITCODE | Should -Be 0
             }
-            & $module {
-                param($stateValue,$ownerValue,$locations,$expectedResult,$terminal)
-                $script:owner = $ownerValue
-                $script:archiveLocations = $locations
-                $recovered = Get-ReleasedModUpdateFinalizationResult -State $stateValue
-                ($recovered | ConvertTo-Json -Depth 40 -Compress) | Should -BeExactly ($expectedResult | ConvertTo-Json -Depth 40 -Compress)
-                $foreign = [ordered]@{}; foreach ($entry in $stateValue.GetEnumerator()) { $foreign[$entry.Key] = $entry.Value }
-                $foreign.reservationToken = '2' * 32
-                { Get-ReleasedModUpdateFinalizationResult -State $foreign } | Should -Throw '*another owner token*'
-                [IO.File]::WriteAllText($terminal, 'tampered', [Text.UTF8Encoding]::new($false))
-                { Get-ReleasedModUpdateFinalizationResult -State $stateValue } | Should -Throw '*terminal receipt*'
-                { Assert-LockOwner -State $stateValue } | Should -Throw '*held-only*'
-            } $state $owner ([ordered]@{ finishedRoot = $finishedRoot; finishedPath = $finishedArchive }) $result $terminalPath
+            else {
+                $fakeGhPath = Join-Path $fakeBin 'gh'
+                [IO.File]::WriteAllText($fakeGhPath, @'
+#!/bin/sh
+printf '%s' "$S8_TEST_GH_JSON"
+'@, [Text.UTF8Encoding]::new($false))
+                & chmod 700 $fakeGhPath
+            }
+            $originalReleasedPath = $env:PATH
+            $env:PATH = $fakeBin + [IO.Path]::PathSeparator + $env:PATH
+            $env:S8_TEST_GH_JSON = ([ordered]@{
+                    number = 131; url = [string]$releasedState.prUrl; state = 'MERGED'; isDraft = $false
+                    mergedAt = '2026-11-15T00:00:00.0000000+00:00'; mergeCommit = [ordered]@{ oid = $mergeCommitOid }
+                    headRefName = [string]$releasedState.branch; headRefOid = $reviewedOid; baseRefName = 'main'
+                } | ConvertTo-Json -Depth 10 -Compress)
+            $evidenceRoot = Join-Path (Join-Path $releasedRepository 'AI Auto Update/Finished/.evidence') ([string]$releasedState.runId)
         }
-        finally { Remove-Module $module -Force }
+
+        AfterAll {
+            $env:PATH = $originalReleasedPath
+            Remove-Item Env:S8_TEST_GH_JSON -ErrorAction SilentlyContinue
+        }
+
+        # Scenario: normal formal finalization publishes terminal evidence and releases its owner, but the caller is interrupted before receiving the result.
+        # Purpose: prove a second formal-entry call validates real owner, receipt, and final evidence and returns the identical result.
+        It 'UnitT131_RecoversReleasedFinalizationBeforeTheFormalEntryAcquiresAWorker' {
+            $captured = [ref]$null
+            { & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru |
+                    ForEach-Object {
+                        $captured.Value = $_ | ConvertTo-Json -Depth 40 -Compress
+                        throw 'injected interruption before formal-entry result delivery'
+                    } } | Should -Throw '*injected interruption before formal-entry result delivery*'
+            $retry = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            ($retry | ConvertTo-Json -Depth 40 -Compress) | Should -BeExactly $captured.Value
+            $releasedOwner = Get-Content -LiteralPath $releasedState.modLockPath -Raw | ConvertFrom-TestJson -AsHashtable
+            $releasedOwner.state | Should -BeExactly 'released'
+            Test-Path -LiteralPath $releasedOwner.releaseReceiptPath -PathType Leaf | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $evidenceRoot 'archive-manifest.json') -PathType Leaf | Should -BeTrue
+        }
+
+        # Scenario: the released reservation is presented with a different caller token.
+        # Purpose: keep released recovery owner-bound at the same formal command entry.
+        It 'InterT132_RejectsForeignReservationTokenAtReleasedFinalizationEntry' {
+            [byte[]]$stateBytes = [IO.File]::ReadAllBytes($releasedStatePath)
+            try {
+                $foreign = Get-Content -LiteralPath $releasedStatePath -Raw | ConvertFrom-TestJson -AsHashtable
+                $foreign.reservationToken = 'f' * 32
+                [IO.File]::WriteAllText($releasedStatePath, ($foreign | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+                { & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
+                    Should -Throw '*another owner token*'
+            }
+            finally { [IO.File]::WriteAllBytes($releasedStatePath, $stateBytes) }
+        }
+
+        # Scenario: a non-finalization stage is invoked after the reservation has reached its terminal released state.
+        # Purpose: prove released-owner tolerance is exclusive to formal finalization recovery.
+        It 'InterT133_RejectsReleasedReservationAtNonFinalizationStageEntry' {
+            [byte[]]$stateBytes = [IO.File]::ReadAllBytes($releasedStatePath)
+            try {
+                { & $runnerPath verify-source -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
+                    Should -Throw '*MOD identity lock owner contract is invalid*'
+            }
+            finally { [IO.File]::WriteAllBytes($releasedStatePath, $stateBytes) }
+        }
     }
 
     # Scenario: A stage spends controlled monotonic-clock intervals on source stability, coordination, and active work.

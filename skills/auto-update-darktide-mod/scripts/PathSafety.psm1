@@ -424,8 +424,20 @@ function Publish-PortableLeaseFile {
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId,
         [switch] $NoReplace,
         [switch] $PreserveDisplaced,
-        [ValidatePattern('^previous-[0-9a-f]{32}$')][string] $DisplacedLeaf
+        $DisplacedLeaf
     )
+    $requestedDisplacedLeaf = $null
+    if ($null -ne $DisplacedLeaf) {
+        if ($DisplacedLeaf -isnot [string]) {
+            throw [ArgumentException]::new('DisplacedLeaf must be a string when provided.')
+        }
+        if (-not [string]::IsNullOrWhiteSpace($DisplacedLeaf)) {
+            if ($DisplacedLeaf -notmatch '^previous-[0-9a-f]{32}$') {
+                throw [ArgumentException]::new('DisplacedLeaf must match ^previous-[0-9a-f]{32}$ when provided.')
+            }
+            $requestedDisplacedLeaf = $DisplacedLeaf
+        }
+    }
     if ($PreserveDisplaced -and -not [bool]$ExpectedState.exists) {
         throw [ArgumentException]::new('A displaced file can be preserved only for an existing expected state.')
     }
@@ -435,11 +447,11 @@ function Publish-PortableLeaseFile {
     $transactionLease = $null
     $stageLease = $null
     $stageLeaf = 'stage-' + [guid]::NewGuid().ToString('N')
-    $displacedLeaf = if ([bool]$ExpectedState.exists) {
-        if ([string]::IsNullOrWhiteSpace($DisplacedLeaf)) { 'previous-' + [guid]::NewGuid().ToString('N') }
-        else { $DisplacedLeaf }
+    $effectiveDisplacedLeaf = if ([bool]$ExpectedState.exists) {
+        if ($null -eq $requestedDisplacedLeaf) { 'previous-' + [guid]::NewGuid().ToString('N') }
+        else { $requestedDisplacedLeaf }
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($DisplacedLeaf)) {
+    elseif ($null -ne $requestedDisplacedLeaf) {
         throw [ArgumentException]::new('DisplacedLeaf requires an existing expected state.')
     }
     else { $null }
@@ -474,14 +486,14 @@ function Publish-PortableLeaseFile {
             ExpectedStage = $stageState
         }
         if ($NoReplace) { $parameters.NoReplace = $true }
-        if ($null -ne $displacedLeaf) { $parameters.DisplacedLeaf = $displacedLeaf }
+        if ($null -ne $effectiveDisplacedLeaf) { $parameters.DisplacedLeaf = $effectiveDisplacedLeaf }
         $receipt = Publish-PlatformFile @parameters
         $published = $true
         if ([string]$receipt.durability -cne 'confirmed') {
             throw [IO.IOException]::new('Lease publication durability was not confirmed.')
         }
-        if ($null -ne $displacedLeaf) {
-            if ([string]$receipt.displacedLeaf -cne $displacedLeaf -or $null -eq $receipt.displacedIdentity) {
+        if ($null -ne $effectiveDisplacedLeaf) {
+            if ([string]$receipt.displacedLeaf -cne $effectiveDisplacedLeaf -or $null -eq $receipt.displacedIdentity) {
                 throw [IO.InvalidDataException]::new('Lease CAS publication did not return the exact displaced file evidence.')
             }
             $displacedState = [ordered]@{
@@ -491,10 +503,10 @@ function Publish-PortableLeaseFile {
                 identity = $receipt.displacedIdentity
             }
             if ($PreserveDisplaced) {
-                $displacedPath = [IO.Path]::GetFullPath((Join-Path (Join-Path $transactionRootPath $TransactionId) $displacedLeaf))
+                $displacedPath = [IO.Path]::GetFullPath((Join-Path (Join-Path $transactionRootPath $TransactionId) $effectiveDisplacedLeaf))
             }
             else {
-                Remove-PortableTransactionFile -TransactionLease $transactionLease -Leaf $displacedLeaf -ExpectedState $displacedState
+                Remove-PortableTransactionFile -TransactionLease $transactionLease -Leaf $effectiveDisplacedLeaf -ExpectedState $displacedState
             }
         }
         [ordered]@{
