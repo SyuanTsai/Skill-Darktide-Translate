@@ -327,7 +327,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $binding.authorityRepository | Should -BeExactly 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
         $binding.authorityCommit | Should -BeExactly 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
         $binding.authoritySourceDirectory | Should -BeExactly 'scripts'
-        $binding.hashMode | Should -BeExactly 'sha256-utf8-lf'
+        $binding.hashMode | Should -BeExactly 'sha256-raw-bytes'
         $binding.manifestSha256 | Should -BeExactly 'd3d8eef434484b3b2449cd4762e60b94afc314d9beb91481538c7f57207a11c9'
         @($binding.files).Count | Should -Be 17
 
@@ -355,7 +355,7 @@ Describe 'Deterministic Darktide MOD update automation' {
     }
 
     # Scenario: A vendored runtime file is changed, added, removed, or checked out with CRLF line endings.
-    # Purpose: Fail closed on any content or file-set drift while accepting the authority's own LF-normalized hash semantics.
+    # Purpose: Fail closed on any exact-byte or file-set drift, including newline conversion away from the authority blob bytes.
     It 'InterT363_RejectsTamperedExtraOrMissingVendoredRuntimeFiles' {
         Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
         $runtimeRoot = Join-Path $skillRoot 'scripts/platform-runtime'
@@ -386,7 +386,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $crlf = & $copyRuntime 'runtime-crlf'
         $crlfPath = Join-Path $crlf 'platform/UnixNative.cs'
         [IO.File]::WriteAllText($crlfPath, ([IO.File]::ReadAllText($crlfPath).Replace("`n", "`r`n")), [Text.UTF8Encoding]::new($false))
-        (Assert-VendoredPlatformRuntime -Root $crlf).manifestSha256 | Should -BeExactly 'd3d8eef434484b3b2449cd4762e60b94afc314d9beb91481538c7f57207a11c9'
+        { Assert-VendoredPlatformRuntime -Root $crlf } | Should -Throw '*hash mismatch: platform/UnixNative.cs*'
     }
 
     # Scenario: An installed Skill copy carries a tampered vendored runtime file and a fresh process loads PathSafety.
@@ -407,6 +407,31 @@ Import-Module -Name $ModulePath -Force
         $result.Stdout | Should -Not -Match 'LOADED'
         ($result.Stdout + $result.Stderr) | Should -Match 'failed verification or loading'
         ($result.Stdout + $result.Stderr) | Should -Match 'hash mismatch: platform/Linux\.psm1'
+    }
+
+    # Scenario: Every vendored blob still has the pinned bytes, but one runtime file is a hard link.
+    # Purpose: Reject a multi-link runtime through provider metadata when exposed, or through the post-load authority identity check.
+    It 'InterT364A_RejectsAMultiLinkVendoredRuntimeFile' {
+        $fixtureSkill = Join-Path $TestDrive 'hard-linked-runtime-skill'
+        Copy-Item -LiteralPath $skillRoot -Destination $fixtureSkill -Recurse
+        $runtimeFile = Join-Path $fixtureSkill 'scripts/platform-runtime/platform/UnixNative.cs'
+        $linkTarget = Join-Path $TestDrive 'hard-linked-UnixNative.cs'
+        [IO.File]::Copy($runtimeFile, $linkTarget)
+        [IO.File]::Delete($runtimeFile)
+        New-TestHardLink -Path $runtimeFile -Target $linkTarget | Out-Null
+        $childPath = Join-Path $TestDrive 'load-hard-linked-path-safety.ps1'
+        [IO.File]::WriteAllText($childPath, @'
+param([string] $ModulePath)
+$ErrorActionPreference = 'Stop'
+Import-Module -Name $ModulePath -Force
+'LOADED'
+'@, [Text.UTF8Encoding]::new($false))
+
+        $result = Invoke-ChildPowerShellForTest -ScriptPath $childPath -ArgumentList @((Join-Path $fixtureSkill 'scripts/PathSafety.psm1'))
+        $result.ExitCode | Should -Not -Be 0
+        $result.Stdout | Should -Not -Match 'LOADED'
+        ($result.Stdout + $result.Stderr) | Should -Match 'failed verification or loading'
+        ($result.Stdout + $result.Stderr) | Should -Match 'contains a link or reparse point|regular file with exactly one link'
     }
 
     # Scenario: A participant holds the coordination owner guard while another process disables .NET advisory file locking.
@@ -868,11 +893,12 @@ catch [TimeoutException] { 'TIMEOUT' }
     # Purpose: Release the exact MOD reservation before deleting state so interruption cannot leave an owner lock with no recovery state.
     It 'UnitT127_ReleasesTheReservationBeforeRemovingTheRunRoot' {
         $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
-        $releaseIndex = $finalizer.IndexOf('[IO.Directory]::Move([string]$State.modLockPath, $releasedTombstone)', [StringComparison]::Ordinal)
+        $releaseIndex = $finalizer.IndexOf('Release-ModReservation -State $State', [StringComparison]::Ordinal)
         $runRemovalIndex = $finalizer.IndexOf("Remove-ModUpdateOwnedTree -Path ([string]`$State.runRoot) -Root `$inProgressRoot", [StringComparison]::Ordinal)
 
         $releaseIndex | Should -BeGreaterThan -1
         $runRemovalIndex | Should -BeGreaterThan $releaseIndex
+        $finalizer | Should -Not -Match '\[IO\.Directory\]::Move\(\[string\]\$State\.modLockPath'
     }
 
     # Scenario: A stage spends controlled monotonic-clock intervals on source stability, coordination, and active work.
@@ -1344,84 +1370,12 @@ function Suspend-Stage {
         $runner | Should -Match 'lastRecovery = if \(\$plannedOwner\.Contains\(''lastRecovery''\)\)'
         $coordination | Should -Match 'function Enter-SharedCoordinationLease'
         $coordination | Should -Match 'Test-CoordinationLeaseMatchesOwner'
-        $coordination | Should -Match '\[int64\]::TryParse\(\[string\]\$Owner\.processStartTicks'
-        $tokens = $null
-        $parseErrors = $null
-        $ast = [Management.Automation.Language.Parser]::ParseInput($coordination, [ref]$tokens, [ref]$parseErrors)
-        @($parseErrors).Count | Should -Be 0
-        $leaseFunctions = @($ast.EndBlock.Statements | Where-Object {
-            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and
-                $_.Name -ceq 'Enter-SharedCoordinationLease'
-        })
-        $leaseFunctions.Count | Should -Be 1
-        $staleAssignments = @($leaseFunctions[0].Body.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
-                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
-                $node.Left.VariablePath.UserPath -ceq 'stalePath'
-        }, $true))
-        $staleAssignments.Count | Should -Be 1
-        $pathCalls = @($staleAssignments[0].Right.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Join-Path'
-        }, $true))
-        $pathCalls.Count | Should -Be 1
-        $pathCalls[0].CommandElements.Count | Should -Be 3
-        $nameAst = $pathCalls[0].CommandElements[-1]
-        @($nameAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.CommandAst] -or
-                $node -is [Management.Automation.Language.AssignmentStatementAst]
-        }, $true)).Count | Should -Be 0
-        foreach ($variable in @($nameAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.VariableExpressionAst]
-        }, $true))) { $variable.VariablePath.UserPath | Should -BeExactly 'ResourceKey' }
-        $calls = @($nameAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.InvokeMemberExpressionAst]
-        }, $true))
-        $guidCalls = @($calls | Where-Object { $_.Member.Extent.Text -ceq 'NewGuid' })
-        $guidCalls.Count | Should -Be 1
-        $guidCalls[0].Static | Should -BeTrue
-        $guidCalls[0].Expression.Extent.Text | Should -BeExactly '[guid]'
-        ($null -eq $guidCalls[0].Arguments) | Should -BeTrue
-        $calls.Count | Should -Be 3
-        foreach ($call in $calls | Where-Object { $_.Member.Extent.Text -cne 'NewGuid' }) {
-            $call.Member.Extent.Text | Should -BeExactly 'ToString'
-            $call.Static | Should -BeFalse
-            $call.Arguments.Count | Should -Be 1
-            ($call.Arguments[0] -is [Management.Automation.Language.StringConstantExpressionAst]) | Should -BeTrue
-            if ($call.Arguments[0].Value -ceq 'N') {
-                $call.Expression.Extent.Text | Should -BeExactly '[guid]::NewGuid()'
-            }
-            else {
-                $call.Arguments[0].Value | Should -BeExactly 'yyyyMMddTHHmmssfffffffZ'
-                $call.Expression.Extent.Text | Should -BeExactly '[DateTimeOffset]::UtcNow'
-            }
-        }
-        foreach ($cast in @($nameAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.ConvertExpressionAst]
-        }, $true))) { $cast.Type.TypeName.FullName | Should -BeExactly 'string' }
-        $ResourceKey = 'source-acquisition'
-        $staleNames = @(& ([scriptblock]::Create($nameAst.Extent.Text)))
-        $staleNames.Count | Should -Be 1
-        ($staleNames[0] -is [string]) | Should -BeTrue
-        $staleName = $staleNames[0]
-        $expectedPrefix = '.stale-source-acquisition-'
-        $staleName.StartsWith($expectedPrefix, [StringComparison]::Ordinal) | Should -BeTrue
-        $staleName.Length | Should -Be ($expectedPrefix.Length + 23 + 1 + 32)
-        $staleName[$expectedPrefix.Length + 23] | Should -Be ([char]'-')
-        $timestamp = $staleName.Substring($expectedPrefix.Length, 23)
-        $parsedTimestamp = [DateTimeOffset]::MinValue
-        [DateTimeOffset]::TryParseExact($timestamp, 'yyyyMMddTHHmmssfffffffZ', [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsedTimestamp) | Should -BeTrue
-        $guidText = $staleName.Substring($expectedPrefix.Length + 24)
-        $parsedGuid = [guid]::Empty
-        [guid]::TryParseExact($guidText, 'N', [ref]$parsedGuid) | Should -BeTrue
-        $parsedGuid | Should -Not -Be ([guid]::Empty)
-        $coordination | Should -Match '(?s)\$owner\.acquiredAt = Get-CoordinationUtcTimestamp.*?Directory\]::Move\(\$prepared, \$lockPath\)'
+        $coordination | Should -Match '\[int64\]::TryParse\(\[string\]\$Owner\.owner\.processStartTicks'
+        $coordination | Should -Match "state = 'held'"
+        $coordination | Should -Match '\$owner\.state = ''released'''
+        $coordination | Should -Match '\$owner\.expiresAt = \$now\.AddMinutes\(3\)\.ToString\(''o''\)'
+        $coordination | Should -Match 'Publish-PortableLeaseFile'
+        $coordination | Should -Not -Match '\[IO\.Directory\]::Move'
         $coordination | Should -Match '\[scriptblock\] \$WaitHeartbeatAction'
         $coordination | Should -Match '\$null = & \$WaitHeartbeatAction'
         $queue | Should -Match 'Enter-SharedCoordinationLease.+source-acquisition'
@@ -1539,7 +1493,7 @@ function Suspend-Stage {
         $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
         @($parseErrors).Count | Should -Be 0
-        $requiredFunctions = @('Assert-NoReparsePath', 'Write-AtomicJson', 'Get-ModReservationOwnerPath', 'Write-ModReservationOwner')
+        $requiredFunctions = @('Assert-NoReparsePath', 'Get-ModReservationOwnerPath', 'Get-ModReservationSnapshot', 'Write-ModReservationOwner')
         $allFunctions = $ast.FindAll({
             param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst]
@@ -1554,8 +1508,8 @@ function Suspend-Stage {
         $module = New-Module -ScriptBlock ([scriptblock]::Create($moduleSource))
         $repository = Join-Path $TestDrive 'old-reservation-token-repository'
         $lockPath = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod/test.lock'
-        New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
-        $ownerPath = Join-Path $lockPath 'owner.json'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $lockPath) -Force | Out-Null
+        $ownerPath = $lockPath
         $newReservationToken = [guid]::NewGuid().ToString('N')
         $newWorkerToken = [guid]::NewGuid().ToString('N')
         $owner = [ordered]@{
@@ -1655,6 +1609,18 @@ function Suspend-Stage {
         BeforeEach {
             $script:syp118Fixture = New-TestPinnedCompletedStageRun -SkillRoot $skillRoot `
                 -FixtureRoot (Join-Path $TestDrive ("syp118-" + [guid]::NewGuid().ToString('N')))
+            $legacyOwnerPath = [string]$script:syp118Fixture.OwnerPath
+            $singleFilePath = Split-Path -Parent $legacyOwnerPath
+            $owner = Get-Content -LiteralPath $legacyOwnerPath -Raw | ConvertFrom-TestJson -AsHashtable
+            $owner.schemaVersion = 3
+            $owner['state'] = 'held'
+            $owner['expiresAt'] = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
+            $owner['platform'] = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+            $owner['lockPrimitive'] = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+            [IO.File]::Delete($legacyOwnerPath)
+            [IO.Directory]::Delete($singleFilePath)
+            [IO.File]::WriteAllText($singleFilePath, ($owner | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+            $script:syp118Fixture.OwnerPath = $singleFilePath
         }
 
         AfterEach {
@@ -2946,7 +2912,8 @@ function Get-SourceTupleContractSha256 {
             Should -BeLessThan 5000
         $statePath = $claim.statePath
         $claimStateAfterExit = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-        $claimOwner = Get-Content -LiteralPath (Join-Path $claimStateAfterExit.modLockPath 'owner.json') -Raw | ConvertFrom-Json
+        $claimOwner = Get-Content -LiteralPath $claimStateAfterExit.modLockPath -Raw | ConvertFrom-Json
+        $claimOwner.state | Should -Be 'held'
         $claimOwner.leaseMode | Should -Be 'reserved'
         $claimOwner.workerToken | Should -BeNullOrEmpty
         $claimOwner.workerId | Should -BeNullOrEmpty
@@ -3339,7 +3306,7 @@ function Get-SourceTupleContractSha256 {
         (& git -C $state.worktreePath rev-parse HEAD).Trim() | Should -Be $headBeforeRerun
 
         $stateBytesBeforePinDrift = [IO.File]::ReadAllBytes($statePath)
-        $ownerPath = Join-Path ([string]$state.modLockPath) 'owner.json'
+        $ownerPath = [string]$state.modLockPath
         $ownerBytesBeforePinDrift = [IO.File]::ReadAllBytes($ownerPath)
         $sourceBytesBeforePinDrift = [IO.File]::ReadAllBytes([string]$state.archive.path)
         $runPinBytes = [IO.File]::ReadAllBytes([string]$state.workflowSourcePinPath)
@@ -3416,7 +3383,7 @@ function Get-SourceTupleContractSha256 {
         $lockKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))).ToLowerInvariant()
         $lockPath = Join-Path $TestDrive "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
         New-Item -ItemType Directory -Path $artifactsRoot -Force | Out-Null
-        New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
+        New-Item -ItemType Directory -Path (Split-Path -Parent $lockPath) -Force | Out-Null
         $archivePath = Join-Path $runRoot 'hostile.zip'
         $archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew)
         $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
@@ -3450,14 +3417,17 @@ function Get-SourceTupleContractSha256 {
         $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         $owner = [ordered]@{
-            schemaVersion = 2
+            schemaVersion = 3; state = 'held'
             runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
             plannedStatePath = $statePath; statePath = $statePath
             reservationToken = [guid]::NewGuid().ToString('N'); workerToken = $null
             machineName = $null; workerId = $null; workerProcessStartTicks = $null
             leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
+            expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
+            platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+            lockPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
         }
-        [IO.File]::WriteAllText((Join-Path $lockPath 'owner.json'), ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($lockPath, ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 
         { & $runnerPath verify-source -RepositoryRoot $TestDrive -StatePath $statePath -PassThru } |
             Should -Throw '*path traversal*'
@@ -3485,7 +3455,7 @@ function Get-SourceTupleContractSha256 {
             $lockKey = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))).ToLowerInvariant()
             $lockPath = Join-Path $TestDrive "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
             New-Item -ItemType Directory -Path $artifactsRoot -Force | Out-Null
-            New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
+            New-Item -ItemType Directory -Path (Split-Path -Parent $lockPath) -Force | Out-Null
             $archivePath = Join-Path $runRoot "$case.zip"
             $archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew)
             $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
@@ -3524,14 +3494,17 @@ function Get-SourceTupleContractSha256 {
             $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
             [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
             $owner = [ordered]@{
-                schemaVersion = 2
+                schemaVersion = 3; state = 'held'
                 runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
                 plannedStatePath = $statePath; statePath = $statePath
                 reservationToken = [guid]::NewGuid().ToString('N'); workerToken = $null
                 machineName = $null; workerId = $null; workerProcessStartTicks = $null
                 leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
+                expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
+                platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+                lockPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
             }
-            [IO.File]::WriteAllText((Join-Path $lockPath 'owner.json'), ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($lockPath, ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
             $expected = switch ($case) {
                 'invalid-root' { '*Invalid archive root*' }
                 'symlink' { '*symlink rejected*' }
@@ -3555,7 +3528,7 @@ function Get-SourceTupleContractSha256 {
         $runRoot = Join-Path $repository 'AI Auto Update/In Progress/examplemod-56565656'
         $artifactsRoot = Join-Path $runRoot 'artifacts'
         $lockPath = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
-        New-Item -ItemType Directory -Path $artifactsRoot, $lockPath, (Join-Path $runRoot 'source'), (Join-Path $repository $modRelativePath) -Force | Out-Null
+        New-Item -ItemType Directory -Path $artifactsRoot, (Split-Path -Parent $lockPath), (Join-Path $runRoot 'source'), (Join-Path $repository $modRelativePath) -Force | Out-Null
         & git -C $repository init --quiet --initial-branch=main
         & git -C $repository config user.name 'Fixture User'
         & git -C $repository config user.email 'fixture@example.invalid'
@@ -3589,11 +3562,14 @@ function Get-SourceTupleContractSha256 {
         $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
         [ordered]@{
-            schemaVersion = 2; runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
+            schemaVersion = 3; state = 'held'; runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
             plannedStatePath = $statePath; statePath = $statePath; reservationToken = [guid]::NewGuid().ToString('N')
             workerToken = $null; machineName = $null; workerId = $null; workerProcessStartTicks = $null
             leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
-        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $lockPath 'owner.json') -NoNewline
+            expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
+            platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+            lockPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+        } | ConvertTo-Json | Set-Content -LiteralPath $lockPath -NoNewline
 
         (& $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru).result | Should -Be 'passed'
         { & $runnerPath extract -RepositoryRoot $repository -StatePath $statePath -PassThru } |
@@ -3688,7 +3664,7 @@ function Get-SourceTupleContractSha256 {
         $runRoot = Join-Path $repository 'AI Auto Update/In Progress/examplemod-58585858'
         $artifactsRoot = Join-Path $runRoot 'artifacts'
         $lockPath = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
-        New-Item -ItemType Directory -Path $artifactsRoot, $lockPath -Force | Out-Null
+        New-Item -ItemType Directory -Path $artifactsRoot, (Split-Path -Parent $lockPath) -Force | Out-Null
         $archivePath = Join-Path $runRoot 'hostile.zip'
         $archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew)
         $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
@@ -3712,13 +3688,16 @@ function Get-SourceTupleContractSha256 {
         $null = Set-TestRunSkillSourcePin -State $state -SourcePinPath $script:skillSourcePinPath
         [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         [ordered]@{
-            schemaVersion = 2
+            schemaVersion = 3; state = 'held'
             runId = $runId; canonicalModRelativePath = $modRelativePath; modLockKey = $lockKey
             plannedStatePath = $statePath; statePath = $statePath
             reservationToken = [guid]::NewGuid().ToString('N'); workerToken = $null
             machineName = $null; workerId = $null; workerProcessStartTicks = $null
             leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
-        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $lockPath 'owner.json') -NoNewline
+            expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
+            platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+            lockPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+        } | ConvertTo-Json | Set-Content -LiteralPath $lockPath -NoNewline
 
         { & $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru } |
             Should -Throw '*canonical reservation tuple*'

@@ -4,7 +4,13 @@
 BeforeAll {
     $script:repositoryRoot = Split-Path -Parent $PSScriptRoot
     $script:verifiedPowerShellExecutable = [IO.Path]::GetFullPath([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
-    Import-Module -Name (Join-Path $script:repositoryRoot 'scripts/CorePesterIntegrity.psm1') -Force
+    # Keep the unit-test host independent from the production bootstrap path.
+    # Production Core Pester imports the reviewed authority checkout explicitly.
+    $script:pathSafetyTestModule = Import-Module -Name (Join-Path $script:repositoryRoot 'skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru
+    $script:platformRuntimeTestModule = & $script:pathSafetyTestModule { $script:VendoredPlatformRuntimeModule }
+    Import-Module -ModuleInfo $script:platformRuntimeTestModule -Force
+    $script:coreIntegrityModule = Import-Module -Name (Join-Path $script:repositoryRoot 'scripts/CorePesterIntegrity.psm1') -Force -PassThru
+    & $script:coreIntegrityModule { param($RuntimeModule) $script:CorePesterPlatformRuntimeModule = $RuntimeModule } $script:platformRuntimeTestModule
     $script:closureLockPath = Join-Path $script:repositoryRoot 'config/pester-6.2.0-closure.lock.json'
     $script:closureLock = Read-CorePesterClosureLock -LiteralPath $script:closureLockPath
     $script:loadedPester = @(Get-Module -Name Pester | Where-Object { $_.Version -eq [version]'6.2.0' }) | Select-Object -First 1
@@ -216,7 +222,9 @@ Describe 'Verified Pester 6.2.0 module closure' {
         $outsideProbe = Join-Path $outside 'survives.txt'
         [IO.File]::WriteAllText($outsideProbe, 'outside target', [Text.UTF8Encoding]::new($false))
 
-        (Test-CorePesterPathBoundary -Path (Join-Path $boundary 'Modules/Pester/6.2.0') -Boundary $boundary).IsValid | Should -BeTrue
+        $createdDestination = Join-Path $boundary 'Modules/Pester/6.2.0'
+        [void][IO.Directory]::CreateDirectory($createdDestination)
+        (Test-CorePesterPathBoundary -Path $createdDestination -Boundary $boundary).IsValid | Should -BeTrue
         (Test-CorePesterPathBoundary -Path $outside -Boundary $boundary).Errors | Should -Contain 'Path escaped its registered boundary.'
 
         $link = Join-Path $boundary 'redirected'
@@ -354,18 +362,29 @@ Describe 'Verified Pester 6.2.0 module closure' {
         $wrapper | Should -Match 'Test-CorePesterClosure'
         $wrapper | Should -Match 'Get-CorePesterExpectedLoadedModulePath'
         $wrapper | Should -Match 'Test-CorePesterLoadedModuleIdentity'
-        $acceptanceGateOffset = $wrapper.IndexOf('if (-not $caseInventoryLedgerWritten', [StringComparison]::Ordinal)
+        $acceptanceGateOffset = $wrapper.IndexOf('if (-not (Test-CorePesterAcceptance', [StringComparison]::Ordinal)
         $successReportOffset = $wrapper.IndexOf('[Console]::Out.WriteLine((ConvertTo-Json -InputObject $summary -Compress))', [StringComparison]::Ordinal)
         ($acceptanceGateOffset -ge 0 -and $successReportOffset -gt $acceptanceGateOffset) | Should -BeTrue
+        $wrapper | Should -Match 'Test-CorePesterAcceptance'
+        $wrapper | Should -Not -Match '\(\$passed \+ \$skipped\) -ne \$total'
         $setup = Get-Content -LiteralPath (Join-Path $script:repositoryRoot 'scripts/Prepare-PesterRuntime.ps1') -Raw -Encoding utf8
         $setup | Should -Match 'https://www\.powershellgallery\.com/api/v2/package/Pester/6\.2\.0'
         $setup | Should -Match 'Invoke-WebRequest.*-PassThru'
         $setup | Should -Match 'observedFinalPackageUri'
         $setup | Should -Match 'Test-CorePesterPackageArchive'
         $setup | Should -Match 'Test-CorePesterPathBoundary'
-        $setup | Should -Match 'Refusing unsafe recursive runtime cleanup'
-        $setup | Should -Match 'Refusing unsafe recursive staging cleanup'
+        $setup | Should -Not -Match 'Remove-PlatformOwnedDirectoryTree|Get-PlatformDirectoryState|Move-PlatformOwnedDirectory'
+        $setup | Should -Match 'retained as failed run evidence and must not be reused'
         $setup | Should -Not -Match 'Install-PSResource|Install-Module|CurrentUser'
+    }
+
+    It 'UnitT61_rejects_skipped_or_notrun_cases_before_success_report_emission' {
+        $passing = @{ CaseInventoryLedgerWritten=$true; CaseInventoryComplete=$true; Total=2; Passed=2; Failed=0; FailedBlocks=0; FailedContainers=0; Inconclusive=0; Skipped=0; NotRun=0 }
+        Test-CorePesterAcceptance @passing | Should -BeTrue
+        $skipped = $passing.Clone(); $skipped.Total = 3; $skipped.Skipped = 1
+        Test-CorePesterAcceptance @skipped | Should -BeFalse
+        $notRun = $passing.Clone(); $notRun.Total = 3; $notRun.NotRun = 1
+        Test-CorePesterAcceptance @notRun | Should -BeFalse
     }
 
     # Scenario: The workflow may provide a pre-existing package cache below its run-owned root.

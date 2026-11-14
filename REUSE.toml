@@ -56,6 +56,9 @@ path = [
     "scripts/StandardSourceDriver.psm1",
     "scripts/StandardWorkflowLeg.psm1",
     "tests/CorePesterIntegrity.Tests.ps1",
+    "tests/PreparePesterRuntime.Tests.ps1",
+    "tests/PrepareWorkflowPowerShell.Tests.ps1",
+    "tests/SourceChildBehavior.Tests.ps1",
     "tests/StandardSourceDriver.Tests.ps1",
 ]
 precedence = "aggregate"

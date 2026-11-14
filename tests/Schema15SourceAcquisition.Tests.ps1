@@ -128,7 +128,7 @@ Describe 'Schema 15 source acquisition contract' {
             -RunId $runId -SourceRequestPath $requestPath -SkillSourcePinPath $script:skillSourcePinPath `
             -Provider browser -PassThru
         $first.status | Should -Be 'waiting-user'
-        $ownerPath = Join-Path $first.modLockPath 'owner.json'
+        $ownerPath = [string]$first.modLockPath
         $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
         $owner.leaseMode | Should -Be 'reserved'
         $owner.reservationState | Should -Be 'waiting-user'
@@ -144,8 +144,8 @@ Describe 'Schema 15 source acquisition contract' {
                 -Provider browser -PassThru } | Should -Throw '*owner tuple changed*'
     }
 
-    # Scenario: The process stops while preparing a new canonical MOD reservation before its owner tuple is published.
-    # Purpose: Publish the fixed reservation only as one atomic directory rename so a crash cannot leave an ownerless lock that permanently blocks same-run recovery.
+    # Scenario: The process stops while publishing a new canonical MOD reservation.
+    # Purpose: Publish one complete owner file with create-only/CAS semantics and never expose an ownerless directory.
     It 'UnitT28A_PublishesOnlyCompleteModReservationsAtomically' {
         $runner = Get-Content -LiteralPath (Join-Path $scriptRoot 'mod-update.ps1') -Raw
         $start = $runner.IndexOf('function Enter-ModReservation')
@@ -154,9 +154,12 @@ Describe 'Schema 15 source acquisition contract' {
         $end | Should -BeGreaterThan $start
         $reservation = $runner.Substring($start, $end - $start)
 
-        $reservation | Should -Match '\$preparedLockPath'
-        $reservation | Should -Match 'Write-ModReservationOwner\s+-ModLockPath\s+\$preparedLockPath'
-        $reservation | Should -Match '\[IO\.Directory\]::Move\(\$preparedLockPath, \[string\]\$Plan\.modLockPath\)'
+        $reservation | Should -Match 'Get-ModReservationSnapshot'
+        $reservation | Should -Match 'Write-ModReservationOwner\s+-ModLockPath\s+\(\[string\]\$Plan\.modLockPath\)'
+        $reservation | Should -Not -Match '\$preparedLockPath'
+        $runner | Should -Match 'Publish-PortableLeaseFile'
+        $runner | Should -Match '-NoReplace:\(-not \$ownerExists\)'
+        $reservation | Should -Not -Match '\[IO\.Directory\]::Move'
         $reservation | Should -Not -Match 'New-Item\s+-ItemType\s+Directory\s+-Path\s+\(\[string\]\$Plan\.modLockPath\)'
     }
 
@@ -409,7 +412,7 @@ Describe 'Schema 15 source acquisition contract' {
         Test-Path -LiteralPath $first.receiptPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath $first.acquisitionPath -PathType Leaf | Should -Be $true
         [IO.File]::Delete($first.acquisitionPath)
-        $ownerPath = Join-Path $first.modLockPath 'owner.json'
+        $ownerPath = [string]$first.modLockPath
         $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
         $owner.leaseMode = 'active'
         $owner.machineName = [Environment]::MachineName
@@ -418,6 +421,7 @@ Describe 'Schema 15 source acquisition contract' {
         $owner.workerToken = [guid]::NewGuid().ToString('N')
         $owner.reservationState = 'running'
         $owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-31).ToString('o')
+        $owner.expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(-1).ToString('o')
         $null = $owner.Remove('waitingReason')
         $owner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
 
@@ -1055,7 +1059,7 @@ Describe 'Schema 15 source acquisition contract' {
         $state.sourceTuple.contractSha256 | Should -Match '^[0-9a-f]{64}$'
         @($state.completedStages) | Should -Contain 'acquire-source'
         @($state.completedStages) | Should -Contain 'claim'
-        (Get-Content -LiteralPath (Join-Path $state.modLockPath 'owner.json') -Raw | ConvertFrom-Json).runId | Should -Be $runId
+        (Get-Content -LiteralPath $state.modLockPath -Raw | ConvertFrom-Json).runId | Should -Be $runId
     }
 
     # Scenario: A Schema 15 candidate reaches the independent Final Candidate Gate after the claimed archive has been copied into run ownership.

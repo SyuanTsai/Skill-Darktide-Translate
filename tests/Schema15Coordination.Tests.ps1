@@ -161,7 +161,8 @@ Describe 'Schema 15 multi-process coordination contract' {
                 Test-Path -LiteralPath ([string]$state.archive.path) -PathType Leaf | Should -BeTrue
                 [string]$state.prNumber | Should -BeNullOrEmpty
                 [bool]$state.published | Should -BeFalse
-                $owner = Get-Content -LiteralPath (Join-Path ([string]$state.modLockPath) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
+                $owner = Get-Content -LiteralPath ([string]$state.modLockPath) -Raw | ConvertFrom-TestJson -AsHashtable
+                [string]$owner.state | Should -Be 'held'
                 [string]$owner.leaseMode | Should -Be 'reserved'
                 [string]$owner.workerToken | Should -BeNullOrEmpty
                 $owner.workerId | Should -BeNullOrEmpty
@@ -170,7 +171,7 @@ Describe 'Schema 15 multi-process coordination contract' {
                 @($state.coordinationReceipts.resourceKey) | Should -Contain 'git-coordination'
             }
             @(Get-ChildItem -LiteralPath (Join-Path $queueRoot '.claims') -Directory).Count | Should -Be 2
-            @(Get-ChildItem -LiteralPath (Join-Path $queueRoot 'In Progress/.locks/mod') -Directory).Count | Should -Be 2
+            @(Get-ChildItem -LiteralPath (Join-Path $queueRoot 'In Progress/.locks/mod') -File -Filter '*.lock').Count | Should -Be 2
 
             $receipts = @($states.coordinationReceipts | ForEach-Object {
                 Get-Content -LiteralPath ([string]$_.path) -Raw | ConvertFrom-TestJson -AsHashtable
@@ -190,7 +191,9 @@ Describe 'Schema 15 multi-process coordination contract' {
         }
     }
 
-    It 'InterT181_RetainsStaleEvidenceAndPreventsAnOldTokenFromDeletingTheNewOwner' {
+    # Scenario: A crashed owner expires and a new owner replaces the same long-lived file by CAS.
+    # Purpose: Recover stale ownership without deleting the lease name and keep old tokens unable to release the successor.
+    It 'InterT181_ReclaimsAnExpiredSingleFileLeaseAndRejectsTheOldToken' {
         Import-Module -Name $coordinationModule -Force
         $repository = Join-Path $TestDrive 'stale-shared-lock-repository'
         New-Item -ItemType Directory -Path $repository -Force | Out-Null
@@ -224,30 +227,37 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
         $crashProcess.ExitCode | Should -Be 91 -Because ($crashError.Result + $crashOutput.Result)
         $crashProcess.Dispose()
         $oldLease = Get-Content -LiteralPath $oldLeasePath -Raw | ConvertFrom-TestJson -AsHashtable
-        $ownerPath = Join-Path ([string]$oldLease.path) 'owner.json'
+        $ownerPath = [string]$oldLease.path
         $oldOwner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-TestJson -AsHashtable
-        $oldOwner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+        [string]$oldOwner.platform | Should -BeExactly ([string]$oldLease.platform)
+        [string]$oldOwner.lockPrimitive | Should -BeExactly ([string]$oldLease.lockPrimitive)
+        [string]$oldOwner.state | Should -Be 'held'
+        $oldOwner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+        $oldOwner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
         $oldOwner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
 
         $newLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' `
             -RunId '18181818-5555-4555-8555-555555555555' -ReceiptRoot $receiptRoot
         try {
-            [string]$newLease.staleEvidencePath | Should -Not -BeNullOrEmpty
-            Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Container | Should -BeTrue
             { Exit-SharedCoordinationLease -Lease $oldLease } | Should -Throw '*ownership changed*'
-            Test-Path -LiteralPath ([string]$newLease.path) -PathType Container | Should -BeTrue
-            $newOwner = Get-Content -LiteralPath (Join-Path ([string]$newLease.path) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
-            [string]$newOwner.token | Should -Be ([string]$newLease.token)
-            $beforeHeartbeat = [DateTimeOffset]$newOwner.heartbeat
+            Test-Path -LiteralPath ([string]$newLease.path) -PathType Leaf | Should -BeTrue
+            $newOwner = Get-Content -LiteralPath ([string]$newLease.path) -Raw | ConvertFrom-TestJson -AsHashtable
+            [string]$newOwner.owner.token | Should -Be ([string]$newLease.token)
+            [string]$newOwner.platform | Should -BeExactly ([string]$newLease.platform)
+            [string]$newOwner.lockPrimitive | Should -BeExactly ([string]$newLease.lockPrimitive)
+            $beforeHeartbeat = [DateTimeOffset]$newOwner.owner.heartbeat
             Start-Sleep -Milliseconds 20
             Update-SharedCoordinationLease -Lease $newLease -Force
-            $refreshedOwner = Get-Content -LiteralPath (Join-Path ([string]$newLease.path) 'owner.json') -Raw | ConvertFrom-TestJson -AsHashtable
-            [DateTimeOffset]$refreshedOwner.heartbeat | Should -BeGreaterThan $beforeHeartbeat
+            $refreshedOwner = Get-Content -LiteralPath ([string]$newLease.path) -Raw | ConvertFrom-TestJson -AsHashtable
+            [DateTimeOffset]$refreshedOwner.owner.heartbeat | Should -BeGreaterThan $beforeHeartbeat
+            [DateTimeOffset]$refreshedOwner.expiresAt | Should -BeGreaterThan ([DateTimeOffset]$refreshedOwner.owner.heartbeat)
         }
         finally {
             $receipt = Exit-SharedCoordinationLease -Lease $newLease
         }
-        Test-Path -LiteralPath ([string]$newLease.path) | Should -BeFalse
+        Test-Path -LiteralPath ([string]$newLease.path) -PathType Leaf | Should -BeTrue
+        $releasedOwner = Get-Content -LiteralPath ([string]$newLease.path) -Raw | ConvertFrom-TestJson -AsHashtable
+        [string]$releasedOwner.state | Should -Be 'released'
         $receiptRecord = Get-Content -LiteralPath ([string]$receipt.path) -Raw | ConvertFrom-TestJson -AsHashtable
         [string]$receiptRecord.staleEvidencePath | Should -Be ([string]$newLease.staleEvidencePath)
     }
@@ -266,17 +276,18 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
                 -WaitHeartbeatAction $waitHeartbeat } | Should -Throw '*Timed out*'
             $counter.Value | Should -BeGreaterThan 1
 
-            $ownerPath = Join-Path ([string]$lease.path) 'owner.json'
+            $ownerPath = [string]$lease.path
             $validOwnerJson = Get-Content -LiteralPath $ownerPath -Raw
             try {
                 $malformedOwner = $validOwnerJson | ConvertFrom-TestJson -AsHashtable
-                $malformedOwner.processStartTicks = 'not-a-number'
-                $malformedOwner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+                $malformedOwner.owner.processStartTicks = 'not-a-number'
+                $malformedOwner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+                $malformedOwner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
                 $malformedOwner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
                 { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
                     -RunId '18218218-4182-4182-8182-182182182182' -TimeoutSeconds 1 } |
                     Should -Throw '*owner contract is invalid*'
-                Test-Path -LiteralPath ([string]$lease.path) -PathType Container | Should -BeTrue
+                Test-Path -LiteralPath ([string]$lease.path) -PathType Leaf | Should -BeTrue
             }
             finally {
                 [IO.File]::WriteAllText($ownerPath, $validOwnerJson, [Text.UTF8Encoding]::new($false))
@@ -384,9 +395,9 @@ finally {
         }
     }
 
-    # Scenario: A coordination lease is published and released, then an unowned empty lease directory appears at the lease name.
-    # Purpose: Record the actual platform and lock primitive as evidence, and never publish over an unowned directory that Unix rename could replace.
-    It 'InterT370_RecordsLockEvidenceAndRefusesAnUnownedEmptyLeaseDirectory' {
+    # Scenario: A lease is released and reacquired from its persistent file, then a legacy directory is placed at that name.
+    # Purpose: Prove released-file reuse and fail-closed migration guidance without automatic legacy conversion.
+    It 'InterT370_ReacquiresAReleasedFileAndRejectsALegacyDirectoryWithMigrationSteps' {
         Import-Module -Name $coordinationModule -Force
         $repository = Join-Path $TestDrive 'lock-evidence-repository'
         $receiptRoot = Join-Path $repository 'receipts'
@@ -403,20 +414,54 @@ finally {
         $receiptValue.lockPrimitive | Should -BeExactly $expectedPrimitive
         $receiptValue.disposition | Should -BeExactly 'released'
 
+        Test-Path -LiteralPath $lease.path -PathType Leaf | Should -BeTrue
+        $releasedValue = Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $releasedValue.state | Should -BeExactly 'released'
+        $secondLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'second-run' -TimeoutSeconds 10
+        try { [string]$secondLease.token | Should -Not -BeExactly ([string]$lease.token) }
+        finally { $null = Exit-SharedCoordinationLease -Lease $secondLease }
+
         $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks'
         $guardPath = Join-Path $lockRoot 'git-coordination.owner-update.guard'
         Test-Path -LiteralPath $guardPath -PathType Leaf | Should -BeTrue -Because 'the vendored lock keeps a fixed guard inode'
         $emptyLease = Join-Path $lockRoot 'git-coordination.lock'
+        [IO.File]::Delete($emptyLease)
         New-Item -ItemType Directory -Path $emptyLease | Out-Null
-        { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'second-run' -TimeoutSeconds 2 } |
-            Should -Throw '*Shared coordination path is missing*'
+        { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'legacy-run' -TimeoutSeconds 2 } |
+            Should -Throw '*Legacy coordination lease directory format*move this directory*outside .locks*Automatic deletion or migration is forbidden*'
         Test-Path -LiteralPath $emptyLease -PathType Container | Should -BeTrue
         @(Get-ChildItem -LiteralPath $emptyLease -Force).Count | Should -Be 0
         @(Get-ChildItem -LiteralPath $lockRoot -Force -Directory | Where-Object { $_.Name -like '.pending-*' }).Count | Should -Be 0
 
         $coordination = Get-Content -LiteralPath $coordinationModule -Raw
-        $coordination | Should -Match '(?s)if \(Test-Path -LiteralPath \$lockPath\) \{\s*throw \[IO\.IOException\]::new\(''The coordination lease appeared before publication\.''\)\s*\}\s*\[IO\.Directory\]::Move\(\$prepared, \$lockPath\)\s*\$published = Get-Content -LiteralPath \(Join-Path \$lockPath ''owner\.json''\)'
-        $coordination | Should -Match '\[string\]\$published\.token -cne \$token'
+        $coordination | Should -Match 'Publish-PortableLeaseFile'
+        $coordination | Should -Match "state = 'held'"
+        $coordination | Should -Match "state = 'released'"
+        $coordination | Should -Not -Match '\[IO\.Directory\]::Move'
+        $coordination | Should -Not -Match '\[IO\.File\]::Delete\(\$ownerPath\)'
+        $coordination | Should -Not -Match '\[IO\.Directory\]::Delete\(\[string\]\$Lease\.path\)'
         $coordination | Should -Not -Match 'FileShare\]::None'
+    }
+
+    # Scenario: A writer reads one file identity, another CAS replaces it, and the first writer retries with stale evidence.
+    # Purpose: Prove replacement requires the exact observed identity/hash/length tuple and rejects a lost race.
+    It 'InterT380_RejectsAStaleExpectedIdentityDuringCasReplacement' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'coordination-cas-race-repository'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'cas-owner'
+        try {
+            InModuleScope SharedCoordinationLock -Parameters @{ Repository = $repository } {
+                $lockRoot = Join-Path $Repository 'AI Auto Update/In Progress/.locks'
+                $stale = Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey 'source-acquisition'
+                $replacement = $stale.value
+                $replacement.owner.heartbeat = [DateTimeOffset]::UtcNow.AddSeconds(1).ToString('o')
+                $replacement.expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(3).ToString('o')
+                $null = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey 'source-acquisition' -Value $replacement -ExpectedState $stale
+                { Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey 'source-acquisition' -Value $replacement -ExpectedState $stale } |
+                    Should -Throw
+            }
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $lease }
     }
 }

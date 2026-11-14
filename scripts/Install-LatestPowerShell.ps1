@@ -20,50 +20,32 @@ $hostArchitecture = Get-PowerShellHostArchitecture
 
 function Get-InstalledPowerShellVersion {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string] $ExecutablePath, [Parameter(Mandatory)] $ExecutableLease)
+    param(
+        [Parameter(Mandatory)][string] $ExecutablePath,
+        [Parameter(Mandatory)] $ExecutableLease,
+        [Parameter(Mandatory)][string] $WorkingDirectoryPath,
+        [Parameter(Mandatory)] $WorkingDirectoryLease
+    )
 
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $ExecutablePath
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write($PSVersionTable.PSVersion.ToString())')) {
-        [void]$startInfo.ArgumentList.Add($argument)
+    $result = Invoke-PowerShellReleaseOwnedProcess -ExecutableLease $ExecutableLease `
+        -ExecutablePath $ExecutablePath -WorkingDirectoryLease $WorkingDirectoryLease `
+        -WorkingDirectoryPath $WorkingDirectoryPath -TimeoutSeconds 15 -ArgumentList @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+            '[Console]::Out.Write($PSVersionTable.PSVersion.ToString())'
+        )
+    if ($result.exitCode -ne 0) {
+        throw "Downloaded PowerShell runtime version probe exited with code $($result.exitCode): $($result.stderr.Trim())"
     }
-
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    try {
-        $identity = Assert-PlatformFileIdentity -Lease $ExecutableLease -Expected $ExecutableLease.Observation -SingleLink -VerifyPath
-        if (-not $process.Start()) { throw 'Downloaded PowerShell runtime version probe did not start.' }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(15000)) {
-            try {
-                $process.Kill($true)
-                [void]$process.WaitForExit(5000)
-            }
-            catch { throw 'Downloaded PowerShell runtime version probe timed out and could not be terminated.' }
-            throw 'Downloaded PowerShell runtime version probe exceeded its 15000 millisecond timeout.'
-        }
-        $stdout = [string]$stdoutTask.GetAwaiter().GetResult()
-        $stderr = [string]$stderrTask.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) {
-            throw "Downloaded PowerShell runtime version probe exited with code $($process.ExitCode): $($stderr.Trim())"
-        }
-        [void](Assert-PlatformFileIdentity -Lease $ExecutableLease -Expected $identity -SingleLink -VerifyPath)
-        return $stdout.Trim()
-    }
-    finally {
-        $process.Dispose()
-    }
+    return ([string]$result.stdout).Trim()
 }
 
 $installRootFullPath = [IO.Path]::GetFullPath($InstallRoot)
 $installParent = [IO.Path]::GetDirectoryName($installRootFullPath)
 $installLeaf = [IO.Path]::GetFileName($installRootFullPath)
 $installRootLease = Open-PlatformDirectory -Root $installParent -RelativePath $installLeaf -CreatePrivate
+$runtimeLease = $null
+$executableLease = $null
+try {
 
 $stableChannelUri = [uri]'https://aka.ms/powershell-release?tag=stable'
 $stableChannelResponse = Invoke-WebRequest `
@@ -102,10 +84,12 @@ $observedDigest = Assert-VerifiedPowerShellArchive -Asset $asset -Path $archiveP
 
 $runtimePath = Join-Path $installRootFullPath 'runtime'
 $executablePath = Expand-VerifiedPowerShellArchive -Asset $asset -ArchivePath $archivePath -DestinationPath $runtimePath
+try {
 $signature = Assert-PowerShellExecutableSignature -Path $executablePath -Platform $asset.platform
 $runtimeLease = Open-PlatformDirectory -Root $installRootFullPath -RelativePath 'runtime'
 $executableLease = Open-PlatformFile -ParentLease $runtimeLease -Leaf ([IO.Path]::GetFileName($executablePath)) -Access Read -CreateMode OpenExisting
-$actualVersion = Get-InstalledPowerShellVersion -ExecutablePath $executablePath -ExecutableLease $executableLease
+$actualVersion = Get-InstalledPowerShellVersion -ExecutablePath $executablePath -ExecutableLease $executableLease `
+    -WorkingDirectoryPath $installRootFullPath -WorkingDirectoryLease $installRootLease
 [void](Assert-PowerShellRuntimeVersion -Tag $asset.tag -ActualVersion $actualVersion)
 
 $receipt = [pscustomobject][ordered]@{
@@ -142,11 +126,23 @@ try {
 finally {
     $receiptStream.Dispose()
 }
-
-$executableLease.Dispose()
-$runtimeLease.Dispose()
-$installRootLease.Dispose()
-Remove-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction SilentlyContinue
-Remove-Module -ModuleInfo $pathSafetyModule -Force -ErrorAction SilentlyContinue
-
 Write-Output -NoEnumerate $receipt
+}
+catch {
+    $runtimeFailure = $_
+    try { Set-PowerShellRuntimeUnusable -DestinationPath $runtimePath }
+    catch {
+        throw [IO.IOException]::new(
+            "$($runtimeFailure.Exception.Message) Failed runtime could not be marked unusable.",
+            [AggregateException]::new($runtimeFailure.Exception, $_.Exception))
+    }
+    throw $runtimeFailure
+}
+}
+finally {
+    if ($null -ne $executableLease) { $executableLease.Dispose() }
+    if ($null -ne $runtimeLease) { $runtimeLease.Dispose() }
+    $installRootLease.Dispose()
+    Remove-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction SilentlyContinue
+    Remove-Module -ModuleInfo $pathSafetyModule -Force -ErrorAction SilentlyContinue
+}

@@ -3,15 +3,17 @@
 #requires -Version 7.0
 
 [CmdletBinding()]
-param()
+param(
+    [Parameter(Mandatory)][string] $AuthorityRepositoryRoot,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $integrityModulePath = Join-Path $PSScriptRoot 'CorePesterIntegrity.psm1'
 $integrityModule = Import-Module -Name $integrityModulePath -Force -PassThru -ErrorAction Stop
-$platformRuntimeModule = & $integrityModule { $script:CorePesterPlatformRuntimeModule }
-if ($platformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Core Pester integrity module did not expose its registry-bound platform runtime.' }
+$platformRuntimeModule = Import-CorePesterAuthorityPlatformRuntime -AuthorityRoot $AuthorityRepositoryRoot -AuthorityRevision $AuthorityRevision
 Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
 Assert-NoLegacyCorePesterBootstrapEnvironment
 $closureLockPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../config/pester-6.2.0-closure.lock.json'))
@@ -40,12 +42,14 @@ if (-not $postImportClosure.IsValid -or $postImportClosure.ClosureSha256 -cne $p
 
 $testRoot = Join-Path ([IO.Path]::GetFullPath((Get-Location).Path)) 'tests'
 $testRootLease = Open-PlatformDirectory -Root $testRoot -RootOnly
-$testRootParentLease = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($testRoot)) -RootOnly
-$testRootStateBefore = Get-PlatformDirectoryState -ParentLease $testRootParentLease -Leaf ([IO.Path]::GetFileName($testRoot))
+$testRootSnapshotBefore = Get-CorePesterTreeSnapshot -Root $testRoot
+if (-not $testRootSnapshotBefore.IsValid) { throw ('Core Pester tests tree could not be bound: ' + (@($testRootSnapshotBefore.Errors) -join '; ')) }
 $candidateSnapshotRoot = [IO.Path]::GetFullPath((Get-Location).Path)
 $candidateSnapshotBefore = Get-CorePesterTreeSnapshot -Root $candidateSnapshotRoot
 if (-not $candidateSnapshotBefore.IsValid) { throw ('Core Pester candidate snapshot could not be bound: ' + (@($candidateSnapshotBefore.Errors) -join '; ')) }
 $previousErrorActionPreference = $ErrorActionPreference
+$previousTestAuthorityRoot = [Environment]::GetEnvironmentVariable('DT_TEST_AUTHORITY_ROOT', 'Process')
+[Environment]::SetEnvironmentVariable('DT_TEST_AUTHORITY_ROOT', [IO.Path]::GetFullPath($AuthorityRepositoryRoot), 'Process')
 $progressCharacters = 0
 $progressLimit = 300000
 $completedCases = 0
@@ -100,6 +104,7 @@ try {
 }
 finally {
     $ErrorActionPreference = $previousErrorActionPreference
+    [Environment]::SetEnvironmentVariable('DT_TEST_AUTHORITY_ROOT', $previousTestAuthorityRoot, 'Process')
 }
 if ($null -eq $result) { throw 'Pester did not return a result object.' }
 $postRunClosure = Test-CorePesterClosure -ModuleRoot $verifiedPesterModuleRoot -Lock $closureLockRecord.Value
@@ -271,9 +276,8 @@ try {
         else { $expectedTestFileInventory.Add($fileKey, $relativePath) }
     }
     if ($expectedTestFileInventory.Count -eq 0) { $caseInventoryErrors.Add('Candidate tests tree contains no *.Tests.ps1 files.') }
-    $testRootStateAfterInventory = Get-PlatformDirectoryState -ParentLease $testRootParentLease -Leaf ([IO.Path]::GetFileName($testRoot))
-    if ($testRootStateAfterInventory.inventorySha256 -cne $testRootStateBefore.inventorySha256 -or
-        $testRootStateAfterInventory.entryCount -ne $testRootStateBefore.entryCount) {
+    $testRootSnapshotAfterInventory = Get-CorePesterTreeSnapshot -Root $testRoot
+    if (-not $testRootSnapshotAfterInventory.IsValid -or $testRootSnapshotAfterInventory.Sha256 -cne $testRootSnapshotBefore.Sha256) {
         $caseInventoryErrors.Add('Candidate tests tree changed while its complete file inventory was read.')
     }
 }
@@ -543,11 +547,10 @@ $summary = [ordered]@{
     skipped = $skipped
 }
 $testRootLease.Dispose()
-$testRootParentLease.Dispose()
-if (-not $caseInventoryLedgerWritten -or -not $caseInventoryComplete -or
-    $total -le 0 -or $passed -le 0 -or $failed -ne 0 -or $failedBlocks -ne 0 -or
-    $failedContainers -ne 0 -or [int]$result.InconclusiveCount -ne 0 -or
-    [int]$result.NotRunCount -ne 0 -or ($passed + $skipped) -ne $total) {
+if (-not (Test-CorePesterAcceptance -CaseInventoryLedgerWritten $caseInventoryLedgerWritten `
+    -CaseInventoryComplete $caseInventoryComplete -Total $total -Passed $passed -Failed $failed `
+    -FailedBlocks $failedBlocks -FailedContainers $failedContainers -Inconclusive ([int]$result.InconclusiveCount) `
+    -Skipped $skipped -NotRun ([int]$result.NotRunCount))) {
     [Console]::Error.WriteLine('Core Pester acceptance failed; no success report was emitted.')
     exit 1
 }

@@ -46,12 +46,7 @@ function Assert-WorkflowArchitecture {
 
 function Resolve-WorkflowPhysicalPath {
     param([Parameter(Mandatory)][string] $Path)
-    if ($IsWindows) { return [IO.Path]::GetFullPath($Path) }
-    $resolved = @(& realpath $Path)
-    if ($LASTEXITCODE -ne 0 -or $resolved.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$resolved[0])) {
-        throw "Could not resolve physical path: $Path"
-    }
-    return ([string]$resolved[0]).Trim()
+    return [IO.Path]::GetFullPath((Resolve-PlatformPhysicalPath -Path ([IO.Path]::GetFullPath($Path))))
 }
 
 function Assert-RequiredValue {
@@ -62,17 +57,6 @@ function Assert-RequiredValue {
 function Get-OfficialManifestArchiveSha256 {
     param([Parameter(Mandatory)][string] $ManifestPath, [Parameter(Mandatory)][string] $ArchiveName)
     return Get-OfficialPowerShellManifestDigest -Path $ManifestPath -ArchiveName $ArchiveName
-}
-
-function Assert-WorkflowRuntimeRootEmpty {
-    param([Parameter(Mandatory)][string] $Path)
-    $full = [IO.Path]::GetFullPath($Path)
-    $parent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($full)) -RootOnly
-    try { $state = Get-PlatformDirectoryState -ParentLease $parent -Leaf ([IO.Path]::GetFileName($full)) }
-    finally { $parent.Dispose() }
-    if (-not $state.exists -or [int64]$state.entryCount -ne 0) {
-        throw 'Verified PowerShell runtime root must be fresh and empty.'
-    }
 }
 
 function Open-WorkflowFile {
@@ -136,6 +120,26 @@ function New-WorkflowPowerShellAssetEvidence {
     }
 }
 
+function Get-WorkflowPowerShellVersion {
+    param(
+        [Parameter(Mandatory)][string] $ExecutablePath,
+        [Parameter(Mandatory)] $ExecutableLease,
+        [Parameter(Mandatory)][string] $WorkingDirectoryPath,
+        [Parameter(Mandatory)] $WorkingDirectoryLease
+    )
+
+    $result = Invoke-PowerShellReleaseOwnedProcess -ExecutableLease $ExecutableLease `
+        -ExecutablePath $ExecutablePath -WorkingDirectoryLease $WorkingDirectoryLease `
+        -WorkingDirectoryPath $WorkingDirectoryPath -TimeoutSeconds 15 -ArgumentList @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+            '[Console]::Out.Write($PSVersionTable.PSVersion.ToString())'
+        )
+    if ($result.exitCode -ne 0) {
+        throw "Installed PowerShell version probe failed with code $($result.exitCode): $($result.stderr.Trim())"
+    }
+    return ([string]$result.stdout).Trim()
+}
+
 if ($DefineFunctionsOnly) { return }
 
 Assert-WorkflowArchitecture
@@ -144,6 +148,7 @@ switch ($Mode) {
     'Resolve' {
         Assert-RequiredValue -Value $AssetTemplate -Name 'AssetTemplate'
         Assert-RequiredValue -Value $env:GITHUB_OUTPUT -Name 'GITHUB_OUTPUT'
+        Assert-RequiredValue -Value $env:RUNNER_TEMP -Name 'RUNNER_TEMP'
         $releaseUri = [Uri]'https://api.github.com/repos/PowerShell/PowerShell/releases/latest'
         $metadataHeaders = @{
             Accept = 'application/vnd.github+json'
@@ -182,7 +187,8 @@ switch ($Mode) {
         }
         $archiveApiSha256 = ([string]$verifiedAsset.digest).Substring(7)
         $manifestApiSha256 = ([string]$verifiedAsset.hashesManifest.digest).Substring(7)
-        $metadataRoot = New-PlatformPrivateRoot -Parent ([IO.Path]::GetTempPath()) -Leaf ("dt-pwsh-metadata-$Platform-$([guid]::NewGuid().ToString('N'))")
+        $metadataRoot = New-PlatformPrivateRoot -Parent ([IO.Path]::GetFullPath($env:RUNNER_TEMP)) `
+            -Leaf ("dt-pwsh-metadata-$Platform-$([guid]::NewGuid().ToString('N'))")
         $manifestPath = Join-Path $metadataRoot 'hashes.sha256'
         Invoke-WebRequest -Uri ([string]$verifiedAsset.hashesManifest.browserDownloadUrl) -OutFile $manifestPath -MaximumRedirection 3 -TimeoutSec 60 -ErrorAction Stop
         [void](Assert-VerifiedPowerShellHashesManifest -Asset $verifiedAsset -Path $manifestPath)
@@ -208,20 +214,29 @@ switch ($Mode) {
         }
         $cacheRootFull = [IO.Path]::GetFullPath($CacheRoot)
         $cacheRootLease = Open-PlatformDirectory -Root $cacheRootFull -RootOnly
+        try {
         $archivePath = Join-Path $CacheRoot $AssetName
         $cachedManifestPath = Join-Path $CacheRoot 'hashes.sha256'
         $cacheValid = $false
         $archiveState = $null
         $manifestState = $null
-        try {
-            $archiveProbe = Open-PlatformFile -ParentLease $cacheRootLease -Leaf $AssetName -Access Read -CreateMode OpenExisting
-            $archiveState = Assert-PlatformFileIdentity -Lease $archiveProbe -Expected $archiveProbe.Observation -SingleLink -VerifyPath
-            $archiveProbe.Dispose()
-            $manifestProbe = Open-PlatformFile -ParentLease $cacheRootLease -Leaf 'hashes.sha256' -Access Read -CreateMode OpenExisting
-            $manifestState = Assert-PlatformFileIdentity -Lease $manifestProbe -Expected $manifestProbe.Observation -SingleLink -VerifyPath
-            $manifestProbe.Dispose()
+        $archiveProbe = $null
+        try { $archiveProbe = Open-PlatformFile -ParentLease $cacheRootLease -Leaf $AssetName -Access Read -CreateMode OpenExisting }
+        catch { $archiveProbe = $null }
+        if ($null -ne $archiveProbe) {
+            try { $archiveState = Assert-PlatformFileIdentity -Lease $archiveProbe -Expected $archiveProbe.Observation -SingleLink -VerifyPath }
+            finally { $archiveProbe.Dispose() }
         }
-        catch { $archiveState = $null; $manifestState = $null }
+        $manifestProbe = $null
+        try { $manifestProbe = Open-PlatformFile -ParentLease $cacheRootLease -Leaf 'hashes.sha256' -Access Read -CreateMode OpenExisting }
+        catch { $manifestProbe = $null }
+        if ($null -ne $manifestProbe) {
+            try { $manifestState = Assert-PlatformFileIdentity -Lease $manifestProbe -Expected $manifestProbe.Observation -SingleLink -VerifyPath }
+            finally { $manifestProbe.Dispose() }
+        }
+        if (($null -eq $archiveState) -ne ($null -eq $manifestState)) {
+            throw 'Existing PowerShell cache entry is incomplete and cannot be repaired in place.'
+        }
         if ($null -ne $archiveState -and $null -ne $manifestState) {
             try {
                 $cachedAsset = New-WorkflowPowerShellAssetEvidence -ArchivePath $archivePath -ManifestPath $cachedManifestPath `
@@ -235,45 +250,65 @@ switch ($Mode) {
             }
         }
         if (-not $cacheValid) {
-            $download = Invoke-WebRequest -Uri $ArchiveUrl -MaximumRedirection 3 -TimeoutSec 300 -ErrorAction Stop
             $archiveBinding = Open-WorkflowFile -Path $archivePath -Access ReadWrite -CreateMode CreateNew
+            $manifestBinding = $null
             try {
+                $manifestBinding = Open-WorkflowFile -Path $cachedManifestPath -Access ReadWrite -CreateMode CreateNew
+                $download = Invoke-WebRequest -Uri $ArchiveUrl -MaximumRedirection 3 -TimeoutSec 300 -ErrorAction Stop
                 $memory = [IO.MemoryStream]::new()
                 try { $download.RawContentStream.CopyTo($memory); $archiveBinding.File.WriteNewBytes($memory.ToArray()) }
                 finally { $memory.Dispose() }
+                $freshManifest = Open-WorkflowFile -Path $FreshHashesPath -Access Read -CreateMode OpenExisting
+                try {
+                    $freshIdentity = Assert-PlatformFileIdentity -Lease $freshManifest.File `
+                        -Expected $freshManifest.File.Observation -SingleLink -VerifyPath
+                    $manifestBinding.File.WriteNewBytes($freshManifest.File.ReadAllBytes(16777216))
+                    [void](Assert-PlatformFileIdentity -Lease $freshManifest.File -Expected $freshIdentity -SingleLink -VerifyPath)
+                }
+                finally { Close-WorkflowFile -Binding $freshManifest }
                 [void](Assert-PlatformFileIdentity -Lease $archiveBinding.File -Expected $archiveBinding.File.Observation -SingleLink -VerifyPath)
+                [void](Assert-PlatformFileIdentity -Lease $manifestBinding.File -Expected $manifestBinding.File.Observation -SingleLink -VerifyPath)
             }
-            finally { Close-WorkflowFile -Binding $archiveBinding }
-            Copy-WorkflowFile -Source $FreshHashesPath -Destination $cachedManifestPath
+            finally {
+                if ($null -ne $manifestBinding) { Close-WorkflowFile -Binding $manifestBinding }
+                Close-WorkflowFile -Binding $archiveBinding
+            }
         }
         $verifiedAsset = New-WorkflowPowerShellAssetEvidence -ArchivePath $archivePath -ManifestPath $cachedManifestPath `
             -ArchiveName $AssetName -ArchiveSha256 $OfficialArchiveSha256 -ManifestSha256 $HashesManifestSha256
-        [void](Assert-VerifiedPowerShellArchive -Asset $verifiedAsset -Path $archivePath)
+        $observedArchiveSha256 = Assert-VerifiedPowerShellArchive -Asset $verifiedAsset -Path $archivePath
         [void](Assert-VerifiedPowerShellHashesManifest -Asset $verifiedAsset -Path $cachedManifestPath)
         if ($AssetName -cne (Get-PowerShellReleaseAssetName -Version $Version -Platform $Platform -Architecture $ExpectedArchitecture)) {
             throw 'AssetName is not the official archive for this platform and architecture.'
         }
-        Assert-WorkflowRuntimeRootEmpty -Path $RuntimeRoot
-        # The shared extractor requires a fresh destination; the empty run-owned
-        # root is removed and recreated by the verified extraction.
-        $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot)
-        $runtimeParentLease = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($runtimeFull)) -RootOnly
-        $runtimeState = Get-PlatformDirectoryState -ParentLease $runtimeParentLease -Leaf ([IO.Path]::GetFileName($runtimeFull))
-        Remove-PlatformOwnedDirectoryTree -TransactionRootLease $runtimeParentLease -Leaf ([IO.Path]::GetFileName($runtimeFull)) -ExpectedIdentity $runtimeState.identity
-        $runtimeParentLease.Dispose()
+        # RuntimeRoot is an attempt-specific, not-yet-existing leaf. The extractor
+        # creates it once and preserves a marked unusable directory on failure.
         $executable = Expand-VerifiedPowerShellArchive -Asset $verifiedAsset -ArchivePath $archivePath -DestinationPath $RuntimeRoot
+        try {
         $signature = Assert-PowerShellExecutableSignature -Path $executable -Platform $Platform
         $signatureStatus = $signature.status; $signerSubject = $signature.signerSubject; $signerThumbprint = $signature.signerThumbprint
-        $versionOutput = @(& $executable -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()')
-        if ($LASTEXITCODE -ne 0 -or $versionOutput.Count -ne 1) { throw 'Installed PowerShell did not report one version.' }
-        [void](Assert-PowerShellRuntimeVersion -Tag $ReleaseTag -ActualVersion ([string]$versionOutput[0]).Trim())
-        if (([string]$versionOutput[0]).Trim() -cne $Version) { throw 'Installed PowerShell version differs from the latest stable release tag.' }
+        $runtimeLease = Open-PlatformDirectory -Root ([IO.Path]::GetFullPath($RuntimeRoot)) -RootOnly
+        $ownedLease = $null
+        $executableLease = $null
+        try {
+            $ownedLease = Open-PlatformDirectory -Root ([IO.Path]::GetFullPath($OwnedRoot)) -RootOnly
+            $executableLease = Open-PlatformFile -ParentLease $runtimeLease -Leaf $ExecutableName -Access Read -CreateMode OpenExisting
+            $versionOutput = Get-WorkflowPowerShellVersion -ExecutablePath $executable -ExecutableLease $executableLease `
+                -WorkingDirectoryPath $OwnedRoot -WorkingDirectoryLease $ownedLease
+        }
+        finally {
+            if ($null -ne $executableLease) { $executableLease.Dispose() }
+            if ($null -ne $ownedLease) { $ownedLease.Dispose() }
+            $runtimeLease.Dispose()
+        }
+        [void](Assert-PowerShellRuntimeVersion -Tag $ReleaseTag -ActualVersion $versionOutput)
+        if ($versionOutput -cne $Version) { throw 'Installed PowerShell version differs from the latest stable release tag.' }
         $receipt = [ordered]@{
             schemaVersion = 1; report = 'verified-latest-official-powershell-runtime-v1'
             sourceRepository = 'https://github.com/PowerShell/PowerShell'; releaseApi = 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest'
             releaseTag = $ReleaseTag; version = $Version; platform = $Platform; architecture = $ExpectedArchitecture
             archiveUri = $ArchiveUrl; hashesManifestUri = $HashesUrl; officialArchiveSha256 = $OfficialArchiveSha256
-            observedArchiveSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            observedArchiveSha256 = $observedArchiveSha256
             executablePath = [IO.Path]::GetFullPath($executable); executableAuthenticodeStatus = $signatureStatus
             executableSignerSubject = $signerSubject; executableSignerThumbprint = $signerThumbprint; cacheRestoredAndValid = $cacheValid
         }
@@ -288,8 +323,20 @@ switch ($Mode) {
         Copy-WorkflowFile -Source $cachedManifestPath -Destination (Join-Path $ArtifactsRoot 'powershell-release-hashes.sha256')
         [IO.File]::AppendAllText($env:GITHUB_ENV, "DT_POWERSHELL_EXECUTABLE=$([IO.Path]::GetFullPath($executable))`nDT_POWERSHELL_VERSION=$Version`nDT_POWERSHELL_ARCHIVE_SHA256=$OfficialArchiveSha256`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::AppendAllText($env:GITHUB_PATH, "$RuntimeRoot`n", [Text.UTF8Encoding]::new($false))
-        $cacheRootLease.Dispose()
         break
+        }
+        catch {
+            $runtimeFailure = $_
+            try { Set-PowerShellRuntimeUnusable -DestinationPath $RuntimeRoot }
+            catch {
+                throw [IO.IOException]::new(
+                    "$($runtimeFailure.Exception.Message) Failed runtime could not be marked unusable.",
+                    [AggregateException]::new($runtimeFailure.Exception, $_.Exception))
+            }
+            throw $runtimeFailure
+        }
+        }
+        finally { $cacheRootLease.Dispose() }
     }
     'Verify' {
         Assert-RequiredValue -Value $env:DT_POWERSHELL_EXECUTABLE -Name 'DT_POWERSHELL_EXECUTABLE'
