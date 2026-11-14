@@ -2386,12 +2386,12 @@ function Enter-ModReservation {
     $initialSnapshot = Get-ModReservationSnapshot -ModLockPath ([string]$Plan.modLockPath) -Repository ([string]$Plan.repositoryRoot)
     if ([bool]$initialSnapshot.exists -and [string]$initialSnapshot.value.state -ceq 'held') {
         $existingOwner = $initialSnapshot.value
-        if ([string]$existingOwner.runId -cne $ActualRunId -or [string]$existingOwner.modLockKey -cne [string]$Plan.lockKey -or
+        if ([string]$existingOwner.runId -cne $ActualRunId) {
+            throw 'Another generation already owns this canonical MOD identity.'
+        }
+        if ([string]$existingOwner.modLockKey -cne [string]$Plan.lockKey -or
             [IO.Path]::GetFullPath([string]$existingOwner.plannedStatePath) -cne $expectedStatePath) {
             throw 'Existing canonical MOD reservation owner tuple changed.'
-        }
-        if ([string]$existingOwner.reservationToken -cne $actorToken) {
-            throw 'Another owner token already holds this canonical MOD reservation.'
         }
         $intendedWorkerToken = Get-ModReservationActorToken -Value ("worker:{0}:{1}:{2}:{3}" -f $actorToken, $identity.machineName, $identity.processId, $identity.processStartTicks)
         if ([string]$existingOwner.reservationToken -ceq $actorToken -and

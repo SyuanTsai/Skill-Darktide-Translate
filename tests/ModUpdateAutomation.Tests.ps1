@@ -1557,7 +1557,8 @@ function Suspend-Stage {
         $coordination | Should -Match '\[int64\]::TryParse\(\[string\]\$Owner\.owner\.processStartTicks'
         $coordination | Should -Match "state = 'held'"
         $coordination | Should -Match '\$owner\.state = ''released'''
-        $coordination | Should -Match '\$owner\.expiresAt = \$now\.AddMinutes\(3\)\.ToString\(''o''\)'
+        $coordination | Should -Match '\$Lease\.pendingExpiresAt = \$now\.AddMinutes\(3\)\.ToString\(''o''\)'
+        $coordination | Should -Match '\$owner\.expiresAt = \[string\]\$Lease\.pendingExpiresAt'
         $coordination | Should -Match 'Publish-PortableLeaseFile'
         $coordination | Should -Not -Match '\[IO\.Directory\]::Move'
         $coordination | Should -Match '\[scriptblock\] \$WaitHeartbeatAction'
@@ -2828,8 +2829,8 @@ function Get-SourceTupleContractSha256 {
 
     # Scenario: A normalization path is exact, a unique case-only variant, untracked, case-sensitive, or ambiguous under core.ignorecase.
     # Purpose: Preserve exact Git identity, canonicalize only the unique ignore-case case, and fail closed on ambiguous tracked paths.
-    # Scenario: Reservation acquisition either retries the same published actor token or observes another token.
-    # Purpose: Make acquisition idempotent only for the exact actor that published the held state.
+    # Scenario: Reservation acquisition either retries the same published actor token or observes another generation.
+    # Purpose: Make acquisition idempotent only for the exact actor and preserve the established competing-generation result.
     It 'UnitT211_HandlesPublishedReservationAcquisition_<Case>' -ForEach @(
         @{ Case = 'SameOwnerRetry' }
         @{ Case = 'OtherOwnerRejected' }
@@ -2876,8 +2877,8 @@ function Get-SourceTupleContractSha256 {
                     ($script:owner | ConvertTo-Json -Depth 20 -Compress) | Should -BeExactly $before
                 }
                 else {
-                    $script:owner = [ordered]@{ state='held'; reservationToken=('b' * 32); runId='run-211'; modLockKey='key'; plannedStatePath=$actualStatePath }
-                    { Enter-ModReservation -Plan $actualPlan -ActualRunId 'run-211' -PlannedStatePath $actualStatePath } | Should -Throw '*Another owner token*'
+                    $script:owner = [ordered]@{ state='held'; reservationToken=('b' * 32); runId='other-run'; modLockKey='key'; plannedStatePath=$actualStatePath }
+                    { Enter-ModReservation -Plan $actualPlan -ActualRunId 'run-211' -PlannedStatePath $actualStatePath } | Should -Throw '*already owns this canonical MOD identity*'
                 }
             } $Case $plan $statePath
         }

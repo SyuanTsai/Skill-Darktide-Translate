@@ -567,15 +567,15 @@ finally {
     }
 
     # Scenario: A different actor token attempts acquisition while the target state is already held.
-    # Purpose: Never treat another owner's completed acquisition as this caller's success.
+    # Purpose: Wait for normal contention and reject only after the bounded acquisition timeout.
     It 'InterT382_RejectsPublishedAcquisitionByAnotherOwnerToken' {
         Import-Module -Name $coordinationModule -Force
         $repository = Join-Path $TestDrive 'coordination-acquire-other'
         New-Item -ItemType Directory -Path $repository | Out-Null
         $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'first-acquirer'
         try {
-            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'other-acquirer' } |
-                Should -Throw '*Another owner token*'
+            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'other-acquirer' -TimeoutSeconds 1 } |
+                Should -Throw '*Timed out*'
         }
         finally { $null = Exit-SharedCoordinationLease -Lease $lease }
     }

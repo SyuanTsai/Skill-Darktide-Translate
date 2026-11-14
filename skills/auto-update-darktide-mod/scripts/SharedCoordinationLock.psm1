@@ -5,7 +5,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+$script:pathSafetyModule = Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -PassThru -ErrorAction Stop
 
 function ConvertFrom-JsonToken {
     param(
@@ -67,6 +67,28 @@ function Get-CoordinationActorToken {
     param([Parameter(Mandatory)][string] $RunId, [Parameter(Mandatory)][string] $ResourceKey)
     [byte[]]$bytes = [Text.UTF8Encoding]::new($false).GetBytes("coordination:${ResourceKey}:$RunId")
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant().Substring(0, 32)
+}
+
+function Open-CoordinationPrivateDirectory {
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][string] $RelativePath
+    )
+    & $script:pathSafetyModule {
+        param($PhysicalRoot, $Relative)
+        $directoryLease = $null
+        try {
+            $directoryLease = Open-PlatformDirectory -Root $PhysicalRoot -RelativePath $Relative -CreatePrivate
+            $observation = Assert-PlatformFileIdentity -Lease $directoryLease -Expected $directoryLease.Observation -VerifyPath
+            if ([string]$observation.Kind -cne 'directory') {
+                throw 'Shared coordination receipt root is not a directory.'
+            }
+            [IO.Path]::GetFullPath((Join-Path $PhysicalRoot $Relative))
+        }
+        finally {
+            if ($null -ne $directoryLease) { $directoryLease.Dispose() }
+        }
+    } $Root $RelativePath
 }
 
 function Assert-CoordinationPath {
@@ -449,9 +471,14 @@ function Enter-SharedCoordinationLease {
     $receiptRootFull = if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) { $null } else {
         $candidateReceiptRoot = [IO.Path]::GetFullPath($ReceiptRoot)
         $null = Assert-CoordinationPath -Path $candidateReceiptRoot -RepositoryRoot $repository -AllowMissing
-        New-Item -ItemType Directory -Path $candidateReceiptRoot -Force | Out-Null
-        $null = Assert-CoordinationPath -Path $candidateReceiptRoot -RepositoryRoot $repository
-        Resolve-PortableTrustedRoot -Path $candidateReceiptRoot
+        $physicalRepository = Resolve-PortableTrustedRoot -Path $repository
+        $relativeReceiptRoot = [IO.Path]::GetRelativePath($repository, $candidateReceiptRoot)
+        if ($relativeReceiptRoot -ceq '.') {
+            $physicalRepository
+        }
+        else {
+            Open-CoordinationPrivateDirectory -Root $physicalRepository -RelativePath $relativeReceiptRoot
+        }
     }
     $logicalLockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks'
     $null = Assert-CoordinationPath -Path $logicalLockRoot -RepositoryRoot $repository -AllowMissing
@@ -505,7 +532,7 @@ function Enter-SharedCoordinationLease {
                     [string]$existing.expiresAt, 'o', [Globalization.CultureInfo]::InvariantCulture,
                     [Globalization.DateTimeStyles]::RoundtripKind)
                 if ([string]$existing.state -ceq 'held' -and [DateTimeOffset]::UtcNow -lt $expiresAt) {
-                    throw 'Another owner token already holds the shared coordination lease.'
+                    $waitForOwner = $true
                 }
             }
             if (-not $waitForOwner) {
