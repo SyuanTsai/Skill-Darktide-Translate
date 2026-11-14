@@ -194,8 +194,8 @@ Describe 'Standard v1 migration and canonical validation contracts' {
         $workflow | Should -Match '(?m)^    timeout-minutes:\s*[1-9][0-9]*\s*$'
         $workflow | Should -Match 'if:\s*always\(\)'
         $workflow | Should -Match 'SGV1_RUN_DIRECTORY'
-        $workflow | Should -Match "\$directoryName = 'sv'"
-        $workflow | Should -Match "\$directoryName -cne 'sv'"
+        $workflow | Should -Match '\$directoryName = ''sv'''
+        $workflow | Should -Match '\$directoryName -cne ''sv'''
         $workflow | Should -Match 'beta_claude_tag_slack_channel_bundle_target_create_param\.py'
         $workflow | Should -Match '\$longestSkillSpectorPath\.Length -ge 248'
         $workflow | Should -Match 'Remove run-owned validation directory'

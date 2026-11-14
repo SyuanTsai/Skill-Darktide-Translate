@@ -15,6 +15,15 @@ BeforeAll {
     $script:closureLock = Read-CorePesterClosureLock -LiteralPath $script:closureLockPath
     $script:loadedPester = @(Get-Module -Name Pester | Where-Object { $_.Version -eq [version]'6.2.0' }) | Select-Object -First 1
     if ($null -eq $script:loadedPester) { throw 'Integrity tests require the explicitly prepared Pester 6.2.0 test host.' }
+    $script:authorityRoot = [Environment]::GetEnvironmentVariable('DT_TEST_AUTHORITY_ROOT', 'Process')
+    if ([string]::IsNullOrWhiteSpace($script:authorityRoot)) {
+        $sourceRepository = [IO.Path]::GetFullPath((Join-Path $script:repositoryRoot '../mainbase'))
+        $authorityArchive = Join-Path $TestDrive 'authority-fbdc793.zip'
+        $script:authorityRoot = Join-Path $TestDrive 'authority-fbdc793'
+        & git -C $sourceRepository archive --format=zip --output=$authorityArchive fbdc793c1c439b15c6def97d53111f250d0ff4db
+        if ($LASTEXITCODE -ne 0) { throw 'Could not materialize the offline authority fixture.' }
+        Expand-Archive -LiteralPath $authorityArchive -DestinationPath $script:authorityRoot
+    }
 
     function Assert-TestThrowsLike {
         param([scriptblock] $ScriptBlock, [string] $Pattern)
@@ -88,6 +97,103 @@ BeforeAll {
         else {
             New-Item -ItemType SymbolicLink -Path $Path -Target $Target -ErrorAction Stop | Out-Null
         }
+    }
+
+    function Invoke-CoreAuthorityImportFixture {
+        param([Parameter(Mandatory)][string] $Variant)
+
+        $fixtureRoot=Join-Path $TestDrive ("authority-$Variant-"+[guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $fixtureRoot | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:authorityRoot 'scripts') -Destination (Join-Path $fixtureRoot 'scripts') -Recurse
+        $revision='fbdc793c1c439b15c6def97d53111f250d0ff4db'
+        switch($Variant){
+            'wrong-revision' { $revision='0'*40 }
+            'bytes-drift' { [IO.File]::AppendAllText((Join-Path $fixtureRoot 'scripts/platform/UnixNative.cs'),"`n// drift`n") }
+            'missing-file' { Remove-Item -LiteralPath (Join-Path $fixtureRoot 'scripts/platform/UnixNative.cs') -Force }
+            'inventory-mismatch' { [IO.File]::WriteAllText((Join-Path $fixtureRoot 'scripts/platform/unexpected.ps1'),'unexpected') }
+        }
+        $probe=Join-Path $TestDrive ("import-probe-$Variant.ps1")
+        $probeText=@'
+param($IntegrityPath,$AuthorityRoot,$Revision)
+$ErrorActionPreference='Stop'
+try {
+    Import-Module -Name $IntegrityPath -Force -ErrorAction Stop
+    [void](Import-CorePesterAuthorityPlatformRuntime -AuthorityRoot $AuthorityRoot -AuthorityRevision $Revision)
+    [pscustomobject]@{Rejected=$false;Message='';UsableModules=@()} | ConvertTo-Json -Compress
+}
+catch {
+    $runtimeRoot=[IO.Path]::GetFullPath((Join-Path $AuthorityRoot 'scripts'))
+    $usable=@(Get-Module -Name platform-runtime | Where-Object { [IO.Path]::GetFullPath($_.ModuleBase) -ceq $runtimeRoot })
+    [pscustomobject]@{Rejected=$true;Message=$_.Exception.Message;UsableModules=@($usable | ForEach-Object { $_.Name })} | ConvertTo-Json -Compress
+}
+'@
+        [IO.File]::WriteAllText($probe,$probeText,[Text.UTF8Encoding]::new($false))
+        $output=@(& $script:verifiedPowerShellExecutable -NoProfile -NonInteractive -File $probe `
+            -IntegrityPath (Join-Path $script:repositoryRoot 'scripts/CorePesterIntegrity.psm1') -AuthorityRoot $fixtureRoot -Revision $revision 2>&1)
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        return (($output -join "`n") | ConvertFrom-Json)
+    }
+}
+
+Describe 'Core Pester authority platform-runtime import boundary' {
+    # Scenario: The reviewed authority revision or its runtime closure is wrong, missing, or has extra inventory bytes.
+    # Purpose: Reject every trust-boundary mutation and leave no imported runtime usable from the failed checkout.
+    It 'InterT05_rejects_<Variant>_without_leaving_a_usable_module' -ForEach @(
+        @{Variant='wrong-revision'}, @{Variant='bytes-drift'}, @{Variant='missing-file'}, @{Variant='inventory-mismatch'}
+    ) {
+        $result=Invoke-CoreAuthorityImportFixture -Variant $Variant
+        $result.Rejected | Should -BeTrue
+        @($result.UsableModules).Count | Should -Be 0
+        $result.Message | Should -Not -BeNullOrEmpty
+    }
+
+    # Scenario: Core receives no authority-root argument and must recover it from the protected adapter closure.
+    # Purpose: Bind the runtime root to the one frozen manifest and reject changed manifest evidence.
+    It 'UnitT06_derives_the_authority_root_from_the_frozen_runtime_manifest' {
+        $runRoot = Join-Path $TestDrive 'core-run-binding'
+        $candidateRoot = Join-Path $runRoot 'candidate'
+        [void](New-Item -ItemType Directory -Path $candidateRoot -Force)
+        $manifestPath = Join-Path $script:authorityRoot 'scripts/platform-runtime.psd1'
+        $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $adapterPath = Join-Path $runRoot 'source-core-adapter.json'
+        $adapter = @{ sourceValidation = @{ frozenFiles = @(@{ path = $manifestPath; sha256 = $manifestHash }) } }
+        [IO.File]::WriteAllText($adapterPath, ($adapter | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+
+        $binding = Get-CorePesterAuthorityRuntimeBinding -CandidateSnapshotRoot $candidateRoot `
+            -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
+        $binding.AuthorityRoot | Should -Be ([IO.Path]::GetFullPath($script:authorityRoot))
+        $binding.ManifestPath | Should -Be ([IO.Path]::GetFullPath($manifestPath))
+
+        $adapter.sourceValidation.frozenFiles[0].sha256 = '0' * 64
+        [IO.File]::WriteAllText($adapterPath, ($adapter | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        Assert-TestThrowsLike {
+            Get-CorePesterAuthorityRuntimeBinding -CandidateSnapshotRoot $candidateRoot `
+                -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
+        } '*manifest changed*'
+    }
+
+    # Scenario: The adapter pathname is replaced after its bootstrap read but before the authority-backed lease read.
+    # Purpose: Fail closed unless the lease-protected adapter bytes are exactly the bytes used to bootstrap the authority runtime.
+    It 'UnitT07_rejects_adapter_replacement_between_bootstrap_and_lease_reads' {
+        $runRoot = Join-Path $TestDrive 'core-run-replaced-adapter'
+        $candidateRoot = Join-Path $runRoot 'candidate'
+        [void](New-Item -ItemType Directory -Path $candidateRoot -Force)
+        $manifestPath = Join-Path $script:authorityRoot 'scripts/platform-runtime.psd1'
+        $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $adapterPath = Join-Path $runRoot 'source-core-adapter.json'
+        $adapter = @{ sourceValidation = @{ frozenFiles = @(@{ path = $manifestPath; sha256 = $manifestHash }) } }
+        [IO.File]::WriteAllText($adapterPath, ($adapter | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+
+        Assert-TestThrowsLike {
+            Get-CorePesterAuthorityRuntimeBinding -CandidateSnapshotRoot $candidateRoot `
+                -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db' `
+                -AfterBootstrapRead {
+                    param($Path)
+                    $replacementPath = Join-Path ([IO.Path]::GetDirectoryName($Path)) 'replacement-adapter.json'
+                    [IO.File]::WriteAllText($replacementPath, '{"sourceValidation":{"frozenFiles":[]}}', [Text.UTF8Encoding]::new($false))
+                    [IO.File]::Move($replacementPath, $Path, $true)
+                }
+        } '*changed between bootstrap and authority-backed lease reads*'
     }
 }
 

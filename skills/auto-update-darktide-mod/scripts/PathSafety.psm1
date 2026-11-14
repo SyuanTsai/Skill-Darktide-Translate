@@ -402,7 +402,15 @@ function Remove-PortableTransactionFile {
         [Parameter(Mandatory)][string] $Leaf,
         [Parameter(Mandatory)] $ExpectedState
     )
-    $null = Remove-PlatformOwnedFile -ParentLease $TransactionLease -Leaf $Leaf -ExpectedState $ExpectedState
+    # Authority cleanup mode applies only to a file already inside the
+    # .ai-instructions-txn/<id> directory. Omitting both optional tombstone
+    # parameters is intentional; supplying only one is invalid on Unix.
+    $parameters = @{
+        ParentLease = $TransactionLease
+        Leaf = $Leaf
+        ExpectedState = $ExpectedState
+    }
+    $null = Remove-PlatformOwnedFile @parameters
 }
 
 function Publish-PortableLeaseFile {
@@ -413,8 +421,12 @@ function Publish-PortableLeaseFile {
         [Parameter(Mandatory)][byte[]] $Bytes,
         [Parameter(Mandatory)][Collections.IDictionary] $ExpectedState,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId,
-        [switch] $NoReplace
+        [switch] $NoReplace,
+        [switch] $PreserveDisplaced
     )
+    if ($PreserveDisplaced -and -not [bool]$ExpectedState.exists) {
+        throw [ArgumentException]::new('A displaced file can be preserved only for an existing expected state.')
+    }
     $parentLease = $null
     $transactionRootLease = $null
     $transactionLease = $null
@@ -424,6 +436,7 @@ function Publish-PortableLeaseFile {
     $transactionRootPath = Join-Path $ParentPath '.ai-instructions-txn'
     $stageState = $null
     $published = $false
+    $displacedPath = $null
     try {
         $parentLease = Open-PlatformDirectory -Root $ParentPath -RootOnly
         try { $transactionRootLease = Open-PlatformDirectory -Root $ParentPath -RelativePath '.ai-instructions-txn' -CreatePrivate }
@@ -458,16 +471,25 @@ function Publish-PortableLeaseFile {
             throw [IO.IOException]::new('Lease publication durability was not confirmed.')
         }
         if ($null -ne $displacedLeaf) {
+            if ([string]$receipt.displacedLeaf -cne $displacedLeaf -or $null -eq $receipt.displacedIdentity) {
+                throw [IO.InvalidDataException]::new('Lease CAS publication did not return the exact displaced file evidence.')
+            }
             $displacedState = [ordered]@{
                 exists = $true
                 sha256 = [string]$ExpectedState.sha256
                 length = [int64]$ExpectedState.length
                 identity = $receipt.displacedIdentity
             }
-            Remove-PortableTransactionFile -TransactionLease $transactionLease -Leaf $displacedLeaf -ExpectedState $displacedState
+            if ($PreserveDisplaced) {
+                $displacedPath = [IO.Path]::GetFullPath((Join-Path (Join-Path $transactionRootPath $TransactionId) $displacedLeaf))
+            }
+            else {
+                Remove-PortableTransactionFile -TransactionLease $transactionLease -Leaf $displacedLeaf -ExpectedState $displacedState
+            }
         }
         [ordered]@{
             receipt = $receipt
+            displacedPath = $displacedPath
             state = [ordered]@{
                 exists = $true
                 sha256 = $digest
@@ -735,6 +757,22 @@ function Test-PortableReparseItem {
     $false
 }
 
+function Get-PortablePlatformErrno {
+    [OutputType([Nullable[int]])]
+    param([Parameter(Mandatory)] $Failure)
+
+    $candidate = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { $Failure }
+    for ($depth = 0; $depth -lt 32 -and $null -ne $candidate; $depth++) {
+        $errnoProperty = $candidate.PSObject.Properties['Errno']
+        if ($null -ne $errnoProperty -and $null -ne $errnoProperty.Value) {
+            $errno = 0
+            if ([int]::TryParse([string]$errnoProperty.Value, [ref]$errno)) { return $errno }
+        }
+        $candidate = $candidate.InnerException
+    }
+    $null
+}
+
 function Get-PortableUnixObservation {
     param([Parameter(Mandatory)][string] $Path)
 
@@ -748,12 +786,11 @@ function Get-PortableUnixObservation {
     }
     $physicalParent = Resolve-PortableTrustedRoot -Path $parent
     $lease = $null
-    try {
-        $lease = Open-PlatformDirectory -Root $physicalParent -RelativePath $leaf
-    }
-    catch [SyuanTsai.AIInstructions.PlatformRuntime.PlatformErrnoException] {
-        if ($_.Exception.Errno -eq 2) { return $null }
-        if ($_.Exception.Errno -ne 20) { throw }
+    try { $lease = Open-PlatformDirectory -Root $physicalParent -RelativePath $leaf }
+    catch {
+        $errno = Get-PortablePlatformErrno -Failure $_
+        if ($errno -eq 2) { return $null }
+        if ($errno -ne 20) { throw }
     }
     if ($null -ne $lease) {
         try {
@@ -766,11 +803,9 @@ function Get-PortableUnixObservation {
     try {
         # Open-PlatformFile rejects symlinks, non-regular files, and any managed
         # regular file whose link count is not exactly one (hard-link aliases).
-        try {
-            $file = Open-PlatformFile -ParentLease $directory -Leaf $leaf -Access Read -CreateMode OpenExisting
-        }
-        catch [SyuanTsai.AIInstructions.PlatformRuntime.PlatformErrnoException] {
-            if ($_.Exception.Errno -eq 2) { return $null }
+        try { $file = Open-PlatformFile -ParentLease $directory -Leaf $leaf -Access Read -CreateMode OpenExisting }
+        catch {
+            if ((Get-PortablePlatformErrno -Failure $_) -eq 2) { return $null }
             throw
         }
         try {

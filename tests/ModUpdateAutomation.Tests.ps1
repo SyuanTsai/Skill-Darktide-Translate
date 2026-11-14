@@ -399,7 +399,15 @@ Describe 'Deterministic Darktide MOD update automation' {
         [IO.File]::WriteAllText($childPath, @'
 param([string] $ModulePath)
 $ErrorActionPreference = 'Stop'
-Import-Module -Name $ModulePath -Force
+try { Import-Module -Name $ModulePath -Force }
+catch {
+    $failure = $_.Exception
+    while ($null -ne $failure) {
+        [Console]::Error.WriteLine($failure.Message)
+        $failure = $failure.InnerException
+    }
+    exit 97
+}
 'LOADED'
 '@, [Text.UTF8Encoding]::new($false))
         $result = Invoke-ChildPowerShellForTest -ScriptPath $childPath -ArgumentList @((Join-Path $fixtureSkill 'scripts/PathSafety.psm1'))
@@ -423,7 +431,15 @@ Import-Module -Name $ModulePath -Force
         [IO.File]::WriteAllText($childPath, @'
 param([string] $ModulePath)
 $ErrorActionPreference = 'Stop'
-Import-Module -Name $ModulePath -Force
+try { Import-Module -Name $ModulePath -Force }
+catch {
+    $failure = $_.Exception
+    while ($null -ne $failure) {
+        [Console]::Error.WriteLine($failure.Message)
+        $failure = $failure.InnerException
+    }
+    exit 97
+}
 'LOADED'
 '@, [Text.UTF8Encoding]::new($false))
 
@@ -634,8 +650,8 @@ catch [TimeoutException] { 'TIMEOUT' }
     }
 
     # Scenario: A reviewed-head merge reaches terminal archival and exact resource cleanup.
-    # Purpose: Preserve recoverable evidence while limiting destructive operations to verified run-owned identities.
-    It 'UnitT116_UsesOwnerCheckedExactCleanupForReviewedHeadFinalization' {
+    # Purpose: Preserve recoverable evidence and mark retained run directories instead of deleting directory trees.
+    It 'UnitT116_UsesOwnerCheckedPreservationForReviewedHeadFinalization' {
         $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
         $finalizer = Get-Content -LiteralPath $finalizerPath -Raw
 
@@ -646,8 +662,10 @@ catch [TimeoutException] { 'TIMEOUT' }
         $finalizer | Should -Match '@\(''update-ref'', ''-d'', \$localRef, \$reviewedOid\)'
         $finalizer | Should -Match 'Read-ActiveReservationOwner'
         $finalizer | Should -Match 'Suspend-ModReservationWorker -State \$State'
-        $finalizer | Should -Match 'Exit-RunWriterLock -Lease \$script:writerLease'
-        $finalizer | Should -Match 'Remove-DirectoryTreeWithHeartbeat -Path \$fullPath -Root \$rootFull'
+        $finalizer | Should -Match 'Invoke-ModUpdateTerminalCleanup'
+        $finalizer | Should -Match 'Write-ModUpdatePreservedDirectoryMarker'
+        $finalizer | Should -Not -Match 'Remove-ModUpdateOwnedTree -Path \$claimDirectory'
+        $finalizer | Should -Not -Match 'Remove-ModUpdateOwnedTree -Path \(\[string\]\$State\.runRoot\)'
         $finalizer | Should -Not -Match '@\(''branch'', ''-D'''
         $finalizer | Should -Not -Match 'Remove-Item\s+-Recurse'
     }
@@ -889,16 +907,166 @@ catch [TimeoutException] { 'TIMEOUT' }
         $finalizer | Should -Match 'The open pull request head differs from reviewed F'
     }
 
-    # Scenario: Terminal cleanup is interrupted after the writer and worker leases are released.
-    # Purpose: Release the exact MOD reservation before deleting state so interruption cannot leave an owner lock with no recovery state.
-    It 'UnitT127_ReleasesTheReservationBeforeRemovingTheRunRoot' {
-        $finalizer = Get-Content -LiteralPath (Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1') -Raw
-        $releaseIndex = $finalizer.IndexOf('Release-ModReservation -State $State', [StringComparison]::Ordinal)
-        $runRemovalIndex = $finalizer.IndexOf("Remove-ModUpdateOwnedTree -Path ([string]`$State.runRoot) -Root `$inProgressRoot", [StringComparison]::Ordinal)
+    # Scenario: The process faults after any persisted terminal-cleanup boundary and reruns the same state.
+    # Purpose: Keep the reservation held as cleanup-pending until writer release and both preservation markers are durable.
+    It 'UnitT127_RecoversCleanupBoundary_<FaultPoint>_BeforeReleasingTheReservation' -ForEach @(
+        @{ FaultPoint = 'cleanup-pending-persisted' },
+        @{ FaultPoint = 'writer-lock-released' },
+        @{ FaultPoint = 'claim-directory-preserved' },
+        @{ FaultPoint = 'run-root-preserved' },
+        @{ FaultPoint = 'before-reservation-release' }
+    ) {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $functions = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -in @('Invoke-ModUpdateCleanupFaultInjection', 'Invoke-ModUpdateTerminalCleanup')
+        }, $true))
+        $functions.Count | Should -Be 2
+        $productionSource = $functions.Extent.Text -join "`n"
+        $module = New-Module -ArgumentList $productionSource -ScriptBlock {
+            param($source)
+            $script:owner = [ordered]@{ state = 'held'; reservationState = 'reserved'; cleanup = $null }
+            $script:writerLease = [pscustomobject]@{ value = 'writer' }
+            $script:events = [Collections.Generic.List[string]]::new()
+            function Suspend-ModReservationWorker { param($State) $script:events.Add('worker-suspended') }
+            function Start-ModReservationCleanup {
+                param($State, $EvidencePath, $ClaimDirectory, $RunRoot)
+                if ($null -eq $script:owner.cleanup) {
+                    $script:owner.reservationState = 'cleanup-pending'
+                    $script:owner.cleanup = [ordered]@{
+                        evidencePath = $EvidencePath; claimDirectory = $ClaimDirectory; runRoot = $RunRoot
+                        writerLockReleased = $false; claimDirectoryPreserved = $false; runRootPreserved = $false
+                    }
+                }
+                $script:owner
+            }
+            function Get-ModReservationCleanupState { param($State) $script:owner }
+            function Exit-RunWriterLock { param($Lease) $script:events.Add('writer-released') }
+            function Set-ModReservationCleanupStep {
+                param($State, $Step)
+                $script:owner.cleanup[$Step] = $true
+                $script:events.Add("step:$Step")
+                $script:owner
+            }
+            function Write-ModUpdatePreservedDirectoryMarker {
+                param($Path, $Root, $Label, $State, $EvidencePath)
+                $script:events.Add("marker:$Label")
+            }
+            function Release-ModReservation {
+                param($State)
+                foreach ($step in @('writerLockReleased', 'claimDirectoryPreserved', 'runRootPreserved')) {
+                    if (-not [bool]$script:owner.cleanup[$step]) { throw "release before $step" }
+                }
+                $script:owner.state = 'released'
+                $script:owner.reservationState = 'released'
+                $script:events.Add('reservation-released')
+            }
+            . ([scriptblock]::Create($source))
+        }
+        try {
+            & $module {
+                param($point)
+                $script:ModUpdateCleanupFaultInjectionHook = {
+                    param($observed)
+                    if ($observed -ceq $point) { throw "fault:$observed" }
+                }.GetNewClosure()
+                { Invoke-ModUpdateTerminalCleanup -State @{ runId = 'cleanup-run' } -EvidencePath 'evidence' `
+                        -ClaimDirectory 'claim' -ClaimRoot 'claims' -RunRoot 'run' -InProgressRoot 'in-progress' } |
+                    Should -Throw "*fault:$point*"
+                $script:owner.state | Should -BeExactly 'held'
+                $script:owner.reservationState | Should -BeExactly 'cleanup-pending'
 
-        $releaseIndex | Should -BeGreaterThan -1
-        $runRemovalIndex | Should -BeGreaterThan $releaseIndex
-        $finalizer | Should -Not -Match '\[IO\.Directory\]::Move\(\[string\]\$State\.modLockPath'
+                $script:ModUpdateCleanupFaultInjectionHook = $null
+                # Process recovery reacquires a new writer lease even when the
+                # prior invocation persisted writerLockReleased.
+                $script:writerLease = [pscustomobject]@{ value = 'recovered-writer' }
+                Invoke-ModUpdateTerminalCleanup -State @{ runId = 'cleanup-run' } -EvidencePath 'evidence' `
+                    -ClaimDirectory 'claim' -ClaimRoot 'claims' -RunRoot 'run' -InProgressRoot 'in-progress'
+                $script:owner.state | Should -BeExactly 'released'
+                $script:owner.cleanup.writerLockReleased | Should -BeTrue
+                $script:owner.cleanup.claimDirectoryPreserved | Should -BeTrue
+                $script:owner.cleanup.runRootPreserved | Should -BeTrue
+                @($script:events | Where-Object { $_ -ceq 'reservation-released' }).Count | Should -Be 1
+                @($script:events | Where-Object { $_ -ceq 'writer-released' }).Count | Should -BeGreaterOrEqual 1
+            } $FaultPoint
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: The persisted reservation owner advances through cleanup-pending and each durable cleanup step.
+    # Purpose: Prove the real state-transition functions reject early release, preserve the tuple, and release only after all steps.
+    It 'UnitT128_RequiresEveryPersistedCleanupStepBeforeReservationRelease' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $required = @(
+            'Release-ModReservation', 'Assert-ModReservationCleanupOwner', 'Start-ModReservationCleanup',
+            'Get-ModReservationCleanupState', 'Set-ModReservationCleanupStep'
+        )
+        $functions = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $required
+        }, $true))
+        $functions.Count | Should -Be $required.Count
+        $source = $functions.Extent.Text -join "`n"
+        $owner = [ordered]@{
+            schemaVersion = 3; state = 'held'; reservationState = 'merged'; runId = 'cleanup-state-run'
+            modLockKey = 'cleanup-key'; leaseMode = 'reserved'; workerToken = $null
+            reservationToken = [guid]::NewGuid().ToString('N'); heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
+        }
+        $module = New-Module -ArgumentList $source, $owner -ScriptBlock {
+            param($functionSource, $initialOwner)
+            $script:owner = $initialOwner
+            function Get-UtcTimestamp { [DateTimeOffset]::UtcNow.ToString('o') }
+            function Read-ModReservationOwner { $script:owner }
+            function Write-ModReservationOwner {
+                param($ModLockPath, $Repository, $Value, $ExpectedReservationToken, $ExpectedWorkerToken)
+                if ([string]$script:owner.reservationToken -cne [string]$ExpectedReservationToken -or
+                    [string]$script:owner.workerToken -cne [string]$ExpectedWorkerToken) {
+                    throw 'test CAS tuple changed'
+                }
+                $script:owner = $Value
+            }
+            . ([scriptblock]::Create($functionSource))
+        }
+        try {
+            $state = [ordered]@{
+                runId = 'cleanup-state-run'; modLockKey = 'cleanup-key'; modLockPath = (Join-Path $TestDrive 'owner.lock')
+                repositoryRoot = $TestDrive
+            }
+            $evidence = Join-Path $TestDrive 'finished/evidence'
+            $claim = Join-Path $TestDrive 'claims/run'
+            $runRoot = Join-Path $TestDrive 'in-progress/run'
+            & $module {
+                param($value, $evidencePath, $claimPath, $runPath)
+                $started = Start-ModReservationCleanup -State $value -EvidencePath $evidencePath `
+                    -ClaimDirectory $claimPath -RunRoot $runPath
+                $started.state | Should -BeExactly 'held'
+                $started.reservationState | Should -BeExactly 'cleanup-pending'
+                { Release-ModReservation -State $value } | Should -Throw '*complete every persisted boundary*'
+
+                $script:owner.reservationState = 'between-stages'
+                (Start-ModReservationCleanup -State $value -EvidencePath $evidencePath `
+                    -ClaimDirectory $claimPath -RunRoot $runPath).reservationState | Should -BeExactly 'cleanup-pending'
+                { Start-ModReservationCleanup -State $value -EvidencePath ($evidencePath + '-changed') `
+                        -ClaimDirectory $claimPath -RunRoot $runPath } | Should -Throw '*cleanup tuple changed*'
+
+                foreach ($step in @('writerLockReleased', 'claimDirectoryPreserved', 'runRootPreserved')) {
+                    $updated = Set-ModReservationCleanupStep -State $value -Step $step
+                    $updated.cleanup[$step] | Should -BeTrue
+                }
+                Release-ModReservation -State $value
+                $script:owner.state | Should -BeExactly 'released'
+                $script:owner.reservationState | Should -BeExactly 'released'
+            } $state $evidence $claim $runRoot
+        }
+        finally { Remove-Module $module -Force }
     }
 
     # Scenario: A stage spends controlled monotonic-clock intervals on source stability, coordination, and active work.

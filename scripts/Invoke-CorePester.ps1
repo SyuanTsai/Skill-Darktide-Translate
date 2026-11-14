@@ -4,7 +4,6 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string] $AuthorityRepositoryRoot,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision
 )
 
@@ -13,6 +12,9 @@ $ErrorActionPreference = 'Stop'
 
 $integrityModulePath = Join-Path $PSScriptRoot 'CorePesterIntegrity.psm1'
 $integrityModule = Import-Module -Name $integrityModulePath -Force -PassThru -ErrorAction Stop
+$candidateSnapshotRoot = [IO.Path]::GetFullPath((Get-Location).Path)
+$authorityBinding = Get-CorePesterAuthorityRuntimeBinding -CandidateSnapshotRoot $candidateSnapshotRoot -AuthorityRevision $AuthorityRevision
+$AuthorityRepositoryRoot = [string]$authorityBinding.AuthorityRoot
 $platformRuntimeModule = Import-CorePesterAuthorityPlatformRuntime -AuthorityRoot $AuthorityRepositoryRoot -AuthorityRevision $AuthorityRevision
 Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
 Assert-NoLegacyCorePesterBootstrapEnvironment
@@ -44,7 +46,6 @@ $testRoot = Join-Path ([IO.Path]::GetFullPath((Get-Location).Path)) 'tests'
 $testRootLease = Open-PlatformDirectory -Root $testRoot -RootOnly
 $testRootSnapshotBefore = Get-CorePesterTreeSnapshot -Root $testRoot
 if (-not $testRootSnapshotBefore.IsValid) { throw ('Core Pester tests tree could not be bound: ' + (@($testRootSnapshotBefore.Errors) -join '; ')) }
-$candidateSnapshotRoot = [IO.Path]::GetFullPath((Get-Location).Path)
 $candidateSnapshotBefore = Get-CorePesterTreeSnapshot -Root $candidateSnapshotRoot
 if (-not $candidateSnapshotBefore.IsValid) { throw ('Core Pester candidate snapshot could not be bound: ' + (@($candidateSnapshotBefore.Errors) -join '; ')) }
 $previousErrorActionPreference = $ErrorActionPreference

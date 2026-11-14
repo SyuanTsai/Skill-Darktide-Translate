@@ -7,8 +7,21 @@ Describe 'Atomic caller-specified validation output' {
         $gitPath = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
         $script:RepositoryRoot = Join-Path $TestDrive 'repository-fixture'
         New-Item -ItemType Directory -Path $script:RepositoryRoot | Out-Null
-        $trackedPaths = @(& $gitPath -c core.quotepath=false -C $sourceRoot ls-files)
-        if ($LASTEXITCODE -ne 0 -or $trackedPaths.Count -eq 0) { throw 'Could not enumerate the atomic-output repository fixture.' }
+        $gitMetadataPath = Join-Path $sourceRoot '.git'
+        if (Test-Path -LiteralPath $gitMetadataPath) {
+            $trackedPaths = @(& $gitPath -c core.quotepath=false -C $sourceRoot ls-files)
+            if ($LASTEXITCODE -ne 0 -or $trackedPaths.Count -eq 0) { throw 'Could not enumerate the atomic-output repository fixture.' }
+        }
+        else {
+            # CorePester deliberately executes a tracked-only snapshot without
+            # Git metadata. In that mode every regular file in the snapshot is
+            # tracked input, so reconstruct the same relative inventory from
+            # the filesystem instead of silently depending on an outer repo.
+            $trackedPaths = @(Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force | ForEach-Object {
+                [IO.Path]::GetRelativePath($sourceRoot, $_.FullName).Replace('\', '/')
+            } | Sort-Object)
+            if ($trackedPaths.Count -eq 0) { throw 'Could not enumerate the tracked-only atomic-output repository fixture.' }
+        }
         foreach ($relative in $trackedPaths) {
             $source = Join-Path $sourceRoot ([string]$relative)
             $destination = Join-Path $script:RepositoryRoot ([string]$relative)

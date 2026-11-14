@@ -192,7 +192,7 @@ Describe 'Darktide Core v2 route and Validate.ps1 dispatch' {
             -SourceToolsPath (Join-Path $artifacts 'source-tools.json') -AuthorityRepositoryRoot $TestDrive -TrustedToolRoot $TestDrive -ArtifactsRoot $artifacts 2>&1)
         $LASTEXITCODE | Should -Not -Be 0
         ($output -join "`n") | Should -Not -BeLike '*Prepared source authority commit does not match the exact approved tuple*'
-        ($output -join "`n") | Should -BeLike '*platform-runtime.psd1*'
+        ($output -join "`n") | Should -BeLike '*approved CI run-owned root*'
         ($output -join "`n") | Should -Not -BeLike '*requires Windows*'
         Test-Path -LiteralPath $artifacts | Should -BeFalse
     }
@@ -260,7 +260,7 @@ Describe 'Darktide Core v2 adapter, dispatch and protected readers' {
     It 'UnitT20_builds_the_exact_standard_core_adapter_v2' {
         $sourceValidation = [ordered]@{ marker = 'kept' }
         $adapter = New-DarktideSourceCoreAdapter -PowerShell $script:PowerShellPath -ActiveSkillIds @('auto-update-darktide-mod') -SourceValidation $sourceValidation `
-            -AuthorityRepositoryRoot $script:RepositoryRoot -AuthorityRevision ('f' * 40)
+            -AuthorityRevision ('f' * 40)
         $adapter.schemaVersion | Should -Be 2
         $adapter.adapter | Should -BeExactly 'standard-core-adapter-v2'
         $adapter.skillsRoot | Should -BeExactly 'skills'
@@ -271,27 +271,63 @@ Describe 'Darktide Core v2 adapter, dispatch and protected readers' {
         @($adapter.checks[0].arguments) | Should -Be @('-NoProfile', '-NonInteractive', '-File', 'scripts/Test-Repository.ps1', '-ReadOnlySnapshot')
         $adapter.checks[1].id | Should -BeExactly 'repository-pester'
         $adapter.checks[1].kind | Should -BeExactly 'pester'
-        @($adapter.checks[1].arguments) | Should -Be @('-NoProfile', '-NonInteractive', '-File', 'scripts/Invoke-CorePester.ps1', '-AuthorityRepositoryRoot', $script:RepositoryRoot, '-AuthorityRevision', ('f' * 40))
+        @($adapter.checks[1].arguments) | Should -Be @('-NoProfile', '-NonInteractive', '-File', 'scripts/Invoke-CorePester.ps1', '-AuthorityRevision', ('f' * 40))
+        @($adapter.checks | ForEach-Object { @($_.arguments | Where-Object { [IO.Path]::IsPathRooted([string]$_) }).Count } | Measure-Object -Sum).Sum | Should -Be 0
         foreach ($check in $adapter.checks) {
             $check.executable | Should -BeExactly $script:PowerShellPath
             $check.executableSha256 | Should -BeExactly (Get-FileHash -LiteralPath $script:PowerShellPath -Algorithm SHA256).Hash.ToLowerInvariant()
         }
         $adapter.sourceValidation.marker | Should -BeExactly 'kept'
-        Assert-TestThrowsLike { New-DarktideSourceCoreAdapter -PowerShell $script:PowerShellPath -ActiveSkillIds @() -SourceValidation $sourceValidation -AuthorityRepositoryRoot $script:RepositoryRoot -AuthorityRevision ('f' * 40) } '*at least one active Skill*'
-        Assert-TestThrowsLike { New-DarktideSourceCoreAdapter -PowerShell $script:PowerShellPath -ActiveSkillIds @('Bad_Id') -SourceValidation $sourceValidation -AuthorityRepositoryRoot $script:RepositoryRoot -AuthorityRevision ('f' * 40) } '*invalid Skill ID*'
+        Assert-TestThrowsLike { New-DarktideSourceCoreAdapter -PowerShell $script:PowerShellPath -ActiveSkillIds @() -SourceValidation $sourceValidation -AuthorityRevision ('f' * 40) } '*at least one active Skill*'
+        Assert-TestThrowsLike { New-DarktideSourceCoreAdapter -PowerShell $script:PowerShellPath -ActiveSkillIds @('Bad_Id') -SourceValidation $sourceValidation -AuthorityRevision ('f' * 40) } '*invalid Skill ID*'
     }
 
     It 'UnitT21_dispatches_each_slot_to_one_child_mode' {
         $arguments = Get-DarktideSourceDispatchArguments -ChildPath 'C' -ToolchainPath 'T' -ToolchainSha256 ('b' * 64) `
-            -DriverModulePath 'D' -DriverModuleSha256 ('d' * 64) -AuthorityRepositoryRoot 'A' -AuthorityRevision ('f' * 40) -TimeoutSeconds 42
+            -DriverModulePath 'D' -DriverModuleSha256 ('d' * 64) -AuthorityRuntimeManifestPath 'M' -AuthorityRevision ('f' * 40) -TimeoutSeconds 42
         @($arguments.Keys) | Should -Be @('packageAdapter', 'skillValidator', 'skillTools', 'staticAnalyzer')
         $modes = @{ packageAdapter = 'package-adapter'; skillValidator = 'skill-validator'; skillTools = 'skill-tools'; staticAnalyzer = 'static' }
         foreach ($slot in $modes.Keys) {
-            @($arguments[$slot]) | Should -Be @('-NoProfile', '-NonInteractive', '-File', 'C', '-ToolchainPath', 'T', '-ToolchainSha256', ('b' * 64), '-DriverModulePath', 'D', '-DriverModuleSha256', ('d' * 64), '-AuthorityRepositoryRoot', 'A', '-AuthorityRevision', ('f' * 40), '-TimeoutSeconds', '42', '-Mode', $modes[$slot])
+            @($arguments[$slot]) | Should -Be @('-NoProfile', '-NonInteractive', '-File', 'C', '-ToolchainPath', 'T', '-ToolchainSha256', ('b' * 64), '-DriverModulePath', 'D', '-DriverModuleSha256', ('d' * 64), '-AuthorityRuntimeManifestPath', 'M', '-AuthorityRevision', ('f' * 40), '-TimeoutSeconds', '42', '-Mode', $modes[$slot])
         }
     }
 
-    It 'UnitT22_child_runner_exposes_only_the_four_source_modes_without_semantic_escalation' {
+    # Scenario: The complete generated adapter is submitted to the exact fbdc793 Core v2 adapter-validation functions.
+    # Purpose: Prove every generated check and source command satisfies the authority runner's path and frozen-file contracts.
+    It 'InterT22_passes_the_complete_generated_adapter_through_the_fbdc793_validator' {
+        $candidate=Join-Path $TestDrive 'candidate'; $artifacts=Join-Path $TestDrive 'artifacts'; $owned=Join-Path $TestDrive 'owned'
+        New-Item -ItemType Directory -Path $candidate,$artifacts,$owned | Out-Null
+        $child=Join-Path $owned 'Invoke-SourceChild.ps1'; $driver=Join-Path $owned 'ProtectedSourceDriver.psm1'; $toolchain=Join-Path $owned 'toolchain.json'
+        Copy-Item -LiteralPath $script:ChildPath -Destination $child
+        Copy-Item -LiteralPath $script:DriverPath -Destination $driver
+        [IO.File]::WriteAllText($toolchain,'{}',[Text.UTF8Encoding]::new($false))
+        $manifest=Join-Path $script:AuthorityRoot 'scripts/platform-runtime.psd1'
+        $dispatch=Get-DarktideSourceDispatchArguments -ChildPath $child -ToolchainPath $toolchain -ToolchainSha256 ((Get-FileHash $toolchain -Algorithm SHA256).Hash.ToLowerInvariant()) `
+            -DriverModulePath $driver -DriverModuleSha256 ((Get-FileHash $driver -Algorithm SHA256).Hash.ToLowerInvariant()) `
+            -AuthorityRuntimeManifestPath $manifest -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
+        $frozen=@($script:PowerShellPath,$child,$driver,$toolchain,$manifest | ForEach-Object { [pscustomobject]@{path=[IO.Path]::GetFullPath($_);sha256=(Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()} })
+        $source=[ordered]@{frozenFiles=$frozen;toolReceipts=@()}
+        foreach($slot in @('packageAdapter','skillValidator','skillTools','staticAnalyzer')){$source[$slot]=[ordered]@{command=$script:PowerShellPath;arguments=@($dispatch[$slot])}}
+        $adapter=New-DarktideSourceCoreAdapter -PowerShell $script:PowerShellPath -ActiveSkillIds @('auto-update-darktide-mod') -SourceValidation $source -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
+        $runner=Join-Path $script:AuthorityRoot 'scripts/Invoke-StandardValidation.ps1'
+        . $runner -DefineFunctionsOnly -CandidateRoot $candidate -AdapterPath (Join-Path $owned 'adapter.json') -ArtifactsRoot $artifacts `
+            -SourceRepository 'https://example.invalid/repo.git' -SourceRevision ('a'*40) -BaseRevision ('b'*40) -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
+        foreach($check in @($adapter.checks)) {
+            foreach($argument in @($check.arguments)) {
+                [IO.Path]::IsPathRooted([string]$argument) | Should -BeFalse
+                if(([string]$argument).Contains('/') -or ([string]$argument).Contains([char]92)){ { Assert-StandardValidationSafeRelativePath -Value ([string]$argument) -Context 'generated check argument' } | Should -Not -Throw }
+            }
+        }
+        Assert-StandardCoreFrozenFiles -Files $frozen
+        foreach($slot in @('packageAdapter','skillValidator','skillTools','staticAnalyzer')) {
+            { Assert-StandardValidationCommandSpec -Spec ([pscustomobject]$adapter.sourceValidation.$slot) -Context "source $slot" -CandidateRoot $candidate -ArtifactsRoot $artifacts -TrustedToolRoot $PSHOME -TrustAnchorRoot $PSHOME -ExpectedToolName $slot -DevelopmentHarness $true } | Should -Not -Throw
+            foreach($argument in @($adapter.sourceValidation.$slot.arguments | Where-Object { [IO.Path]::IsPathRooted([string]$_) })) {
+                @($adapter.sourceValidation.frozenFiles | Where-Object path -CEQ ([IO.Path]::GetFullPath([string]$argument))).Count | Should -Be 1
+            }
+        }
+    }
+
+    It 'UnitT23_child_runner_exposes_only_the_four_source_modes_without_semantic_escalation' {
         $tokens = $null; $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($script:ChildPath, [ref]$tokens, [ref]$errors)
         @($errors).Count | Should -Be 0
@@ -308,7 +344,7 @@ Describe 'Darktide Core v2 adapter, dispatch and protected readers' {
         $text | Should -Match "'scan', \`$skillRoot, '--no-llm', '--format', 'json'"
     }
 
-    It 'UnitT23_requires_candidate_protected_readers_to_equal_the_driver_bytes' {
+    It 'UnitT24_requires_candidate_protected_readers_to_equal_the_driver_bytes' {
         $base = Join-Path $TestDrive ('base-' + [guid]::NewGuid().ToString('N'))
         $candidate = Join-Path $TestDrive ('candidate-' + [guid]::NewGuid().ToString('N'))
         $readers = @('scripts/Test-Repository.ps1', 'scripts/Invoke-CorePester.ps1', 'scripts/CorePesterIntegrity.psm1', 'config/pester-6.2.0-closure.lock.json')
@@ -327,12 +363,12 @@ Describe 'Darktide Core v2 adapter, dispatch and protected readers' {
         Assert-TestThrowsLike { Assert-DarktideSourceProtectedReaders -ProtectedBaseRoot $base -CandidateRoot $candidate } '*Protected reader is missing*'
     }
 
-    It 'UnitT24_protected_readers_of_this_checkout_are_self_consistent' {
+    It 'UnitT25_protected_readers_of_this_checkout_are_self_consistent' {
         @(Assert-DarktideSourceProtectedReaders -ProtectedBaseRoot $script:RepositoryRoot -CandidateRoot $script:RepositoryRoot).Count | Should -Be 4
         (Get-DarktideSourceChildRunnerPath) | Should -BeExactly ([IO.Path]::GetFullPath($script:ChildPath))
     }
 
-    It 'UnitT25_reads_the_strict_active_skill_inventory' {
+    It 'UnitT26_reads_the_strict_active_skill_inventory' {
         @(Get-DarktideActiveSkillIds -Root $script:RepositoryRoot) | Should -Be @('auto-update-darktide-mod')
         $fixture = Join-Path $TestDrive ('inventory-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $fixture 'catalog'), (Join-Path $fixture 'skills/auto-update-darktide-mod'), (Join-Path $fixture 'skills/extra-skill') -Force | Out-Null
@@ -342,7 +378,7 @@ Describe 'Darktide Core v2 adapter, dispatch and protected readers' {
 
     # Scenario: Candidate PathSafety and StandardSourceDriver modules contain import-time side effects.
     # Purpose: Prove the protected child imports only the frozen protected-base driver and authority runtime.
-    It 'InterT26_ignores_candidate_control_plane_module_tampering' {
+    It 'InterT27_ignores_candidate_control_plane_module_tampering' {
         $candidate = Join-Path $TestDrive 'candidate-tamper'
         $marker = Join-Path $TestDrive 'candidate-module-executed.txt'
         foreach ($relative in @('skills/auto-update-darktide-mod/scripts/PathSafety.psm1','scripts/StandardSourceDriver.psm1')) {
@@ -357,7 +393,7 @@ Describe 'Darktide Core v2 adapter, dispatch and protected readers' {
             $output = @(& $script:PowerShellPath -NoProfile -NonInteractive -File $script:ChildPath `
                 -Mode skill-validator -ToolchainPath $missingToolchain -ToolchainSha256 ('0' * 64) `
                 -DriverModulePath $script:DriverPath -DriverModuleSha256 ((Get-FileHash -LiteralPath $script:DriverPath -Algorithm SHA256).Hash.ToLowerInvariant()) `
-                -AuthorityRepositoryRoot $script:AuthorityRoot -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db' 2>&1)
+                -AuthorityRuntimeManifestPath (Join-Path $script:AuthorityRoot 'scripts/platform-runtime.psd1') -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db' 2>&1)
             $LASTEXITCODE | Should -Not -Be 0
             ($output -join "`n") | Should -Not -Match 'candidate module executed'
             Test-Path -LiteralPath $marker | Should -BeFalse
@@ -392,6 +428,40 @@ Describe 'Darktide Core v2 frozen receipts, timing and whitespace gate' {
             }
             return [pscustomobject]@{ bindings = $bindings; frozen = $frozen; tool = $tool }
         }
+    }
+
+    # Scenario: The workflow supplies an explicit stable Go version or an invalid stable-channel value.
+    # Purpose: Accept only stable semantic versions before any resolver dispatch is created.
+    It 'UnitT27_accepts_stable_and_rejects_prerelease_or_malformed_Go_versions' {
+        $module=$script:DriverModule
+        (& $module { Resolve-DarktideGoRuntimeVersion -Expected '1.24.3' }) | Should -BeExactly '1.24.3'
+        foreach($invalid in @('1.24.0-rc.1','go1.24.3','1.24','latest')) {
+            Assert-TestThrowsLike { & $module { param($Value) Resolve-DarktideGoRuntimeVersion -Expected $Value } $invalid } '*stable semantic Go version*'
+        }
+    }
+
+    # Scenario: A controlled go version process succeeds, exits non-zero, emits malformed output, or exceeds its deadline.
+    # Purpose: Bind automatic resolution to one exact stable result and fail closed on every process failure mode.
+    It 'UnitT28_controls_go_version_<Scenario>' -ForEach @(
+        @{Scenario='success';ExitCode=0;Stdout="go version go1.24.3 windows/amd64`n";Throws=$false;Pattern=''},
+        @{Scenario='nonzero';ExitCode=9;Stdout='';Throws=$true;Pattern='*exited with code 9*'},
+        @{Scenario='malformed';ExitCode=0;Stdout="go version devel go1.25-deadbeef windows/amd64`n";Throws=$true;Pattern='*Could not resolve the current stable Go runtime version*'}
+    ) {
+        $module=$script:DriverModule; $commandPath=$script:PowerShellPath
+        $resolver={ [pscustomobject]@{Path=$commandPath} }.GetNewClosure()
+        $invoker={ param($Path,$Arguments) [pscustomobject]@{exitCode=$ExitCode;stdout=$Stdout;stderr=''} }.GetNewClosure()
+        if($Throws){ Assert-TestThrowsLike { & $module { param($Resolve,$Invoke) Resolve-DarktideGoRuntimeVersion -CommandResolver $Resolve -ProcessInvoker $Invoke } $resolver $invoker } $Pattern }
+        else { (& $module { param($Resolve,$Invoke) Resolve-DarktideGoRuntimeVersion -CommandResolver $Resolve -ProcessInvoker $Invoke } $resolver $invoker) | Should -BeExactly '1.24.3' }
+    }
+
+    It 'UnitT29_fails_closed_when_controlled_go_version_times_out_and_binds_the_result_to_every_resolver' {
+        $module=$script:DriverModule; $commandPath=$script:PowerShellPath
+        $resolver={ [pscustomobject]@{Path=$commandPath} }.GetNewClosure()
+        $invoker={ throw 'Owned process exceeded its 1 second deadline.' }
+        Assert-TestThrowsLike { & $module { param($Resolve,$Invoke) Resolve-DarktideGoRuntimeVersion -CommandResolver $Resolve -ProcessInvoker $Invoke } $resolver $invoker } '*exceeded its 1 second deadline*'
+        $driverText=Get-Content -LiteralPath $script:DriverPath -Raw
+        $driverText | Should -Match "foreach \(\`$tool in \`$script:DarktideSourceToolNames\)"
+        $driverText | Should -Match "'-ExpectedGoRuntimeVersion', \`$GoVersion"
     }
 
     It 'UnitT30_requires_every_receipt_and_tool_payload_frozen_exactly_once' {
@@ -511,9 +581,70 @@ Describe 'Darktide prepared authority checkout binding' {
         (Get-Content -LiteralPath $script:DriverPath -Raw) | Should -Match 'No cleanup journal is needed|No cleanup journal'
     }
 
+    # Scenario: Source purposes run locally, omit registration, or point outside the registered CI run root.
+    # Purpose: Prevent retained attempt evidence from accumulating in shared or caller-selected directories.
+    It 'UnitT43_rejects_unregistered_or_outside_CI_artifacts_roots' {
+        (Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/Validate.ps1') -Raw) |
+            Should -Not -Match 'Invoke-DarktideSourceEntryPoint[^\r\n]*DefaultArtifactsRoot'
+        (Get-Content -LiteralPath $script:DriverPath -Raw) | Should -Not -Match 'DefaultArtifactsRoot'
+        $oldActions=$env:GITHUB_ACTIONS; $oldOwned=$env:RUN_OWNED_ROOT
+        try {
+            $env:GITHUB_ACTIONS=$null; $env:RUN_OWNED_ROOT=$null
+            Assert-TestThrowsLike { Open-DarktideRunOwnedArtifactsRoot -ArtifactsRoot $TestDrive } '*approved CI run-owned root*'
+            $env:GITHUB_ACTIONS='true'
+            Assert-TestThrowsLike { Open-DarktideRunOwnedArtifactsRoot -ArtifactsRoot $TestDrive } '*require RUN_OWNED_ROOT*'
+            $owned=Join-Path $TestDrive 'owned'; $outside=Join-Path $TestDrive 'outside'
+            New-Item -ItemType Directory -Path $owned,$outside | Out-Null
+            $env:RUN_OWNED_ROOT=$owned
+            Assert-TestThrowsLike { Open-DarktideRunOwnedArtifactsRoot -ArtifactsRoot $outside } '*within the registered RUN_OWNED_ROOT*'
+            $artifacts=Join-Path $owned 'artifacts'; New-Item -ItemType Directory -Path $artifacts | Out-Null
+            $binding=Open-DarktideRunOwnedArtifactsRoot -ArtifactsRoot $artifacts
+            try {
+                $binding.RunRoot | Should -BeExactly ([IO.Path]::GetFullPath($owned))
+                $binding.ArtifactsRoot | Should -BeExactly ([IO.Path]::GetFullPath($artifacts))
+                $binding.RunLease | Should -Not -BeNullOrEmpty
+                $binding.ArtifactsLease | Should -Not -BeNullOrEmpty
+            }
+            finally { $binding.ArtifactsLease.Dispose(); $binding.RunLease.Dispose() }
+        }
+        finally { $env:GITHUB_ACTIONS=$oldActions; $env:RUN_OWNED_ROOT=$oldOwned }
+    }
+
+    # Scenario: A successful or failed canonical report is projected to a new stable caller path, while a prior path is preserved.
+    # Purpose: Decouple public OutputPath from the unpredictable attempt directory without permitting replacement.
+    It 'UnitT44_projects_success_and_failure_reports_create_only' {
+        $attemptRoot=Join-Path $TestDrive 'attempt'; $outputRoot=Join-Path $TestDrive 'outputs'
+        New-Item -ItemType Directory -Path $attemptRoot,$outputRoot | Out-Null
+        foreach($case in @(@{Name='success';Json='{"result":"passed"}'},@{Name='failure';Json='{"result":"failed"}'})) {
+            $source=Join-Path $attemptRoot "$($case.Name).json"; $target=Join-Path $outputRoot "$($case.Name).json"
+            [IO.File]::WriteAllText($source,$case.Json,[Text.UTF8Encoding]::new($false))
+            Publish-DarktideCanonicalReport -AttemptReportPath $source -OutputPath $target -RunOwnedRoot $TestDrive | Should -BeExactly ([IO.Path]::GetFullPath($target))
+            [IO.File]::ReadAllText($target,[Text.UTF8Encoding]::new($false)) | Should -BeExactly $case.Json
+        }
+        $existing=Join-Path $outputRoot 'existing.json'; [IO.File]::WriteAllText($existing,'sentinel',[Text.UTF8Encoding]::new($false))
+        { Publish-DarktideCanonicalReport -AttemptReportPath (Join-Path $attemptRoot 'success.json') -OutputPath $existing -RunOwnedRoot $TestDrive } | Should -Throw
+        [IO.File]::ReadAllText($existing,[Text.UTF8Encoding]::new($false)) | Should -BeExactly 'sentinel'
+    }
+
+    # Scenario: Stop-PlatformOwnedProcess returns a superficially successful but incomplete receipt.
+    # Purpose: Cleanup uncertainty must never be accepted as successful child termination.
+    It 'UnitT45_rejects_incomplete_owned_process_cleanup_receipts' {
+        Test-DarktideOwnedProcessCleanupReceipt -Receipt ([pscustomobject]@{CleanedUp=$true}) | Should -BeFalse
+        Test-DarktideOwnedProcessCleanupReceipt -Receipt ([pscustomobject]@{CleanedUp=$true;CaptureReadersStopped=$true;CaptureResourcesClosed=$true;RemainingPids=@(123);Uncertainty=$null}) | Should -BeFalse
+        Test-DarktideOwnedProcessCleanupReceipt -Receipt ([pscustomobject]@{CleanedUp=$true;CaptureReadersStopped=$true;CaptureResourcesClosed=$true;RemainingPids=@();Uncertainty=$null}) | Should -BeTrue
+
+        Mock -CommandName Stop-PlatformOwnedProcess -ModuleName $script:DriverModule.Name -MockWith {
+            [pscustomobject]@{CleanedUp=$true;CaptureReadersStopped=$false;CaptureResourcesClosed=$true;RemainingPids=@();Uncertainty='reader status unavailable'}
+        }
+        Assert-TestThrowsLike {
+            Invoke-DarktideOwnedProcess -ExecutablePath $script:PowerShellPath -Arguments @('-NoProfile','-NonInteractive','-Command','exit 0') `
+                -WorkingDirectory $TestDrive -CaptureRoot $TestDrive
+        } '*cleanup could not be verified*'
+    }
+
     # Scenario: The protected driver starts a runner that does not exit before its own deadline.
     # Purpose: Make TimeoutSeconds supervise the process itself and require verified descendant cleanup.
-    It 'UnitT43_bounds_and_cleans_up_a_hung_owned_process' {
+    It 'UnitT46_bounds_and_cleans_up_a_hung_owned_process' {
         $module = $script:DriverModule
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
         Assert-TestThrowsLike {

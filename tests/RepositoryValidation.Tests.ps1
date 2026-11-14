@@ -41,7 +41,7 @@ Describe 'Repository pre-push validation' {
         $result.headOid | Should -Be $expectedHead
     }
 
-    It 'UnitT20_RejectsTrackedAndUntrackedChangesBeforeValidation' -ForEach @(
+    It 'UnitT20_RejectsTrackedAndUntrackedChangesBeforeValidation_<Case>' -ForEach @(
         @{ Case = 'tracked'; Mutate = { param($root) Set-Content -LiteralPath (Join-Path $root 'tracked.txt') -Value 'changed' } }
         @{ Case = 'untracked'; Mutate = { param($root) Set-Content -LiteralPath (Join-Path $root 'untracked.txt') -Value 'new' } }
     ) {
@@ -222,7 +222,7 @@ Describe 'Latest stable PowerShell release evidence' {
 
     # Scenario: Each supported operating system and architecture selects its own official archive.
     # Purpose: Bind Windows to the zip with pwsh.exe and Linux/macOS to the tar.gz with pwsh, rejecting other targets.
-    It 'UnitT71_SelectsThePlatformArchiveAndExecutableName' -ForEach @(
+    It 'UnitT71_SelectsThePlatformArchiveAndExecutableName_<Platform>_<Architecture>' -ForEach @(
         @{ Platform = 'windows'; Architecture = 'x64'; AssetName = 'PowerShell-7.6.6-win-x64.zip'; ExecutableName = 'pwsh.exe' }
         @{ Platform = 'windows'; Architecture = 'arm64'; AssetName = 'PowerShell-7.6.6-win-arm64.zip'; ExecutableName = 'pwsh.exe' }
         @{ Platform = 'linux'; Architecture = 'x64'; AssetName = 'powershell-7.6.6-linux-x64.tar.gz'; ExecutableName = 'pwsh' }
@@ -392,7 +392,7 @@ Describe 'Latest stable PowerShell release evidence' {
 
     # Scenario: Microsoft's manifest is published with any supported, explicitly identified encoding.
     # Purpose: Decode BOMs strictly while continuing to hash the exact downloaded bytes.
-    It 'UnitT105A_StrictlyDecodesSupportedHashManifestEncodings' -ForEach @(
+    It 'UnitT105A_StrictlyDecodesSupportedHashManifestEncodings_<Encoding>' -ForEach @(
         @{ Encoding = 'Utf8' }
         @{ Encoding = 'Utf8Bom' }
         @{ Encoding = 'Utf16LeBom' }
@@ -512,7 +512,7 @@ Describe 'Latest stable PowerShell release evidence' {
     if (-not $IsWindows) {
         # Scenario: A verified Linux or macOS archive is expanded by tar.
         # Purpose: Retain the archive execute mode, restore a missing owner execute bit, and skip Authenticode on Unix.
-        It 'UnitT111_ExpandsTheUnixTarGzAndRetainsTheExecutableMode' -ForEach @(
+        It 'UnitT111_ExpandsTheUnixTarGzAndRetainsTheExecutableMode_<Case>' -ForEach @(
             @{ Case = 'executable'; Mode = 'UserRead, UserWrite, UserExecute, GroupRead, GroupExecute, OtherRead, OtherExecute' }
             @{ Case = 'non-executable'; Mode = 'UserRead, UserWrite, GroupRead, OtherRead' }
         ) {

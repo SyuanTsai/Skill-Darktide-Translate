@@ -274,7 +274,8 @@ function Publish-CoordinationLeaseSnapshot {
         [string] $ResourceKey,
         [Collections.IDictionary] $Value,
         [Collections.IDictionary] $ExpectedState,
-        [switch] $NoReplace
+        [switch] $NoReplace,
+        [switch] $PreserveDisplaced
     )
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 30 -Compress) + "`n")
     $idBytes = [Text.UTF8Encoding]::new($false).GetBytes("coordination:$ResourceKey")
@@ -282,7 +283,8 @@ function Publish-CoordinationLeaseSnapshot {
     try { $transactionId = ([BitConverter]::ToString($sha256.ComputeHash($idBytes))).Replace('-', '').ToLowerInvariant().Substring(0, 32) }
     finally { $sha256.Dispose() }
     Publish-PortableLeaseFile -ParentPath $LockRoot -Leaf "$ResourceKey.lock" -Bytes $bytes `
-        -ExpectedState $ExpectedState -TransactionId $transactionId -NoReplace:$NoReplace
+        -ExpectedState $ExpectedState -TransactionId $transactionId -NoReplace:$NoReplace `
+        -PreserveDisplaced:$PreserveDisplaced
 }
 
 function Write-CoordinationReceipt {
@@ -410,9 +412,24 @@ function Enter-SharedCoordinationLease {
                 }
             }
             if (-not $waitForOwner) {
+                $preserveStaleEvidence = [bool]$snapshot.exists -and [string]$existing.state -ceq 'held'
                 try {
-                    $null = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey $ResourceKey -Value $owner `
-                        -ExpectedState $snapshot -NoReplace:(-not [bool]$snapshot.exists)
+                    $publication = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey $ResourceKey -Value $owner `
+                        -ExpectedState $snapshot -NoReplace:(-not [bool]$snapshot.exists) `
+                        -PreserveDisplaced:$preserveStaleEvidence
+                    if ($preserveStaleEvidence) {
+                        $staleEvidencePath = [string]$publication.displacedPath
+                        if ([string]::IsNullOrWhiteSpace($staleEvidencePath)) {
+                            throw 'Stale coordination CAS did not return its displaced owner evidence path.'
+                        }
+                        $evidence = Get-PortableLeaseFileState -ParentPath (Split-Path -Parent $staleEvidencePath) `
+                            -Leaf (Split-Path -Leaf $staleEvidencePath)
+                        if ([string]$evidence.sha256 -cne [string]$snapshot.sha256 -or
+                            [int64]$evidence.length -ne [int64]$snapshot.length -or
+                            [Convert]::ToHexString([byte[]]$evidence.bytes) -cne [Convert]::ToHexString([byte[]]$snapshot.bytes)) {
+                            throw 'Stale coordination evidence differs from the displaced owner snapshot.'
+                        }
+                    }
                     $waitingMilliseconds = if ($waitStartedMilliseconds -lt 0) {
                         [int64]0
                     }

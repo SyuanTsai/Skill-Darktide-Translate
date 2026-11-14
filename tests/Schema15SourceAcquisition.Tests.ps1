@@ -163,6 +163,44 @@ Describe 'Schema 15 source acquisition contract' {
         $reservation | Should -Not -Match 'New-Item\s+-ItemType\s+Directory\s+-Path\s+\(\[string\]\$Plan\.modLockPath\)'
     }
 
+    # Scenario: An upgrade encounters the former .locks/mod/<key>.lock/owner.json directory layout.
+    # Purpose: Preserve every legacy byte and fail with explicit manual migration guidance before reservation or claim mutation.
+    It 'InterT28B_PreservesLegacyModReservationDirectoryAndRequiresManualMigration' {
+        $repository = Join-Path $TestDrive 'legacy-mod-reservation-repository'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $requestPath = Join-Path $TestDrive 'legacy-mod-reservation-request.json'
+        [ordered]@{
+            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
+            version = '2.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+        } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
+
+        $modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $lockKey = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))
+        ).ToLowerInvariant()
+        $legacyDirectory = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
+        New-Item -ItemType Directory -Path $legacyDirectory -Force | Out-Null
+        $legacyOwnerPath = Join-Path $legacyDirectory 'owner.json'
+        [byte[]]$legacyBytes = [Text.UTF8Encoding]::new($false).GetBytes('{"schemaVersion":2,"state":"held","runId":"legacy-run"}')
+        [IO.File]::WriteAllBytes($legacyOwnerPath, $legacyBytes)
+        $beforeEntries = @(Get-ChildItem -LiteralPath $legacyDirectory -Force | ForEach-Object Name)
+
+        { & (Join-Path $scriptRoot 'mod-update.ps1') acquire-source `
+                -RepositoryRoot $repository -ModDirectory 'ExampleMod' `
+                -RunId '47474747-5555-4666-8777-888888888888' `
+                -SourceRequestPath $requestPath -SkillSourcePinPath $script:skillSourcePinPath `
+                -Provider browser -PassThru } |
+            Should -Throw '*Legacy MOD reservation directory format*move this directory*outside .locks*Automatic deletion or migration is forbidden*'
+
+        Test-Path -LiteralPath $legacyDirectory -PathType Container | Should -BeTrue
+        Test-Path -LiteralPath $legacyOwnerPath -PathType Leaf | Should -BeTrue
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($legacyOwnerPath)) |
+            Should -BeExactly ([Convert]::ToHexString($legacyBytes))
+        @(Get-ChildItem -LiteralPath $legacyDirectory -Force | ForEach-Object Name) |
+            Should -BeExactly $beforeEntries
+        @(Get-ChildItem -LiteralPath (Split-Path -Parent $legacyDirectory) -Force -File).Count | Should -Be 0
+    }
+
     # Scenario: Untrusted orchestration supplies a path-like MOD identity or an off-domain source page.
     # Purpose: Keep canonical MOD paths inside one directory and bind source identity to the official Nexus game page.
     It 'UnitT26_RejectsPathLikeModNamesAndOffDomainSourcePages' {

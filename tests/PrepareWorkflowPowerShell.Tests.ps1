@@ -176,7 +176,7 @@ Describe 'Offline workflow PowerShell preparation' {
 
     # Scenario: Either published digest disagrees with the injected archive or manifest.
     # Purpose: Reject both evidence mismatches before an extraction destination is created.
-    It 'UnitT30_RejectsArchiveAndManifestDigestMismatch' -ForEach @(
+    It 'UnitT30_RejectsArchiveAndManifestDigestMismatch_<Case>' -ForEach @(
         @{ Case = 'archive'; ArchiveSha = ('0' * 64); ManifestSha = $null }
         @{ Case = 'manifest'; ArchiveSha = $null; ManifestSha = ('0' * 64) }
     ) {
@@ -294,5 +294,111 @@ Describe 'Offline workflow PowerShell preparation' {
             $executableLease.Dispose()
             $executableParent.Dispose()
         }
+    }
+
+    # Scenario: The owned PowerShell root and its long-running descendant remain alive past a one-second deadline.
+    # Purpose: Bound the real wrapper, reclaim the complete process tree, withhold success, and retain capture evidence.
+    It 'InterT81_BoundsAHangingPowerShellTreeAndPreservesFailureEvidence' {
+        $workingPath = New-PlatformPrivateRoot -Parent $TestDrive -Leaf ('owned-timeout-' + [guid]::NewGuid().ToString('N'))
+        $successReceiptPath = Join-Path $workingPath 'fixture-success-receipt.json'
+        $executablePath = [Environment]::ProcessPath
+        $executableParent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($executablePath)) -RootOnly
+        $executableLease = Open-PlatformFile -ParentLease $executableParent `
+            -Leaf ([IO.Path]::GetFileName($executablePath)) -Access Read -CreateMode OpenExisting
+        $workingLease = Open-PlatformDirectory -Root $workingPath -RootOnly
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $fixtureCommand = @'
+[Console]::Out.WriteLine('timeout-failure-evidence')
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = [Environment]::ProcessPath
+$info.UseShellExecute = $false
+$info.CreateNoWindow = $true
+foreach ($argument in @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30')) {
+    [void]$info.ArgumentList.Add($argument)
+}
+$descendant = [Diagnostics.Process]::Start($info)
+[Console]::Out.WriteLine($descendant.Id)
+Start-Sleep -Seconds 30
+'@
+            $failure = { Invoke-PowerShellReleaseOwnedProcess -ExecutableLease $executableLease `
+                    -ExecutablePath $executablePath -WorkingDirectoryLease $workingLease `
+                    -WorkingDirectoryPath $workingPath -TimeoutSeconds 1 -ArgumentList @(
+                        '-NoProfile', '-NonInteractive', '-Command', $fixtureCommand
+                    ) } | Should -Throw '*exceeded its 1 second deadline*' -PassThru
+            if ($null -eq $failure) {
+                [IO.File]::WriteAllText($successReceiptPath, '{"result":"passed"}')
+            }
+        }
+        finally {
+            $stopwatch.Stop()
+            $workingLease.Dispose()
+            $executableLease.Dispose()
+            $executableParent.Dispose()
+        }
+
+        $stopwatch.Elapsed.TotalSeconds | Should -BeLessThan 15
+        $failure.Exception | Should -BeOfType ([TimeoutException])
+        Test-Path -LiteralPath $successReceiptPath | Should -BeFalse
+        [string]$failure.Exception.Data['Stdout'] | Should -Match 'timeout-failure-evidence'
+        $descendantId = [int](@(([string]$failure.Exception.Data['Stdout']) -split '\r?\n' | Where-Object { $_ -match '^\d+$' })[0])
+        Get-Process -Id $descendantId -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        $failure.Exception.Data['CleanupReceipt'].CleanedUp | Should -BeTrue
+        @($failure.Exception.Data['CleanupReceipt'].RemainingPids).Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path ([string]$failure.Exception.Data['CapturePath']) 'stdout.txt') -PathType Leaf | Should -BeTrue
+    }
+
+    # Scenario: Native cleanup completes, but the boundary receives either an unstopped reader or a reported remaining PID.
+    # Purpose: Reject every incomplete receipt without mocking the wrapper or losing its retained stdout failure evidence.
+    It 'InterT82_RejectsIncompleteOwnedProcessCleanupReceipt_<Fault>' -ForEach @(
+        @{ Fault = 'CaptureReadersStopped' }
+        @{ Fault = 'RemainingPids' }
+    ) {
+        $workingPath = New-PlatformPrivateRoot -Parent $TestDrive -Leaf ("owned-cleanup-$Fault-" + [guid]::NewGuid().ToString('N'))
+        $successReceiptPath = Join-Path $workingPath 'fixture-success-receipt.json'
+        $executablePath = [Environment]::ProcessPath
+        $executableParent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($executablePath)) -RootOnly
+        $executableLease = Open-PlatformFile -ParentLease $executableParent `
+            -Leaf ([IO.Path]::GetFileName($executablePath)) -Access Read -CreateMode OpenExisting
+        $workingLease = Open-PlatformDirectory -Root $workingPath -RootOnly
+        $global:S8Fix4CCleanupFault = $Fault
+        Mock Stop-PlatformOwnedProcess -ModuleName $script:releaseModule.Name {
+            param($Lease, $ExpectedStartIdentity, $Deadline)
+            $actual = $Lease.Stop([TimeSpan]::FromMilliseconds(250), $Deadline, $ExpectedStartIdentity)
+            [pscustomobject][ordered]@{
+                CleanedUp = [bool]$actual.CleanedUp
+                CaptureReadersStopped = if ($global:S8Fix4CCleanupFault -ceq 'CaptureReadersStopped') { $false } else { [bool]$actual.CaptureReadersStopped }
+                CaptureResourcesClosed = [bool]$actual.CaptureResourcesClosed
+                RemainingPids = if ($global:S8Fix4CCleanupFault -ceq 'RemainingPids') { [int[]]@($PID) } else { [int[]]@($actual.RemainingPids) }
+                Uncertainty = $actual.Uncertainty
+            }
+        }
+
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $failure = { Invoke-PowerShellReleaseOwnedProcess -ExecutableLease $executableLease `
+                    -ExecutablePath $executablePath -WorkingDirectoryLease $workingLease `
+                    -WorkingDirectoryPath $workingPath -TimeoutSeconds 5 -ArgumentList @(
+                        '-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write("cleanup-failure-evidence"); exit 0'
+                    ) } | Should -Throw '*cleanup was incomplete or uncertain*' -PassThru
+            if ($null -eq $failure) {
+                [IO.File]::WriteAllText($successReceiptPath, '{"result":"passed"}')
+            }
+        }
+        finally {
+            $stopwatch.Stop()
+            $workingLease.Dispose()
+            $executableLease.Dispose()
+            $executableParent.Dispose()
+            Remove-Variable -Name S8Fix4CCleanupFault -Scope Global -ErrorAction SilentlyContinue
+        }
+
+        $stopwatch.Elapsed.TotalSeconds | Should -BeLessThan 15
+        $failure.Exception.Message | Should -Match 'cleanup was incomplete or uncertain'
+        Test-Path -LiteralPath $successReceiptPath | Should -BeFalse
+        $captureDirectory = @(Get-ChildItem -LiteralPath $workingPath -Directory -Filter '.owned-process-*')
+        $captureDirectory.Count | Should -Be 1
+        Get-Content -Raw -LiteralPath (Join-Path $captureDirectory[0].FullName 'stdout.txt') |
+            Should -BeExactly 'cleanup-failure-evidence'
     }
 }

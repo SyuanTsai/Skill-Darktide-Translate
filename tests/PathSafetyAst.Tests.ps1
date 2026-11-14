@@ -84,6 +84,7 @@ $prProductionPowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Unix.psm1',
     'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Windows.psm1'
 )
+$protectedPrProductionPowerShellInventorySha256 = '7ab7baed9a924e161ed9cd5168b4397ef0c6a78808604d9ec2fa76b5811a0c1c'
 
 # These files are byte-exact authority fbdc793 runtime artifacts. Their hashes
 # are verified by PathSafety before loading and consumer changes are forbidden,
@@ -429,28 +430,45 @@ skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-VendoredPlatformRunt
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Assert-VendoredPlatformRuntime|Get-Item|1
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Assert-VendoredPlatformRuntime|Get-ChildItem|1
 '@ -split "`r?`n" | Where-Object { $_ }
+
+$corePesterBootstrapAllowances = [ordered]@{
+    'scripts/CorePesterIntegrity.psm1|Get-CorePesterAuthorityRuntimeBinding|IO.File::ReadAllBytes|1' =
+        'Authority runtime 載入前的 bootstrap 讀取，載入後以 lease 重讀並比對 bytes。'
+}
 }
 
 Describe 'Epic pathname safety AST boundary' {
-    It 'matches every production PowerShell file changed from origin main when Git metadata is present' {
+    # Scenario: Core Pester runs either in the developer worktree or in a tracked-only snapshot with no .git entry.
+    # Purpose: Keep the complete reviewed PR production-file scope enforced in both environments without an implicit skip.
+    It 'matches every production PowerShell file changed from origin main or its protected snapshot inventory' {
         $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-        if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot '.git'))) { return }
-
-        $branchChanged = @(& git -C $repositoryRoot diff --name-only origin/main...HEAD -- '*.ps1' '*.psm1')
-        $LASTEXITCODE | Should -Be 0
-        $worktreeChanged = @(& git -C $repositoryRoot diff --name-only -- '*.ps1' '*.psm1')
-        $LASTEXITCODE | Should -Be 0
-        $changed = @($branchChanged + $worktreeChanged | Sort-Object -Unique)
-        [string[]]$expected = @($changed | Where-Object { $_ -notlike 'tests/*' })
         [string[]]$actual = @($prProductionPowerShellFiles)
-        [Array]::Sort($expected, [StringComparer]::Ordinal)
         [Array]::Sort($actual, [StringComparer]::Ordinal)
+        $inventoryBytes = [Text.UTF8Encoding]::new($false).GetBytes($actual -join "`n")
+        [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($inventoryBytes)).ToLowerInvariant() |
+            Should -BeExactly $protectedPrProductionPowerShellInventorySha256
+        foreach ($relative in $actual) {
+            Test-Path -LiteralPath (Join-Path $repositoryRoot $relative) -PathType Leaf | Should -BeTrue -Because $relative
+        }
+
+        if (Test-Path -LiteralPath (Join-Path $repositoryRoot '.git')) {
+            $branchChanged = @(& git -C $repositoryRoot diff --name-only origin/main...HEAD -- '*.ps1' '*.psm1')
+            $LASTEXITCODE | Should -Be 0
+            $worktreeChanged = @(& git -C $repositoryRoot diff --name-only -- '*.ps1' '*.psm1')
+            $LASTEXITCODE | Should -Be 0
+            $changed = @($branchChanged + $worktreeChanged | Sort-Object -Unique)
+            [string[]]$expected = @($changed | Where-Object { $_ -notlike 'tests/*' })
+            [Array]::Sort($expected, [StringComparer]::Ordinal)
+        }
+        else {
+            [string[]]$expected = @($actual)
+        }
         ($actual -join "`n") | Should -BeExactly ($expected -join "`n")
     }
 
     It 'contains no unreviewed pathname command, static IO method, or FileInfo/DirectoryInfo check' {
         $allowances = @{}
-        foreach ($row in @($originMainExclusions + $pureReadExclusions + $f8VerifiedImportAllowances)) {
+        foreach ($row in @($originMainExclusions + $pureReadExclusions + $f8VerifiedImportAllowances + @($corePesterBootstrapAllowances.Keys))) {
             $parts = $row -split '\|'
             $allowances["$($parts[0])|$($parts[1])|$($parts[2])"] = [int]$parts[3]
         }

@@ -12,7 +12,7 @@ param(
     [Parameter(Mandatory = $true)][string] $ToolchainSha256,
     [Parameter(Mandatory = $true)][string] $DriverModulePath,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string] $DriverModuleSha256,
-    [Parameter(Mandatory = $true)][string] $AuthorityRepositoryRoot,
+    [Parameter(Mandatory = $true)][string] $AuthorityRuntimeManifestPath,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision,
     [ValidateRange(1, 86400)][int] $TimeoutSeconds = 900
 )
@@ -32,7 +32,13 @@ if ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($driverBytes
 $driverText = [Text.UTF8Encoding]::new($false, $true).GetString($driverBytes)
 $driverModule = New-Module -Name 'DarktideFrozenSourceDriver' -ScriptBlock ([scriptblock]::Create($driverText))
 Import-Module -ModuleInfo $driverModule -Force -ErrorAction Stop
-$platformRuntimeModule = Import-DarktideAuthorityPlatformRuntime -AuthorityRoot $AuthorityRepositoryRoot -AuthorityRevision $AuthorityRevision
+$authorityManifest = [IO.Path]::GetFullPath($AuthorityRuntimeManifestPath)
+if ([IO.Path]::GetFileName($authorityManifest) -cne 'platform-runtime.psd1' -or
+    [IO.Path]::GetFileName((Split-Path -Parent $authorityManifest)) -cne 'scripts') {
+    throw 'Frozen authority runtime manifest has an unexpected layout.'
+}
+$authorityRoot = Split-Path -Parent (Split-Path -Parent $authorityManifest)
+$platformRuntimeModule = Import-DarktideAuthorityPlatformRuntime -AuthorityRoot $authorityRoot -AuthorityRevision $AuthorityRevision
 Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
 
 function Open-ChildFile {
@@ -274,7 +280,7 @@ function Invoke-ChildOwnedCommand {
         if($null-ne$executableBinding-and$executableBinding-ne$commandBinding){Close-ChildFile $executableBinding}
         if($null-ne$commandBinding){Close-ChildFile $commandBinding}
     }
-    if($null-eq$cleanup-or-not[bool]$cleanup.CleanedUp){throw 'Native tool cleanup could not be verified.'}
+    if(-not (Test-DarktideOwnedProcessCleanupReceipt -Receipt $cleanup)){throw 'Native tool cleanup could not be verified.'}
     if($timedOut){throw "Native tool exceeded its $TimeoutSeconds second deadline."}
     $stdout=if(Test-ChildFile $stdoutPath){Read-ChildText $stdoutPath}else{''}
     $stderr=if(Test-ChildFile $stderrPath){Read-ChildText $stderrPath}else{''}

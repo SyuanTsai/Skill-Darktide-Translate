@@ -2052,6 +2052,13 @@ function Release-ModReservation {
     if ([string]$owner.leaseMode -cne 'reserved' -or -not [string]::IsNullOrWhiteSpace([string]$owner.workerToken)) {
         throw 'Reservation worker must be suspended before terminal release.'
     }
+    if ([string]$owner.reservationState -cne 'cleanup-pending' -or
+        -not $owner.Contains('cleanup') -or $owner.cleanup -isnot [Collections.IDictionary] -or
+        -not [bool]$owner.cleanup.writerLockReleased -or
+        -not [bool]$owner.cleanup.claimDirectoryPreserved -or
+        -not [bool]$owner.cleanup.runRootPreserved) {
+        throw 'Reservation cleanup must complete every persisted boundary before terminal release.'
+    }
     $expectedReservationToken = [string]$owner.reservationToken
     $expectedWorkerToken = [string]$owner.workerToken
     $now = Get-UtcTimestamp
@@ -2061,6 +2068,91 @@ function Release-ModReservation {
     $owner.expiresAt = $now
     Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
         -Value $owner -ExpectedReservationToken $expectedReservationToken -ExpectedWorkerToken $expectedWorkerToken
+}
+
+function Assert-ModReservationCleanupOwner {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][Collections.IDictionary] $Owner
+    )
+    if ([string]$Owner.state -cne 'held' -or [string]$Owner.runId -cne [string]$State.runId -or
+        [string]$Owner.modLockKey -cne [string]$State.modLockKey -or
+        [string]$Owner.leaseMode -cne 'reserved' -or
+        -not [string]::IsNullOrWhiteSpace([string]$Owner.workerToken)) {
+        throw 'Reservation owner changed before terminal cleanup.'
+    }
+}
+
+function Start-ModReservationCleanup {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][string] $EvidencePath,
+        [Parameter(Mandatory)][string] $ClaimDirectory,
+        [Parameter(Mandatory)][string] $RunRoot
+    )
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+    Assert-ModReservationCleanupOwner -State $State -Owner $owner
+    $tuple = [ordered]@{
+        schemaVersion = 1
+        runId = [string]$State.runId
+        evidencePath = [IO.Path]::GetFullPath($EvidencePath)
+        claimDirectory = [IO.Path]::GetFullPath($ClaimDirectory)
+        runRoot = [IO.Path]::GetFullPath($RunRoot)
+    }
+    if ($owner.Contains('cleanup') -and $owner.cleanup -is [Collections.IDictionary]) {
+        foreach ($field in @('schemaVersion', 'runId', 'evidencePath', 'claimDirectory', 'runRoot')) {
+            if ([string]$owner.cleanup[$field] -cne [string]$tuple[$field]) {
+                throw 'Persisted reservation cleanup tuple changed before recovery.'
+            }
+        }
+        if ([string]$owner.reservationState -cne 'cleanup-pending') {
+            $owner.reservationState = 'cleanup-pending'
+            Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
+                -Value $owner -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
+            $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+        }
+        return $owner
+    }
+    $owner.reservationState = 'cleanup-pending'
+    $owner['cleanup'] = [ordered]@{
+        schemaVersion = $tuple.schemaVersion
+        runId = $tuple.runId
+        evidencePath = $tuple.evidencePath
+        claimDirectory = $tuple.claimDirectory
+        runRoot = $tuple.runRoot
+        startedAt = Get-UtcTimestamp
+        writerLockReleased = $false
+        claimDirectoryPreserved = $false
+        runRootPreserved = $false
+    }
+    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
+        -Value $owner -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
+    Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+}
+
+function Get-ModReservationCleanupState {
+    param([Parameter(Mandatory)][Collections.IDictionary] $State)
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+    Assert-ModReservationCleanupOwner -State $State -Owner $owner
+    if ([string]$owner.reservationState -cne 'cleanup-pending' -or
+        -not $owner.Contains('cleanup') -or $owner.cleanup -isnot [Collections.IDictionary]) {
+        throw 'Reservation does not contain a recoverable cleanup-pending tuple.'
+    }
+    $owner
+}
+
+function Set-ModReservationCleanupStep {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][ValidateSet('writerLockReleased', 'claimDirectoryPreserved', 'runRootPreserved')][string] $Step
+    )
+    $owner = Get-ModReservationCleanupState -State $State
+    if ([bool]$owner.cleanup[$Step]) { return $owner }
+    $owner.cleanup[$Step] = $true
+    $owner.cleanup["${Step}At"] = Get-UtcTimestamp
+    Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
+        -Value $owner -ExpectedReservationToken ([string]$owner.reservationToken) -ExpectedWorkerToken ([string]$owner.workerToken)
+    Get-ModReservationCleanupState -State $State
 }
 
 function Test-RunWriterOwnerActive {
