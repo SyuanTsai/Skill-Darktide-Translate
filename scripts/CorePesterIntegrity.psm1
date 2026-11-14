@@ -41,11 +41,90 @@ function Import-CorePesterAuthorityPlatformRuntime {
         if ($hash -cne [string]$entry.Value) { throw "Core Pester authority runtime file differs from the reviewed tuple: $($entry.Key)" }
     }
     $manifestPath = Join-Path $root 'scripts/platform-runtime.psd1'
-    $module = Import-Module -Name $manifestPath -Force -PassThru -ErrorAction Stop
-    & $module { param($RuntimeRoot,$Manifest) Assert-PlatformRuntimeInventory -Root $RuntimeRoot -ManifestPath $Manifest | Out-Null } (Split-Path -Parent $manifestPath) $manifestPath
+    $module = $null
+    try {
+        $module = Import-Module -Name $manifestPath -Force -PassThru -ErrorAction Stop
+        & $module { param($RuntimeRoot,$Manifest) Assert-PlatformRuntimeInventory -Root $RuntimeRoot -ManifestPath $Manifest | Out-Null } (Split-Path -Parent $manifestPath) $manifestPath
+    }
+    catch {
+        if ($module -is [Management.Automation.PSModuleInfo]) { Remove-Module -ModuleInfo $module -Force -ErrorAction SilentlyContinue }
+        throw
+    }
     $script:CorePesterPlatformRuntimeModule = $module
     Import-Module -ModuleInfo $module -Force -ErrorAction Stop
     return $module
+}
+
+function Get-CorePesterAuthorityRuntimeBinding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $CandidateSnapshotRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string] $AuthorityRevision,
+        [scriptblock] $AfterBootstrapRead
+    )
+
+    if ($AuthorityRevision -cne $script:CorePesterAuthorityRevision) { throw 'Core Pester authority revision differs from the reviewed tuple.' }
+    $candidate = [IO.Path]::GetFullPath($CandidateSnapshotRoot)
+    $runRoot = [IO.Path]::GetFullPath((Split-Path -Parent $candidate))
+    $adapterPath = Join-Path $runRoot 'source-core-adapter.json'
+    $bootstrapAdapterBytes = [IO.File]::ReadAllBytes($adapterPath)
+    $bootstrapAdapter = [Text.UTF8Encoding]::new($false, $true).GetString($bootstrapAdapterBytes) | ConvertFrom-Json -Depth 80 -ErrorAction Stop
+    $bootstrapBindings = @($bootstrapAdapter.sourceValidation.frozenFiles | Where-Object {
+        [IO.Path]::GetFileName([string]$_.path) -ceq 'platform-runtime.psd1'
+    })
+    if ($bootstrapBindings.Count -ne 1 -or [string]$bootstrapBindings[0].sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Core Pester requires exactly one frozen authority runtime manifest.'
+    }
+    $bootstrapManifestPath = [IO.Path]::GetFullPath([string]$bootstrapBindings[0].path)
+    if ([IO.Path]::GetFileName((Split-Path -Parent $bootstrapManifestPath)) -cne 'scripts') {
+        throw 'Core Pester frozen authority runtime manifest has an unexpected layout.'
+    }
+    $stream = [IO.FileStream]::new($bootstrapManifestPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try { $bootstrapManifestSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
+    finally { $stream.Dispose() }
+    if ($bootstrapManifestSha256 -cne [string]$bootstrapBindings[0].sha256) { throw 'Core Pester frozen authority runtime manifest changed.' }
+    $bootstrapAuthorityRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $bootstrapManifestPath)))
+
+    [void](Import-CorePesterAuthorityPlatformRuntime -AuthorityRoot $bootstrapAuthorityRoot -AuthorityRevision $AuthorityRevision)
+    if ($null -ne $AfterBootstrapRead) { & $AfterBootstrapRead $adapterPath }
+
+    $adapterDirectoryLease = $null
+    $adapterFileLease = $null
+    try {
+        $adapterDirectoryLease = Open-PlatformDirectory -Root $runRoot -RootOnly
+        $adapterFileLease = Open-PlatformFile -ParentLease $adapterDirectoryLease -Leaf 'source-core-adapter.json' -Access Read -CreateMode OpenExisting
+        $adapterIdentity = Assert-PlatformFileIdentity -Lease $adapterFileLease -Expected $adapterFileLease.Observation -SingleLink -VerifyPath
+        [byte[]]$adapterBytes = $adapterFileLease.ReadAllBytes(16777216)
+        [void](Assert-PlatformFileIdentity -Lease $adapterFileLease -Expected $adapterIdentity -SingleLink -VerifyPath)
+    }
+    finally {
+        if ($null -ne $adapterFileLease) { $adapterFileLease.Dispose() }
+        if ($null -ne $adapterDirectoryLease) { $adapterDirectoryLease.Dispose() }
+    }
+    if (-not [Collections.StructuralComparisons]::StructuralEqualityComparer.Equals($bootstrapAdapterBytes, $adapterBytes)) {
+        throw 'Core Pester source adapter changed between bootstrap and authority-backed lease reads.'
+    }
+
+    $adapter = [Text.UTF8Encoding]::new($false, $true).GetString($adapterBytes) | ConvertFrom-Json -Depth 80 -ErrorAction Stop
+    $bindings = @($adapter.sourceValidation.frozenFiles | Where-Object {
+        [IO.Path]::GetFileName([string]$_.path) -ceq 'platform-runtime.psd1'
+    })
+    if ($bindings.Count -ne 1 -or [string]$bindings[0].sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Core Pester requires exactly one frozen authority runtime manifest.'
+    }
+    $manifestPath = [IO.Path]::GetFullPath([string]$bindings[0].path)
+    if ([IO.Path]::GetFileName((Split-Path -Parent $manifestPath)) -cne 'scripts') {
+        throw 'Core Pester frozen authority runtime manifest has an unexpected layout.'
+    }
+    $stream = [IO.FileStream]::new($manifestPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try { $actual = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
+    finally { $stream.Dispose() }
+    if ($actual -cne [string]$bindings[0].sha256) { throw 'Core Pester frozen authority runtime manifest changed.' }
+    return [pscustomobject]@{
+        AuthorityRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $manifestPath)))
+        ManifestPath = $manifestPath
+        ManifestSha256 = $actual
+    }
 }
 
 $script:expectedMetadataEntries = @(
@@ -764,4 +843,4 @@ function Test-CorePesterPackageArchive {
     }
 }
 
-Export-ModuleMember -Function Import-CorePesterAuthorityPlatformRuntime, Open-CorePesterFileBinding, Close-CorePesterFileBinding, Get-CorePesterLeasedBytes, Read-CorePesterClosureLock, Get-CorePesterRuntimeModuleRoot, Assert-NoLegacyCorePesterBootstrapEnvironment, Test-CorePesterPathBoundary, Test-CorePesterClosure, Test-CorePesterModuleCandidates, Get-CorePesterExpectedLoadedModulePath, Test-CorePesterLoadedModuleIdentity, Get-CorePesterCaseIdentity, ConvertFrom-CorePesterProgressLine, Test-CorePesterCaseIdentityPartition, Test-CorePesterShardUnion, Test-CorePesterAcceptance, Get-CorePesterTreeSnapshot, Test-CorePesterPackageArchive
+Export-ModuleMember -Function Import-CorePesterAuthorityPlatformRuntime, Get-CorePesterAuthorityRuntimeBinding, Open-CorePesterFileBinding, Close-CorePesterFileBinding, Get-CorePesterLeasedBytes, Read-CorePesterClosureLock, Get-CorePesterRuntimeModuleRoot, Assert-NoLegacyCorePesterBootstrapEnvironment, Test-CorePesterPathBoundary, Test-CorePesterClosure, Test-CorePesterModuleCandidates, Get-CorePesterExpectedLoadedModulePath, Test-CorePesterLoadedModuleIdentity, Get-CorePesterCaseIdentity, ConvertFrom-CorePesterProgressLine, Test-CorePesterCaseIdentityPartition, Test-CorePesterShardUnion, Test-CorePesterAcceptance, Get-CorePesterTreeSnapshot, Test-CorePesterPackageArchive

@@ -509,6 +509,93 @@ function Invoke-ModUpdateMergeTopologyReconciliation {
     Suspend-Stage -State $State -Context $Stage -Result 'waiting-user' -ArtifactSha256 (Get-FileSha256 -Path $reconciliationPath) -OutputStage 'merge-topology-reconciliation' -Data $record
 }
 
+function Invoke-ModUpdateCleanupFaultInjection {
+    param([Parameter(Mandatory)][string] $Point)
+    $hook = Get-Variable -Name ModUpdateCleanupFaultInjectionHook -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($hook -is [scriptblock]) { & $hook $Point }
+}
+
+function Write-ModUpdatePreservedDirectoryMarker {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][string] $Label,
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][string] $EvidencePath
+    )
+    $directory = Assert-NoReparsePath -Path $Path -Root $Root -Label $Label
+    $leaf = '.mod-update-finalized.json'
+    $snapshot = Get-PortableLeaseFileState -ParentPath $directory -Leaf $leaf -AllowMissing
+    if ([bool]$snapshot.exists) {
+        try {
+            $existing = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$snapshot.bytes) |
+                ConvertFrom-Json -AsHashtable
+        }
+        catch { throw "$Label preservation marker is unreadable." }
+        if ([int]$existing.schemaVersion -ne 1 -or [string]$existing.runId -cne [string]$State.runId -or
+            [string]$existing.label -cne $Label -or
+            [IO.Path]::GetFullPath([string]$existing.evidencePath) -cne [IO.Path]::GetFullPath($EvidencePath)) {
+            throw "$Label preservation marker belongs to a different cleanup tuple."
+        }
+        return [IO.Path]::GetFullPath((Join-Path $directory $leaf))
+    }
+    $record = [ordered]@{
+        schemaVersion = 1
+        disposition = 'finalized-directory-preserved'
+        runId = [string]$State.runId
+        label = $Label
+        evidencePath = [IO.Path]::GetFullPath($EvidencePath)
+        preservedAt = Get-UtcTimestamp
+    }
+    [byte[]]$bytes = [Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Depth 10 -Compress) + "`n")
+    $idMaterial = [Text.UTF8Encoding]::new($false).GetBytes("finalization-marker:$($State.runId):$Label")
+    $transactionId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($idMaterial)).ToLowerInvariant().Substring(0, 32)
+    $null = Publish-PortableLeaseFile -ParentPath $directory -Leaf $leaf -Bytes $bytes -ExpectedState $snapshot `
+        -TransactionId $transactionId -NoReplace
+    [IO.Path]::GetFullPath((Join-Path $directory $leaf))
+}
+
+function Invoke-ModUpdateTerminalCleanup {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $State,
+        [Parameter(Mandatory)][string] $EvidencePath,
+        [Parameter(Mandatory)][string] $ClaimDirectory,
+        [Parameter(Mandatory)][string] $ClaimRoot,
+        [Parameter(Mandatory)][string] $RunRoot,
+        [Parameter(Mandatory)][string] $InProgressRoot
+    )
+    Suspend-ModReservationWorker -State $State
+    $owner = Start-ModReservationCleanup -State $State -EvidencePath $EvidencePath `
+        -ClaimDirectory $ClaimDirectory -RunRoot $RunRoot
+    Invoke-ModUpdateCleanupFaultInjection -Point 'cleanup-pending-persisted'
+
+    # A recovery invocation may have reacquired a fresh writer lease even when
+    # the prior process already persisted writerLockReleased. Always release
+    # the current invocation's handle before the reservation can be released.
+    if ($null -ne $script:writerLease) {
+        Exit-RunWriterLock -Lease $script:writerLease
+        $script:writerLease = $null
+    }
+    if (-not [bool]$owner.cleanup.writerLockReleased) {
+        Invoke-ModUpdateCleanupFaultInjection -Point 'writer-lock-released'
+        $owner = Set-ModReservationCleanupStep -State $State -Step writerLockReleased
+    }
+    if (-not [bool]$owner.cleanup.claimDirectoryPreserved) {
+        $null = Write-ModUpdatePreservedDirectoryMarker -Path $ClaimDirectory -Root $ClaimRoot `
+            -Label 'Finalized claim directory' -State $State -EvidencePath $EvidencePath
+        Invoke-ModUpdateCleanupFaultInjection -Point 'claim-directory-preserved'
+        $owner = Set-ModReservationCleanupStep -State $State -Step claimDirectoryPreserved
+    }
+    if (-not [bool]$owner.cleanup.runRootPreserved) {
+        $null = Write-ModUpdatePreservedDirectoryMarker -Path $RunRoot -Root $InProgressRoot `
+            -Label 'Finalized run root' -State $State -EvidencePath $EvidencePath
+        Invoke-ModUpdateCleanupFaultInjection -Point 'run-root-preserved'
+        $owner = Set-ModReservationCleanupStep -State $State -Step runRootPreserved
+    }
+    Invoke-ModUpdateCleanupFaultInjection -Point 'before-reservation-release'
+    Release-ModReservation -State $State
+}
+
 function Invoke-ModUpdateReviewedHeadFinalization {
     param(
         [Parameter(Mandatory)][Collections.IDictionary] $State,
@@ -691,16 +778,9 @@ function Invoke-ModUpdateReviewedHeadFinalization {
     if ([string]$owner.runId -cne $runId -or [string]$owner.modLockKey -cne [string]$State.modLockKey) {
         throw 'Reservation owner changed before terminal release.'
     }
-    Suspend-ModReservationWorker -State $State
-    Release-ModReservation -State $State
-    Exit-RunWriterLock -Lease $script:writerLease
-    $script:writerLease = $null
-    if (Test-Path -LiteralPath $claimDirectory -PathType Container) {
-        Remove-ModUpdateOwnedTree -Path $claimDirectory -Root $claimRoot -Label 'Finalized claim directory'
-    }
-    if (Test-Path -LiteralPath ([string]$State.runRoot) -PathType Container) {
-        Remove-ModUpdateOwnedTree -Path ([string]$State.runRoot) -Root $inProgressRoot -Label 'Finalized run root'
-    }
+    Invoke-ModUpdateTerminalCleanup -State $State -EvidencePath $evidenceFinal `
+        -ClaimDirectory $claimDirectory -ClaimRoot $claimRoot `
+        -RunRoot ([string]$State.runRoot) -InProgressRoot $inProgressRoot
 
     [ordered]@{
         result = 'passed'

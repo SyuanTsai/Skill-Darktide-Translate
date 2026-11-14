@@ -56,7 +56,7 @@ if (@($PSBoundParameters.Keys | Where-Object {
         [void](Resolve-DarktideSourceRoute -AdapterVersion $AdapterVersion -BoundParameters $PSBoundParameters)
         throw 'Core v2 parameters require -PrepareSourceTools or -SourceValidation.'
     }
-    $sourceResult = @(Invoke-DarktideSourceEntryPoint -BoundParameters $PSBoundParameters -DefaultArtifactsRoot $ArtifactsRoot)
+    $sourceResult = @(Invoke-DarktideSourceEntryPoint -BoundParameters $PSBoundParameters)
     if ($sourceResult.Count -eq 0 -or $sourceResult[-1] -isnot [int]) { throw 'Core v2 source purpose did not return an exit code.' }
     exit [int]$sourceResult[-1]
 }

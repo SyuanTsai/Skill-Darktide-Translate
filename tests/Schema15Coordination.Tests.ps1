@@ -235,6 +235,7 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
         $oldOwner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
         $oldOwner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
         $oldOwner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
+        [byte[]]$staleOwnerBytes = [IO.File]::ReadAllBytes($ownerPath)
 
         $newLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' `
             -RunId '18181818-5555-4555-8555-555555555555' -ReceiptRoot $receiptRoot
@@ -259,7 +260,15 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
         $releasedOwner = Get-Content -LiteralPath ([string]$newLease.path) -Raw | ConvertFrom-TestJson -AsHashtable
         [string]$releasedOwner.state | Should -Be 'released'
         $receiptRecord = Get-Content -LiteralPath ([string]$receipt.path) -Raw | ConvertFrom-TestJson -AsHashtable
+        [string]$newLease.staleEvidencePath | Should -Not -BeNullOrEmpty
         [string]$receiptRecord.staleEvidencePath | Should -Be ([string]$newLease.staleEvidencePath)
+        [string]$newLease.staleEvidencePath | Should -Match '[\\/]\.ai-instructions-txn[\\/][0-9a-f]{32}[\\/]previous-[0-9a-f]{32}$'
+        Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Leaf | Should -BeTrue
+        [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$newLease.staleEvidencePath)) |
+            Should -BeExactly ([Convert]::ToHexString($staleOwnerBytes))
+        $staleOwner = Get-Content -LiteralPath ([string]$newLease.staleEvidencePath) -Raw |
+            ConvertFrom-TestJson -AsHashtable
+        [string]$staleOwner.owner.token | Should -BeExactly ([string]$oldLease.token)
     }
 
     It 'InterT182_HeartbeatsWhileWaitingAndRejectsMalformedStaleProcessIdentity' {
@@ -451,7 +460,9 @@ finally {
         New-Item -ItemType Directory -Path $repository -Force | Out-Null
         $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'cas-owner'
         try {
-            InModuleScope SharedCoordinationLock -Parameters @{ Repository = $repository } {
+            $coordinationModuleObject = Get-Module -Name SharedCoordinationLock | Select-Object -First 1
+            $coordinationModuleObject | Should -Not -BeNullOrEmpty
+            InModuleScope $coordinationModuleObject -Parameters @{ Repository = $repository } {
                 $lockRoot = Join-Path $Repository 'AI Auto Update/In Progress/.locks'
                 $stale = Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey 'source-acquisition'
                 $replacement = $stale.value

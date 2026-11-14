@@ -45,6 +45,13 @@ $Rest = [string[]]$args
 $scenario = [string]$env:SOURCE_CHILD_FIXTURE_SCENARIO
 if ($scenario -ceq 'nonzero') { [Console]::Error.WriteLine('fixture non-zero'); exit 9 }
 if ($scenario -ceq 'malformed') { [Console]::Out.WriteLine('{'); return }
+if ($scenario -ceq 'hang') { [Console]::Error.WriteLine('fixture hang evidence'); Start-Sleep -Seconds 30; return }
+if ($scenario -ceq 'descendant') {
+    $child = Start-Process -FilePath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru
+    [Console]::Error.WriteLine("fixture descendant evidence pid=$($child.Id)")
+    Start-Sleep -Seconds 30
+    return
+}
 $skillId = 'auto-update-darktide-mod'
 $skillRoot = Join-Path ([string]$env:STANDARD_VALIDATION_SKILLS_ROOT) $skillId
 $skillFile = Join-Path $skillRoot 'SKILL.md'
@@ -94,7 +101,7 @@ else {
     }
 
     function Invoke-SourceChildFixture {
-        param([string] $Mode, [string] $Scenario)
+        param([string] $Mode, [string] $Scenario, [int] $TimeoutSeconds = 900)
         $root = Join-Path $TestDrive ("$Mode-$Scenario-" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $root | Out-Null
         $fixture = New-SourceChildFixture -Root $root
@@ -104,7 +111,8 @@ else {
             $output = @(& $script:PowerShellPath -NoProfile -NonInteractive -File $script:ChildPath -Mode $Mode `
                 -ToolchainPath $fixture.Toolchain -ToolchainSha256 $fixture.ToolchainSha256 `
                 -DriverModulePath $script:DriverPath -DriverModuleSha256 $script:DriverSha256 `
-                -AuthorityRepositoryRoot $script:AuthorityRoot -AuthorityRevision $script:AuthorityRevision 2>&1)
+                -AuthorityRuntimeManifestPath (Join-Path $script:AuthorityRoot 'scripts/platform-runtime.psd1') -AuthorityRevision $script:AuthorityRevision `
+                -TimeoutSeconds $TimeoutSeconds 2>&1)
             return [pscustomobject]@{ ExitCode=$LASTEXITCODE; Output=($output -join "`n"); Root=$root }
         }
         finally { Pop-Location }
@@ -159,6 +167,28 @@ Describe 'Protected Core v2 source child subprocess behavior' {
             $envelope = $result.Output | ConvertFrom-Json -Depth 100
             @($envelope.findings).Count | Should -Be 1
             $envelope.findings[0].severity | Should -BeExactly 'high'
+        }
+    }
+
+    # Scenario: A native source tool hangs directly or leaves a sleeping descendant past a one-second deadline.
+    # Purpose: Bound failure time, reject success envelopes, and retain capture evidence for cleanup diagnosis.
+    It 'InterT50_times_out_<Scenario>_and_retains_failure_evidence' -ForEach @(
+        @{Scenario='hang'}, @{Scenario='descendant'}
+    ) {
+        $watch=[Diagnostics.Stopwatch]::StartNew()
+        $result=Invoke-SourceChildFixture -Mode skill-validator -Scenario $Scenario -TimeoutSeconds 1
+        $watch.Stop()
+        $result.ExitCode | Should -Not -Be 0
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 20
+        $result.Output | Should -Not -Match '"validation":"skill-validator"'
+        $captures=@(Get-ChildItem -LiteralPath $result.Root -File | Where-Object Name -Match '\.(stdout|stderr)$')
+        $captures.Count | Should -BeGreaterThan 0
+        $captureText=@($captures | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
+        $captureText | Should -Match 'fixture (hang|descendant) evidence'
+        if($Scenario -ceq 'descendant') {
+            $pidMatch=[regex]::Match($captureText,'pid=(?<pid>[0-9]+)')
+            $pidMatch.Success | Should -BeTrue
+            Get-Process -Id ([int]$pidMatch.Groups['pid'].Value) -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
         }
     }
 }

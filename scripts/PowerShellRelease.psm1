@@ -161,6 +161,16 @@ function Invoke-PowerShellReleaseOwnedProcess {
     if (-not (Test-PowerShellReleaseCleanupReceipt -Receipt $cleanupReceipt)) {
         throw 'Owned PowerShell process cleanup was incomplete or uncertain.'
     }
+    if ($null -eq $exitCode) {
+        $timeoutFailure = [TimeoutException]::new(
+            "Owned PowerShell process exceeded its $TimeoutSeconds second deadline without a verified exit code."
+        )
+        $timeoutFailure.Data['CapturePath'] = $capturePath
+        $timeoutFailure.Data['Stdout'] = $stdout
+        $timeoutFailure.Data['Stderr'] = $stderr
+        $timeoutFailure.Data['CleanupReceipt'] = $cleanupReceipt
+        throw $timeoutFailure
+    }
     return [pscustomobject][ordered]@{
         exitCode = $exitCode
         stdout = $stdout
