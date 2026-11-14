@@ -323,6 +323,30 @@ function Assert-VerifiedPowerShellHashesManifest {
     return $actualManifestDigest
 }
 
+function Assert-SafePowerShellTarArchiveListing {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $Members,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $DetailedMembers
+    )
+
+    if ($Members.Count -eq 0 -or $DetailedMembers.Count -ne $Members.Count) {
+        throw 'PowerShell tar archive listings are empty or inconsistent.'
+    }
+    for ($index = 0; $index -lt $Members.Count; $index++) {
+        $memberName = [string]$Members[$index]
+        $detail = [string]$DetailedMembers[$index]
+        if ([string]::IsNullOrEmpty($memberName) -or $memberName.StartsWith('/', [StringComparison]::Ordinal) -or
+            $memberName.StartsWith('\', [StringComparison]::Ordinal) -or $memberName -cmatch '^[A-Za-z]:' -or
+            $memberName -cmatch '(^|/)\.\.(/|$)') {
+            throw "PowerShell tar archive member '$memberName' escapes the run-owned runtime directory."
+        }
+        if ([string]::IsNullOrEmpty($detail) -or $detail[0] -cnotin @('-', 'd')) {
+            throw "PowerShell tar archive member '$memberName' is a link or unsupported special entry."
+        }
+    }
+}
+
 function Expand-VerifiedPowerShellArchive {
     [CmdletBinding()]
     param(
@@ -347,18 +371,20 @@ function Expand-VerifiedPowerShellArchive {
         $tarPath = (Get-Command -Name 'tar' -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
         $members = @(& $tarPath -tzf $ArchivePath)
         if ($LASTEXITCODE -ne 0 -or $members.Count -eq 0) { throw 'PowerShell tar archive listing failed.' }
-        foreach ($member in $members) {
-            $memberName = [string]$member
-            if ([string]::IsNullOrEmpty($memberName) -or $memberName.StartsWith('/', [StringComparison]::Ordinal) -or
-                $memberName -cmatch '(^|/)\.\.(/|$)') {
-                throw "PowerShell tar archive member '$memberName' escapes the run-owned runtime directory."
-            }
-        }
+        $detailedMembers = @(& $tarPath -tvzf $ArchivePath)
+        if ($LASTEXITCODE -ne 0) { throw 'PowerShell tar archive detailed listing failed.' }
+        Assert-SafePowerShellTarArchiveListing -Members $members -DetailedMembers $detailedMembers
         [void](New-Item -ItemType Directory -Path $destinationFullPath -ErrorAction Stop)
         # Extract without -p so ownership is not restored, while the archive's
         # file modes, including the executable bit, are retained under umask.
         & $tarPath -xzf $ArchivePath -C $destinationFullPath
         if ($LASTEXITCODE -ne 0) { throw 'PowerShell tar archive extraction failed.' }
+        foreach ($item in @(Get-ChildItem -LiteralPath $destinationFullPath -Recurse -Force -ErrorAction Stop)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                -not [string]::IsNullOrEmpty([string]$item.LinkType)) {
+                throw "PowerShell tar extraction produced an unsafe link: $($item.FullName)"
+            }
+        }
     }
 
     $executablePath = Join-Path $destinationFullPath $executableName
@@ -440,6 +466,7 @@ Export-ModuleMember -Function @(
     'Assert-VerifiedPowerShellArchive'
     'Get-OfficialPowerShellManifestDigest'
     'Assert-VerifiedPowerShellHashesManifest'
+    'Assert-SafePowerShellTarArchiveListing'
     'Expand-VerifiedPowerShellArchive'
     'Assert-PowerShellExecutableSignature'
     'Assert-PowerShellRuntimeVersion'

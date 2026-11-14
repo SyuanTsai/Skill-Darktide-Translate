@@ -20,6 +20,11 @@ Describe 'Darktide bootstrap transition' {
             }
             & git -C $Destination init --quiet --initial-branch=main
             if ($LASTEXITCODE -ne 0) { throw 'Failed to initialize the validator Git snapshot.' }
+            foreach ($setting in @(
+                @('maintenance.auto', 'false'), @('maintenance.autoDetach', 'false'),
+                @('gc.auto', '0'), @('gc.autoDetach', 'false'))) {
+                & git -C $Destination config --local $setting[0] $setting[1]
+            }
             # The protected runner's run-owned TEMP can put fixture Git objects beyond MAX_PATH.
             & git -C $Destination config core.longpaths true
             if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the validator Git snapshot.' }

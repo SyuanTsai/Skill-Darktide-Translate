@@ -68,6 +68,29 @@ function Assert-WorkflowRuntimeRootEmpty {
     }
 }
 
+function New-WorkflowPowerShellAssetEvidence {
+    param(
+        [Parameter(Mandatory)][string] $ArchivePath,
+        [Parameter(Mandatory)][string] $ManifestPath,
+        [Parameter(Mandatory)][string] $ArchiveName,
+        [Parameter(Mandatory)][string] $ArchiveSha256,
+        [Parameter(Mandatory)][string] $ManifestSha256
+    )
+    $archiveItem = Get-Item -LiteralPath $ArchivePath -Force -ErrorAction Stop
+    $manifestItem = Get-Item -LiteralPath $ManifestPath -Force -ErrorAction Stop
+    return [pscustomobject][ordered]@{
+        platform = $Platform
+        name = $ArchiveName
+        digest = "sha256:$ArchiveSha256"
+        size = [long]$archiveItem.Length
+        hashesManifest = [pscustomobject][ordered]@{
+            name = 'hashes.sha256'
+            digest = "sha256:$ManifestSha256"
+            size = [long]$manifestItem.Length
+        }
+    }
+}
+
 if ($DefineFunctionsOnly) { return }
 
 Assert-WorkflowArchitecture
@@ -105,45 +128,24 @@ switch ($Mode) {
             throw "PowerShell release metadata request redirected to an unexpected host: $($finalUri.Host)"
         }
         $release = $metadataResponse.Content | ConvertFrom-Json
-        $tag = [string]$release.tag_name
-        if ($release.draft -or $release.prerelease -or $tag -cnotmatch '^v(?<version>[0-9]+\.[0-9]+\.[0-9]+)$') {
-            throw 'PowerShell latest release is not a stable semantic-version release.'
-        }
-        $resolvedVersion = [string]$Matches.version
-        $resolvedAssetName = Get-PowerShellReleaseAssetName -Version $resolvedVersion -Platform $Platform -Architecture $ExpectedArchitecture
+        $verifiedAsset = Get-VerifiedPowerShellReleaseAsset -Release $release -Platform $Platform -Architecture $ExpectedArchitecture
+        $tag = [string]$verifiedAsset.tag
+        $resolvedVersion = [string]$verifiedAsset.version
+        $resolvedAssetName = [string]$verifiedAsset.name
         if (($AssetTemplate -f $resolvedVersion) -cne $resolvedAssetName) {
             throw "Workflow asset template does not name the official $Platform/$ExpectedArchitecture archive '$resolvedAssetName'."
         }
-        $archiveAssets = @($release.assets | Where-Object { [string]$_.name -ceq $resolvedAssetName })
-        $hashAssets = @($release.assets | Where-Object { [string]$_.name -ceq 'hashes.sha256' })
-        if ($archiveAssets.Count -ne 1 -or $hashAssets.Count -ne 1) {
-            throw 'Latest official PowerShell release is missing the exact platform archive or hashes.sha256.'
-        }
-        $releasePrefix = "https://github.com/PowerShell/PowerShell/releases/download/$tag/"
-        foreach ($asset in @($archiveAssets[0], $hashAssets[0])) {
-            $uri = [Uri][string]$asset.browser_download_url
-            if ($uri.Scheme -cne 'https' -or $uri.Host -cne 'github.com' -or
-                -not $uri.AbsoluteUri.StartsWith($releasePrefix, [StringComparison]::Ordinal) -or
-                [string]$asset.digest -cnotmatch '^sha256:(?<hash>[0-9a-fA-F]{64})$') {
-                throw "PowerShell release asset '$($asset.name)' lacks an official immutable URL or SHA-256 digest."
-            }
-        }
-        $archiveApiSha256 = ([string]$archiveAssets[0].digest).Substring(7).ToLowerInvariant()
-        $manifestApiSha256 = ([string]$hashAssets[0].digest).Substring(7).ToLowerInvariant()
+        $archiveApiSha256 = ([string]$verifiedAsset.digest).Substring(7)
+        $manifestApiSha256 = ([string]$verifiedAsset.hashesManifest.digest).Substring(7)
         $metadataRoot = Join-Path ([IO.Path]::GetTempPath()) ("dt-pwsh-metadata-$Platform-$([guid]::NewGuid().ToString('N'))")
         [void](New-Item -ItemType Directory -Path $metadataRoot -ErrorAction Stop)
         $manifestPath = Join-Path $metadataRoot 'hashes.sha256'
-        Invoke-WebRequest -Uri ([string]$hashAssets[0].browser_download_url) -OutFile $manifestPath -MaximumRedirection 3 -TimeoutSec 60 -ErrorAction Stop
-        if ((Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifestApiSha256) {
-            throw 'PowerShell hashes.sha256 bytes differ from the official release asset digest.'
-        }
-        if ((Get-OfficialManifestArchiveSha256 -ManifestPath $manifestPath -ArchiveName $resolvedAssetName) -cne $archiveApiSha256) {
-            throw 'PowerShell archive API digest differs from hashes.sha256.'
-        }
+        Invoke-WebRequest -Uri ([string]$verifiedAsset.hashesManifest.browserDownloadUrl) -OutFile $manifestPath -MaximumRedirection 3 -TimeoutSec 60 -ErrorAction Stop
+        [void](Assert-VerifiedPowerShellHashesManifest -Asset $verifiedAsset -Path $manifestPath)
         $outputs = @(
             "version=$resolvedVersion", "tag=$tag", "asset=$resolvedAssetName",
-            "archive_url=$([string]$archiveAssets[0].browser_download_url)",
-            "hashes_url=$([string]$hashAssets[0].browser_download_url)",
+            "archive_url=$([string]$verifiedAsset.browserDownloadUrl)",
+            "hashes_url=$([string]$verifiedAsset.hashesManifest.browserDownloadUrl)",
             "official_sha256=$archiveApiSha256", "hashes_sha256=$manifestApiSha256",
             "fresh_hashes_path=$manifestPath"
         )
@@ -166,9 +168,10 @@ switch ($Mode) {
         $cacheValid = $false
         if ((Test-Path -LiteralPath $archivePath -PathType Leaf) -and (Test-Path -LiteralPath $cachedManifestPath -PathType Leaf)) {
             try {
-                if ((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $OfficialArchiveSha256) { throw 'cached archive hash mismatch' }
-                if ((Get-FileHash -LiteralPath $cachedManifestPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $HashesManifestSha256) { throw 'cached manifest hash mismatch' }
-                if ((Get-OfficialManifestArchiveSha256 -ManifestPath $cachedManifestPath -ArchiveName $AssetName) -cne $OfficialArchiveSha256) { throw 'cached manifest entry mismatch' }
+                $cachedAsset = New-WorkflowPowerShellAssetEvidence -ArchivePath $archivePath -ManifestPath $cachedManifestPath `
+                    -ArchiveName $AssetName -ArchiveSha256 $OfficialArchiveSha256 -ManifestSha256 $HashesManifestSha256
+                [void](Assert-VerifiedPowerShellArchive -Asset $cachedAsset -Path $archivePath)
+                [void](Assert-VerifiedPowerShellHashesManifest -Asset $cachedAsset -Path $cachedManifestPath)
                 $cacheValid = $true
             }
             catch {
@@ -180,11 +183,10 @@ switch ($Mode) {
             Invoke-WebRequest -Uri $ArchiveUrl -OutFile $archivePath -MaximumRedirection 3 -TimeoutSec 300 -ErrorAction Stop
             [IO.File]::Copy($FreshHashesPath, $cachedManifestPath, $false)
         }
-        if ((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $OfficialArchiveSha256 -or
-            (Get-FileHash -LiteralPath $cachedManifestPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $HashesManifestSha256 -or
-            (Get-OfficialManifestArchiveSha256 -ManifestPath $cachedManifestPath -ArchiveName $AssetName) -cne $OfficialArchiveSha256) {
-            throw 'PowerShell release bytes failed mandatory post-cache verification.'
-        }
+        $verifiedAsset = New-WorkflowPowerShellAssetEvidence -ArchivePath $archivePath -ManifestPath $cachedManifestPath `
+            -ArchiveName $AssetName -ArchiveSha256 $OfficialArchiveSha256 -ManifestSha256 $HashesManifestSha256
+        [void](Assert-VerifiedPowerShellArchive -Asset $verifiedAsset -Path $archivePath)
+        [void](Assert-VerifiedPowerShellHashesManifest -Asset $verifiedAsset -Path $cachedManifestPath)
         if ($AssetName -cne (Get-PowerShellReleaseAssetName -Version $Version -Platform $Platform -Architecture $ExpectedArchitecture)) {
             throw 'AssetName is not the official archive for this platform and architecture.'
         }
@@ -192,7 +194,6 @@ switch ($Mode) {
         # The shared extractor requires a fresh destination; the empty run-owned
         # root is removed and recreated by the verified extraction.
         Remove-Item -LiteralPath $RuntimeRoot -Force -ErrorAction Stop
-        $verifiedAsset = [pscustomobject][ordered]@{ platform = $Platform; name = $AssetName; digest = "sha256:$OfficialArchiveSha256" }
         $executable = Expand-VerifiedPowerShellArchive -Asset $verifiedAsset -ArchivePath $archivePath -DestinationPath $RuntimeRoot
         if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'Official archive did not contain the expected PowerShell executable.' }
         $signature = Assert-PowerShellExecutableSignature -Path $executable -Platform $Platform

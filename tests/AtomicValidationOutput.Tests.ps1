@@ -3,7 +3,27 @@
 
 Describe 'Atomic caller-specified validation output' {
     BeforeAll {
-        $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
+        $sourceRoot = Split-Path -Parent $PSScriptRoot
+        $gitPath = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+        $script:RepositoryRoot = Join-Path $TestDrive 'repository-fixture'
+        New-Item -ItemType Directory -Path $script:RepositoryRoot | Out-Null
+        $trackedPaths = @(& $gitPath -c core.quotepath=false -C $sourceRoot ls-files)
+        if ($LASTEXITCODE -ne 0 -or $trackedPaths.Count -eq 0) { throw 'Could not enumerate the atomic-output repository fixture.' }
+        foreach ($relative in $trackedPaths) {
+            $source = Join-Path $sourceRoot ([string]$relative)
+            $destination = Join-Path $script:RepositoryRoot ([string]$relative)
+            $parent = Split-Path -Parent $destination
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+            [IO.File]::Copy($source, $destination, $false)
+        }
+        & $gitPath -C $script:RepositoryRoot init --quiet
+        foreach ($setting in @(
+            @('core.autocrlf', 'false'), @('maintenance.auto', 'false'), @('maintenance.autoDetach', 'false'),
+            @('gc.auto', '0'), @('gc.autoDetach', 'false'))) {
+            & $gitPath -C $script:RepositoryRoot config --local $setting[0] $setting[1]
+        }
+        & $gitPath -C $script:RepositoryRoot add -A
+        if ($LASTEXITCODE -ne 0) { throw 'Could not stage the atomic-output repository fixture.' }
         $script:RepositoryValidator = Join-Path $script:RepositoryRoot 'scripts/Test-Repository.ps1'
         $script:OutputRoot = Join-Path $TestDrive 'validation-output'
         New-Item -ItemType Directory -Path $script:OutputRoot -Force | Out-Null

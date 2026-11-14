@@ -15,6 +15,11 @@ Describe 'Immutable Skill source pin' {
         Copy-Item -LiteralPath $layout.SkillRoot -Destination $fixtureSkillRoot -Recurse
         Copy-Item -LiteralPath $sourceScript -Destination (Join-Path $fixtureScripts 'Get-SourcePin.ps1')
         & git -C $fixtureRoot init --quiet
+        foreach ($setting in @(
+            @('maintenance.auto', 'false'), @('maintenance.autoDetach', 'false'),
+            @('gc.auto', '0'), @('gc.autoDetach', 'false'))) {
+            & git -C $fixtureRoot config --local $setting[0] $setting[1]
+        }
         & git -C $fixtureRoot config core.longpaths true
         if ($LASTEXITCODE -ne 0) { throw 'Failed to enable long paths for the source-pin Git fixture.' }
         & git -C $fixtureRoot config user.name 'Source Pin Test'

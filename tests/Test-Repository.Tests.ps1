@@ -14,6 +14,11 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         Copy-Item -LiteralPath (Join-Path $script:RepositoryRoot 'config') -Destination $script:FixtureRoot -Recurse
         Copy-Item -LiteralPath (Join-Path $script:RepositoryRoot 'skills') -Destination $script:FixtureRoot -Recurse
         & $script:GitPath -C $script:FixtureRoot init --quiet
+        foreach ($setting in @(
+            @('maintenance.auto', 'false'), @('maintenance.autoDetach', 'false'),
+            @('gc.auto', '0'), @('gc.autoDetach', 'false'))) {
+            & $script:GitPath -C $script:FixtureRoot config --local $setting[0] $setting[1]
+        }
         & $script:GitPath -C $script:FixtureRoot add -- catalog/source.json config skills
         if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the repository contract fixture.' }
         $script:SkillId = 'auto-update-darktide-mod'

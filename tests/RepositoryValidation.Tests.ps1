@@ -14,6 +14,11 @@ Describe 'Repository pre-push validation' {
             New-Item -ItemType Directory -Path $Path -Force | Out-Null
             & git -C $Path init --quiet --initial-branch=main
             if ($LASTEXITCODE -ne 0) { throw 'Failed to initialize the test repository.' }
+            foreach ($setting in @(
+                @('maintenance.auto', 'false'), @('maintenance.autoDetach', 'false'),
+                @('gc.auto', '0'), @('gc.autoDetach', 'false'))) {
+                & git -C $Path config --local $setting[0] $setting[1]
+            }
             & git -C $Path config user.name 'Repository Validation Test'
             & git -C $Path config user.email 'repository-validation@example.invalid'
             Set-Content -LiteralPath (Join-Path $Path 'tracked.txt') -Value 'committed'
@@ -371,6 +376,39 @@ Describe 'Latest stable PowerShell release evidence' {
         # The manifest bytes were altered after the API digest was published.
         [IO.File]::AppendAllText($manifestPath, "# appended`n", [Text.UTF8Encoding]::new($false))
         { Assert-VerifiedPowerShellHashesManifest -Asset $asset -Path $manifestPath } | Should -Throw
+    }
+
+    # Scenario: A Unix tar listing contains links or other special entries whose targets could escape after extraction.
+    # Purpose: Reject every non-file/non-directory member before extraction, independently of the host running this unit test.
+    It 'UnitT106_RejectsUnixTarLinksAndSpecialEntriesBeforeExtraction' {
+        { Assert-SafePowerShellTarArchiveListing -Members @('pwsh', 'Modules/') -DetailedMembers @(
+                '-rwxr-xr-x owner/group 1 2026-01-01 00:00 pwsh'
+                'drwxr-xr-x owner/group 0 2026-01-01 00:00 Modules/'
+            ) } | Should -Not -Throw
+
+        foreach ($detail in @(
+            'lrwxrwxrwx owner/group 0 2026-01-01 00:00 pwsh -> ../outside'
+            'hrw-r--r-- owner/group 0 2026-01-01 00:00 pwsh link to ../outside'
+            'crw-r--r-- owner/group 0 2026-01-01 00:00 device'
+        )) {
+            { Assert-SafePowerShellTarArchiveListing -Members @('pwsh') -DetailedMembers @($detail) } |
+                Should -Throw '*link or unsupported special entry*'
+        }
+        { Assert-SafePowerShellTarArchiveListing -Members @('../outside') -DetailedMembers @('-rw-r--r-- owner/group 1 2026-01-01 00:00 ../outside') } |
+            Should -Throw '*escapes the run-owned runtime directory*'
+    }
+
+    # Scenario: The PR-B workflow helper resolves and installs PowerShell on three platforms.
+    # Purpose: Keep release selection, archive/manifest verification, and extraction in the shared repository module.
+    It 'UnitT107_DelegatesWorkflowReleaseVerificationAndExtractionToTheSharedModule' {
+        $workflowHelper = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Prepare-WorkflowPowerShell.ps1') -Raw
+        $workflowHelper | Should -Match "Import-Module -Name \(Join-Path \`$PSScriptRoot 'PowerShellRelease\.psm1'\)"
+        foreach ($functionName in @(
+            'Get-VerifiedPowerShellReleaseAsset', 'Assert-VerifiedPowerShellArchive',
+            'Assert-VerifiedPowerShellHashesManifest', 'Expand-VerifiedPowerShellArchive')) {
+            $workflowHelper | Should -Match ([regex]::Escape($functionName))
+        }
+        $workflowHelper | Should -Not -Match '\bExpand-Archive\b|&\s+(?:\$\w+|tar)\s+-x'
     }
 
     # Register only on the native host: Windows archives are zip files whose pwsh.exe carries an Authenticode signature.

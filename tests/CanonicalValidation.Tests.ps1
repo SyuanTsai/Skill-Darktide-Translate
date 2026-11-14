@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+}
 Describe 'Run-owned workflow cleanup filesystem boundary' {
     BeforeAll {
-        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $workflow = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $block = [regex]::Match($workflow,
             '(?ms)^      - name: Remove run-owned validation directory\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:|\z)')
@@ -101,7 +103,6 @@ Describe 'Run-owned workflow cleanup filesystem boundary' {
 
 Describe 'Trusted resolver API credential lifetime' {
     BeforeAll {
-        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $source = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1') -Raw
         $tokens = $null; $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
@@ -146,8 +147,9 @@ Describe 'Trusted resolver API credential lifetime' {
         function Invoke-CredentialLifetimeFixture {
             param([string] $Root, [string] $FailTool, [bool] $WithToken)
             $module = New-Module -ScriptBlock ([scriptblock]::Create($script:CredentialFunctions))
+            $powerShellPath = Get-TestPowerShellExecutablePath
             return & $module {
-                param($root, $failTool, $withToken, $earlyBody, $setup, $sources, $loop)
+                param($root, $failTool, $withToken, $earlyBody, $setup, $sources, $loop, $powerShellPath)
                 $before = [Environment]::GetEnvironmentVariables('Process')
                 try {
                     $script:IsWindowsHost = $true
@@ -161,7 +163,7 @@ Describe 'Trusted resolver API credential lifetime' {
                     $child = [Diagnostics.Process]::new()
                     try {
                         $child.StartInfo = [Diagnostics.ProcessStartInfo]::new()
-                        $child.StartInfo.FileName = Get-TestPowerShellExecutablePath
+                        $child.StartInfo.FileName = $powerShellPath
                         $child.StartInfo.UseShellExecute = $false
                         $child.StartInfo.CreateNoWindow = $true
                         $child.StartInfo.RedirectStandardOutput = $true
@@ -219,7 +221,7 @@ Describe 'Trusted resolver API credential lifetime' {
                         [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
                     }
                 }
-            } $Root $FailTool $WithToken $script:CredentialEarlyBody $script:CredentialSetup $script:CredentialSources $script:CredentialLoop
+            } $Root $FailTool $WithToken $script:CredentialEarlyBody $script:CredentialSetup $script:CredentialSources $script:CredentialLoop $powerShellPath
         }
     }
 
@@ -329,7 +331,6 @@ Describe 'Trusted resolver API credential lifetime' {
 }
 Describe 'Workflow resolver credential handoff' {
     BeforeAll {
-        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $workflow = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) '.github/workflows/standard-v1-candidate-windows.yml') -Raw
         $block = [regex]::Match($workflow,
             '(?ms)^      - name: Validate exact commit with verified PowerShell\r?\n.*?^        run: \|\r?\n(?<code>.*?)(?=^      - name:)')
@@ -360,8 +361,9 @@ Describe 'Workflow resolver credential handoff' {
         function Invoke-WorkflowCredentialFixture {
             param([string] $Root, [int] $ValidatorExit)
             $module = New-Module -ScriptBlock {}
+            $powerShellPath = Get-TestPowerShellExecutablePath
             return & $module {
-                param($root, $validatorExit, $earlyBody, $invocation)
+                param($root, $validatorExit, $earlyBody, $invocation, $powerShellPath)
                 $before = [Environment]::GetEnvironmentVariables('Process')
                 try {
                     [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', 'fixture-read-only-api-token', 'Process')
@@ -372,7 +374,7 @@ Describe 'Workflow resolver credential handoff' {
                     $child = [Diagnostics.Process]::new()
                     try {
                         $child.StartInfo = [Diagnostics.ProcessStartInfo]::new()
-                        $child.StartInfo.FileName = Get-TestPowerShellExecutablePath
+                        $child.StartInfo.FileName = $powerShellPath
                         $child.StartInfo.UseShellExecute = $false
                         $child.StartInfo.CreateNoWindow = $true
                         $child.StartInfo.RedirectStandardOutput = $true
@@ -398,7 +400,6 @@ exit ([int]$env:WORKFLOW_FIXTURE_EXIT)
                     [IO.File]::WriteAllText((Join-Path $repositoryRoot 'scripts/Validate.ps1'), $fixture,
                         [Text.UTF8Encoding]::new($false))
                     [Environment]::SetEnvironmentVariable('WORKFLOW_FIXTURE_EXIT', [string]$validatorExit, 'Process')
-                    $powerShellPath = Get-TestPowerShellExecutablePath
                     $runDirectory = $root; $reportPath = Join-Path $root 'credential-booleans.json'
                     $baseCommit = ('a' * 40); $checkoutHead = ('b' * 40); $expectedGoRuntimeVersion = 'fixture-runtime'
                     . ([scriptblock]::Create($invocation))
@@ -421,7 +422,7 @@ exit ([int]$env:WORKFLOW_FIXTURE_EXIT)
                         [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
                     }
                 }
-            } $Root $ValidatorExit $script:WorkflowEarlyBody $script:WorkflowInvocation
+            } $Root $ValidatorExit $script:WorkflowEarlyBody $script:WorkflowInvocation $powerShellPath
         }
     }
 

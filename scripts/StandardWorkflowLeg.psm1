@@ -212,7 +212,7 @@ function Test-DarktidePlatformLegReceiptSet {
         if ($match.Success) { $match.Groups['mm'].Value }
     } | Sort-Object -Unique)
     if ($pythonMinors.Count -ne 1) { $problems.Add('Python major.minor differs across platform receipts or is missing.') }
-    return , $problems.ToArray()
+    return $problems.ToArray()
 }
 
 Export-ModuleMember -Function Get-DarktideProtectedDriverHelperPaths, Get-DarktideLegOutcomeNames, Assert-DarktideProtectedDriverCheckout, New-DarktidePlatformLegReceipt, Test-DarktidePlatformLegReceiptSet

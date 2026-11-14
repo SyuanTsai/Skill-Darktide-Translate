@@ -45,3 +45,25 @@ path = "config/pester-6.2.0-closure.lock.json"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 SyuanTsai"
 SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [
+    "scripts/CorePesterIntegrity.psm1",
+    "scripts/Invoke-CorePester.ps1",
+    "scripts/Invoke-SourceChild.ps1",
+    "scripts/Prepare-PesterRuntime.ps1",
+    "scripts/Prepare-WorkflowPowerShell.ps1",
+    "scripts/StandardSourceDriver.psm1",
+    "scripts/StandardWorkflowLeg.psm1",
+    "tests/CorePesterIntegrity.Tests.ps1",
+    "tests/StandardSourceDriver.Tests.ps1",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 SyuanTsai"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "skills/auto-update-darktide-mod/scripts/platform-runtime/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 SyuanTsai"
+SPDX-License-Identifier = "Apache-2.0"

@@ -203,19 +203,19 @@ function Assert-DarktideOutsideRoot {
 function Resolve-DarktidePhysicalPath {
     # Resolve every existing link component (for example macOS /var and /tmp,
     # which are system symlinks to /private/...) so trusted roots are compared
-    # by their physical location. Windows paths are returned unchanged.
+    # by their physical location before a trusted-boundary walk begins.
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string] $Path)
 
     $full = [IO.Path]::GetFullPath($Path)
-    if ($IsWindows) { return $full }
     $resolved = [IO.Path]::GetPathRoot($full)
     foreach ($segment in @($full.Substring($resolved.Length).Split([IO.Path]::DirectorySeparatorChar) | Where-Object { $_ -ne '' })) {
         $candidate = Join-Path $resolved $segment
         $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
-        if ($null -ne $item -and -not [string]::IsNullOrEmpty([string]$item.LinkType)) {
-            $target = [IO.Directory]::ResolveLinkTarget($candidate, $true)
-            if ($null -eq $target) { $target = [IO.File]::ResolveLinkTarget($candidate, $true) }
+        if ($null -ne $item -and ((($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+                -not [string]::IsNullOrEmpty([string]$item.LinkType))) {
+            $target = if ($item.PSIsContainer) { [IO.Directory]::ResolveLinkTarget($candidate, $true) }
+                else { [IO.File]::ResolveLinkTarget($candidate, $true) }
             if ($null -eq $target) { throw "Could not resolve the physical target of '$candidate'." }
             $candidate = [IO.Path]::GetFullPath([string]$target.FullName)
         }
@@ -225,45 +225,39 @@ function Resolve-DarktidePhysicalPath {
 }
 
 function Assert-DarktideNoReparseAncestors {
-    # Windows: every ancestor up to the volume root must be a non-reparse
-    # entry (unchanged v1 semantics). Linux/macOS: the walk stops at the
-    # trusted boundary (TrustedRoot, or the immediate parent when none is
-    # supplied); ancestors above the boundary are system path components that
-    # are resolved physically instead of rejected. Nothing at or below the
-    # boundary may be a link.
+    # The trusted root is physically canonicalized first (for example macOS
+    # /var -> /private/var). Ancestors above that boundary are trusted host
+    # path components, while every existing component below it must be a plain
+    # non-link entry.
     param(
         [Parameter(Mandatory = $true)][string] $Path,
         [Parameter(Mandatory = $true)][string] $Context,
         [string] $TrustedRoot
     )
-    $current = [IO.Path]::GetFullPath($Path)
-    if ($IsWindows) {
-        while (-not [string]::IsNullOrWhiteSpace($current)) {
-            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$Context is backed by a reparse point: $current" }
-            $parent = Split-Path -Parent $current
-            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $current) { break }
-            $current = $parent
-        }
-        return
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $logicalRoot = if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
+        [IO.Path]::GetPathRoot($fullPath)
     }
-    $checkBoundary = -not [string]::IsNullOrWhiteSpace($TrustedRoot)
-    $boundary = if ($checkBoundary) { [IO.Path]::GetFullPath($TrustedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) } else { Split-Path -Parent $current }
-    if ([string]::IsNullOrWhiteSpace($boundary)) { $boundary = [IO.Path]::GetPathRoot($current) }
-    if (-not (Test-DarktidePathWithinOrEqual -Path $current -Root $boundary)) { throw "$Context escapes its trusted root '$boundary': $current" }
-    while ($true) {
-        $atBoundary = $current.TrimEnd([IO.Path]::DirectorySeparatorChar).Equals($boundary.TrimEnd([IO.Path]::DirectorySeparatorChar), [StringComparison]::Ordinal)
-        if ($atBoundary -and -not $checkBoundary) { break }
+    else { [IO.Path]::GetFullPath($TrustedRoot) }
+    $physicalRoot = Resolve-DarktidePhysicalPath -Path $logicalRoot
+    $relative = if (Test-DarktidePathWithinOrEqual -Path $fullPath -Root $logicalRoot) {
+        [IO.Path]::GetRelativePath($logicalRoot, $fullPath)
+    }
+    elseif (Test-DarktidePathWithinOrEqual -Path $fullPath -Root $physicalRoot) {
+        [IO.Path]::GetRelativePath($physicalRoot, $fullPath)
+    }
+    else { throw "$Context escapes its trusted root '$logicalRoot': $fullPath" }
+
+    if ($relative -ceq '.') { return }
+    $current = $physicalRoot
+    foreach ($segment in @($relative.Split([IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries))) {
+        if ($segment -ceq '..') { throw "$Context escapes its trusted root '$logicalRoot': $fullPath" }
+        $current = Join-Path $current $segment
         $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not [string]::IsNullOrEmpty([string]$item.LinkType)) {
             throw "$Context is backed by a reparse point: $current"
         }
-        if ($atBoundary) { break }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $current) { break }
-        $current = $parent
     }
-    [void](Resolve-DarktidePhysicalPath -Path $boundary)
 }
 
 function Write-DarktideUtf8CreateNew {
@@ -536,9 +530,9 @@ function Assert-DarktidePreparedAuthorityCheckout {
         [Parameter(Mandatory = $true)] $AuthorityPin
     )
 
-    $fullRoot = [IO.Path]::GetFullPath($AuthorityRoot)
+    $fullRoot = Resolve-DarktidePhysicalPath -Path $AuthorityRoot
     if (-not (Test-Path -LiteralPath $fullRoot -PathType Container)) { throw "Prepared authority Git checkout is missing: $fullRoot" }
-    Assert-DarktideNoReparseAncestors -Path $fullRoot -Context 'Prepared authority checkout'
+    Assert-DarktideNoReparseAncestors -Path $fullRoot -Context 'Prepared authority checkout' -TrustedRoot $fullRoot
     $top = @(& $GitPath -C $fullRoot rev-parse --show-toplevel 2>$null)
     if ($LASTEXITCODE -ne 0 -or $top.Count -ne 1 -or -not (Test-DarktidePathEqual -Left ([string]$top[0]) -Right $fullRoot)) {
         throw 'Prepared authority path is not the root of a Git checkout.'
@@ -561,7 +555,7 @@ function Assert-DarktidePreparedAuthorityCheckout {
     foreach ($entry in $AuthorityPin.files.GetEnumerator()) {
         $filePath = [IO.Path]::GetFullPath((Join-Path $fullRoot ($entry.Key -replace '/', [IO.Path]::DirectorySeparatorChar)))
         if (-not (Test-DarktidePathWithinOrEqual -Path $filePath -Root $fullRoot)) { throw "Prepared authority file escaped its checkout: $($entry.Key)" }
-        Assert-DarktideNoReparseAncestors -Path $filePath -Context 'Prepared authority file'
+        Assert-DarktideNoReparseAncestors -Path $filePath -Context 'Prepared authority file' -TrustedRoot $fullRoot
         if (-not (Test-Path -LiteralPath $filePath -PathType Leaf) -or (Get-DarktideFileSha256 -Path $filePath) -cne [string]$entry.Value) {
             throw "Prepared authority file identity mismatch: $($entry.Key)"
         }
@@ -598,7 +592,7 @@ function Remove-DarktideOwnedCoreAdapterRoot {
     }
     if (-not (Test-Path -LiteralPath $ownedFull -PathType Container)) { return }
     foreach ($root in $ProtectedRoots) { Assert-DarktideOutsideRoot -Path $ownedFull -Root $root -Context 'Core adapter cleanup root' }
-    Assert-DarktideNoReparseAncestors -Path $ownedFull -Context 'Core adapter cleanup root'
+    Assert-DarktideNoReparseAncestors -Path $ownedFull -Context 'Core adapter cleanup root' -TrustedRoot $ArtifactsRoot
 
     $markerPath = Join-Path $ownedFull '.source-owned.json'
     if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { throw 'Core adapter cleanup ownership marker is missing.' }
@@ -713,19 +707,27 @@ function Assert-DarktideSourceReceiptClosureFrozen {
         if ($toolName -cnotin $script:DarktideSourceToolNames -or -not $seenTools.Add($toolName)) {
             throw 'Source tool receipts must identify each approved tool exactly once.'
         }
-        $pairs = if ($toolName -ceq 'skill-tools') { @(@('entryPointPath', 'entryPointSha256'), @('nodePath', 'nodeSha256')) } else { @(, @('executablePath', 'executableSha256')) }
+        $pairs = if ($toolName -ceq 'skill-tools') {
+            @(
+                [pscustomobject]@{ path = 'entryPointPath'; sha256 = 'entryPointSha256' }
+                [pscustomobject]@{ path = 'nodePath'; sha256 = 'nodeSha256' }
+            )
+        }
+        else {
+            @([pscustomobject]@{ path = 'executablePath'; sha256 = 'executableSha256' })
+        }
         foreach ($pair in $pairs) {
-            $pathProperty = $receipt.PSObject.Properties[[string]$pair[0]]
-            $hashProperty = $receipt.PSObject.Properties[[string]$pair[1]]
+            $pathProperty = $receipt.PSObject.Properties[[string]$pair.path]
+            $hashProperty = $receipt.PSObject.Properties[[string]$pair.sha256]
             if ($null -eq $pathProperty -or $null -eq $hashProperty -or
                 $pathProperty.Value -isnot [string] -or $hashProperty.Value -isnot [string] -or
                 [string]$hashProperty.Value -cnotmatch '^[0-9a-f]{64}$' -or -not [IO.Path]::IsPathRooted([string]$pathProperty.Value)) {
-                throw "Source $toolName receipt has an invalid $($pair[0]) frozen identity."
+                throw "Source $toolName receipt has an invalid $($pair.path) frozen identity."
             }
             $frozenMatches = @($FrozenFiles | Where-Object {
                 (Test-DarktidePathEqual -Left ([string]$_.path) -Right ([string]$pathProperty.Value)) -and [string]$_.sha256 -ceq [string]$hashProperty.Value
             })
-            if ($frozenMatches.Count -ne 1) { throw "Source $toolName receipt $($pair[0]) is not frozen exactly once." }
+            if ($frozenMatches.Count -ne 1) { throw "Source $toolName receipt $($pair.path) is not frozen exactly once." }
         }
     }
 }
@@ -763,7 +765,7 @@ function New-DarktideSourceToolSetup {
     $owned = [IO.Path]::GetFullPath((Join-Path $Root "source-tools-$setupId"))
     if (Test-Path -LiteralPath $owned) { throw 'Source setup root already exists.' }
     [void](New-Item -ItemType Directory -Path $owned -ErrorAction Stop)
-    Assert-DarktideNoReparseAncestors -Path $owned -Context 'Source setup owned root'
+    Assert-DarktideNoReparseAncestors -Path $owned -Context 'Source setup owned root' -TrustedRoot $Root
 
     $runner = Join-Path $AuthorityRoot 'scripts/Invoke-StandardValidation.ps1'
     if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) { throw 'Pinned source authority runner is missing.' }
@@ -906,7 +908,8 @@ function Read-DarktideSourceToolSetup {
     $fullPath = [IO.Path]::GetFullPath($Path)
     $authorityRunner = Join-Path $AuthorityRoot 'scripts/Invoke-StandardValidation.ps1'
     . $authorityRunner -DefineFunctionsOnly -CandidateRoot $AuthorityRoot -AdapterPath $fullPath -ArtifactsRoot (Split-Path -Parent $fullPath) -SourceRepository $script:DarktideSourceRepository -SourceRevision $SourceRevision -BaseRevision $SourceRevision -AuthorityRevision $AuthorityRevision
-    Assert-DarktideNoReparseAncestors -Path $fullPath -Context 'Prepared source setup'
+    $setupRoot = Split-Path -Parent $fullPath
+    Assert-DarktideNoReparseAncestors -Path $fullPath -Context 'Prepared source setup' -TrustedRoot $setupRoot
     $prepared = Read-DarktideJsonFile -Path $fullPath -Context 'Prepared source setup'
     Assert-DarktideExactPropertySet -Value $prepared -Expected @('schemaVersion', 'preparation', 'runId', 'sourceRevision', 'authorityRevision', 'ownedRoot', 'sourceValidation') -Context 'Prepared source setup'
     if ([int]$prepared.schemaVersion -ne 1 -or [string]$prepared.preparation -cne 'darktide-translate-source-tools' -or
@@ -923,7 +926,7 @@ function Read-DarktideSourceToolSetup {
     }
     $expectedOwned = Join-Path (Split-Path -Parent $fullPath) "source-tools-$($prepared.runId)"
     if (-not (Test-DarktidePathEqual -Left ([string]$prepared.ownedRoot) -Right $expectedOwned)) { throw 'Prepared source setup owned root differs.' }
-    Assert-DarktideNoReparseAncestors -Path $expectedOwned -Context 'Prepared source setup owned root'
+    Assert-DarktideNoReparseAncestors -Path $expectedOwned -Context 'Prepared source setup owned root' -TrustedRoot $setupRoot
     $child = Join-Path $expectedOwned $script:DarktideChildRunnerName
     if ((Get-DarktideFileSha256 -Path $child) -cne (Get-DarktideFileSha256 -Path (Get-DarktideSourceChildRunnerPath))) {
         throw 'Prepared source child runner differs from the protected driver.'
@@ -1041,7 +1044,7 @@ function Invoke-DarktideSourcePurpose {
     if (-not (Test-Path -LiteralPath $TrustedToolRoot -PathType Container)) { throw "Trusted PowerShell root is missing: $TrustedToolRoot" }
     $trustedRoot = Resolve-DarktidePhysicalPath -Path $TrustedToolRoot
     $pwshPath = Resolve-DarktidePhysicalPath -Path $pwshPath
-    Assert-DarktideNoReparseAncestors -Path $trustedRoot -Context 'Trusted PowerShell root'
+    Assert-DarktideNoReparseAncestors -Path $pwshPath -Context 'Trusted PowerShell executable' -TrustedRoot $trustedRoot
     if (-not (Test-DarktidePathWithinOrEqual -Path $pwshPath -Root $trustedRoot) -or (Test-DarktidePathEqual -Left $pwshPath -Right $trustedRoot)) {
         throw 'Trusted PowerShell executable must be within TrustedToolRoot.'
     }
@@ -1058,7 +1061,7 @@ function Invoke-DarktideSourcePurpose {
         if (Test-DarktidePathOverlap -Path $root -Root $artifactsRootFull) { throw "Source artifacts root must not contain '$root'." }
     }
     [void](New-Item -ItemType Directory -Path $artifactsRootFull -Force)
-    Assert-DarktideNoReparseAncestors -Path $artifactsRootFull -Context 'Source artifacts root'
+    Assert-DarktideNoReparseAncestors -Path $artifactsRootFull -Context 'Source artifacts root' -TrustedRoot $artifactsRootFull
 
     if ($Mode -ceq 'prepare-source-tools') {
         $sourceToolsParent = Split-Path -Parent ([IO.Path]::GetFullPath($SourceToolsPath))
@@ -1077,7 +1080,12 @@ function Invoke-DarktideSourcePurpose {
     }
 
     if (-not (Test-Path -LiteralPath $SourceToolsPath -PathType Leaf)) { throw "Prepared source tools are missing: $SourceToolsPath" }
-    $preparedPath = Resolve-DarktidePhysicalPath -Path $SourceToolsPath
+    $sourceToolsLogicalPath = [IO.Path]::GetFullPath($SourceToolsPath)
+    if (-not (Test-DarktidePathWithinOrEqual -Path $sourceToolsLogicalPath -Root $artifactsRootFull)) {
+        throw 'Prepared source tools must stay within ArtifactsRoot.'
+    }
+    Assert-DarktideNoReparseAncestors -Path $sourceToolsLogicalPath -Context 'Prepared source tools' -TrustedRoot $artifactsRootFull
+    $preparedPath = Resolve-DarktidePhysicalPath -Path $sourceToolsLogicalPath
     foreach ($root in @($repoRoot, $authorityCheckout.root, $trustedRoot)) {
         Assert-DarktideOutsideRoot -Path $preparedPath -Root $root -Context 'Source tools input'
     }
@@ -1090,7 +1098,7 @@ function Invoke-DarktideSourcePurpose {
     $adapterRoot = [string]$adapterLayout.adapterRoot
     if ((Test-Path -LiteralPath $coreArtifactsRoot) -or (Test-Path -LiteralPath $adapterRoot)) { throw 'Source validation run-owned path unexpectedly exists.' }
     [void](New-Item -ItemType Directory -Path $coreArtifactsRoot -ErrorAction Stop)
-    Assert-DarktideNoReparseAncestors -Path $coreArtifactsRoot -Context 'Source validation artifacts root'
+    Assert-DarktideNoReparseAncestors -Path $coreArtifactsRoot -Context 'Source validation artifacts root' -TrustedRoot $artifactsRootFull
     $outputFull = if ([string]::IsNullOrWhiteSpace($OutputPath)) { Join-Path $coreArtifactsRoot 'darktide-translate-source-validation.json' }
         else { Assert-DarktidePathWithinRoot -Path $OutputPath -Root $coreArtifactsRoot -Context 'Source validation OutputPath' }
     if (Test-Path -LiteralPath $outputFull) { throw 'Source validation output path is not create-only.' }
@@ -1099,7 +1107,7 @@ function Invoke-DarktideSourcePurpose {
     try {
         [void](New-Item -ItemType Directory -Path $adapterRoot -ErrorAction Stop)
         $adapterOwned = $true
-        Assert-DarktideNoReparseAncestors -Path $adapterRoot -Context 'Core adapter root'
+        Assert-DarktideNoReparseAncestors -Path $adapterRoot -Context 'Core adapter root' -TrustedRoot $artifactsRootFull
         $ownerMarker = [ordered]@{ owner = 'darktide-translate-source-core-adapter'; runId = $runId; token = $adapterOwnerToken }
         Write-DarktideUtf8CreateNew -Path ([string]$adapterLayout.ownerMarkerPath) -Text (($ownerMarker | ConvertTo-Json -Compress) + [Environment]::NewLine)
         $adapterPath = [string]$adapterLayout.adapterPath

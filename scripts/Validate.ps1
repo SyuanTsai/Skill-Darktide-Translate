@@ -59,7 +59,8 @@ if (@($PSBoundParameters.Keys | Where-Object {
     $sourceResult = @(Invoke-DarktideSourceEntryPoint -BoundParameters $PSBoundParameters -DefaultArtifactsRoot $ArtifactsRoot)
     if ($sourceResult.Count -eq 0 -or $sourceResult[-1] -isnot [int]) { throw 'Core v2 source purpose did not return an exit code.' }
     exit [int]$sourceResult[-1]
-}$script:IsWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+}
+$script:IsWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 if (-not $script:IsWindowsHost) {
     throw 'Standard v1 validation requires Windows with PowerShell 7.'
 }

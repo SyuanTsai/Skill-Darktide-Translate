@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+}
 Describe 'Darktide Translate repository contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
-        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $layout = Get-TestRepositoryLayout -RepositoryRoot $repoRoot
 
         function New-WindowsCheckoutEvidence {
@@ -50,6 +52,11 @@ Describe 'Darktide Translate repository contract' {
 
             & git -c core.longpaths=true -C $sourceRepository init --quiet --initial-branch=main
             if ($LASTEXITCODE -ne 0) { throw 'Could not initialize the checkout evidence source repository.' }
+            foreach ($setting in @(
+                @('maintenance.auto', 'false'), @('maintenance.autoDetach', 'false'),
+                @('gc.auto', '0'), @('gc.autoDetach', 'false'))) {
+                & git -c core.longpaths=true -C $sourceRepository config --local $setting[0] $setting[1]
+            }
             & git -c core.longpaths=true -C $sourceRepository config user.name 'EOL Contract Test'
             & git -c core.longpaths=true -C $sourceRepository config user.email 'eol-contract@example.invalid'
             & git -c core.longpaths=true -C $sourceRepository config core.autocrlf true

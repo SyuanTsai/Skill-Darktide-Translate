@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'TestSupport.ps1')
     $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
     $script:DriverPath = Join-Path $script:RepositoryRoot 'scripts/StandardSourceDriver.psm1'
     $script:LegPath = Join-Path $script:RepositoryRoot 'scripts/StandardWorkflowLeg.psm1'
@@ -166,9 +167,15 @@ Describe 'Darktide Core v2 route and Validate.ps1 dispatch' {
     }
 
     It 'UnitT14_rejects_v2_parameters_without_a_source_purpose_through_Validate' {
-        $output = @(& $script:PowerShellPath -NoProfile -NonInteractive -File $script:ValidatePath -AdapterVersion 2 2>&1)
-        $LASTEXITCODE | Should -Not -Be 0
-        ($output -join "`n") | Should -BeLike '*only valid with -AdapterVersion 2 and an explicit source purpose*'
+        $previousPath = $env:DT_TEST_VALIDATE_PATH
+        try {
+            $env:DT_TEST_VALIDATE_PATH = $script:ValidatePath
+            $exceptionMessageCommand = 'try { & $env:DT_TEST_VALIDATE_PATH -AdapterVersion 2 } catch { [Console]::Out.WriteLine($_.Exception.Message); exit 1 }'
+            $output = @(& $script:PowerShellPath -NoProfile -NonInteractive -Command $exceptionMessageCommand 2>&1)
+            $LASTEXITCODE | Should -Not -Be 0
+            ($output -join "`n") | Should -BeLike '*only valid with -AdapterVersion 2 and an explicit source purpose*'
+        }
+        finally { $env:DT_TEST_VALIDATE_PATH = $previousPath }
     }
 
     It 'UnitT15_preserves_the_v1_modes_and_gate_unchanged' {
@@ -196,6 +203,25 @@ Describe 'Darktide Core v2 route and Validate.ps1 dispatch' {
             $route = Resolve-DarktideSourceRoute -BoundParameters @{ BootstrapTransition = $true }
             $route.mode | Should -BeExactly 'v1'
         }
+    }
+
+    It 'UnitT17_canonicalizes_the_trusted_root_but_rejects_links_below_it' {
+        $physicalRoot = Join-Path $TestDrive ('physical-' + [guid]::NewGuid().ToString('N'))
+        $outsideRoot = Join-Path $TestDrive ('outside-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $physicalRoot, $outsideRoot | Out-Null
+        $logicalRoot = Join-Path $TestDrive ('logical-' + [guid]::NewGuid().ToString('N'))
+        [void](New-TestReparsePoint -Path $logicalRoot -Target $physicalRoot)
+        $ordinary = Join-Path $physicalRoot 'ordinary'
+        New-Item -ItemType Directory -Path $ordinary | Out-Null
+        $module = Get-Module -Name StandardSourceDriver -ErrorAction Stop
+
+        { & $module { param($Path, $Root) Assert-DarktideNoReparseAncestors -Path $Path -Context 'fixture' -TrustedRoot $Root } $ordinary $logicalRoot } |
+            Should -Not -Throw
+
+        $linked = Join-Path $physicalRoot 'linked'
+        [void](New-TestReparsePoint -Path $linked -Target $outsideRoot)
+        { & $module { param($Path, $Root) Assert-DarktideNoReparseAncestors -Path $Path -Context 'fixture' -TrustedRoot $Root } $linked $logicalRoot } |
+            Should -Throw '*reparse point*'
     }
 }
 
