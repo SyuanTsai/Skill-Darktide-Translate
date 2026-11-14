@@ -558,10 +558,10 @@ function Enter-SharedCoordinationLease {
         [ValidateRange(1, 3600)][int] $TimeoutSeconds = 300
     )
     $repository = [IO.Path]::GetFullPath($RepositoryRoot)
-    $receiptRootFull = if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) { $null } else {
+    $physicalRepository = Resolve-PortableTrustedRoot -Path $repository
+    $receiptRootFull = if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) { $physicalRepository } else {
         $candidateReceiptRoot = [IO.Path]::GetFullPath($ReceiptRoot)
         $null = Assert-CoordinationPath -Path $candidateReceiptRoot -RepositoryRoot $repository -AllowMissing
-        $physicalRepository = Resolve-PortableTrustedRoot -Path $repository
         $relativeReceiptRoot = [IO.Path]::GetRelativePath($repository, $candidateReceiptRoot)
         if ($relativeReceiptRoot -ceq '.') {
             $physicalRepository

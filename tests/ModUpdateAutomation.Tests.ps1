@@ -1212,7 +1212,7 @@ catch [TimeoutException] { 'TIMEOUT' }
             $claim.result | Should -BeExactly 'passed'
             $releasedStatePath = [string]$claim.statePath
             $releasedState = Get-Content -LiteralPath $releasedStatePath -Raw | ConvertFrom-TestJson -AsHashtable
-            $fingerprintRelative = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod/.hash/examplemod.hash'
+            $fingerprintRelative = '.hash/examplemod.hash'
             $fingerprintPath = Join-Path ([string]$releasedState.worktreePath) $fingerprintRelative
             New-Item -ItemType Directory -Path (Split-Path -Parent $fingerprintPath) -Force | Out-Null
             @(
