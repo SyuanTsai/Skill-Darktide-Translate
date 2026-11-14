@@ -1305,9 +1305,74 @@ printf '%s' "$S8_TEST_GH_JSON"
             Test-Path -LiteralPath (Join-Path $evidenceRoot 'archive-manifest.json') -PathType Leaf | Should -BeTrue
         }
 
+        # Scenario: terminal release receipt bytes no longer match the immutable receipt contract.
+        # Purpose: prove the formal finalization entry fails closed, then remains idempotent after exact byte restoration.
+        It 'InterT134_RejectsTamperedTerminalReceiptAtReleasedFinalizationEntry' {
+            $released = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            $released.result | Should -BeExactly 'passed'
+            $releasedOwner = Get-Content -LiteralPath $releasedState.modLockPath -Raw | ConvertFrom-TestJson -AsHashtable
+            $receiptPath = [string]$releasedOwner.releaseReceiptPath
+            [byte[]]$receiptBytes = [IO.File]::ReadAllBytes($receiptPath)
+            try {
+                [byte[]]$tamperedReceiptBytes = [byte[]]::new($receiptBytes.Length + 1)
+                [Array]::Copy($receiptBytes, $tamperedReceiptBytes, $receiptBytes.Length)
+                $tamperedReceiptBytes[$tamperedReceiptBytes.Length - 1] = 0x20
+                [IO.File]::WriteAllBytes($receiptPath, $tamperedReceiptBytes)
+                { & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
+                    Should -Throw '*terminal receipt belongs to another owner token or tuple*'
+            }
+            finally { [IO.File]::WriteAllBytes($receiptPath, $receiptBytes) }
+
+            $restored = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            ($restored | ConvertTo-Json -Depth 40 -Compress) | Should -BeExactly ($released | ConvertTo-Json -Depth 40 -Compress)
+        }
+
+        # Scenario: the persisted released owner names a different cleanup run after terminal release.
+        # Purpose: prove the formal finalization entry validates the persisted owner tuple before returning its result.
+        It 'InterT135_RejectsTamperedReleasedOwnerTupleAtFinalizationEntry' {
+            $released = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            $released.result | Should -BeExactly 'passed'
+            $ownerPath = [string]$releasedState.modLockPath
+            [byte[]]$ownerBytes = [IO.File]::ReadAllBytes($ownerPath)
+            try {
+                $tamperedOwner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-TestJson -AsHashtable
+                $tamperedOwner.cleanup.runId = 'tampered-run'
+                [IO.File]::WriteAllText($ownerPath, ($tamperedOwner | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+                { & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
+                    Should -Throw '*cleanup tuple differs from the immutable run paths*'
+            }
+            finally { [IO.File]::WriteAllBytes($ownerPath, $ownerBytes) }
+
+            $restored = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            ($restored | ConvertTo-Json -Depth 40 -Compress) | Should -BeExactly ($released | ConvertTo-Json -Depth 40 -Compress)
+        }
+
+        # Scenario: an artifact archived under final evidence no longer matches its manifest tuple.
+        # Purpose: prove the formal finalization entry revalidates final evidence before returning a released result.
+        It 'InterT136_RejectsTamperedFinalEvidenceArtifactAtFinalizationEntry' {
+            $released = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            $released.result | Should -BeExactly 'passed'
+            $artifactPath = Join-Path $evidenceRoot 'artifacts/merge-finalization.json'
+            [byte[]]$artifactBytes = [IO.File]::ReadAllBytes($artifactPath)
+            try {
+                [byte[]]$tamperedArtifactBytes = [byte[]]::new($artifactBytes.Length + 1)
+                [Array]::Copy($artifactBytes, $tamperedArtifactBytes, $artifactBytes.Length)
+                $tamperedArtifactBytes[$tamperedArtifactBytes.Length - 1] = 0x20
+                [IO.File]::WriteAllBytes($artifactPath, $tamperedArtifactBytes)
+                { & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
+                    Should -Throw '*Immutable file tuple mismatch:*merge-finalization.json*'
+            }
+            finally { [IO.File]::WriteAllBytes($artifactPath, $artifactBytes) }
+
+            $restored = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            ($restored | ConvertTo-Json -Depth 40 -Compress) | Should -BeExactly ($released | ConvertTo-Json -Depth 40 -Compress)
+        }
+
         # Scenario: the released reservation is presented with a different caller token.
         # Purpose: keep released recovery owner-bound at the same formal command entry.
         It 'InterT132_RejectsForeignReservationTokenAtReleasedFinalizationEntry' {
+            $released = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            $released.result | Should -BeExactly 'passed'
             [byte[]]$stateBytes = [IO.File]::ReadAllBytes($releasedStatePath)
             try {
                 $foreign = Get-Content -LiteralPath $releasedStatePath -Raw | ConvertFrom-TestJson -AsHashtable
@@ -1322,6 +1387,8 @@ printf '%s' "$S8_TEST_GH_JSON"
         # Scenario: a non-finalization stage is invoked after the reservation has reached its terminal released state.
         # Purpose: prove released-owner tolerance is exclusive to formal finalization recovery.
         It 'InterT133_RejectsReleasedReservationAtNonFinalizationStageEntry' {
+            $released = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
+            $released.result | Should -BeExactly 'passed'
             [byte[]]$stateBytes = [IO.File]::ReadAllBytes($releasedStatePath)
             try {
                 { & $runnerPath verify-source -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
