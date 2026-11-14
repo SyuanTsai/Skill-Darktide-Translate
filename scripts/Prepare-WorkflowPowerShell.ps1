@@ -29,7 +29,10 @@ $ErrorActionPreference = 'Stop'
 
 # Asset naming, manifest digest parsing, extraction, Authenticode and version
 # checks are shared with the repository installer through PowerShellRelease.psm1.
-Import-Module -Name (Join-Path $PSScriptRoot 'PowerShellRelease.psm1') -Force -ErrorAction Stop
+$releaseModule = Import-Module -Name (Join-Path $PSScriptRoot 'PowerShellRelease.psm1') -Force -PassThru -ErrorAction Stop
+$platformRuntimeModule = & $releaseModule { $script:PowerShellReleasePlatformRuntimeModule }
+if ($platformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'PowerShell release module did not expose its registry-bound platform runtime.' }
+Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
 if ($ExecutableName -cne (Get-PowerShellExecutableName -Platform $Platform)) {
     throw "ExecutableName '$ExecutableName' is not the official $Platform PowerShell executable."
 }
@@ -63,8 +66,45 @@ function Get-OfficialManifestArchiveSha256 {
 
 function Assert-WorkflowRuntimeRootEmpty {
     param([Parameter(Mandatory)][string] $Path)
-    if (@(Get-ChildItem -LiteralPath $Path -Force).Count -ne 0) {
+    $full = [IO.Path]::GetFullPath($Path)
+    $parent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($full)) -RootOnly
+    try { $state = Get-PlatformDirectoryState -ParentLease $parent -Leaf ([IO.Path]::GetFileName($full)) }
+    finally { $parent.Dispose() }
+    if (-not $state.exists -or [int64]$state.entryCount -ne 0) {
         throw 'Verified PowerShell runtime root must be fresh and empty.'
+    }
+}
+
+function Open-WorkflowFile {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Access, [Parameter(Mandatory)][string] $CreateMode)
+    $full = [IO.Path]::GetFullPath($Path)
+    $parent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($full)) -RootOnly
+    try {
+        $file = Open-PlatformFile -ParentLease $parent -Leaf ([IO.Path]::GetFileName($full)) -Access $Access -CreateMode $CreateMode
+        return [pscustomobject]@{ Parent = $parent; File = $file; Path = $full }
+    }
+    catch { $parent.Dispose(); throw }
+}
+
+function Close-WorkflowFile {
+    param([Parameter(Mandatory)] $Binding)
+    try { $Binding.File.Dispose() } finally { $Binding.Parent.Dispose() }
+}
+
+function Copy-WorkflowFile {
+    param([Parameter(Mandatory)][string] $Source, [Parameter(Mandatory)][string] $Destination)
+    $sourceBinding = Open-WorkflowFile -Path $Source -Access Read -CreateMode OpenExisting
+    $destinationBinding = $null
+    try {
+        $sourceIdentity = Assert-PlatformFileIdentity -Lease $sourceBinding.File -Expected $sourceBinding.File.Observation -SingleLink -VerifyPath
+        $destinationBinding = Open-WorkflowFile -Path $Destination -Access ReadWrite -CreateMode CreateNew
+        $destinationBinding.File.WriteNewBytes($sourceBinding.File.ReadAllBytes(1073741824))
+        [void](Assert-PlatformFileIdentity -Lease $sourceBinding.File -Expected $sourceIdentity -SingleLink -VerifyPath)
+        [void](Assert-PlatformFileIdentity -Lease $destinationBinding.File -Expected $destinationBinding.File.Observation -SingleLink -VerifyPath)
+    }
+    finally {
+        if ($null -ne $destinationBinding) { Close-WorkflowFile -Binding $destinationBinding }
+        Close-WorkflowFile -Binding $sourceBinding
     }
 }
 
@@ -76,17 +116,22 @@ function New-WorkflowPowerShellAssetEvidence {
         [Parameter(Mandatory)][string] $ArchiveSha256,
         [Parameter(Mandatory)][string] $ManifestSha256
     )
-    $archiveItem = Get-Item -LiteralPath $ArchivePath -Force -ErrorAction Stop
-    $manifestItem = Get-Item -LiteralPath $ManifestPath -Force -ErrorAction Stop
+    $archiveBinding = Open-WorkflowFile -Path $ArchivePath -Access Read -CreateMode OpenExisting
+    $manifestBinding = Open-WorkflowFile -Path $ManifestPath -Access Read -CreateMode OpenExisting
+    try {
+        $archiveLength = $archiveBinding.File.ReadAllBytes(1073741824).Length
+        $manifestLength = $manifestBinding.File.ReadAllBytes(16777216).Length
+    }
+    finally { Close-WorkflowFile -Binding $archiveBinding; Close-WorkflowFile -Binding $manifestBinding }
     return [pscustomobject][ordered]@{
         platform = $Platform
         name = $ArchiveName
         digest = "sha256:$ArchiveSha256"
-        size = [long]$archiveItem.Length
+        size = [long]$archiveLength
         hashesManifest = [pscustomobject][ordered]@{
             name = 'hashes.sha256'
             digest = "sha256:$ManifestSha256"
-            size = [long]$manifestItem.Length
+            size = [long]$manifestLength
         }
     }
 }
@@ -137,8 +182,7 @@ switch ($Mode) {
         }
         $archiveApiSha256 = ([string]$verifiedAsset.digest).Substring(7)
         $manifestApiSha256 = ([string]$verifiedAsset.hashesManifest.digest).Substring(7)
-        $metadataRoot = Join-Path ([IO.Path]::GetTempPath()) ("dt-pwsh-metadata-$Platform-$([guid]::NewGuid().ToString('N'))")
-        [void](New-Item -ItemType Directory -Path $metadataRoot -ErrorAction Stop)
+        $metadataRoot = New-PlatformPrivateRoot -Parent ([IO.Path]::GetTempPath()) -Leaf ("dt-pwsh-metadata-$Platform-$([guid]::NewGuid().ToString('N'))")
         $manifestPath = Join-Path $metadataRoot 'hashes.sha256'
         Invoke-WebRequest -Uri ([string]$verifiedAsset.hashesManifest.browserDownloadUrl) -OutFile $manifestPath -MaximumRedirection 3 -TimeoutSec 60 -ErrorAction Stop
         [void](Assert-VerifiedPowerShellHashesManifest -Asset $verifiedAsset -Path $manifestPath)
@@ -162,11 +206,23 @@ switch ($Mode) {
         foreach ($sha in @($OfficialArchiveSha256, $HashesManifestSha256)) {
             if ($sha -cnotmatch '^[0-9a-f]{64}$') { throw 'Official PowerShell SHA-256 inputs must be lowercase hex.' }
         }
-        [void](New-Item -ItemType Directory -Path $CacheRoot -Force -ErrorAction Stop)
+        $cacheRootFull = [IO.Path]::GetFullPath($CacheRoot)
+        $cacheRootLease = Open-PlatformDirectory -Root $cacheRootFull -RootOnly
         $archivePath = Join-Path $CacheRoot $AssetName
         $cachedManifestPath = Join-Path $CacheRoot 'hashes.sha256'
         $cacheValid = $false
-        if ((Test-Path -LiteralPath $archivePath -PathType Leaf) -and (Test-Path -LiteralPath $cachedManifestPath -PathType Leaf)) {
+        $archiveState = $null
+        $manifestState = $null
+        try {
+            $archiveProbe = Open-PlatformFile -ParentLease $cacheRootLease -Leaf $AssetName -Access Read -CreateMode OpenExisting
+            $archiveState = Assert-PlatformFileIdentity -Lease $archiveProbe -Expected $archiveProbe.Observation -SingleLink -VerifyPath
+            $archiveProbe.Dispose()
+            $manifestProbe = Open-PlatformFile -ParentLease $cacheRootLease -Leaf 'hashes.sha256' -Access Read -CreateMode OpenExisting
+            $manifestState = Assert-PlatformFileIdentity -Lease $manifestProbe -Expected $manifestProbe.Observation -SingleLink -VerifyPath
+            $manifestProbe.Dispose()
+        }
+        catch { $archiveState = $null; $manifestState = $null }
+        if ($null -ne $archiveState -and $null -ne $manifestState) {
             try {
                 $cachedAsset = New-WorkflowPowerShellAssetEvidence -ArchivePath $archivePath -ManifestPath $cachedManifestPath `
                     -ArchiveName $AssetName -ArchiveSha256 $OfficialArchiveSha256 -ManifestSha256 $HashesManifestSha256
@@ -175,13 +231,20 @@ switch ($Mode) {
                 $cacheValid = $true
             }
             catch {
-                Remove-Item -LiteralPath $archivePath, $cachedManifestPath -Force -ErrorAction SilentlyContinue
-                Write-Warning "Discarded invalid PowerShell cache entry: $($_.Exception.Message)"
+                throw "Existing PowerShell cache entry failed closed: $($_.Exception.Message)"
             }
         }
         if (-not $cacheValid) {
-            Invoke-WebRequest -Uri $ArchiveUrl -OutFile $archivePath -MaximumRedirection 3 -TimeoutSec 300 -ErrorAction Stop
-            [IO.File]::Copy($FreshHashesPath, $cachedManifestPath, $false)
+            $download = Invoke-WebRequest -Uri $ArchiveUrl -MaximumRedirection 3 -TimeoutSec 300 -ErrorAction Stop
+            $archiveBinding = Open-WorkflowFile -Path $archivePath -Access ReadWrite -CreateMode CreateNew
+            try {
+                $memory = [IO.MemoryStream]::new()
+                try { $download.RawContentStream.CopyTo($memory); $archiveBinding.File.WriteNewBytes($memory.ToArray()) }
+                finally { $memory.Dispose() }
+                [void](Assert-PlatformFileIdentity -Lease $archiveBinding.File -Expected $archiveBinding.File.Observation -SingleLink -VerifyPath)
+            }
+            finally { Close-WorkflowFile -Binding $archiveBinding }
+            Copy-WorkflowFile -Source $FreshHashesPath -Destination $cachedManifestPath
         }
         $verifiedAsset = New-WorkflowPowerShellAssetEvidence -ArchivePath $archivePath -ManifestPath $cachedManifestPath `
             -ArchiveName $AssetName -ArchiveSha256 $OfficialArchiveSha256 -ManifestSha256 $HashesManifestSha256
@@ -193,9 +256,12 @@ switch ($Mode) {
         Assert-WorkflowRuntimeRootEmpty -Path $RuntimeRoot
         # The shared extractor requires a fresh destination; the empty run-owned
         # root is removed and recreated by the verified extraction.
-        Remove-Item -LiteralPath $RuntimeRoot -Force -ErrorAction Stop
+        $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot)
+        $runtimeParentLease = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($runtimeFull)) -RootOnly
+        $runtimeState = Get-PlatformDirectoryState -ParentLease $runtimeParentLease -Leaf ([IO.Path]::GetFileName($runtimeFull))
+        Remove-PlatformOwnedDirectoryTree -TransactionRootLease $runtimeParentLease -Leaf ([IO.Path]::GetFileName($runtimeFull)) -ExpectedIdentity $runtimeState.identity
+        $runtimeParentLease.Dispose()
         $executable = Expand-VerifiedPowerShellArchive -Asset $verifiedAsset -ArchivePath $archivePath -DestinationPath $RuntimeRoot
-        if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'Official archive did not contain the expected PowerShell executable.' }
         $signature = Assert-PowerShellExecutableSignature -Path $executable -Platform $Platform
         $signatureStatus = $signature.status; $signerSubject = $signature.signerSubject; $signerThumbprint = $signature.signerThumbprint
         $versionOutput = @(& $executable -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()')
@@ -212,11 +278,17 @@ switch ($Mode) {
             executableSignerSubject = $signerSubject; executableSignerThumbprint = $signerThumbprint; cacheRestoredAndValid = $cacheValid
         }
         $receiptPath = Join-Path $OwnedRoot 'powershell-runtime-setup.json'
-        [IO.File]::WriteAllText($receiptPath, (($receipt | ConvertTo-Json -Depth 8) + "`n"), [Text.UTF8Encoding]::new($false))
-        [IO.File]::Copy($receiptPath, (Join-Path $ArtifactsRoot 'powershell-runtime-setup.json'), $false)
-        [IO.File]::Copy($cachedManifestPath, (Join-Path $ArtifactsRoot 'powershell-release-hashes.sha256'), $false)
+        $receiptBinding = Open-WorkflowFile -Path $receiptPath -Access ReadWrite -CreateMode CreateNew
+        try {
+            $receiptBinding.File.WriteNewBytes([Text.UTF8Encoding]::new($false).GetBytes((($receipt | ConvertTo-Json -Depth 8) + "`n")))
+            [void](Assert-PlatformFileIdentity -Lease $receiptBinding.File -Expected $receiptBinding.File.Observation -SingleLink -VerifyPath)
+        }
+        finally { Close-WorkflowFile -Binding $receiptBinding }
+        Copy-WorkflowFile -Source $receiptPath -Destination (Join-Path $ArtifactsRoot 'powershell-runtime-setup.json')
+        Copy-WorkflowFile -Source $cachedManifestPath -Destination (Join-Path $ArtifactsRoot 'powershell-release-hashes.sha256')
         [IO.File]::AppendAllText($env:GITHUB_ENV, "DT_POWERSHELL_EXECUTABLE=$([IO.Path]::GetFullPath($executable))`nDT_POWERSHELL_VERSION=$Version`nDT_POWERSHELL_ARCHIVE_SHA256=$OfficialArchiveSha256`n", [Text.UTF8Encoding]::new($false))
         [IO.File]::AppendAllText($env:GITHUB_PATH, "$RuntimeRoot`n", [Text.UTF8Encoding]::new($false))
+        $cacheRootLease.Dispose()
         break
     }
     'Verify' {

@@ -11,12 +11,16 @@ $ProgressPreference = 'SilentlyContinue'
 
 $modulePath = Join-Path $PSScriptRoot 'PowerShellRelease.psm1'
 Import-Module -Name $modulePath -Force -ErrorAction Stop
+$pathSafetyModule = Import-Module -Name (Join-Path $PSScriptRoot '../skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru -ErrorAction Stop
+$platformRuntimeModule = & $pathSafetyModule { $script:VendoredPlatformRuntimeModule }
+if ($platformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Vendored authority platform runtime was not registry-bound.' }
+Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
 $hostPlatform = Get-PowerShellHostPlatform
 $hostArchitecture = Get-PowerShellHostArchitecture
 
 function Get-InstalledPowerShellVersion {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string] $ExecutablePath)
+    param([Parameter(Mandatory)][string] $ExecutablePath, [Parameter(Mandatory)] $ExecutableLease)
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $ExecutablePath
@@ -31,6 +35,7 @@ function Get-InstalledPowerShellVersion {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     try {
+        $identity = Assert-PlatformFileIdentity -Lease $ExecutableLease -Expected $ExecutableLease.Observation -SingleLink -VerifyPath
         if (-not $process.Start()) { throw 'Downloaded PowerShell runtime version probe did not start.' }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
@@ -47,6 +52,7 @@ function Get-InstalledPowerShellVersion {
         if ($process.ExitCode -ne 0) {
             throw "Downloaded PowerShell runtime version probe exited with code $($process.ExitCode): $($stderr.Trim())"
         }
+        [void](Assert-PlatformFileIdentity -Lease $ExecutableLease -Expected $identity -SingleLink -VerifyPath)
         return $stdout.Trim()
     }
     finally {
@@ -55,8 +61,9 @@ function Get-InstalledPowerShellVersion {
 }
 
 $installRootFullPath = [IO.Path]::GetFullPath($InstallRoot)
-if (Test-Path -LiteralPath $installRootFullPath) { throw 'Run-owned PowerShell installation path already exists.' }
-[void](New-Item -ItemType Directory -Path $installRootFullPath -ErrorAction Stop)
+$installParent = [IO.Path]::GetDirectoryName($installRootFullPath)
+$installLeaf = [IO.Path]::GetFileName($installRootFullPath)
+$installRootLease = Open-PlatformDirectory -Root $installParent -RelativePath $installLeaf -CreatePrivate
 
 $stableChannelUri = [uri]'https://aka.ms/powershell-release?tag=stable'
 $stableChannelResponse = Invoke-WebRequest `
@@ -96,7 +103,9 @@ $observedDigest = Assert-VerifiedPowerShellArchive -Asset $asset -Path $archiveP
 $runtimePath = Join-Path $installRootFullPath 'runtime'
 $executablePath = Expand-VerifiedPowerShellArchive -Asset $asset -ArchivePath $archivePath -DestinationPath $runtimePath
 $signature = Assert-PowerShellExecutableSignature -Path $executablePath -Platform $asset.platform
-$actualVersion = Get-InstalledPowerShellVersion -ExecutablePath $executablePath
+$runtimeLease = Open-PlatformDirectory -Root $installRootFullPath -RelativePath 'runtime'
+$executableLease = Open-PlatformFile -ParentLease $runtimeLease -Leaf ([IO.Path]::GetFileName($executablePath)) -Access Read -CreateMode OpenExisting
+$actualVersion = Get-InstalledPowerShellVersion -ExecutablePath $executablePath -ExecutableLease $executableLease
 [void](Assert-PowerShellRuntimeVersion -Tag $asset.tag -ActualVersion $actualVersion)
 
 $receipt = [pscustomobject][ordered]@{
@@ -125,13 +134,19 @@ $receipt = [pscustomobject][ordered]@{
 $receiptPath = Join-Path $installRootFullPath 'powershell-release.json'
 $receiptJson = $receipt | ConvertTo-Json -Depth 5 -Compress
 $receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
-$receiptStream = [IO.File]::Open($receiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+$receiptStream = Open-PlatformFile -ParentLease $installRootLease -Leaf 'powershell-release.json' -Access ReadWrite -CreateMode CreateNew
 try {
-    $receiptStream.Write($receiptBytes, 0, $receiptBytes.Length)
-    $receiptStream.Flush($true)
+    $receiptStream.WriteNewBytes($receiptBytes)
+    [void](Assert-PlatformFileIdentity -Lease $receiptStream -Expected $receiptStream.Observation -SingleLink -VerifyPath)
 }
 finally {
     $receiptStream.Dispose()
 }
+
+$executableLease.Dispose()
+$runtimeLease.Dispose()
+$installRootLease.Dispose()
+Remove-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction SilentlyContinue
+Remove-Module -ModuleInfo $pathSafetyModule -Force -ErrorAction SilentlyContinue
 
 Write-Output -NoEnumerate $receipt

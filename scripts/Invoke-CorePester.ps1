@@ -9,7 +9,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $integrityModulePath = Join-Path $PSScriptRoot 'CorePesterIntegrity.psm1'
-Import-Module -Name $integrityModulePath -Force -ErrorAction Stop
+$integrityModule = Import-Module -Name $integrityModulePath -Force -PassThru -ErrorAction Stop
+$platformRuntimeModule = & $integrityModule { $script:CorePesterPlatformRuntimeModule }
+if ($platformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Core Pester integrity module did not expose its registry-bound platform runtime.' }
+Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
 Assert-NoLegacyCorePesterBootstrapEnvironment
 $closureLockPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../config/pester-6.2.0-closure.lock.json'))
 $closureLockRecord = Read-CorePesterClosureLock -LiteralPath $closureLockPath
@@ -36,9 +39,9 @@ if (-not $postImportClosure.IsValid -or $postImportClosure.ClosureSha256 -cne $p
 }
 
 $testRoot = Join-Path ([IO.Path]::GetFullPath((Get-Location).Path)) 'tests'
-if (-not (Test-Path -LiteralPath $testRoot -PathType Container)) {
-    throw "Canonical Pester test root is missing: $testRoot"
-}
+$testRootLease = Open-PlatformDirectory -Root $testRoot -RootOnly
+$testRootParentLease = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($testRoot)) -RootOnly
+$testRootStateBefore = Get-PlatformDirectoryState -ParentLease $testRootParentLease -Leaf ([IO.Path]::GetFileName($testRoot))
 $candidateSnapshotRoot = [IO.Path]::GetFullPath((Get-Location).Path)
 $candidateSnapshotBefore = Get-CorePesterTreeSnapshot -Root $candidateSnapshotRoot
 if (-not $candidateSnapshotBefore.IsValid) { throw ('Core Pester candidate snapshot could not be bound: ' + (@($candidateSnapshotBefore.Errors) -join '; ')) }
@@ -155,9 +158,8 @@ function New-CorePesterCaseInventoryRow {
         if (-not $sourcePath.StartsWith($rootPrefix, $comparison)) {
             throw 'the Pester case source file is outside the complete tests tree.'
         }
-        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-            throw 'the Pester case source file no longer exists.'
-        }
+        $sourceBinding = Open-CorePesterFileBinding -Path $sourcePath
+        Close-CorePesterFileBinding -Binding $sourceBinding
         $relativePath = [IO.Path]::GetRelativePath($TestRoot, $sourcePath).Replace('\', '/')
         $sourceStartOffset = [int]$extent.StartOffset
         if ($sourceStartOffset -lt 0) { throw 'the Pester case source offset is invalid.' }
@@ -269,6 +271,11 @@ try {
         else { $expectedTestFileInventory.Add($fileKey, $relativePath) }
     }
     if ($expectedTestFileInventory.Count -eq 0) { $caseInventoryErrors.Add('Candidate tests tree contains no *.Tests.ps1 files.') }
+    $testRootStateAfterInventory = Get-PlatformDirectoryState -ParentLease $testRootParentLease -Leaf ([IO.Path]::GetFileName($testRoot))
+    if ($testRootStateAfterInventory.inventorySha256 -cne $testRootStateBefore.inventorySha256 -or
+        $testRootStateAfterInventory.entryCount -ne $testRootStateBefore.entryCount) {
+        $caseInventoryErrors.Add('Candidate tests tree changed while its complete file inventory was read.')
+    }
 }
 catch {
     $caseInventoryErrors.Add("Candidate complete test-file inventory failed: $($_.Exception.Message)")
@@ -403,16 +410,18 @@ if (-not [string]::IsNullOrEmpty($caseInventoryLedgerPath)) {
     try {
         $ledgerJson = ConvertTo-Json -InputObject $caseInventoryLedger -Depth 8 -Compress -ErrorAction Stop
         $ledgerBytes = [Text.UTF8Encoding]::new($false).GetBytes($ledgerJson + "`n")
-        $ledgerStream = [IO.FileStream]::new($caseInventoryLedgerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $ledgerParent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($caseInventoryLedgerPath)) -RootOnly
+        $ledgerStream = Open-PlatformFile -ParentLease $ledgerParent -Leaf ([IO.Path]::GetFileName($caseInventoryLedgerPath)) -Access ReadWrite -CreateMode CreateNew
         try {
-            $ledgerStream.Write($ledgerBytes, 0, $ledgerBytes.Length)
-            $ledgerStream.Flush($true)
+            $ledgerStream.WriteNewBytes($ledgerBytes)
+            $ledgerIdentity = Assert-PlatformFileIdentity -Lease $ledgerStream -Expected $ledgerStream.Observation -SingleLink -VerifyPath
         }
-        finally { $ledgerStream.Dispose() }
+        finally { $ledgerStream.Dispose(); $ledgerParent.Dispose() }
 
-        $ledgerItem = Get-Item -LiteralPath $caseInventoryLedgerPath -Force -ErrorAction Stop
-        if ($ledgerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'the created case inventory sidecar is a reparse point.' }
-        $readbackBytes = [IO.File]::ReadAllBytes($caseInventoryLedgerPath)
+        $ledgerReadback = Open-CorePesterFileBinding -Path $caseInventoryLedgerPath
+        $readbackBytes = $ledgerReadback.File.ReadAllBytes(16777216)
+        [void](Assert-PlatformFileIdentity -Lease $ledgerReadback.File -Expected $ledgerIdentity -SingleLink -VerifyPath)
+        Close-CorePesterFileBinding -Binding $ledgerReadback
         if ($readbackBytes.Length -ne $ledgerBytes.Length) { throw 'case inventory sidecar readback is truncated.' }
         for ($index = 0; $index -lt $ledgerBytes.Length; $index++) {
             if ($readbackBytes[$index] -ne $ledgerBytes[$index]) { throw 'case inventory sidecar readback differs from the complete emitted ledger.' }
@@ -533,6 +542,8 @@ $summary = [ordered]@{
     failed = $failed
     skipped = $skipped
 }
+$testRootLease.Dispose()
+$testRootParentLease.Dispose()
 if (-not $caseInventoryLedgerWritten -or -not $caseInventoryComplete -or
     $total -le 0 -or $passed -le 0 -or $failed -ne 0 -or $failedBlocks -ne 0 -or
     $failedContainers -ne 0 -or [int]$result.InconclusiveCount -ne 0 -or

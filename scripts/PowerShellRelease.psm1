@@ -3,9 +3,66 @@
 
 Set-StrictMode -Version Latest
 
+$script:PowerShellReleasePathSafetyModule = Import-Module -Name (Join-Path $PSScriptRoot '../skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru -ErrorAction Stop
+$script:PowerShellReleasePlatformRuntimeModule = & $script:PowerShellReleasePathSafetyModule { $script:VendoredPlatformRuntimeModule }
+if ($script:PowerShellReleasePlatformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) {
+    throw 'Vendored authority platform runtime was not registry-bound for PowerShell release handling.'
+}
+Import-Module -ModuleInfo $script:PowerShellReleasePlatformRuntimeModule -Force -ErrorAction Stop
+
 $script:PowerShellReleasePlatforms = @('windows', 'linux', 'macos')
 $script:PowerShellReleaseArchitectures = @('x64', 'arm64')
 $script:PowerShellHashesManifestName = 'hashes.sha256'
+
+function Open-PowerShellReleaseFile {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Access)
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $parent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($fullPath)) -RootOnly
+    try {
+        $file = Open-PlatformFile -ParentLease $parent -Leaf ([IO.Path]::GetFileName($fullPath)) -Access $Access -CreateMode OpenExisting
+        $identity = Assert-PlatformFileIdentity -Lease $file -Expected $file.Observation -SingleLink -VerifyPath
+        return [pscustomobject]@{ Parent = $parent; File = $file; Identity = $identity; Path = $fullPath }
+    }
+    catch {
+        $parent.Dispose()
+        throw
+    }
+}
+
+function Close-PowerShellReleaseFile {
+    param([Parameter(Mandatory)] $Binding)
+    try { $Binding.File.Dispose() } finally { $Binding.Parent.Dispose() }
+}
+
+function Open-PowerShellReleaseRelativeDirectory {
+    param(
+        [Parameter(Mandatory)] $RootLease,
+        [Parameter(Mandatory)][string] $RootPath,
+        [Parameter(Mandatory)][string] $RelativePath
+    )
+
+    $currentLease = $RootLease
+    $ownsCurrent = $false
+    $currentPath = $RootPath
+    try {
+        foreach ($segment in @($RelativePath.Replace('\', '/').Split('/', [StringSplitOptions]::RemoveEmptyEntries))) {
+            if ($segment -in @('.', '..')) { throw 'PowerShell archive directory path is unsafe.' }
+            $state = Get-PlatformDirectoryState -ParentLease $currentLease -Leaf $segment
+            $nextLease = if ($state.exists) { Open-PlatformDirectory -Root $currentPath -RelativePath $segment }
+                else { Open-PlatformDirectory -Root $currentPath -RelativePath $segment -CreatePrivate }
+            if ($ownsCurrent) { $currentLease.Dispose() }
+            $currentLease = $nextLease
+            $ownsCurrent = $true
+            $currentPath = Join-Path $currentPath $segment
+        }
+        if (-not $ownsCurrent) { throw 'PowerShell archive directory path is empty.' }
+        $result = $currentLease
+        $currentLease = $null
+        return $result
+    }
+    finally { if ($null -ne $currentLease -and $ownsCurrent) { $currentLease.Dispose() } }
+}
 
 function Get-ReleaseField {
     [CmdletBinding()]
@@ -245,14 +302,13 @@ function Assert-PowerShellDownloadedRegularFile {
         throw "PowerShell $Description evidence has an invalid size."
     }
     if ([long]$ExpectedSize -le 0) { throw "PowerShell $Description evidence has an invalid size." }
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Downloaded PowerShell $Description is missing." }
-
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-        -not [string]::IsNullOrEmpty([string]$item.LinkType)) {
-        throw "Downloaded PowerShell $Description is not a regular file."
+    $binding = Open-PowerShellReleaseFile -Path $Path -Access Read
+    try {
+        [byte[]]$bytes = $binding.File.ReadAllBytes(1073741824)
+        [void](Assert-PlatformFileIdentity -Lease $binding.File -Expected $binding.Identity -SingleLink -VerifyPath)
+        if ([long]$bytes.Length -ne [long]$ExpectedSize) { throw "Downloaded PowerShell $Description size does not match release metadata." }
     }
-    if ([long]$item.Length -ne [long]$ExpectedSize) { throw "Downloaded PowerShell $Description size does not match release metadata." }
+    finally { Close-PowerShellReleaseFile -Binding $binding }
 }
 
 function Assert-VerifiedPowerShellArchive {
@@ -269,7 +325,12 @@ function Assert-VerifiedPowerShellArchive {
     $expectedSize = Get-ReleaseField -Object $Asset -Name 'size'
     Assert-PowerShellDownloadedRegularFile -Path $Path -ExpectedSize $expectedSize -Description 'archive'
 
-    $actualDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash.ToLowerInvariant()
+    $archiveBinding = Open-PowerShellReleaseFile -Path $Path -Access Read
+    try {
+        $actualDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($archiveBinding.File.ReadAllBytes(1073741824))).ToLowerInvariant()
+        [void](Assert-PlatformFileIdentity -Lease $archiveBinding.File -Expected $archiveBinding.Identity -SingleLink -VerifyPath)
+    }
+    finally { Close-PowerShellReleaseFile -Binding $archiveBinding }
     if (('sha256:' + $actualDigest) -cne $expectedDigest) {
         throw 'Downloaded PowerShell archive bytes do not match the published release digest.'
     }
@@ -284,7 +345,10 @@ function Get-OfficialPowerShellManifestDigest {
     )
 
     $pattern = '^(?<hash>[0-9a-fA-F]{64})\s+\*?' + [regex]::Escape($ArchiveName) + '\s*$'
-    $digests = @(foreach ($line in [IO.File]::ReadAllLines($Path, [Text.UTF8Encoding]::new($false, $true))) {
+    $manifestBinding = Open-PowerShellReleaseFile -Path $Path -Access Read
+    try { $manifestLines = [Text.UTF8Encoding]::new($false, $true).GetString($manifestBinding.File.ReadAllBytes(16777216)) -split '\r?\n' }
+    finally { Close-PowerShellReleaseFile -Binding $manifestBinding }
+    $digests = @(foreach ($line in $manifestLines) {
         $lineMatch = [regex]::Match($line, $pattern)
         if ($lineMatch.Success) { $lineMatch.Groups['hash'].Value.ToLowerInvariant() }
     })
@@ -313,7 +377,12 @@ function Assert-VerifiedPowerShellHashesManifest {
     }
     Assert-PowerShellDownloadedRegularFile -Path $Path -ExpectedSize (Get-ReleaseField -Object $manifest -Name 'size') -Description 'hash manifest'
 
-    $actualManifestDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash.ToLowerInvariant()
+    $manifestBinding = Open-PowerShellReleaseFile -Path $Path -Access Read
+    try {
+        $actualManifestDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($manifestBinding.File.ReadAllBytes(16777216))).ToLowerInvariant()
+        [void](Assert-PlatformFileIdentity -Lease $manifestBinding.File -Expected $manifestBinding.Identity -SingleLink -VerifyPath)
+    }
+    finally { Close-PowerShellReleaseFile -Binding $manifestBinding }
     if (('sha256:' + $actualManifestDigest) -cne $manifestDigest) {
         throw 'Downloaded PowerShell hash manifest bytes do not match the published release digest.'
     }
@@ -362,50 +431,108 @@ function Expand-VerifiedPowerShellArchive {
     }
     $executableName = Get-PowerShellExecutableName -Platform $platform
     $destinationFullPath = [IO.Path]::GetFullPath($DestinationPath)
-    if (Test-Path -LiteralPath $destinationFullPath) { throw 'Run-owned PowerShell runtime extraction path already exists.' }
+    $destinationParentPath = [IO.Path]::GetDirectoryName($destinationFullPath)
+    $destinationLeaf = [IO.Path]::GetFileName($destinationFullPath)
+    $destinationParentLease = Open-PlatformDirectory -Root $destinationParentPath -RootOnly
+    $destinationState = Get-PlatformDirectoryState -ParentLease $destinationParentLease -Leaf $destinationLeaf
+    if ($destinationState.exists) { $destinationParentLease.Dispose(); throw 'Run-owned PowerShell runtime extraction path already exists.' }
+    $destinationLease = Open-PlatformDirectory -Root $destinationParentPath -RelativePath $destinationLeaf -CreatePrivate
 
     if ($platform -ceq 'windows') {
-        Expand-Archive -LiteralPath $ArchivePath -DestinationPath $destinationFullPath -ErrorAction Stop
+        $archiveBinding = Open-PowerShellReleaseFile -Path $ArchivePath -Access Read
+        $archiveStream = $null
+        $zip = $null
+        try {
+            $assetSize = [long](Get-ReleaseField -Object $Asset -Name 'size')
+            if ($assetSize -le 0 -or $assetSize -ge [int]::MaxValue) { throw 'PowerShell archive size is outside the in-memory extraction bound.' }
+            $archiveBytes = $archiveBinding.File.ReadAllBytes([int]($assetSize + 1))
+            if ($archiveBytes.Length -ne $assetSize) { throw 'PowerShell archive bytes changed before extraction.' }
+            $archiveStream = [IO.MemoryStream]::new($archiveBytes, $false)
+            $zip = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Read, $false)
+            foreach ($entry in $zip.Entries) {
+                $relative = ([string]$entry.FullName).Replace('\', '/')
+                if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or
+                    $relative -cmatch '(^|/)\.\.(/|$)' -or $relative.Contains(':')) {
+                    throw "PowerShell zip archive member '$relative' is unsafe."
+                }
+                $externalAttributes = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$entry.ExternalAttributes), 0)
+                if ((($externalAttributes -shr 16) -band [uint32]0xF000) -eq 0xA000) {
+                    throw "PowerShell zip archive member '$relative' is a symbolic link."
+                }
+                $trimmed = $relative.TrimEnd('/')
+                $relativeParent = [IO.Path]::GetDirectoryName($trimmed.Replace('/', [IO.Path]::DirectorySeparatorChar))
+                if ($relative.EndsWith('/')) {
+                    $directoryLease = Open-PowerShellReleaseRelativeDirectory -RootLease $destinationLease -RootPath $destinationFullPath -RelativePath $trimmed
+                    $directoryLease.Dispose()
+                    continue
+                }
+                $outputParent = if ([string]::IsNullOrWhiteSpace($relativeParent)) { $destinationLease }
+                    else { Open-PowerShellReleaseRelativeDirectory -RootLease $destinationLease -RootPath $destinationFullPath -RelativePath $relativeParent }
+                $input = $entry.Open()
+                $output = $null
+                try {
+                    if ([long]$entry.Length -lt 0 -or [long]$entry.Length -gt 268435456) { throw "PowerShell zip member '$relative' exceeds the extraction bound." }
+                    $buffer = [IO.MemoryStream]::new()
+                    try { $input.CopyTo($buffer); $bytes = $buffer.ToArray() } finally { $buffer.Dispose() }
+                    if ($bytes.Length -ne [long]$entry.Length) { throw "PowerShell zip member '$relative' changed during extraction." }
+                    $output = Open-PlatformFile -ParentLease $outputParent -Leaf ([IO.Path]::GetFileName($trimmed)) -Access ReadWrite -CreateMode CreateNew
+                    $output.WriteNewBytes($bytes)
+                    [void](Assert-PlatformFileIdentity -Lease $output -Expected $output.Observation -SingleLink -VerifyPath)
+                }
+                finally {
+                    if ($null -ne $output) { $output.Dispose() }
+                    $input.Dispose()
+                    if ($outputParent -ne $destinationLease) { $outputParent.Dispose() }
+                }
+            }
+            [void](Assert-PlatformFileIdentity -Lease $archiveBinding.File -Expected $archiveBinding.Identity -SingleLink -VerifyPath)
+        }
+        finally {
+            if ($null -ne $zip) { $zip.Dispose() }
+            if ($null -ne $archiveStream) { $archiveStream.Dispose() }
+            Close-PowerShellReleaseFile -Binding $archiveBinding
+        }
     }
     else {
         $tarPath = (Get-Command -Name 'tar' -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+        $tarBinding = Open-PowerShellReleaseFile -Path $tarPath -Access Read
+        [void](Assert-PlatformFileIdentity -Lease $tarBinding.File -Expected $tarBinding.Identity -SingleLink -VerifyPath)
         $members = @(& $tarPath -tzf $ArchivePath)
         if ($LASTEXITCODE -ne 0 -or $members.Count -eq 0) { throw 'PowerShell tar archive listing failed.' }
+        [void](Assert-PlatformFileIdentity -Lease $tarBinding.File -Expected $tarBinding.Identity -SingleLink -VerifyPath)
         $detailedMembers = @(& $tarPath -tvzf $ArchivePath)
         if ($LASTEXITCODE -ne 0) { throw 'PowerShell tar archive detailed listing failed.' }
         Assert-SafePowerShellTarArchiveListing -Members $members -DetailedMembers $detailedMembers
-        [void](New-Item -ItemType Directory -Path $destinationFullPath -ErrorAction Stop)
         # Extract without -p so ownership is not restored, while the archive's
         # file modes, including the executable bit, are retained under umask.
         & $tarPath -xzf $ArchivePath -C $destinationFullPath
         if ($LASTEXITCODE -ne 0) { throw 'PowerShell tar archive extraction failed.' }
-        foreach ($item in @(Get-ChildItem -LiteralPath $destinationFullPath -Recurse -Force -ErrorAction Stop)) {
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-                -not [string]::IsNullOrEmpty([string]$item.LinkType)) {
-                throw "PowerShell tar extraction produced an unsafe link: $($item.FullName)"
-            }
-        }
+        [void](Assert-PlatformFileIdentity -Lease $tarBinding.File -Expected $tarBinding.Identity -SingleLink -VerifyPath)
+        Close-PowerShellReleaseFile -Binding $tarBinding
+        [void](Get-PlatformDirectoryState -ParentLease $destinationParentLease -Leaf $destinationLeaf)
     }
 
     $executablePath = Join-Path $destinationFullPath $executableName
-    if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
-        throw "Verified PowerShell archive did not contain $executableName at its root."
+    try { $executableLease = Open-PlatformFile -ParentLease $destinationLease -Leaf $executableName -Access ReadWrite -CreateMode OpenExisting }
+    catch {
+        $destinationLease.Dispose()
+        $destinationParentLease.Dispose()
+        throw "PowerShell archive did not contain $executableName at its root."
     }
-    $executable = Get-Item -LiteralPath $executablePath -Force -ErrorAction Stop
-    if ($executable.PSIsContainer -or ($executable.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-        -not [string]::IsNullOrEmpty([string]$executable.LinkType)) {
-        throw 'Downloaded PowerShell executable is not a regular file.'
-    }
+    $executableIdentity = Assert-PlatformFileIdentity -Lease $executableLease -Expected $executableLease.Observation -SingleLink -VerifyPath
     if ($platform -cne 'windows') {
-        $mode = [IO.File]::GetUnixFileMode($executablePath)
-        if (($mode -band [IO.UnixFileMode]::UserExecute) -eq 0) {
-            $executeBits = [IO.UnixFileMode]::UserExecute -bor [IO.UnixFileMode]::GroupExecute -bor [IO.UnixFileMode]::OtherExecute
-            [IO.File]::SetUnixFileMode($executablePath, ($mode -bor $executeBits))
-        }
-        if (([IO.File]::GetUnixFileMode($executablePath) -band [IO.UnixFileMode]::UserExecute) -eq 0) {
+        $permissions = Get-PlatformPermissions -Lease $executableLease
+        $modeValue = [Convert]::ToInt32([string]$permissions.mode, 8)
+        if (($modeValue -band 64) -eq 0) { [void](Set-PlatformPermissions -Lease $executableLease -Policy @{ Mode = ($modeValue -bor 73) }) }
+        $permissions = Get-PlatformPermissions -Lease $executableLease
+        if (([Convert]::ToInt32([string]$permissions.mode, 8) -band 64) -eq 0) {
             throw 'Downloaded PowerShell executable is not executable by its owner.'
         }
     }
+    [void](Assert-PlatformFileIdentity -Lease $executableLease -Expected $executableIdentity -SingleLink -VerifyPath)
+    $executableLease.Dispose()
+    $destinationLease.Dispose()
+    $destinationParentLease.Dispose()
     return [IO.Path]::GetFullPath($executablePath)
 }
 

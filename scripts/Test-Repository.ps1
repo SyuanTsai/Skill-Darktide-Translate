@@ -307,6 +307,42 @@ function Get-GitBlobSha256 {
     }
 }
 
+function Invoke-GitUtf8NulText {
+    param(
+        [Parameter(Mandatory = $true)][string] $GitPath,
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $Context
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $GitPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $startInfo.StandardOutputEncoding = $strictUtf8
+    $startInfo.StandardErrorEncoding = $strictUtf8
+    foreach ($argument in @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot", '-C', $RepositoryRoot) + $Arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw "Could not start Git for $Context." }
+        $process.StandardInput.Close()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw "Git $Context failed: $stderr" }
+        return $stdout
+    }
+    finally { $process.Dispose() }
+}
+
 function Get-RawFileSha256 {
     param(
         [Parameter(Mandatory = $true)][string] $Path
@@ -685,8 +721,8 @@ function Get-ContentInventory {
     if ([string]::IsNullOrWhiteSpace($gitPath)) { throw 'Trusted Git executable was not bound before repository validation.' }
     $gitConfigArguments = @('-c', "safe.directory=$RepositoryRoot", '-c', "core.worktree=$RepositoryRoot")
     $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    $gitOutput = [string]((& $gitPath @gitConfigArguments -C $RepositoryRoot ls-files -s -z -- $skillRootRelative) -join '')
-    if ($LASTEXITCODE -ne 0) { throw "Git inventory lookup failed for '$SkillId'." }
+    $gitOutput = Invoke-GitUtf8NulText -GitPath $gitPath -RepositoryRoot $RepositoryRoot `
+        -Arguments @('ls-files', '-s', '-z', '--', $skillRootRelative) -Context "inventory lookup for '$SkillId'"
     foreach ($record in @($gitOutput.Split([char]0) | Where-Object { $_ -ne '' })) {
         if ([string]$record -cnotmatch '^(?<mode>[0-9]{6}) (?<objectId>[0-9a-f]{40}) (?<stage>[0-3])\t(?<path>[^\x00\r\n]+)$') {
             throw "Git returned malformed index entry for '$SkillId': $record"

@@ -14,13 +14,75 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$candidateRootForRuntime = [IO.Path]::GetFullPath([string]$env:STANDARD_VALIDATION_CANDIDATE_ROOT)
+$pathSafetyModule = Import-Module -Name (Join-Path $candidateRootForRuntime 'skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru -ErrorAction Stop
+$platformRuntimeModule = & $pathSafetyModule { $script:VendoredPlatformRuntimeModule }
+if ($platformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Vendored authority platform runtime was not registry-bound.' }
+Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
+
+function Open-ChildFile {
+    param([Parameter(Mandatory)][string] $Path, [string] $Access = 'Read', [string] $CreateMode = 'OpenExisting')
+    $full = [IO.Path]::GetFullPath($Path)
+    $parent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($full)) -RootOnly
+    try {
+        $file = Open-PlatformFile -ParentLease $parent -Leaf ([IO.Path]::GetFileName($full)) -Access $Access -CreateMode $CreateMode
+        $identity = Assert-PlatformFileIdentity -Lease $file -Expected $file.Observation -SingleLink -VerifyPath
+        return [pscustomobject]@{ Parent=$parent; File=$file; Identity=$identity; Path=$full }
+    }
+    catch { $parent.Dispose(); throw }
+}
+function Close-ChildFile { param([Parameter(Mandatory)]$Binding) try { $Binding.File.Dispose() } finally { $Binding.Parent.Dispose() } }
+function Test-ChildFile {
+    param([Parameter(Mandatory)][string]$Path)
+    $binding=$null
+    try { $binding=Open-ChildFile -Path $Path; return $true } catch { return $false }
+    finally { if($null-ne$binding){Close-ChildFile $binding} }
+}
+function Test-ChildDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    $lease=$null
+    try { $lease=Open-PlatformDirectory -Root ([IO.Path]::GetFullPath($Path)) -RootOnly; return $true } catch { return $false }
+    finally { if($null-ne$lease){$lease.Dispose()} }
+}
+function Write-ChildUtf8CreateNew {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $binding=Open-ChildFile -Path $Path -Access ReadWrite -CreateMode CreateNew
+    try {
+        $binding.File.WriteNewBytes([Text.UTF8Encoding]::new($false).GetBytes($Text))
+        [void](Assert-PlatformFileIdentity -Lease $binding.File -Expected $binding.Identity -SingleLink -VerifyPath)
+    } finally { Close-ChildFile $binding }
+}
+function Read-ChildText {
+    param([Parameter(Mandatory)][string]$Path,[int]$Limit=268435456)
+    $binding=Open-ChildFile -Path $Path
+    try {
+        $text=[Text.UTF8Encoding]::new($false,$true).GetString($binding.File.ReadAllBytes($Limit))
+        [void](Assert-PlatformFileIdentity -Lease $binding.File -Expected $binding.Identity -SingleLink -VerifyPath)
+        return $text
+    } finally { Close-ChildFile $binding }
+}
+function Remove-ChildOwnedFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if(-not(Test-ChildFile -Path $Path)){return}
+    $binding=Open-ChildFile -Path $Path -Access ReadWrite
+    $state=$binding.File.Observation
+    $binding.File.Dispose()
+    try { Remove-PlatformOwnedFile -ParentLease $binding.Parent -Leaf ([IO.Path]::GetFileName($binding.Path)) -ExpectedState $state | Out-Null }
+    finally { $binding.Parent.Dispose() }
+}
+
 function Get-FileSha256 {
     param([Parameter(Mandatory = $true)][string] $Path)
-    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    $binding=Open-ChildFile -Path $Path
+    try {
+        $hash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($binding.File.ReadAllBytes(268435456))).ToLowerInvariant()
+        [void](Assert-PlatformFileIdentity -Lease $binding.File -Expected $binding.Identity -SingleLink -VerifyPath)
+        return $hash
+    } finally { Close-ChildFile $binding }
 }
 function Assert-FileIdentity {
     param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Sha256, [Parameter(Mandatory = $true)][string] $Context)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Get-FileSha256 -Path $Path) -cne $Sha256) { throw "$Context changed or is missing." }
+    if (-not (Test-ChildFile -Path $Path) -or (Get-FileSha256 -Path $Path) -cne $Sha256) { throw "$Context changed or is missing." }
 }
 function Get-Property {
     param([Parameter(Mandatory = $true)] $Object, [Parameter(Mandatory = $true)][string] $Name, [Parameter(Mandatory = $true)][string] $Context)
@@ -29,8 +91,7 @@ function Get-Property {
 }
 function Read-Json {
     param([Parameter(Mandatory = $true)][string] $Path, [Parameter(Mandatory = $true)][string] $Context)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Context is missing: $Path" }
-    try { return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 100) }
+    try { return (Read-ChildText -Path $Path | ConvertFrom-Json -Depth 100) }
     catch { throw "$Context is not valid JSON: $($_.Exception.Message)" }
 }
 function Test-PathEqual {
@@ -54,7 +115,7 @@ function Get-SkillRoot {
     param([Parameter(Mandatory = $true)][string] $SkillId)
     $skillsRoot = [IO.Path]::GetFullPath([string]$env:STANDARD_VALIDATION_SKILLS_ROOT)
     $skillRoot = [IO.Path]::GetFullPath((Join-Path $skillsRoot $SkillId))
-    if (-not (Test-PathWithin -Path $skillRoot -Root $skillsRoot) -or -not (Test-Path -LiteralPath $skillRoot -PathType Container)) {
+    if (-not (Test-PathWithin -Path $skillRoot -Root $skillsRoot) -or -not (Test-ChildDirectory -Path $skillRoot)) {
         throw "Central runner supplied an unsafe or missing Skill root: $SkillId"
     }
     return $skillRoot
@@ -62,10 +123,11 @@ function Get-SkillRoot {
 function Get-InventoryPaths {
     param([Parameter(Mandatory = $true)][string] $SkillRoot)
     $root = [IO.Path]::GetFullPath($SkillRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    $paths = @(
+    $rootLease=Open-PlatformDirectory -Root $root -RootOnly
+    try { $paths = @(
         Get-ChildItem -LiteralPath $root -Recurse -File -Force |
             ForEach-Object { $_.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar).Replace([IO.Path]::DirectorySeparatorChar, '/') }
-    )
+    ) } finally { $rootLease.Dispose() }
     [Array]::Sort($paths, [StringComparer]::Ordinal)
     if ($paths.Count -eq 0) { throw "Skill inventory is empty: $SkillRoot" }
     return [string[]]$paths
@@ -148,7 +210,7 @@ function Add-NativeReport {
         [Parameter(Mandatory = $true)][int] $ExitCode, [Parameter(Mandatory = $true)][string] $Path,
         [Parameter(Mandatory = $true)][string] $SkillId)
     $fullPath = [IO.Path]::GetFullPath($Path)
-    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw 'Native tool did not create its raw report file.' }
+    if (-not (Test-ChildFile -Path $fullPath)) { throw 'Native tool did not create its raw report file.' }
     $script:NativeReports += [pscustomobject][ordered]@{
         skillId = $SkillId
         command = [IO.Path]::GetFullPath($Command)
@@ -165,17 +227,17 @@ function Invoke-NativeJson {
     try {
         $lines = @(& $Command @Arguments 2> $stderrPath)
         $exitCode = $LASTEXITCODE
-        $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+        $stderr = if (Test-ChildFile -Path $stderrPath) { Read-ChildText -Path $stderrPath } else { '' }
         $json = ($lines -join "`n").Trim()
         $nativePath = Join-Path (Get-Location) ("native-$Mode-$($env:STANDARD_VALIDATION_SKILL_ID).json")
-        [IO.File]::WriteAllText($nativePath, $json, [Text.UTF8Encoding]::new($false))
+        Write-ChildUtf8CreateNew -Path $nativePath -Text $json
         Add-NativeReport -Command $Command -Arguments $Arguments -ExitCode $exitCode -Path $nativePath -SkillId ([string]$env:STANDARD_VALIDATION_SKILL_ID)
         if ($exitCode -ne 0) { throw "$Context returned exit code $exitCode. $stderr" }
         if ([string]::IsNullOrWhiteSpace($json)) { throw "$Context produced no JSON output." }
         return ($json | ConvertFrom-Json -Depth 100)
     }
     finally {
-        if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
+        Remove-ChildOwnedFile -Path $stderrPath
     }
 }
 function Invoke-DomainJson {
@@ -189,17 +251,17 @@ function Invoke-DomainJson {
     try {
         $lines = @(& $Command @Arguments 2> $stderrPath)
         $exitCode = $LASTEXITCODE
-        $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+        $stderr = if (Test-ChildFile -Path $stderrPath) { Read-ChildText -Path $stderrPath } else { '' }
         $json = ($lines -join "`n").Trim()
         $reportPath = Join-Path (Get-Location) $ReportName
-        if (Test-Path -LiteralPath $reportPath) { throw "$Context report path already exists." }
-        [IO.File]::WriteAllText($reportPath, $json, [Text.UTF8Encoding]::new($false))
+        if (Test-ChildFile -Path $reportPath) { throw "$Context report path already exists." }
+        Write-ChildUtf8CreateNew -Path $reportPath -Text $json
         if ($exitCode -ne 0) { throw "$Context returned exit code $exitCode. $stderr" }
         if ([string]::IsNullOrWhiteSpace($json)) { throw "$Context produced no JSON output." }
         return ($json | ConvertFrom-Json -Depth 100)
     }
     finally {
-        if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
+        Remove-ChildOwnedFile -Path $stderrPath
     }
 }
 function Assert-SkillValidatorReport {
@@ -290,6 +352,11 @@ function Assert-SkillSpectorReport {
 try {
     $toolchain = Read-Json -Path $ToolchainPath -Context 'run-owned validation toolchain'
     Assert-FileIdentity -Path $ToolchainPath -Sha256 $ToolchainSha256 -Context 'run-owned validation toolchain'
+    $centralRunnerFullPath = [IO.Path]::GetFullPath([string]$toolchain.centralRunnerPath)
+    $authorityRoot = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($centralRunnerFullPath))
+    $driverModule = Import-Module -Name (Join-Path $candidateRootForRuntime 'scripts/StandardSourceDriver.psm1') -Force -PassThru -ErrorAction Stop
+    $authorityRuntimeModule = Import-DarktideAuthorityPlatformRuntime -AuthorityRoot $authorityRoot -AuthorityRevision 'fbdc793c1c439b15c6def97d53111f250d0ff4db'
+    Import-Module -ModuleInfo $authorityRuntimeModule -Force -ErrorAction Stop
     $candidateRoot = [IO.Path]::GetFullPath([string]$env:STANDARD_VALIDATION_CANDIDATE_ROOT)
     if ($Mode -cin @('skill-validator', 'package-adapter')) {
         Assert-FileIdentity -Path ([string]$toolchain.centralRunnerPath) -Sha256 ([string]$toolchain.centralRunnerSha256) -Context 'central validation runner'
@@ -387,12 +454,12 @@ try {
                 $skillRoot = Get-SkillRoot -SkillId $skillId
                 $inventory = Get-InventoryPaths -SkillRoot $skillRoot
                 $reportPath = Join-Path (Get-Location) ("skillspector-$skillId.json")
-                if (Test-Path -LiteralPath $reportPath) { throw "SkillSpector stdout report path already exists for '$skillId'." }
+                if (Test-ChildFile -Path $reportPath) { throw "SkillSpector stdout report path already exists for '$skillId'." }
                 $staticStderrPath = Join-Path (Get-Location) ("skillspector-$skillId.stderr")
                 $nativeArguments = @('scan', $skillRoot, '--no-llm', '--format', 'json')
                 & ([string]$toolchain.skillSpectorPath) @nativeArguments 1> $reportPath 2> $staticStderrPath
                 $nativeExit = $LASTEXITCODE
-                $staticStderr = if (Test-Path -LiteralPath $staticStderrPath -PathType Leaf) { [IO.File]::ReadAllText($staticStderrPath) } else { [string]::Empty }
+                $staticStderr = if (Test-ChildFile -Path $staticStderrPath) { Read-ChildText -Path $staticStderrPath } else { [string]::Empty }
                 if (-not [string]::IsNullOrEmpty($staticStderr) -and $staticStderr.Length -gt 4096) { $staticStderr = $staticStderr.Substring(0, 4096) + '[truncated]' }
                 $staticStderrDiagnostic = if ([string]::IsNullOrWhiteSpace($staticStderr)) { '' } else { " SkillSpector stderr: $staticStderr" }
                 Add-NativeReport -Command ([string]$toolchain.skillSpectorPath) -Arguments $nativeArguments -ExitCode $nativeExit -Path $reportPath -SkillId $skillId

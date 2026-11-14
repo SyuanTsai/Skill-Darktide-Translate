@@ -367,4 +367,15 @@ Describe 'Verified Pester 6.2.0 module closure' {
         $setup | Should -Match 'Refusing unsafe recursive staging cleanup'
         $setup | Should -Not -Match 'Install-PSResource|Install-Module|CurrentUser'
     }
+
+    # Scenario: The workflow may provide a pre-existing package cache below its run-owned root.
+    # Purpose: Never create, populate, or repair that cache; disable it explicitly and use the same package verifier on fallback.
+    It 'UnitT65_accepts_only_a_preexisting_verified_run_owned_package_cache' {
+        $setup = Get-Content -LiteralPath (Join-Path $script:repositoryRoot 'scripts/Prepare-PesterRuntime.ps1') -Raw -Encoding utf8
+        $setup | Should -Match 'Open-PesterPackageCacheRoot'
+        $setup | Should -Match 'Open-PlatformFile.*Pester\.6\.2\.0\.nupkg.*OpenExisting'
+        $setup | Should -Match 'Pester package cache disabled:'
+        ([regex]::Matches($setup, 'Test-CorePesterPackageArchive -ArchivePath')).Count | Should -Be 2
+        $setup | Should -Not -Match 'CreatePrivate[^\r\n]*PackageCacheRoot|Remove-PlatformOwnedDirectoryTree[^\r\n]*cache|\$cacheFileLease\.WriteNewBytes'
+    }
 }

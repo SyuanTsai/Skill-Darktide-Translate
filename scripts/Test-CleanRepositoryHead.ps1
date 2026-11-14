@@ -9,32 +9,31 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$resolvedRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
+$pathSafetyModule = Import-Module -Name (Join-Path $PSScriptRoot '../skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru -ErrorAction Stop
+$platformRuntimeModule = & $pathSafetyModule { $script:VendoredPlatformRuntimeModule }
+if ($platformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Vendored authority platform runtime was not registry-bound.' }
+Import-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction Stop
+$logicalRoot = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $RepositoryRoot).Path)
+$resolvedRoot = [IO.Path]::GetFullPath((Resolve-PlatformPhysicalPath -Path $logicalRoot))
 
 function Resolve-PhysicalRepositoryPath {
     param([Parameter(Mandatory = $true)] [string] $Path)
 
-    # Resolve every existing link component on both sides so that a logical
-    # alias (for example macOS /var -> /private/var) compares equal to the
-    # physical path Git reports.
-    $fullPath = [IO.Path]::GetFullPath($Path)
-    $current = [IO.Path]::GetPathRoot($fullPath)
-    $segments = @($fullPath.Substring($current.Length).Split([IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries))
-    foreach ($segment in $segments) {
-        $candidate = Join-Path $current $segment
-        $target = [IO.Directory]::ResolveLinkTarget($candidate, $true)
-        $current = if ($null -eq $target) { $candidate } else { [IO.Path]::GetFullPath($target.FullName) }
-    }
-    if ($current.Length -gt [IO.Path]::GetPathRoot($current).Length) {
-        $current = $current.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    }
-    return $current
+    return [IO.Path]::GetFullPath((Resolve-PlatformPhysicalPath -Path $Path)).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
 }
+
+$gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+$gitPhysicalPath = Resolve-PhysicalRepositoryPath -Path ([string]$gitCommand.Path)
+$gitParentLease = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($gitPhysicalPath)) -RootOnly
+$gitLease = Open-PlatformFile -ParentLease $gitParentLease -Leaf ([IO.Path]::GetFileName($gitPhysicalPath)) -Access Read -CreateMode OpenExisting
+$gitIdentity = Assert-PlatformFileIdentity -Lease $gitLease -Expected $gitLease.Observation -SingleLink -VerifyPath
 
 function Invoke-GitText {
     param([Parameter(Mandatory = $true)] [string[]] $Arguments)
 
-    $output = @(& git -C $resolvedRoot @Arguments 2>&1)
+    [void](Assert-PlatformFileIdentity -Lease $gitLease -Expected $gitIdentity -SingleLink -VerifyPath)
+    $output = @(& $gitPhysicalPath -C $resolvedRoot @Arguments 2>&1)
     if ($LASTEXITCODE -ne 0) {
         throw "git $($Arguments -join ' ') failed: $($output -join [Environment]::NewLine)"
     }
@@ -64,9 +63,17 @@ if ($status.Count -ne 0) {
 
 $result = [ordered]@{
     result = 'passed'
-    repositoryRoot = $resolvedRoot
+    repositoryRoot = $logicalRoot
     headOid = $headOid
 }
 
-if ($PassThru) { [PSCustomObject]$result }
-else { $result | ConvertTo-Json }
+try {
+    if ($PassThru) { [PSCustomObject]$result }
+    else { $result | ConvertTo-Json }
+}
+finally {
+    $gitLease.Dispose()
+    $gitParentLease.Dispose()
+    Remove-Module -ModuleInfo $platformRuntimeModule -Force -ErrorAction SilentlyContinue
+    Remove-Module -ModuleInfo $pathSafetyModule -Force -ErrorAction SilentlyContinue
+}

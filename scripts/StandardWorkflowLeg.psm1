@@ -8,6 +8,11 @@
 
 Set-StrictMode -Version Latest
 
+$script:WorkflowLegPathSafetyModule = Import-Module -Name (Join-Path $PSScriptRoot '../skills/auto-update-darktide-mod/scripts/PathSafety.psm1') -Force -PassThru -ErrorAction Stop
+$script:WorkflowLegPlatformRuntimeModule = & $script:WorkflowLegPathSafetyModule { $script:VendoredPlatformRuntimeModule }
+if ($script:WorkflowLegPlatformRuntimeModule -isnot [Management.Automation.PSModuleInfo]) { throw 'Vendored authority platform runtime was not registry-bound.' }
+Import-Module -ModuleInfo $script:WorkflowLegPlatformRuntimeModule -Force -ErrorAction Stop
+
 $script:DarktideProtectedDriverHelperPaths = @(
     'scripts/Validate.ps1',
     'scripts/StandardSourceDriver.psm1',
@@ -57,35 +62,45 @@ function Assert-DarktideProtectedDriverCheckout {
 
     if ($BaseRevision -cnotmatch '^[0-9a-f]{40}$') { throw 'Protected driver base revision must be one full commit SHA.' }
     $root = [IO.Path]::GetFullPath($DriverRoot)
-    $head = @(& $GitPath -C $root rev-parse --verify 'HEAD^{commit}' 2>$null)
+    $gitPhysical = [IO.Path]::GetFullPath((Resolve-PlatformPhysicalPath -Path $GitPath))
+    $gitParentLease = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($gitPhysical)) -RootOnly
+    $gitLease = Open-PlatformFile -ParentLease $gitParentLease -Leaf ([IO.Path]::GetFileName($gitPhysical)) -Access Read -CreateMode OpenExisting
+    $gitIdentity = Assert-PlatformFileIdentity -Lease $gitLease -Expected $gitLease.Observation -SingleLink -VerifyPath
+    [void](Assert-PlatformFileIdentity -Lease $gitLease -Expected $gitIdentity -SingleLink -VerifyPath)
+    $head = @(& $gitPhysical -C $root rev-parse --verify 'HEAD^{commit}' 2>$null)
     if ($LASTEXITCODE -ne 0 -or $head.Count -ne 1 -or ([string]$head[0]).Trim() -cne $BaseRevision) {
         throw 'Protected driver HEAD differs from the exact event base SHA.'
     }
-    $dirty = @(& $GitPath -C $root status --porcelain=v1 --untracked-files=all 2>$null)
+    $dirty = @(& $gitPhysical -C $root status --porcelain=v1 --untracked-files=all 2>$null)
     if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { throw 'Protected driver checkout is not clean.' }
     $bindings = [Collections.Generic.List[object]]::new()
     foreach ($relative in $script:DarktideProtectedDriverHelperPaths) {
         $path = Join-Path $root ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))
-        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not [string]::IsNullOrEmpty([string]$item.LinkType)) {
-            throw "Protected driver helper must be a plain file: $relative"
-        }
-        $entries = @(& $GitPath -C $root ls-tree --full-tree $BaseRevision -- $relative 2>$null)
+        $fileParent = Open-PlatformDirectory -Root ([IO.Path]::GetDirectoryName($path)) -RootOnly
+        $fileLease = Open-PlatformFile -ParentLease $fileParent -Leaf ([IO.Path]::GetFileName($path)) -Access Read -CreateMode OpenExisting
+        $fileIdentity = Assert-PlatformFileIdentity -Lease $fileLease -Expected $fileLease.Observation -SingleLink -VerifyPath
+        [void](Assert-PlatformFileIdentity -Lease $gitLease -Expected $gitIdentity -SingleLink -VerifyPath)
+        $entries = @(& $gitPhysical -C $root ls-tree --full-tree $BaseRevision -- $relative 2>$null)
         if ($LASTEXITCODE -ne 0 -or $entries.Count -ne 1 -or
             [string]$entries[0] -cnotmatch ('^(?:100644|100755) blob (?<objectId>[0-9a-f]{40})\t' + [regex]::Escape($relative) + '$')) {
             throw "Protected base must contain the exact helper as one regular Git blob: $relative"
         }
         $objectId = [string]$Matches.objectId
-        $raw = @(& $GitPath -C $root hash-object --no-filters -- $path 2>$null)
+        $raw = @(& $gitPhysical -C $root hash-object --no-filters -- $path 2>$null)
         if ($LASTEXITCODE -ne 0 -or $raw.Count -ne 1 -or ([string]$raw[0]).Trim() -cne $objectId) {
             throw "Protected driver helper raw bytes differ from the exact event-base Git blob: $relative"
         }
+        [void](Assert-PlatformFileIdentity -Lease $fileLease -Expected $fileIdentity -SingleLink -VerifyPath)
         $bindings.Add([pscustomobject][ordered]@{
             path = $relative
             blob = $objectId
             sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         })
+        $fileLease.Dispose()
+        $fileParent.Dispose()
     }
+    $gitLease.Dispose()
+    $gitParentLease.Dispose()
     return $bindings.ToArray()
 }
 
