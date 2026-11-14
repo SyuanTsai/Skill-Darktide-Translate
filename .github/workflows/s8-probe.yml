@@ -1,0 +1,427 @@
+# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-License-Identifier: Apache-2.0
+name: S8 three-platform probe
+
+'on':
+  push:
+    branches:
+      - 'probe/SYP-358-**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s8-probe:
+    name: S8 probe (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            architecture: x64
+            executable: pwsh.exe
+            assetTemplate: PowerShell-{0}-win-x64.zip
+          - os: ubuntu-latest
+            platform: linux
+            architecture: x64
+            executable: pwsh
+            assetTemplate: powershell-{0}-linux-x64.tar.gz
+          - os: macos-latest
+            platform: macos
+            architecture: arm64
+            executable: pwsh
+            assetTemplate: powershell-{0}-osx-arm64.tar.gz
+    env:
+      # These process-scoped settings apply before either checkout action runs.
+      GIT_CONFIG_COUNT: 2
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+      GIT_CONFIG_KEY_1: core.eol
+      GIT_CONFIG_VALUE_1: lf
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout exact prepared authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: SyuanTsai/SyuanTsai-AI-Instructions
+          ref: fbdc793c1c439b15c6def97d53111f250d0ff4db
+          path: authority
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind immutable inputs and create run-owned roots
+        shell: pwsh
+        env:
+          S8_CANDIDATE_SHA_INPUT: ${{ github.sha }}
+          S8_MATRIX_PLATFORM: ${{ matrix.platform }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'candidate'))
+          $authorityRoot = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'authority'))
+
+          function Get-Commit([string] $Root, [string] $Revision) {
+            $result = @(& git -C $Root rev-parse --verify --end-of-options "$Revision^{commit}")
+            if ($LASTEXITCODE -ne 0 -or $result.Count -ne 1 -or [string]$result[0] -cnotmatch '^[0-9a-f]{40}$') {
+              throw "Could not resolve one immutable commit: $Revision"
+            }
+            return [string]$result[0]
+          }
+
+          foreach ($root in @($candidateRoot, $authorityRoot)) {
+            $status = @(& git -C $root status --porcelain=v1 --untracked-files=all)
+            if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) { throw "Checkout is not clean: $root" }
+            $autoCrlf = @(& git -C $root config --get core.autocrlf)
+            $eol = @(& git -C $root config --get core.eol)
+            if ($LASTEXITCODE -ne 0 -or $autoCrlf.Count -ne 1 -or [string]$autoCrlf[0] -cne 'false' -or
+                $eol.Count -ne 1 -or [string]$eol[0] -cne 'lf') {
+              throw "Checkout line-ending policy is not autocrlf=false/eol=lf: $root"
+            }
+          }
+
+          $candidateCommit = Get-Commit $candidateRoot 'HEAD'
+          $authorityCommit = Get-Commit $authorityRoot 'HEAD'
+          $baseCommit = Get-Commit $candidateRoot 'HEAD^'
+          if ($candidateCommit -cne $env:S8_CANDIDATE_SHA_INPUT) { throw 'Candidate HEAD differs from the event SHA.' }
+          if ($authorityCommit -cne 'fbdc793c1c439b15c6def97d53111f250d0ff4db') { throw 'Authority HEAD differs from the required tuple.' }
+          & git -C $candidateRoot merge-base --is-ancestor $baseCommit $candidateCommit
+          if ($LASTEXITCODE -ne 0 -or $baseCommit -ceq $candidateCommit) { throw 'HEAD^ must be a distinct candidate ancestor.' }
+
+          $origin = @(& git -C $authorityRoot remote get-url --all origin)
+          if ($LASTEXITCODE -ne 0 -or $origin.Count -ne 1 -or
+              (([string]$origin[0]).TrimEnd('/') -replace '\.git$', '') -cne 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions') {
+            throw 'Authority origin differs from the required repository.'
+          }
+
+          $nonce = [guid]::NewGuid().ToString('N').Substring(0, 12)
+          $ownedRoot = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP "s8-$($env:S8_MATRIX_PLATFORM)-$nonce"))
+          $artifactsRoot = if ($IsWindows) {
+            Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) "a-$nonce"
+          } else {
+            Join-Path $env:RUNNER_TEMP "a-$nonce"
+          }
+          $artifactsRoot = [IO.Path]::GetFullPath($artifactsRoot)
+          $runtimeRoot = Join-Path $ownedRoot 'runtime'
+          $powerShellCacheRoot = Join-Path $ownedRoot 'pwsh-cache'
+          $pesterCacheRoot = Join-Path $ownedRoot 'pester-cache'
+          $pesterResultsRoot = Join-Path $artifactsRoot 'pester'
+          $sourceArtifactsRoot = Join-Path $artifactsRoot 'source'
+          foreach ($path in @($ownedRoot, $artifactsRoot)) {
+            if (Test-Path -LiteralPath $path) { throw "Run-owned root unexpectedly exists: $path" }
+          }
+          foreach ($path in @($ownedRoot, $artifactsRoot, $runtimeRoot, $powerShellCacheRoot,
+              $pesterCacheRoot, $pesterResultsRoot, $sourceArtifactsRoot)) {
+            [void](New-Item -ItemType Directory -Path $path -ErrorAction Stop)
+          }
+
+          $bindings = [ordered]@{
+            schemaVersion = 1
+            candidateCommit = $candidateCommit
+            baseCommit = $baseCommit
+            authorityCommit = $authorityCommit
+            platform = $env:S8_MATRIX_PLATFORM
+            ownedRoot = $ownedRoot
+            artifactsRoot = $artifactsRoot
+          }
+          [IO.File]::WriteAllText((Join-Path $artifactsRoot 'input-bindings.json'),
+            (($bindings | ConvertTo-Json -Depth 5) + "`n"), [Text.UTF8Encoding]::new($false))
+          $environment = @(
+            "S8_CANDIDATE_ROOT=$candidateRoot"
+            "S8_AUTHORITY_ROOT=$authorityRoot"
+            "S8_CANDIDATE_COMMIT=$candidateCommit"
+            "S8_BASE_COMMIT=$baseCommit"
+            "S8_AUTHORITY_COMMIT=$authorityCommit"
+            "S8_OWNED_ROOT=$ownedRoot"
+            "RUN_OWNED_ROOT=$ownedRoot"
+            "S8_ARTIFACTS_ROOT=$artifactsRoot"
+            "S8_RUNTIME_ROOT=$runtimeRoot"
+            "S8_POWERSHELL_CACHE_ROOT=$powerShellCacheRoot"
+            "S8_PESTER_CACHE_ROOT=$pesterCacheRoot"
+            "S8_PESTER_RESULTS_ROOT=$pesterResultsRoot"
+            "S8_SOURCE_ARTIFACTS_ROOT=$sourceArtifactsRoot"
+            "S8_SOURCE_TOOLS_PATH=$(Join-Path $sourceArtifactsRoot 'source-tools.json')"
+          )
+          [IO.File]::AppendAllText($env:GITHUB_ENV, ($environment -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+
+      - name: Set up approved Go runtime
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: Capture stable Go version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $versionOutput = @(& go version)
+          if ($LASTEXITCODE -ne 0 -or $versionOutput.Count -ne 1 -or
+              [string]$versionOutput[0] -notmatch '^go version go(?<version>[0-9]+\.[0-9]+\.[0-9]+) [^\s]+/[^\s]+$') {
+            throw "setup-go did not provide one stable Go runtime. Evidence='$($versionOutput -join ' | ')'"
+          }
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "STANDARD_GO_RUNTIME_VERSION=$($Matches.version)`n", [Text.UTF8Encoding]::new($false))
+
+      - name: Set up approved Node 24 runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.21.0'
+
+      - name: Set up approved Python 3.12 runtime
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          check-latest: false
+
+      - name: Resolve latest official stable PowerShell
+        id: powershell_release
+        shell: pwsh
+        env:
+          S8_MATRIX_PLATFORM: ${{ matrix.platform }}
+          S8_MATRIX_ARCHITECTURE: ${{ matrix.architecture }}
+          S8_MATRIX_EXECUTABLE: ${{ matrix.executable }}
+          S8_MATRIX_ASSET_TEMPLATE: ${{ matrix.assetTemplate }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-WorkflowPowerShell.ps1') -Mode Resolve `
+            -Platform ([string]$env:S8_MATRIX_PLATFORM) -ExpectedArchitecture ([string]$env:S8_MATRIX_ARCHITECTURE) `
+            -ExecutableName ([string]$env:S8_MATRIX_EXECUTABLE) -AssetTemplate ([string]$env:S8_MATRIX_ASSET_TEMPLATE)
+
+      - name: Install verified latest stable PowerShell
+        shell: pwsh
+        env:
+          S8_MATRIX_PLATFORM: ${{ matrix.platform }}
+          S8_MATRIX_ARCHITECTURE: ${{ matrix.architecture }}
+          S8_MATRIX_EXECUTABLE: ${{ matrix.executable }}
+          S8_POWERSHELL_VERSION_INPUT: ${{ steps.powershell_release.outputs.version }}
+          S8_POWERSHELL_RELEASE_TAG: ${{ steps.powershell_release.outputs.tag }}
+          S8_POWERSHELL_ASSET: ${{ steps.powershell_release.outputs.asset }}
+          S8_POWERSHELL_ARCHIVE_URL: ${{ steps.powershell_release.outputs.archive_url }}
+          S8_POWERSHELL_HASHES_URL: ${{ steps.powershell_release.outputs.hashes_url }}
+          S8_POWERSHELL_OFFICIAL_SHA256: ${{ steps.powershell_release.outputs.official_sha256 }}
+          S8_POWERSHELL_HASHES_SHA256: ${{ steps.powershell_release.outputs.hashes_sha256 }}
+          S8_POWERSHELL_FRESH_HASHES_PATH: ${{ steps.powershell_release.outputs.fresh_hashes_path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-WorkflowPowerShell.ps1') -Mode Install `
+            -Platform ([string]$env:S8_MATRIX_PLATFORM) -ExpectedArchitecture ([string]$env:S8_MATRIX_ARCHITECTURE) `
+            -ExecutableName ([string]$env:S8_MATRIX_EXECUTABLE) -RuntimeRoot $env:S8_RUNTIME_ROOT `
+            -OwnedRoot $env:S8_OWNED_ROOT -ArtifactsRoot $env:S8_ARTIFACTS_ROOT -CacheRoot $env:S8_POWERSHELL_CACHE_ROOT `
+            -Version ([string]$env:S8_POWERSHELL_VERSION_INPUT) -ReleaseTag ([string]$env:S8_POWERSHELL_RELEASE_TAG) `
+            -AssetName ([string]$env:S8_POWERSHELL_ASSET) -ArchiveUrl ([string]$env:S8_POWERSHELL_ARCHIVE_URL) `
+            -HashesUrl ([string]$env:S8_POWERSHELL_HASHES_URL) -OfficialArchiveSha256 ([string]$env:S8_POWERSHELL_OFFICIAL_SHA256) `
+            -HashesManifestSha256 ([string]$env:S8_POWERSHELL_HASHES_SHA256) `
+            -FreshHashesPath ([string]$env:S8_POWERSHELL_FRESH_HASHES_PATH)
+
+      - name: Verify selected PowerShell runtime
+        shell: pwsh
+        env:
+          S8_MATRIX_PLATFORM: ${{ matrix.platform }}
+          S8_MATRIX_ARCHITECTURE: ${{ matrix.architecture }}
+          S8_MATRIX_EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-WorkflowPowerShell.ps1') -Mode Verify `
+            -Platform ([string]$env:S8_MATRIX_PLATFORM) -ExpectedArchitecture ([string]$env:S8_MATRIX_ARCHITECTURE) `
+            -ExecutableName ([string]$env:S8_MATRIX_EXECUTABLE)
+
+      - name: Prepare exact Pester 6.2.0 closure
+        shell: pwsh
+        env:
+          S8_MATRIX_PLATFORM: ${{ matrix.platform }}
+          S8_MATRIX_ARCHITECTURE: ${{ matrix.architecture }}
+          S8_MATRIX_EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-WorkflowPowerShell.ps1') -Mode Verify `
+            -Platform ([string]$env:S8_MATRIX_PLATFORM) -ExpectedArchitecture ([string]$env:S8_MATRIX_ARCHITECTURE) `
+            -ExecutableName ([string]$env:S8_MATRIX_EXECUTABLE)
+          & $env:DT_POWERSHELL_EXECUTABLE -NoProfile -NonInteractive -File `
+            (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-PesterRuntime.ps1') `
+            -RuntimeExecutable $env:DT_POWERSHELL_EXECUTABLE -OwnedRoot $env:S8_OWNED_ROOT `
+            -PackageCacheRoot $env:S8_PESTER_CACHE_ROOT -AuthorityRepositoryRoot $env:S8_AUTHORITY_ROOT `
+            -AuthorityRevision $env:S8_AUTHORITY_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw "Pester closure preparation failed with exit code $LASTEXITCODE." }
+          Copy-Item -LiteralPath (Join-Path $env:S8_OWNED_ROOT 'pester-setup/setup-receipt.json') `
+            -Destination (Join-Path $env:S8_PESTER_RESULTS_ROOT 'setup-receipt.json') -ErrorAction Stop
+
+      - name: Run CorePester in tracked-only no-git snapshot
+        shell: pwsh
+        env:
+          S8_MATRIX_PLATFORM: ${{ matrix.platform }}
+          S8_MATRIX_ARCHITECTURE: ${{ matrix.architecture }}
+          S8_MATRIX_EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Prepare-WorkflowPowerShell.ps1') -Mode Verify `
+            -Platform ([string]$env:S8_MATRIX_PLATFORM) -ExpectedArchitecture ([string]$env:S8_MATRIX_ARCHITECTURE) `
+            -ExecutableName ([string]$env:S8_MATRIX_EXECUTABLE)
+
+          $snapshotRoot = Join-Path $env:S8_OWNED_ROOT 'tracked-snapshot'
+          [void](New-Item -ItemType Directory -Path $snapshotRoot -ErrorAction Stop)
+          $prefix = $snapshotRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          & git -C $env:S8_CANDIDATE_ROOT checkout-index --all --force --prefix=$prefix
+          if ($LASTEXITCODE -ne 0) { throw "Could not materialize the tracked-only snapshot (exit $LASTEXITCODE)." }
+          if (Test-Path -LiteralPath (Join-Path $snapshotRoot '.git')) { throw 'Tracked-only snapshot unexpectedly contains .git.' }
+
+          Push-Location $snapshotRoot
+          try {
+            $coreOutput = @(& $env:DT_POWERSHELL_EXECUTABLE -NoProfile -NonInteractive -File `
+              (Join-Path $snapshotRoot 'scripts/Invoke-CorePester.ps1') 2>&1)
+            $coreExit = $LASTEXITCODE
+          }
+          finally { Pop-Location }
+          $coreLines = @($coreOutput | ForEach-Object { [string]$_ })
+          [IO.File]::WriteAllLines((Join-Path $env:S8_PESTER_RESULTS_ROOT 'core-pester.log'), $coreLines, [Text.UTF8Encoding]::new($false))
+          $coreLines | Out-Host
+          if ($coreExit -ne 0) { throw "CorePester failed with exit code $coreExit." }
+
+          $summary = $null
+          for ($index = $coreLines.Count - 1; $index -ge 0 -and $null -eq $summary; $index--) {
+            try {
+              $candidate = $coreLines[$index] | ConvertFrom-Json -ErrorAction Stop
+              if ([string]$candidate.report -ceq 'standard-core-pester-result-v1') { $summary = $candidate }
+            } catch { }
+          }
+          if ($null -eq $summary) { throw 'CorePester did not emit its canonical result JSON.' }
+          [IO.File]::WriteAllText((Join-Path $env:S8_PESTER_RESULTS_ROOT 'core-pester-result.json'),
+            (($summary | ConvertTo-Json -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
+          if ([int]$summary.total -le 0 -or [int]$summary.failed -ne 0 -or [int]$summary.skipped -ne 0 -or
+              [int]$summary.passed -ne [int]$summary.total) {
+            throw "CorePester acceptance requires total>0, failed=0 and skipped=0; observed total=$($summary.total) passed=$($summary.passed) failed=$($summary.failed) skipped=$($summary.skipped)."
+          }
+
+      - name: Run diagnostic Pester in checkout
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Join-Path $env:S8_RUNTIME_ROOT 'Modules/Pester/6.2.0/Pester.psd1'
+          Import-Module -Name $manifest -Force -ErrorAction Stop
+          $configuration = New-PesterConfiguration
+          $configuration.Run.Path = Join-Path $env:S8_CANDIDATE_ROOT 'tests'
+          $configuration.Run.PassThru = $true
+          $configuration.Output.Verbosity = 'Detailed'
+          $configuration.TestRegistry.Enabled = $false
+          $configuration.TestResult.Enabled = $true
+          $configuration.TestResult.OutputFormat = 'NUnitXml'
+          $configuration.TestResult.OutputPath = Join-Path $env:S8_PESTER_RESULTS_ROOT 'diagnostic-nunit.xml'
+          $result = Invoke-Pester -Configuration $configuration
+          foreach ($container in @($result.FailedContainers)) {
+            Write-Error "Pester container failed: $($container.Name)" -ErrorAction Continue
+            foreach ($failure in @($container.ErrorRecord)) { Write-Error $failure.Exception.Message -ErrorAction Continue }
+          }
+          foreach ($block in @($result.FailedBlocks)) {
+            Write-Error "Pester block failed: $($block.Name)" -ErrorAction Continue
+            foreach ($failure in @($block.ErrorRecord)) { Write-Error $failure.Exception.Message -ErrorAction Continue }
+          }
+          foreach ($test in @($result.Failed)) {
+            Write-Error "Pester test failed: $($test.ExpandedPath)" -ErrorAction Continue
+            foreach ($failure in @($test.ErrorRecord)) { Write-Error $failure.Exception.Message -ErrorAction Continue }
+          }
+          if ([int]$result.FailedCount -ne 0 -or [int]$result.FailedBlocksCount -ne 0 -or
+              [int]$result.FailedContainersCount -ne 0) {
+            exit 1
+          }
+
+      - name: Prepare candidate source tools
+        shell: pwsh
+        env:
+          # The candidate driver consumes this protected intake, deletes it, and
+          # exposes it only to the authority resolver under the same name.
+          STANDARD_VALIDATION_GITHUB_API_TOKEN: ${{ github.token }}
+          npm_config_prefix: ''
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:DT_SOURCE_SETUP_GITHUB_TOKEN = $env:STANDARD_VALIDATION_GITHUB_API_TOKEN
+          Remove-Item -LiteralPath 'Env:STANDARD_VALIDATION_GITHUB_API_TOKEN' -Force -ErrorAction Stop
+          & $env:DT_POWERSHELL_EXECUTABLE -NoProfile -NonInteractive -File `
+            (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Validate.ps1') -RepositoryRoot $env:S8_CANDIDATE_ROOT `
+            -AdapterVersion 2 -PrepareSourceTools -ArtifactsRoot $env:S8_SOURCE_ARTIFACTS_ROOT `
+            -SourceToolsPath $env:S8_SOURCE_TOOLS_PATH -AuthorityRepositoryRoot $env:S8_AUTHORITY_ROOT `
+            -TrustedToolRoot $env:S8_RUNTIME_ROOT -ExpectedGoRuntimeVersion $env:STANDARD_GO_RUNTIME_VERSION `
+            -TimeoutSeconds 1800
+          $setupExit = $LASTEXITCODE
+          Remove-Item -LiteralPath 'Env:DT_SOURCE_SETUP_GITHUB_TOKEN' -Force -ErrorAction SilentlyContinue
+          if ($setupExit -ne 0) { throw "Candidate source-tool preparation failed with exit code $setupExit." }
+          $prepared = Get-Content -LiteralPath $env:S8_SOURCE_TOOLS_PATH -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 80
+          if ([string]$prepared.runId -cnotmatch '^[0-9a-f]{32}$' -or
+              [string]$prepared.sourceRevision -cne $env:S8_CANDIDATE_COMMIT -or
+              [string]$prepared.authorityRevision -cne $env:S8_AUTHORITY_COMMIT) {
+            throw 'Prepared source receipt does not bind the candidate and authority tuple.'
+          }
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "S8_SOURCE_RUN_ID=$($prepared.runId)`n", [Text.UTF8Encoding]::new($false))
+
+      - name: Run candidate Core v2 source validation
+        shell: pwsh
+        env:
+          npm_config_prefix: ''
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prepared = Get-Content -LiteralPath $env:S8_SOURCE_TOOLS_PATH -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 80
+          if ([string]$prepared.runId -cne $env:S8_SOURCE_RUN_ID -or
+              [string]$prepared.sourceRevision -cne $env:S8_CANDIDATE_COMMIT -or
+              [string]$prepared.authorityRevision -cne $env:S8_AUTHORITY_COMMIT) {
+            throw 'Prepared source receipt identity changed before validation.'
+          }
+          & $env:DT_POWERSHELL_EXECUTABLE -NoProfile -NonInteractive -File `
+            (Join-Path $env:S8_CANDIDATE_ROOT 'scripts/Validate.ps1') -RepositoryRoot $env:S8_CANDIDATE_ROOT `
+            -AdapterVersion 2 -SourceValidation -BaseCommit $env:S8_BASE_COMMIT `
+            -ArtifactsRoot $env:S8_SOURCE_ARTIFACTS_ROOT -SourceToolsPath $env:S8_SOURCE_TOOLS_PATH `
+            -AuthorityRepositoryRoot $env:S8_AUTHORITY_ROOT -TrustedToolRoot $env:S8_RUNTIME_ROOT `
+            -ExpectedGoRuntimeVersion $env:STANDARD_GO_RUNTIME_VERSION -TimeoutSeconds 1800
+          $validationExit = $LASTEXITCODE
+          [IO.File]::WriteAllText((Join-Path $env:S8_SOURCE_ARTIFACTS_ROOT 'source-validation-exit.txt'),
+            [string]$validationExit, [Text.UTF8Encoding]::new($false))
+          if ($validationExit -ne 0) { throw "Candidate source validation did not PASS; exit code $validationExit." }
+          $reports = @(Get-ChildItem -LiteralPath $env:S8_SOURCE_ARTIFACTS_ROOT -Recurse -File `
+            -Filter 'darktide-translate-source-validation.json' -ErrorAction Stop)
+          if ($reports.Count -ne 1 -or $reports[0].Length -le 0) {
+            throw "Candidate source validation must emit one non-empty canonical report; found $($reports.Count)."
+          }
+          Write-Host "Candidate source validation PASS report: $($reports[0].FullName)"
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s8-evidence-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.S8_ARTIFACTS_ROOT || format('{0}/__missing-s8-artifacts__', github.workspace) }}/
+            !${{ env.S8_SOURCE_ARTIFACTS_ROOT || format('{0}/__missing-s8-source__', github.workspace) }}/source-tools-*/runtime/**
+            !${{ env.S8_SOURCE_ARTIFACTS_ROOT || format('{0}/__missing-s8-source__', github.workspace) }}/source-tools-*/installed/**
+          include-hidden-files: true
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload Pester results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s8-pester-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.S8_PESTER_RESULTS_ROOT || format('{0}/__missing-s8-pester__', github.workspace) }}/
+          include-hidden-files: true
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload source report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s8-source-report-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.S8_SOURCE_ARTIFACTS_ROOT || format('{0}/__missing-s8-source__', github.workspace) }}/source-validation-*/darktide-translate-source-validation.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 30
