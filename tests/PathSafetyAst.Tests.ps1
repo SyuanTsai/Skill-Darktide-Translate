@@ -52,6 +52,7 @@ $prProductionPowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/Expand-Schema14Reference.ps1',
     'skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1',
     'skills/auto-update-darktide-mod/scripts/Finalize-LocalizationWorksetEvidence.ps1',
+    'skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1',
     'skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1',
     'skills/auto-update-darktide-mod/scripts/PathSafety.psm1',
     'skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1',
@@ -71,7 +72,7 @@ $prProductionPowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Unix.psm1',
     'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Windows.psm1'
 )
-$protectedPrProductionPowerShellInventorySha256 = '7aa0a9fcaa5ec25b3882f8cb8c22fa9fbceb543eff2875166ae17c8287584f68'
+$protectedPrProductionPowerShellInventorySha256 = '6a6d400e48357e5ffb04440b576cd66c07cf915119a51b0bb0bcf678d35b72c4'
 
 # These files are byte-exact authority acc3d73 runtime artifacts. Their hashes
 # are verified by PathSafety before loading and consumer changes are forbidden,
