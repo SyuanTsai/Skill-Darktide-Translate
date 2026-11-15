@@ -123,6 +123,12 @@ function Get-ModReservationActorToken {
     (Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($Value))).Substring(0, 32)
 }
 
+function Get-ModFinalizationResultSha256 {
+    param([Parameter(Mandatory)][Collections.IDictionary] $Value)
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 40 -Compress))
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
 function Get-FileSha256 {
     param([Parameter(Mandatory)][string] $Path)
     Update-ActiveReservationHeartbeat -Force
@@ -842,6 +848,12 @@ function Write-ModReservationOwner {
     finally {
         if ($guardStream) { $guardStream.Dispose() }
     }
+}
+
+function Invoke-ModReservationFaultInjection {
+    param([Parameter(Mandatory)][string] $Point)
+    $hook = Get-Variable -Name ModReservationFaultInjectionHook -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($hook -is [scriptblock]) { & $hook $Point }
 }
 
 function Get-ModReservationReleaseReceipt {
@@ -2109,7 +2121,10 @@ function Suspend-ModReservationWorker {
 }
 
 function Release-ModReservation {
-    param([Collections.IDictionary] $State)
+    param(
+        [Collections.IDictionary] $State,
+        [Parameter(Mandatory)][Collections.IDictionary] $FinalizationResult
+    )
     if (-not $State.Contains('reservationToken') -or
         [string]$State.reservationToken -notmatch '^[0-9a-f]{32}$') {
         throw 'Reservation release requires the caller reservation token.'
@@ -2125,6 +2140,12 @@ function Release-ModReservation {
             throw 'Reservation was released by another or legacy owner token.'
         }
         $null = Get-ModReservationReleaseReceipt -State $State -OwnerToken $expectedOwnerToken
+        if (-not $owner.Contains('cleanup') -or $owner.cleanup -isnot [Collections.IDictionary] -or
+            $owner.cleanup.finalizationResult -isnot [Collections.IDictionary] -or
+            (Get-ModFinalizationResultSha256 -Value $owner.cleanup.finalizationResult) -cne
+                (Get-ModFinalizationResultSha256 -Value $FinalizationResult)) {
+            throw 'Released reservation finalization result differs from the retry tuple.'
+        }
         return
     }
     if ([string]$owner.state -cne 'held' -or [string]$owner.runId -cne [string]$State.runId -or
@@ -2144,6 +2165,11 @@ function Release-ModReservation {
     $expectedReservationToken = [string]$owner.reservationToken
     if ($expectedReservationToken -cne $expectedOwnerToken) { throw 'Reservation owner token changed before terminal release.' }
     $expectedWorkerToken = [string]$owner.workerToken
+    $finalizationResultSha256 = Get-ModFinalizationResultSha256 -Value $FinalizationResult
+    if (-not $owner.cleanup.Contains('finalizationResultSha256') -or
+        [string]$owner.cleanup.finalizationResultSha256 -cne $finalizationResultSha256) {
+        throw 'Reservation cleanup finalization result changed before terminal release.'
+    }
     $terminal = Get-ModReservationReleaseReceipt -State $State -OwnerToken $expectedReservationToken -Publish
     $now = Get-UtcTimestamp
     $owner.state = 'released'
@@ -2151,10 +2177,12 @@ function Release-ModReservation {
     $owner.releasedByOwnerToken = $expectedReservationToken
     $owner.releaseReceiptPath = [string]$terminal.path
     $owner.releaseReceiptSha256 = [string]$terminal.sha256
+    $owner.cleanup['finalizationResult'] = $FinalizationResult
     $owner.heartbeat = $now
     $owner.expiresAt = $now
     Write-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot) `
         -Value $owner -ExpectedReservationToken $expectedReservationToken -ExpectedWorkerToken $expectedWorkerToken
+    Invoke-ModReservationFaultInjection -Point 'release-published-before-return'
 }
 
 function Assert-ModReservationCleanupOwner {
@@ -2186,7 +2214,7 @@ function Start-ModReservationCleanup {
         evidencePath = [IO.Path]::GetFullPath($EvidencePath)
         claimDirectory = [IO.Path]::GetFullPath($ClaimDirectory)
         runRoot = [IO.Path]::GetFullPath($RunRoot)
-        finalizationResult = $FinalizationResult
+        finalizationResultSha256 = Get-ModFinalizationResultSha256 -Value $FinalizationResult
     }
     if ($owner.Contains('cleanup') -and $owner.cleanup -is [Collections.IDictionary]) {
         foreach ($field in @('schemaVersion', 'runId', 'evidencePath', 'claimDirectory', 'runRoot')) {
@@ -2194,8 +2222,7 @@ function Start-ModReservationCleanup {
                 throw 'Persisted reservation cleanup tuple changed before recovery.'
             }
         }
-        if (($owner.cleanup.finalizationResult | ConvertTo-Json -Depth 40 -Compress) -cne
-            ($FinalizationResult | ConvertTo-Json -Depth 40 -Compress)) {
+        if ([string]$owner.cleanup.finalizationResultSha256 -cne [string]$tuple.finalizationResultSha256) {
             throw 'Persisted reservation finalization result changed before recovery.'
         }
         if ([string]$owner.reservationState -cne 'cleanup-pending') {
@@ -2213,7 +2240,7 @@ function Start-ModReservationCleanup {
         evidencePath = $tuple.evidencePath
         claimDirectory = $tuple.claimDirectory
         runRoot = $tuple.runRoot
-        finalizationResult = $tuple.finalizationResult
+        finalizationResultSha256 = $tuple.finalizationResultSha256
         startedAt = Get-UtcTimestamp
         writerLockReleased = $false
         claimDirectoryPreserved = $false

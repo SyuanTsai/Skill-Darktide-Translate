@@ -594,7 +594,7 @@ function Invoke-ModUpdateTerminalCleanup {
         $owner = Set-ModReservationCleanupStep -State $State -Step runRootPreserved
     }
     Invoke-ModUpdateCleanupFaultInjection -Point 'before-reservation-release'
-    Release-ModReservation -State $State
+    Release-ModReservation -State $State -FinalizationResult $FinalizationResult
 }
 
 function Invoke-ModUpdateReviewedHeadFinalization {

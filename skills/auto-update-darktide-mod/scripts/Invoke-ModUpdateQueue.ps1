@@ -46,6 +46,7 @@ try {
     $rawItems = @($queue.items)
     if ($rawItems.Count -eq 0) { throw 'Queue must contain at least one source acquisition item.' }
     $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $explicitRunIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $items = @(
         foreach ($item in $rawItems) {
             Update-SharedCoordinationLease -Lease $sourceInventoryLease
@@ -55,13 +56,17 @@ try {
             if ([string]$item.provider -notin @('api', 'browser')) { throw 'Queue provider must be api or browser.' }
             $canonicalMod = ([string]$item.modDirectory).Trim()
             if (-not $identities.Add($canonicalMod)) { throw 'Queue contains a duplicate canonical MOD identity.' }
+            $explicitRunId = if ($item.Contains('runId') -and -not [string]::IsNullOrWhiteSpace([string]$item.runId)) {
+                [guid]::Parse([string]$item.runId).ToString()
+            } else { $null }
+            if ($null -ne $explicitRunId -and -not $explicitRunIds.Add($explicitRunId)) {
+                throw "Queue contains a duplicate explicit runId: $explicitRunId"
+            }
             [ordered]@{
                 modDirectory = $canonicalMod
                 sourceRequestPath = [IO.Path]::GetFullPath([string]$item.sourceRequestPath)
                 provider = [string]$item.provider
-                runId = if ($item.Contains('runId') -and -not [string]::IsNullOrWhiteSpace([string]$item.runId)) {
-                    [guid]::Parse([string]$item.runId).ToString()
-                } else { $null }
+                runId = $explicitRunId
                 downloadedFilePath = if ($item.Contains('downloadedFilePath') -and -not [string]::IsNullOrWhiteSpace([string]$item.downloadedFilePath)) {
                     [IO.Path]::GetFullPath([string]$item.downloadedFilePath)
                 } else { $null }

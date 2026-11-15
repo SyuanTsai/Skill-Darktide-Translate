@@ -560,10 +560,11 @@ finally {
         Import-Module -Name $coordinationModule -Force
         $repository = Join-Path $TestDrive 'coordination-acquire-retry'
         New-Item -ItemType Directory -Path $repository | Out-Null
-        $first = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'same-acquirer'
+        $attemptToken = '1' * 32
+        $first = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'same-acquirer' -AttemptToken $attemptToken
         try {
             $before = (Get-FileHash -LiteralPath $first.path -Algorithm SHA256).Hash
-            $retry = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'same-acquirer'
+            $retry = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'same-acquirer' -AttemptToken $attemptToken
             $retry.token | Should -BeExactly $first.token
             (Get-FileHash -LiteralPath $first.path -Algorithm SHA256).Hash | Should -BeExactly $before
         }
@@ -591,16 +592,29 @@ finally {
         $repository = Join-Path $TestDrive 'coordination-heartbeat-retry'
         New-Item -ItemType Directory -Path $repository | Out-Null
         $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'heartbeat-owner'
+        $coordinationModuleObject = Get-Module -Name SharedCoordinationLock | Select-Object -First 1
         try {
-            Update-SharedCoordinationLease -Lease $lease -Force
-            $owner = Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable
+            & $coordinationModuleObject {
+                $script:CoordinationFaultInjectionHook = {
+                    param($point)
+                    if ($point -ceq 'heartbeat-published-before-readback') { throw 'injected heartbeat return interruption' }
+                }
+            }
+            { Update-SharedCoordinationLease -Lease $lease -Force } | Should -Throw '*injected heartbeat return interruption*'
             $before = (Get-FileHash -LiteralPath $lease.path -Algorithm SHA256).Hash
-            $lease.pendingHeartbeat = [string]$owner.owner.heartbeat
-            $lease.pendingExpiresAt = [string]$owner.expiresAt
+            $lease.Contains('pendingHeartbeat') | Should -BeTrue
+            $publishedHeartbeat = [string]$lease.pendingHeartbeat
+            & $coordinationModuleObject { $script:CoordinationFaultInjectionHook = $null }
             Update-SharedCoordinationLease -Lease $lease -Force
             (Get-FileHash -LiteralPath $lease.path -Algorithm SHA256).Hash | Should -BeExactly $before
+            $lease.Contains('pendingHeartbeat') | Should -BeFalse
+            (Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable).owner.heartbeat |
+                Should -BeExactly $publishedHeartbeat
         }
-        finally { $null = Exit-SharedCoordinationLease -Lease $lease }
+        finally {
+            & $coordinationModuleObject { $script:CoordinationFaultInjectionHook = $null }
+            $null = Exit-SharedCoordinationLease -Lease $lease
+        }
     }
 
     # Scenario: A heartbeat caller presents a token different from the persisted held owner.
@@ -727,19 +741,70 @@ $null = Exit-SharedCoordinationLease -Lease $lease
                 if ($point -ceq 'acquire-published-before-evidence-verification') { throw 'injected stale takeover interruption' }
             }
         }
-        { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner' } |
+        $attemptToken = '2' * 32
+        { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner' -AttemptToken $attemptToken } |
             Should -Throw '*injected stale takeover interruption*'
         & $coordinationModuleObject { $script:CoordinationFaultInjectionHook = $null }
-        $retry = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner'
+        $retry = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner' -AttemptToken $attemptToken
         try {
             $retry.staleEvidencePath | Should -Not -BeNullOrEmpty
             [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$retry.staleEvidencePath)) |
                 Should -BeExactly ([Convert]::ToHexString($displacedBytes))
             $retry.waitingMilliseconds | Should -BeGreaterOrEqual 0
             [IO.File]::WriteAllText([string]$retry.staleEvidencePath, 'tampered', [Text.UTF8Encoding]::new($false))
-            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner' } |
+            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'retry-owner' -AttemptToken $attemptToken } |
                 Should -Throw '*differs from the persisted takeover metadata*'
         }
         finally { $null = Exit-SharedCoordinationLease -Lease $retry }
+    }
+
+    # Scenario: Two independent acquisitions in one process present the same run ID without sharing an attempt token.
+    # Purpose: A fresh acquisition must contend instead of being mistaken for an interrupted retry.
+    It 'InterT389_TimesOutAnIndependentSameProcessAcquisitionWithTheSameRunId' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'same-process-independent-acquisition'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'same-run-id'
+        try {
+            [byte[]]$ownerBytes = [IO.File]::ReadAllBytes([string]$lease.path)
+            $ownerToken = (Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable).owner.token
+            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
+                    -RunId 'same-run-id' -TimeoutSeconds 1 } | Should -Throw '*Timed out*'
+            [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$lease.path)) |
+                Should -BeExactly ([Convert]::ToHexString($ownerBytes))
+            (Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable).owner.token |
+                Should -BeExactly $ownerToken
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $lease }
+    }
+
+    # Scenario: An expired owner is either from another machine or names a PID now used by a different process start.
+    # Purpose: Both identities are stale, while malformed owner schemas remain fail closed in InterT182.
+    It 'InterT390_ReclaimsAnExpiredOwnerWithStaleIdentity_<Case>' -ForEach @(
+        @{ Case = 'ForeignMachine' }
+        @{ Case = 'ReusedProcessId' }
+    ) {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive "expired-stale-identity-$Case"
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $oldLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId "old-$Case"
+        $owner = Get-Content -LiteralPath $oldLease.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $owner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+        $owner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
+        if ($Case -ceq 'ForeignMachine') {
+            $owner.owner.machineName = "foreign-$([Environment]::MachineName)"
+        }
+        else {
+            $owner.owner.processId = $PID
+            $owner.owner.processStartTicks = 1
+        }
+        [IO.File]::WriteAllText([string]$oldLease.path, ($owner | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+        $newLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId "new-$Case"
+        try {
+            $newLease.token | Should -Not -BeExactly $oldLease.token
+            $newLease.staleEvidencePath | Should -Not -BeNullOrEmpty
+            { Exit-SharedCoordinationLease -Lease $oldLease } | Should -Throw '*ownership changed*'
+        }
+        finally { $null = Exit-SharedCoordinationLease -Lease $newLease }
     }
 }

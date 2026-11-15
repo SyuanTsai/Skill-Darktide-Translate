@@ -944,6 +944,7 @@ catch [TimeoutException] { 'TIMEOUT' }
                     $script:owner.reservationState = 'cleanup-pending'
                     $script:owner.cleanup = [ordered]@{
                         evidencePath = $EvidencePath; claimDirectory = $ClaimDirectory; runRoot = $RunRoot
+                        finalizationResultSha256 = ('a' * 64)
                         writerLockReleased = $false; claimDirectoryPreserved = $false; runRootPreserved = $false
                     }
                 }
@@ -962,10 +963,11 @@ catch [TimeoutException] { 'TIMEOUT' }
                 $script:events.Add("marker:$Label")
             }
             function Release-ModReservation {
-                param($State)
+                param($State, $FinalizationResult)
                 foreach ($step in @('writerLockReleased', 'claimDirectoryPreserved', 'runRootPreserved')) {
                     if (-not [bool]$script:owner.cleanup[$step]) { throw "release before $step" }
                 }
+                $script:owner.cleanup.finalizationResult = $FinalizationResult
                 $script:owner.state = 'released'
                 $script:owner.reservationState = 'released'
                 $script:events.Add('reservation-released')
@@ -985,6 +987,7 @@ catch [TimeoutException] { 'TIMEOUT' }
                     Should -Throw "*fault:$point*"
                 $script:owner.state | Should -BeExactly 'held'
                 $script:owner.reservationState | Should -BeExactly 'cleanup-pending'
+                $script:owner.cleanup.Contains('finalizationResult') | Should -BeFalse
 
                 $script:ModUpdateCleanupFaultInjectionHook = $null
                 # Process recovery reacquires a new writer lease even when the
@@ -997,6 +1000,7 @@ catch [TimeoutException] { 'TIMEOUT' }
                 $script:owner.cleanup.writerLockReleased | Should -BeTrue
                 $script:owner.cleanup.claimDirectoryPreserved | Should -BeTrue
                 $script:owner.cleanup.runRootPreserved | Should -BeTrue
+                $script:owner.cleanup.finalizationResult.result | Should -BeExactly 'passed'
                 @($script:events | Where-Object { $_ -ceq 'reservation-released' }).Count | Should -Be 1
                 @($script:events | Where-Object { $_ -ceq 'writer-released' }).Count | Should -BeGreaterOrEqual 1
             } $FaultPoint
@@ -1012,7 +1016,8 @@ catch [TimeoutException] { 'TIMEOUT' }
         $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
         @($parseErrors).Count | Should -Be 0
         $required = @(
-            'Release-ModReservation', 'Assert-ModReservationCleanupOwner', 'Start-ModReservationCleanup',
+            'Get-ModFinalizationResultSha256', 'Invoke-ModReservationFaultInjection', 'Release-ModReservation',
+            'Assert-ModReservationCleanupOwner', 'Start-ModReservationCleanup',
             'Get-ModReservationCleanupState', 'Set-ModReservationCleanupStep'
         )
         $functions = @($ast.FindAll({
@@ -1059,17 +1064,19 @@ catch [TimeoutException] { 'TIMEOUT' }
                 $heldJson = $script:owner | ConvertTo-Json -Depth 20 -Compress
                 $missingToken = [ordered]@{}; foreach ($entry in $value.GetEnumerator()) { $missingToken[$entry.Key] = $entry.Value }
                 $missingToken.Remove('reservationToken')
-                { Release-ModReservation -State $missingToken } | Should -Throw '*requires the caller reservation token*'
+                { Release-ModReservation -State $missingToken -FinalizationResult @{ result = 'passed' } } | Should -Throw '*requires the caller reservation token*'
                 $foreignHeld = [ordered]@{}; foreach ($entry in $value.GetEnumerator()) { $foreignHeld[$entry.Key] = $entry.Value }
                 $foreignHeld.reservationToken = 'f' * 32
-                { Release-ModReservation -State $foreignHeld } | Should -Throw '*owner token changed*'
+                { Release-ModReservation -State $foreignHeld -FinalizationResult @{ result = 'passed' } } | Should -Throw '*owner token changed*'
                 ($script:owner | ConvertTo-Json -Depth 20 -Compress) | Should -BeExactly $heldJson
 
                 $started = Start-ModReservationCleanup -State $value -EvidencePath $evidencePath `
                     -ClaimDirectory $claimPath -RunRoot $runPath -FinalizationResult @{ result = 'passed' }
                 $started.state | Should -BeExactly 'held'
                 $started.reservationState | Should -BeExactly 'cleanup-pending'
-                { Release-ModReservation -State $value } | Should -Throw '*complete every persisted boundary*'
+                $started.cleanup.Contains('finalizationResult') | Should -BeFalse
+                $started.cleanup.finalizationResultSha256 | Should -Match '^[0-9a-f]{64}$'
+                { Release-ModReservation -State $value -FinalizationResult @{ result = 'passed' } } | Should -Throw '*complete every persisted boundary*'
 
                 $script:owner.reservationState = 'between-stages'
                 (Start-ModReservationCleanup -State $value -EvidencePath $evidencePath `
@@ -1081,16 +1088,17 @@ catch [TimeoutException] { 'TIMEOUT' }
                     $updated = Set-ModReservationCleanupStep -State $value -Step $step
                     $updated.cleanup[$step] | Should -BeTrue
                 }
-                Release-ModReservation -State $value
+                Release-ModReservation -State $value -FinalizationResult @{ result = 'passed' }
                 $script:owner.state | Should -BeExactly 'released'
                 $script:owner.reservationState | Should -BeExactly 'released'
                 $script:owner.releasedByOwnerToken | Should -BeExactly ([string]$value.reservationToken)
+                $script:owner.cleanup.finalizationResult.result | Should -BeExactly 'passed'
                 $releasedJson = $script:owner | ConvertTo-Json -Depth 20 -Compress
-                { Release-ModReservation -State $value } | Should -Not -Throw
+                { Release-ModReservation -State $value -FinalizationResult @{ result = 'passed' } } | Should -Not -Throw
                 ($script:owner | ConvertTo-Json -Depth 20 -Compress) | Should -BeExactly $releasedJson
                 $foreign = [ordered]@{}; foreach ($entry in $value.GetEnumerator()) { $foreign[$entry.Key] = $entry.Value }
                 $foreign.reservationToken = 'f' * 32
-                { Release-ModReservation -State $foreign } | Should -Throw '*owner token changed*'
+                { Release-ModReservation -State $foreign -FinalizationResult @{ result = 'passed' } } | Should -Throw '*owner token changed*'
             } $state $evidence $claim $runRoot
         }
         finally { Remove-Module $module -Force }
@@ -1154,7 +1162,7 @@ catch [TimeoutException] { 'TIMEOUT' }
                 function Start-ModReservationCleanup { param($State,$EvidencePath,$ClaimDirectory,$RunRoot,$FinalizationResult) $script:owner }
                 function Exit-RunWriterLock { param($Lease) }
                 function Set-ModReservationCleanupStep { param($State,$Step) $script:owner.cleanup[$Step] = $true; $script:owner }
-                function Release-ModReservation { param($State) $script:releaseCount++ }
+                function Release-ModReservation { param($State,$FinalizationResult) $script:releaseCount++ }
                 $claim = Join-Path $rootPath 'claim-failure'
                 New-Item -ItemType Directory -Path $claim -Force | Out-Null
                 { Invoke-ModUpdateTerminalCleanup -State @{ runId = 'failure-run' } -EvidencePath $evidencePath `
@@ -3236,6 +3244,103 @@ function Get-SourceTupleContractSha256 {
             } $Case
         }
         finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: Two distinct queue items provide the same explicit run ID.
+    # Purpose: Reject the ambiguous generation tuple before any parallel acquisition worker starts.
+    It 'UnitT213_RejectsDuplicateExplicitQueueRunIdsOrdinally' {
+        $repository = Join-Path $TestDrive 'duplicate-queue-run-id'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $queuePath = Join-Path $TestDrive 'duplicate-run-id-queue.json'
+        $runId = '21321321-3213-4213-8213-213213213213'
+        [ordered]@{
+            schemaVersion = 1
+            items = @(
+                [ordered]@{ modDirectory = 'FirstMod'; sourceRequestPath = (Join-Path $TestDrive 'first.json'); provider = 'browser'; runId = $runId },
+                [ordered]@{ modDirectory = 'SecondMod'; sourceRequestPath = (Join-Path $TestDrive 'second.json'); provider = 'browser'; runId = $runId }
+            )
+        } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $queuePath -NoNewline
+        $queueRunner = Join-Path $skillRoot 'scripts/Invoke-ModUpdateQueue.ps1'
+        { & $queueRunner -RepositoryRoot $repository -QueuePath $queuePath -PassThru } |
+            Should -Throw "*duplicate explicit runId: $runId*"
+    }
+
+    # Scenario: Reservation release owner bytes publish successfully, then the caller is interrupted before return.
+    # Purpose: Retry the same token through the real owner writer without rewriting bytes, while foreign tokens fail closed.
+    It 'UnitT214_RecoversReservationReleaseAfterPublishedOwnerBeforeReturn' {
+        $tokens = $null; $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $names = @(
+            'Get-ModFinalizationResultSha256', 'Assert-NoReparsePath', 'Get-ModReservationOwnerPath', 'Get-ModReservationSnapshot',
+            'Read-ModReservationOwner', 'Write-ModReservationOwner', 'Invoke-ModReservationFaultInjection',
+            'Get-ModReservationReleaseReceipt', 'Release-ModReservation'
+        )
+        $source = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
+        }, $true)).Extent.Text -join "`n"
+        $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
+        $module = New-Module -ArgumentList $source, $pathSafetyPath -ScriptBlock {
+            param($functionSource, $pathSafetyModule)
+            Import-Module -Name $pathSafetyModule -Force
+            function Get-UtcTimestamp { [DateTimeOffset]::UtcNow.ToString('o') }
+            function Get-ModReservationActorToken {
+                param($Value)
+                [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]$Value))).ToLowerInvariant().Substring(0, 32)
+            }
+            . ([scriptblock]::Create($functionSource))
+        }
+        try {
+            $repository = Join-Path $TestDrive 'reservation-release-real-write'
+            $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod'
+            New-Item -ItemType Directory -Path $lockRoot -Force | Out-Null
+            $lockPath = Join-Path $lockRoot (('d' * 64) + '.lock')
+            $reservationToken = 'a' * 32
+            $state = [ordered]@{
+                runId = 'release-real-write-run'; modLockKey = 'd' * 64; modLockPath = $lockPath
+                repositoryRoot = $repository; reservationToken = $reservationToken
+            }
+            $finalizationResult = [ordered]@{
+                result = 'passed'; status = 'merged-and-finalized'; data = [ordered]@{ reservationReleased = $true }
+            }
+            & $module {
+                param($value, $result)
+                $owner = [ordered]@{
+                    schemaVersion = 3; state = 'held'; reservationState = 'cleanup-pending'
+                    runId = [string]$value.runId; modLockKey = [string]$value.modLockKey
+                    reservationToken = [string]$value.reservationToken; workerToken = $null; leaseMode = 'reserved'
+                    heartbeat = Get-UtcTimestamp; expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
+                    cleanup = [ordered]@{
+                        finalizationResultSha256 = Get-ModFinalizationResultSha256 -Value $result
+                        writerLockReleased = $true; claimDirectoryPreserved = $true; runRootPreserved = $true
+                    }
+                }
+                Write-ModReservationOwner -ModLockPath ([string]$value.modLockPath) -Repository ([string]$value.repositoryRoot) -Value $owner
+                $script:ModReservationFaultInjectionHook = {
+                    param($point)
+                    if ($point -ceq 'release-published-before-return') { throw 'injected reservation release interruption' }
+                }
+                { Release-ModReservation -State $value -FinalizationResult $result } |
+                    Should -Throw '*injected reservation release interruption*'
+                [byte[]]$publishedBytes = [IO.File]::ReadAllBytes([string]$value.modLockPath)
+                $script:ModReservationFaultInjectionHook = $null
+                { Release-ModReservation -State $value -FinalizationResult $result } | Should -Not -Throw
+                [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$value.modLockPath)) |
+                    Should -BeExactly ([Convert]::ToHexString($publishedBytes))
+                $released = Read-ModReservationOwner -ModLockPath ([string]$value.modLockPath) -Repository ([string]$value.repositoryRoot)
+                $released.state | Should -BeExactly 'released'
+                $released.cleanup.finalizationResult.status | Should -BeExactly 'merged-and-finalized'
+                $released.cleanup.finalizationResult.data.reservationReleased | Should -BeTrue
+                $foreign = [ordered]@{}; foreach ($entry in $value.GetEnumerator()) { $foreign[$entry.Key] = $entry.Value }
+                $foreign.reservationToken = 'f' * 32
+                { Release-ModReservation -State $foreign -FinalizationResult $result } | Should -Throw '*owner token changed*'
+            } $state $finalizationResult
+        }
+        finally {
+            & $module { $script:ModReservationFaultInjectionHook = $null }
+            Remove-Module $module -Force
+        }
     }
 
     It 'UnitT215_ResolvesOnlyUniqueIgnoreCaseGitNormalizationPaths' {

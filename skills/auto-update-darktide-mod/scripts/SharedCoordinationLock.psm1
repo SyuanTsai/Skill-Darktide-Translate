@@ -198,16 +198,14 @@ function Test-CoordinationProcessStartMatch {
 function Test-CoordinationProcessActive {
     param([Parameter(Mandatory)][Collections.IDictionary] $Owner)
     if ([string]$Owner.machineName -cne [Environment]::MachineName) {
-        throw 'Cannot verify a stale coordination owner process on another machine.'
+        return $false
     }
     $process = Get-Process -Id ([int]$Owner.processId) -ErrorAction SilentlyContinue
     if ($null -eq $process) { return $false }
     try { $actualStartTicks = $process.StartTime.ToUniversalTime().Ticks }
-    catch {
-        throw 'Cannot verify the stale coordination owner process identity.'
-    }
+    catch { return $false }
     if (-not (Test-CoordinationProcessStartMatch -ActualTicks $actualStartTicks -ExpectedTicks ([int64]$Owner.processStartTicks))) {
-        throw 'Stale coordination owner process identity contradicts the live process.'
+        return $false
     }
     $true
 }
@@ -553,6 +551,7 @@ function Enter-SharedCoordinationLease {
         [Parameter(Mandatory)][string] $RepositoryRoot,
         [Parameter(Mandatory)][ValidateSet('source-acquisition', 'git-coordination')][string] $ResourceKey,
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9._-]+$')][string] $RunId,
+        [ValidatePattern('^[0-9a-f]{32}$')][string] $AttemptToken,
         [string] $ReceiptRoot,
         [scriptblock] $WaitHeartbeatAction,
         [ValidateRange(1, 3600)][int] $TimeoutSeconds = 300
@@ -577,7 +576,8 @@ function Enter-SharedCoordinationLease {
     $lockRoot = Resolve-PortableTrustedRoot -Path $logicalLockRoot
     $lockPath = Join-Path $lockRoot "$ResourceKey.lock"
     $identity = Get-CoordinationProcessIdentity
-    $token = Get-CoordinationActorToken -RunId ("{0}:{1}:{2}:{3}" -f $RunId, $identity.machineName, $identity.processId, $identity.processStartTicks) -ResourceKey $ResourceKey
+    $effectiveAttemptToken = if ([string]::IsNullOrWhiteSpace($AttemptToken)) { [guid]::NewGuid().ToString('N') } else { $AttemptToken }
+    $token = Get-CoordinationActorToken -RunId ("{0}:{1}:{2}:{3}:{4}" -f $RunId, $identity.machineName, $identity.processId, $identity.processStartTicks, $effectiveAttemptToken) -ResourceKey $ResourceKey
     $staleEvidencePath = $null
     [int64]$waitStartedMilliseconds = -1
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -742,6 +742,7 @@ function Update-SharedCoordinationLease {
         $owner.expiresAt = [string]$Lease.pendingExpiresAt
         $null = Publish-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey) `
             -Value $owner -ExpectedState $snapshot
+        Invoke-CoordinationFaultInjection -Point 'heartbeat-published-before-readback'
         $verified = (Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey ([string]$Lease.resourceKey)).value
         if (-not (Test-CoordinationLeaseMatchesOwner -Lease $Lease -Owner $verified) -or
             [DateTimeOffset]::ParseExact([string]$verified.owner.heartbeat, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) -lt $target) {
