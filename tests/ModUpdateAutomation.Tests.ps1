@@ -203,6 +203,19 @@ Describe 'Deterministic Darktide MOD update automation' {
         $expander | Should -Not -Match '\[StringComparison\]::Ordinal\s*\r?\n\s*\}'
     }
 
+    # Scenario: a case-insensitive volume exposes the Git worktree through a differently-cased prefix.
+    # Purpose: The Candidate Gate must request the conservative exclusion comparer before rejecting the workset path.
+    It 'UnitT393_UsesExclusionComparisonForLocalizationWorksetBoundary' {
+        $candidate = Get-Content -LiteralPath $validatorPath -Raw
+        $candidate | Should -Match 'Get-PortablePathComparison -Paths @\(\$worktreeFull, \$worksetFull\) -Purpose Exclusion'
+        $worktreePrefix = ([IO.Path]::GetFullPath((Join-Path $TestDrive 'WorkTree')).TrimEnd(
+                [IO.Path]::DirectorySeparatorChar
+            ) + [IO.Path]::DirectorySeparatorChar)
+        $caseAlias = [IO.Path]::GetFullPath((Join-Path $TestDrive 'worktree/review-artifacts/localization-workset.json'))
+        $caseAlias.StartsWith($worktreePrefix, [StringComparison]::Ordinal) | Should -BeFalse
+        $caseAlias.StartsWith($worktreePrefix, [StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
+    }
+
     # Scenario: A Unix-like host compares two names of managed regular files by kernel identity.
     # Purpose: Use the vendored (st_dev, st_ino) identity, require exactly one link, and reject symlinks instead of treating them as the same file.
     if (-not $IsWindows) {
@@ -654,7 +667,7 @@ catch [TimeoutException] { 'TIMEOUT' }
     }
 
     # Scenario: A reviewed-head merge reaches terminal archival and exact resource cleanup.
-    # Purpose: Preserve recoverable evidence and mark retained run directories instead of deleting directory trees.
+    # Purpose: Preserve recoverable evidence, then remove the exact claim and run directories before release.
     It 'UnitT116_UsesOwnerCheckedPreservationForReviewedHeadFinalization' {
         $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
         $finalizer = Get-Content -LiteralPath $finalizerPath -Raw
@@ -667,9 +680,10 @@ catch [TimeoutException] { 'TIMEOUT' }
         $finalizer | Should -Match 'Read-ActiveReservationOwner'
         $finalizer | Should -Match 'Suspend-ModReservationWorker -State \$State'
         $finalizer | Should -Match 'Invoke-ModUpdateTerminalCleanup'
-        $finalizer | Should -Match 'Write-ModUpdatePreservedDirectoryMarker'
-        $finalizer | Should -Not -Match 'Remove-ModUpdateOwnedTree -Path \$claimDirectory'
-        $finalizer | Should -Not -Match 'Remove-ModUpdateOwnedTree -Path \(\[string\]\$State\.runRoot\)'
+        $finalizer | Should -Match 'Remove-ModUpdateOwnedDirectory'
+        $finalizer | Should -Match 'claimDirectoryRemoved'
+        $finalizer | Should -Match 'runRootRemoved'
+        $finalizer | Should -Not -Match '\.mod-update-finalized\.json'
         $finalizer | Should -Not -Match '@\(''branch'', ''-D'''
         $finalizer | Should -Not -Match 'Remove-Item\s+-Recurse'
     }
@@ -916,8 +930,8 @@ catch [TimeoutException] { 'TIMEOUT' }
     It 'UnitT127_RecoversCleanupBoundary_<FaultPoint>_BeforeReleasingTheReservation' -ForEach @(
         @{ FaultPoint = 'cleanup-pending-persisted' },
         @{ FaultPoint = 'writer-lock-released' },
-        @{ FaultPoint = 'claim-directory-preserved' },
-        @{ FaultPoint = 'run-root-preserved' },
+        @{ FaultPoint = 'claim-directory-removed' },
+        @{ FaultPoint = 'run-root-removed' },
         @{ FaultPoint = 'before-reservation-release' }
     ) {
         $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
@@ -945,7 +959,8 @@ catch [TimeoutException] { 'TIMEOUT' }
                     $script:owner.cleanup = [ordered]@{
                         evidencePath = $EvidencePath; claimDirectory = $ClaimDirectory; runRoot = $RunRoot
                         finalizationResultSha256 = ('a' * 64)
-                        writerLockReleased = $false; claimDirectoryPreserved = $false; runRootPreserved = $false
+                        finalizationResult = $FinalizationResult
+                        writerLockReleased = $false; claimDirectoryRemoved = $false; runRootRemoved = $false
                     }
                 }
                 $script:owner
@@ -958,13 +973,13 @@ catch [TimeoutException] { 'TIMEOUT' }
                 $script:events.Add("step:$Step")
                 $script:owner
             }
-            function Write-ModUpdatePreservedDirectoryMarker {
-                param($Path, $Root, $Label, $State, $EvidencePath)
-                $script:events.Add("marker:$Label")
+            function Remove-ModUpdateOwnedDirectory {
+                param($Path, $Root, $Label)
+                $script:events.Add("removed:$Label")
             }
             function Release-ModReservation {
                 param($State, $FinalizationResult)
-                foreach ($step in @('writerLockReleased', 'claimDirectoryPreserved', 'runRootPreserved')) {
+                foreach ($step in @('writerLockReleased', 'claimDirectoryRemoved', 'runRootRemoved')) {
                     if (-not [bool]$script:owner.cleanup[$step]) { throw "release before $step" }
                 }
                 $script:owner.cleanup.finalizationResult = $FinalizationResult
@@ -987,7 +1002,7 @@ catch [TimeoutException] { 'TIMEOUT' }
                     Should -Throw "*fault:$point*"
                 $script:owner.state | Should -BeExactly 'held'
                 $script:owner.reservationState | Should -BeExactly 'cleanup-pending'
-                $script:owner.cleanup.Contains('finalizationResult') | Should -BeFalse
+                $script:owner.cleanup.finalizationResult.result | Should -BeExactly 'passed'
 
                 $script:ModUpdateCleanupFaultInjectionHook = $null
                 # Process recovery reacquires a new writer lease even when the
@@ -998,8 +1013,8 @@ catch [TimeoutException] { 'TIMEOUT' }
                     -FinalizationResult @{ result = 'passed' }
                 $script:owner.state | Should -BeExactly 'released'
                 $script:owner.cleanup.writerLockReleased | Should -BeTrue
-                $script:owner.cleanup.claimDirectoryPreserved | Should -BeTrue
-                $script:owner.cleanup.runRootPreserved | Should -BeTrue
+                $script:owner.cleanup.claimDirectoryRemoved | Should -BeTrue
+                $script:owner.cleanup.runRootRemoved | Should -BeTrue
                 $script:owner.cleanup.finalizationResult.result | Should -BeExactly 'passed'
                 @($script:events | Where-Object { $_ -ceq 'reservation-released' }).Count | Should -Be 1
                 @($script:events | Where-Object { $_ -ceq 'writer-released' }).Count | Should -BeGreaterOrEqual 1
@@ -1074,7 +1089,7 @@ catch [TimeoutException] { 'TIMEOUT' }
                     -ClaimDirectory $claimPath -RunRoot $runPath -FinalizationResult @{ result = 'passed' }
                 $started.state | Should -BeExactly 'held'
                 $started.reservationState | Should -BeExactly 'cleanup-pending'
-                $started.cleanup.Contains('finalizationResult') | Should -BeFalse
+                $started.cleanup.finalizationResult.result | Should -BeExactly 'passed'
                 $started.cleanup.finalizationResultSha256 | Should -Match '^[0-9a-f]{64}$'
                 { Release-ModReservation -State $value -FinalizationResult @{ result = 'passed' } } | Should -Throw '*complete every persisted boundary*'
 
@@ -1084,7 +1099,7 @@ catch [TimeoutException] { 'TIMEOUT' }
                 { Start-ModReservationCleanup -State $value -EvidencePath ($evidencePath + '-changed') `
                         -ClaimDirectory $claimPath -RunRoot $runPath -FinalizationResult @{ result = 'passed' } } | Should -Throw '*cleanup tuple changed*'
 
-                foreach ($step in @('writerLockReleased', 'claimDirectoryPreserved', 'runRootPreserved')) {
+                foreach ($step in @('writerLockReleased', 'claimDirectoryRemoved', 'runRootRemoved')) {
                     $updated = Set-ModReservationCleanupStep -State $value -Step $step
                     $updated.cleanup[$step] | Should -BeTrue
                 }
@@ -1104,15 +1119,15 @@ catch [TimeoutException] { 'TIMEOUT' }
         finally { Remove-Module $module -Force }
     }
 
-    # Scenario: Finalization preserves real directories with immutable marker files and publication may fail before a cleanup step advances.
-    # Purpose: Exercise NoReplace marker bytes, tuple validation, corrupt JSON rejection, and release ordering without replacing the marker function.
+    # Scenario: Finalization removes exact run-owned directories and deletion may fail before a cleanup step advances.
+    # Purpose: Exercise idempotent absence, owner-checked deletion, and release ordering without preserving marker files.
     It 'UnitT129_PublishesAndValidatesRealPreservedDirectoryMarkersBeforeRelease' {
         $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
         $tokens = $null
         $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
         @($parseErrors).Count | Should -Be 0
-        $required = @('Write-ModUpdatePreservedDirectoryMarker', 'Invoke-ModUpdateCleanupFaultInjection', 'Invoke-ModUpdateTerminalCleanup')
+        $required = @('Remove-ModUpdateOwnedDirectory', 'Invoke-ModUpdateCleanupFaultInjection', 'Invoke-ModUpdateTerminalCleanup')
         $functions = @($ast.FindAll({
             param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $required
@@ -1123,55 +1138,46 @@ catch [TimeoutException] { 'TIMEOUT' }
         $module = New-Module -ArgumentList $source, $pathSafetyPath -ScriptBlock {
             param($functionSource, $pathSafety)
             Import-Module $pathSafety -Force
-            function Get-UtcTimestamp { [DateTimeOffset]::UtcNow.ToString('o') }
             function Assert-NoReparsePath { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+            function Remove-DirectoryTreeWithHeartbeat { param($Path,$Root) [IO.Directory]::Delete($Path, $true) }
             . ([scriptblock]::Create($functionSource))
         }
         try {
-            $root = Join-Path $TestDrive 'preserved-root'
+            $root = Join-Path $TestDrive 'cleanup-root'
             $directory = Join-Path $root 'run'
             New-Item -ItemType Directory -Path $directory -Force | Out-Null
-            $evidence = Join-Path $TestDrive 'finished/evidence'
-            $state = [ordered]@{ runId = 'marker-run' }
             & $module {
-                param($directoryPath, $rootPath, $stateValue, $evidencePath)
-                $marker = Write-ModUpdatePreservedDirectoryMarker -Path $directoryPath -Root $rootPath `
-                    -Label 'Finalized run root' -State $stateValue -EvidencePath $evidencePath
-                [byte[]]$firstBytes = [IO.File]::ReadAllBytes($marker)
-                $retry = Write-ModUpdatePreservedDirectoryMarker -Path $directoryPath -Root $rootPath `
-                    -Label 'Finalized run root' -State $stateValue -EvidencePath $evidencePath
-                [Convert]::ToHexString([IO.File]::ReadAllBytes($retry)) | Should -BeExactly ([Convert]::ToHexString($firstBytes))
-                { Write-ModUpdatePreservedDirectoryMarker -Path $directoryPath -Root $rootPath `
-                        -Label 'Finalized run root' -State @{ runId = 'other-run' } -EvidencePath $evidencePath } |
-                    Should -Throw '*different cleanup tuple*'
-                [IO.File]::WriteAllText($marker, '{broken', [Text.UTF8Encoding]::new($false))
-                { Write-ModUpdatePreservedDirectoryMarker -Path $directoryPath -Root $rootPath `
-                        -Label 'Finalized run root' -State $stateValue -EvidencePath $evidencePath } |
-                    Should -Throw '*marker is unreadable*'
-            } $directory $root $state $evidence
+                param($directoryPath, $rootPath)
+                Remove-ModUpdateOwnedDirectory -Path $directoryPath -Root $rootPath -Label 'Finalized run root'
+                Test-Path -LiteralPath $directoryPath | Should -BeFalse
+                { Remove-ModUpdateOwnedDirectory -Path $directoryPath -Root $rootPath -Label 'Finalized run root' } |
+                    Should -Not -Throw
+            } $directory $root
 
             & $module {
-                param($directoryPath, $rootPath, $evidencePath)
+                param($rootPath)
                 $script:owner = [ordered]@{
-                    cleanup = [ordered]@{ writerLockReleased = $false; claimDirectoryPreserved = $false; runRootPreserved = $false }
+                    cleanup = [ordered]@{ writerLockReleased = $false; claimDirectoryRemoved = $false; runRootRemoved = $false }
                 }
                 $script:writerLease = @{ token = 'writer' }
                 $script:releaseCount = 0
-                function Publish-PortableLeaseFile { throw 'injected marker publication failure' }
+                function Remove-ModUpdateOwnedDirectory { throw 'injected directory removal failure' }
                 function Suspend-ModReservationWorker { param($State) }
                 function Start-ModReservationCleanup { param($State,$EvidencePath,$ClaimDirectory,$RunRoot,$FinalizationResult) $script:owner }
                 function Exit-RunWriterLock { param($Lease) }
                 function Set-ModReservationCleanupStep { param($State,$Step) $script:owner.cleanup[$Step] = $true; $script:owner }
                 function Release-ModReservation { param($State,$FinalizationResult) $script:releaseCount++ }
                 $claim = Join-Path $rootPath 'claim-failure'
+                $run = Join-Path $rootPath 'run-failure'
                 New-Item -ItemType Directory -Path $claim -Force | Out-Null
-                { Invoke-ModUpdateTerminalCleanup -State @{ runId = 'failure-run' } -EvidencePath $evidencePath `
-                        -ClaimDirectory $claim -ClaimRoot $rootPath -RunRoot $directoryPath -InProgressRoot $rootPath `
-                        -FinalizationResult @{ result = 'passed' } } | Should -Throw '*publication failure*'
-                $script:owner.cleanup.claimDirectoryPreserved | Should -BeFalse
-                $script:owner.cleanup.runRootPreserved | Should -BeFalse
+                New-Item -ItemType Directory -Path $run -Force | Out-Null
+                { Invoke-ModUpdateTerminalCleanup -State @{ runId = 'failure-run' } -EvidencePath 'evidence' `
+                        -ClaimDirectory $claim -ClaimRoot $rootPath -RunRoot $run -InProgressRoot $rootPath `
+                        -FinalizationResult @{ result = 'passed' } } | Should -Throw '*removal failure*'
+                $script:owner.cleanup.claimDirectoryRemoved | Should -BeFalse
+                $script:owner.cleanup.runRootRemoved | Should -BeFalse
                 $script:releaseCount | Should -Be 0
-            } $directory $root $evidence
+            } $root
         }
         finally { Remove-Module $module -Force }
     }
@@ -1311,6 +1317,9 @@ printf '%s' "$S8_TEST_GH_JSON"
             $releasedOwner.state | Should -BeExactly 'released'
             Test-Path -LiteralPath $releasedOwner.releaseReceiptPath -PathType Leaf | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $evidenceRoot 'archive-manifest.json') -PathType Leaf | Should -BeTrue
+            Test-Path -LiteralPath ([string]$releasedState.runRoot) | Should -BeFalse
+            Test-Path -LiteralPath (Split-Path -Parent ([string]$releasedState.claimPath)) | Should -BeFalse
+            Test-Path -LiteralPath $releasedStatePath | Should -BeFalse
         }
 
         # Scenario: terminal release receipt bytes no longer match the immutable receipt contract.
@@ -1347,7 +1356,7 @@ printf '%s' "$S8_TEST_GH_JSON"
                 $tamperedOwner.cleanup.runId = 'tampered-run'
                 [IO.File]::WriteAllText($ownerPath, ($tamperedOwner | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
                 { & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
-                    Should -Throw '*cleanup tuple differs from the immutable run paths*'
+                    Should -Throw '*evidence path differs from its deterministic archive path*'
             }
             finally { [IO.File]::WriteAllBytes($ownerPath, $ownerBytes) }
 
@@ -1381,15 +1390,23 @@ printf '%s' "$S8_TEST_GH_JSON"
         It 'InterT132_RejectsForeignReservationTokenAtReleasedFinalizationEntry' {
             $released = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
             $released.result | Should -BeExactly 'passed'
-            [byte[]]$stateBytes = [IO.File]::ReadAllBytes($releasedStatePath)
+            $archivedStatePath = Join-Path $evidenceRoot 'supporting/state-merged.json'
+            $foreign = Get-Content -LiteralPath $archivedStatePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $foreign.reservationToken = 'f' * 32
+            $foreign.workflowSourcePinPath = Join-Path $evidenceRoot 'review-artifacts/skill-source-pin.json'
+            $foreign['_resolvedFromTerminalOwner'] = $true
+            $foreign['_terminalEvidencePath'] = $evidenceRoot
+            New-Item -ItemType Directory -Path ([string]$releasedState.runRoot) -Force | Out-Null
+            [IO.File]::WriteAllText($releasedStatePath, ($foreign | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
             try {
-                $foreign = Get-Content -LiteralPath $releasedStatePath -Raw | ConvertFrom-TestJson -AsHashtable
-                $foreign.reservationToken = 'f' * 32
-                [IO.File]::WriteAllText($releasedStatePath, ($foreign | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
                 { & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
                     Should -Throw '*another owner token*'
             }
-            finally { [IO.File]::WriteAllBytes($releasedStatePath, $stateBytes) }
+            finally {
+                if (Test-Path -LiteralPath ([string]$releasedState.runRoot)) {
+                    [IO.Directory]::Delete([string]$releasedState.runRoot, $true)
+                }
+            }
         }
 
         # Scenario: a non-finalization stage is invoked after the reservation has reached its terminal released state.
@@ -1397,12 +1414,8 @@ printf '%s' "$S8_TEST_GH_JSON"
         It 'InterT133_RejectsReleasedReservationAtNonFinalizationStageEntry' {
             $released = & $runnerPath finalize-merge -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru
             $released.result | Should -BeExactly 'passed'
-            [byte[]]$stateBytes = [IO.File]::ReadAllBytes($releasedStatePath)
-            try {
-                { & $runnerPath verify-source -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
-                    Should -Throw '*MOD identity lock owner contract is invalid*'
-            }
-            finally { [IO.File]::WriteAllBytes($releasedStatePath, $stateBytes) }
+            { & $runnerPath verify-source -RepositoryRoot $releasedRepository -StatePath $releasedStatePath -PassThru } |
+                Should -Throw '*State file does not exist*'
         }
     }
 
@@ -1426,8 +1439,13 @@ printf '%s' "$S8_TEST_GH_JSON"
         }
         $coordinationStub = @'
 function Update-ActiveReservationHeartbeat {}
+function Start-SharedCoordinationAcquisitionAttempt {
+    param($RepositoryRoot, $ResourceKey, $RunId, $ReceiptRoot)
+    [ordered]@{ path = 'attempt.json'; attemptToken = ('1' * 32); resourceKey = $ResourceKey; runId = $RunId }
+}
+function Complete-SharedCoordinationAcquisitionAttempt { param($Attempt) }
 function Enter-SharedCoordinationLease {
-    param($RepositoryRoot, $ResourceKey, $RunId, $ReceiptRoot, $WaitHeartbeatAction, $TimeoutSeconds)
+    param($RepositoryRoot, $ResourceKey, $RunId, $AttemptToken, $ReceiptRoot, $WaitHeartbeatAction, $TimeoutSeconds)
     [ordered]@{ waitingMilliseconds = [int64]25 }
 }
 '@
@@ -1455,6 +1473,67 @@ function Enter-SharedCoordinationLease {
                 Should -Be ([int64]$timing.wallClockMilliseconds)
         }
         finally {
+            Remove-Module $module -Force
+        }
+    }
+
+    # Scenario: the production wrapper loses the primitive's return after the held owner was published.
+    # Purpose: Its persisted pending attempt token must make retry byte-idempotent, while a later independent call gets a fresh token and contends.
+    It 'InterT394_PersistsProductionAttemptTokenAcrossPublishedBeforeReturnRetry' {
+        $coordinationPath = Join-Path $skillRoot 'scripts/SharedCoordinationLock.psm1'
+        Import-Module $coordinationPath -Force
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $wrapper = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Enter-SharedCoordinationLock'
+        }, $true)
+        $module = New-Module -ArgumentList $wrapper.Extent.Text -ScriptBlock {
+            param($source)
+            $script:activeStageContext = $null
+            $script:activeSharedCoordinationLease = $null
+            function Update-ActiveReservationHeartbeat {}
+            function Add-StageWait { param($Context,$Reason,$Milliseconds) }
+            . ([scriptblock]::Create($source))
+        }
+        $coordinationModuleObject = Get-Module SharedCoordinationLock | Select-Object -First 1
+        $repository = Join-Path $TestDrive 'production-attempt-token-retry'
+        $receiptRoot = Join-Path $repository 'attempt-receipts'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $lease = $null
+        try {
+            & $coordinationModuleObject {
+                $script:CoordinationFaultInjectionHook = {
+                    param($point)
+                    if ($point -ceq 'acquire-published-before-evidence-verification') { throw 'injected production acquire interruption' }
+                }
+            }
+            { & $module {
+                    param($repositoryPath,$receiptPath)
+                    Enter-SharedCoordinationLock -Repository $repositoryPath -ResourceKey 'git-coordination' `
+                        -ActualRunId 'production-retry' -ReceiptRoot $receiptPath -TimeoutSeconds 2
+                } $repository $receiptRoot } | Should -Throw '*injected production acquire interruption*'
+            $ownerPath = Join-Path $repository 'AI Auto Update/In Progress/.locks/git-coordination.lock'
+            [byte[]]$ownerBytes = [IO.File]::ReadAllBytes($ownerPath)
+            & $coordinationModuleObject { $script:CoordinationFaultInjectionHook = $null }
+            $lease = & $module {
+                param($repositoryPath,$receiptPath)
+                Enter-SharedCoordinationLock -Repository $repositoryPath -ResourceKey 'git-coordination' `
+                    -ActualRunId 'production-retry' -ReceiptRoot $receiptPath -TimeoutSeconds 2
+            } $repository $receiptRoot
+            [Convert]::ToHexString([IO.File]::ReadAllBytes($ownerPath)) |
+                Should -BeExactly ([Convert]::ToHexString($ownerBytes))
+            { & $module {
+                    param($repositoryPath,$receiptPath)
+                    Enter-SharedCoordinationLock -Repository $repositoryPath -ResourceKey 'git-coordination' `
+                        -ActualRunId 'production-retry' -ReceiptRoot $receiptPath -TimeoutSeconds 1
+                } $repository $receiptRoot } | Should -Throw '*Timed out*'
+        }
+        finally {
+            & $coordinationModuleObject { $script:CoordinationFaultInjectionHook = $null }
+            if ($lease) { $null = Exit-SharedCoordinationLease -Lease $lease }
             Remove-Module $module -Force
         }
     }
@@ -1874,6 +1953,8 @@ function Suspend-Stage {
         )) { $runner | Should -Match ([regex]::Escape($contract)) }
         $runner | Should -Match 'lastRecovery = if \(\$plannedOwner\.Contains\(''lastRecovery''\)\)'
         $coordination | Should -Match 'function Enter-SharedCoordinationLease'
+        $coordination | Should -Match 'function Start-SharedCoordinationAcquisitionAttempt'
+        $coordination | Should -Match 'function Complete-SharedCoordinationAcquisitionAttempt'
         $coordination | Should -Match 'Test-CoordinationLeaseMatchesOwner'
         $coordination | Should -Match '\[int64\]::TryParse\(\[string\]\$Owner\.owner\.processStartTicks'
         $coordination | Should -Match "state = 'held'"
@@ -1885,6 +1966,8 @@ function Suspend-Stage {
         $coordination | Should -Match '\[scriptblock\] \$WaitHeartbeatAction'
         $coordination | Should -Match '\$null = & \$WaitHeartbeatAction'
         $queue | Should -Match 'Enter-SharedCoordinationLease.+source-acquisition'
+        $queue | Should -Match '-AttemptToken \(\[string\]\$sourceInventoryAttempt\.attemptToken\)'
+        $runner | Should -Match '-AttemptToken \(\[string\]\$attempt\.attemptToken\)'
         $runner | Should -Match '\$gitCommand -in @\(''fetch'', ''push'', ''update-ref''\)'
         $runner | Should -Match '\$gitCommand -ceq ''worktree'''
         $runner | Should -Match 'HeartbeatAction = \{ Update-ActiveReservationHeartbeat \}'
@@ -3313,7 +3396,7 @@ function Get-SourceTupleContractSha256 {
                     heartbeat = Get-UtcTimestamp; expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
                     cleanup = [ordered]@{
                         finalizationResultSha256 = Get-ModFinalizationResultSha256 -Value $result
-                        writerLockReleased = $true; claimDirectoryPreserved = $true; runRootPreserved = $true
+                        writerLockReleased = $true; claimDirectoryRemoved = $true; runRootRemoved = $true
                     }
                 }
                 Write-ModReservationOwner -ModLockPath ([string]$value.modLockPath) -Repository ([string]$value.repositoryRoot) -Value $owner
@@ -3341,6 +3424,173 @@ function Get-SourceTupleContractSha256 {
             & $module { $script:ModReservationFaultInjectionHook = $null }
             Remove-Module $module -Force
         }
+    }
+
+    # Scenario: a new claim encounters a released MOD reservation whose terminal evidence is missing or inconsistent.
+    # Purpose: Fail before owner publication and preserve the released owner bytes for explicit recovery.
+    It 'UnitT395_RejectsReleasedModReservationWithoutCompleteTerminalEvidence_<Case>' -ForEach @(
+        @{ Case = 'MissingReceipt' }
+        @{ Case = 'TamperedReceipt' }
+        @{ Case = 'IncompleteCleanup' }
+        @{ Case = 'FinalizationHashMismatch' }
+    ) {
+        $tokens = $null; $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $names = @('Get-ModFinalizationResultSha256', 'Assert-ReleasedModReservationOwnerReusable', 'Enter-ModReservation')
+        $source = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
+        }, $true)).Extent.Text -join "`n"
+        $module = New-Module -ArgumentList $source -ScriptBlock {
+            param($functionSource)
+            $script:writes = 0
+            $script:receiptMode = 'valid'
+            function Assert-NoReparsePath { param($Path,$Root,$Label,[switch]$AllowMissing) [IO.Path]::GetFullPath($Path) }
+            function Get-CurrentProcessIdentity { [ordered]@{ machineName = 'test'; processId = 42; processStartTicks = 43 } }
+            function Get-ModReservationActorToken { param($Value) 'a' * 32 }
+            function Get-ModReservationSnapshot { param($ModLockPath,$Repository) $script:snapshot }
+            function Get-ModReservationReleaseReceipt {
+                param($State,$OwnerToken)
+                if ($script:receiptMode -ceq 'missing') { throw 'MOD reservation terminal receipt is missing.' }
+                [ordered]@{
+                    path = [string]$script:snapshot.value.releaseReceiptPath
+                    sha256 = if ($script:receiptMode -ceq 'tampered') { 'f' * 64 } else { [string]$script:snapshot.value.releaseReceiptSha256 }
+                }
+            }
+            function Write-ModReservationOwner { $script:writes++ }
+            . ([scriptblock]::Create($functionSource))
+        }
+        try {
+            $repository = Join-Path $TestDrive "released-mod-validation-$Case"
+            $runId = '36636636-3663-4663-8663-366366366366'
+            $lockKey = 'd' * 64
+            $runRoot = Join-Path $repository 'AI Auto Update/In Progress/examplemod-36636636'
+            $statePath = Join-Path $runRoot 'state.json'
+            $plan = [ordered]@{
+                repositoryRoot = $repository
+                modLockPath = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
+                lockKey = $lockKey
+                modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+            }
+            $result = [ordered]@{ result = 'passed'; runId = $runId }
+            $owner = [ordered]@{
+                schemaVersion = 3; state = 'released'; reservationState = 'released'; runId = $runId
+                canonicalModRelativePath = [string]$plan.modRelativePath; modLockKey = $lockKey
+                plannedStatePath = $statePath; statePath = $statePath
+                reservationToken = 'b' * 32; releasedByOwnerToken = 'b' * 32; workerToken = $null
+                releaseReceiptPath = Join-Path (Split-Path -Parent ([string]$plan.modLockPath)) ((Split-Path -Leaf ([string]$plan.modLockPath)) + '.released-' + ('b' * 32) + '.json')
+                releaseReceiptSha256 = 'c' * 64
+                cleanup = [ordered]@{
+                    schemaVersion = 1; runId = $runId
+                    evidencePath = Join-Path $repository "AI Auto Update/Finished/.evidence/$runId"
+                    claimDirectory = Join-Path $repository "AI Auto Update/.claims/$runId"
+                    runRoot = $runRoot; finalizationResult = $result
+                    finalizationResultSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                            [Text.UTF8Encoding]::new($false).GetBytes(($result | ConvertTo-Json -Depth 40 -Compress))
+                        )).ToLowerInvariant()
+                    startedAt = [DateTimeOffset]::UtcNow.ToString('o')
+                    writerLockReleased = $true; claimDirectoryRemoved = $true; runRootRemoved = $true
+                }
+            }
+            if ($Case -ceq 'IncompleteCleanup') { $owner.cleanup.Remove('runRootRemoved') }
+            if ($Case -ceq 'FinalizationHashMismatch') { $owner.cleanup.finalizationResultSha256 = 'e' * 64 }
+            & $module {
+                param($planValue,$ownerValue,$stateValue,$caseValue)
+                $script:snapshot = [ordered]@{ exists = $true; value = $ownerValue }
+                $script:receiptMode = if ($caseValue -ceq 'MissingReceipt') { 'missing' }
+                    elseif ($caseValue -ceq 'TamperedReceipt') { 'tampered' } else { 'valid' }
+                $before = $ownerValue | ConvertTo-Json -Depth 30 -Compress
+                { Enter-ModReservation -Plan $planValue -ActualRunId 'new-claim' -PlannedStatePath $stateValue } |
+                    Should -Throw
+                ($ownerValue | ConvertTo-Json -Depth 30 -Compress) | Should -BeExactly $before
+                $script:writes | Should -Be 0
+            } $plan $owner $statePath $Case
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: a released MOD reservation has an exact receipt, cleanup tuple, and finalization result hash.
+    # Purpose: Positive control proves the predecessor validation accepts complete terminal evidence.
+    It 'UnitT396_AcceptsCompleteReleasedModReservationTerminalEvidence' {
+        $tokens = $null; $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $names = @('Get-ModFinalizationResultSha256', 'Assert-ReleasedModReservationOwnerReusable', 'Enter-ModReservation')
+        $source = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
+        }, $true)).Extent.Text -join "`n"
+        $module = New-Module -ArgumentList $source -ScriptBlock {
+            param($functionSource)
+            $script:writes = 0
+            function Assert-NoReparsePath { param($Path,$Root,$Label,[switch]$AllowMissing) [IO.Path]::GetFullPath($Path) }
+            function Get-CurrentProcessIdentity { [ordered]@{ machineName = 'test'; processId = 42; processStartTicks = 43 } }
+            function Get-ModReservationActorToken { param($Value) 'a' * 32 }
+            function Get-ModReservationSnapshot { param($ModLockPath,$Repository) $script:snapshot }
+            function Get-ModReservationReleaseReceipt {
+                param($State,$OwnerToken)
+                [ordered]@{
+                    path = [string]$script:snapshot.value.releaseReceiptPath
+                    sha256 = [string]$script:snapshot.value.releaseReceiptSha256
+                }
+            }
+            function Write-ModReservationOwner {
+                param($ModLockPath,$Repository,$Value,$ExpectedReservationToken,$ExpectedWorkerToken)
+                $script:writes++
+                $script:snapshot = [ordered]@{ exists = $true; value = $Value }
+            }
+            function Read-ModReservationOwner { param($ModLockPath,$Repository) $script:snapshot.value }
+            function Get-PortablePlatformName { 'Windows' }
+            function Get-PortableLockPrimitive { 'test-lock' }
+            function Test-ReservationLeaseMatchesOwner { param($Lease,$Owner) $false }
+            function Get-UtcTimestamp { [DateTimeOffset]::UtcNow.ToString('o') }
+            . ([scriptblock]::Create($functionSource))
+        }
+        try {
+            $repository = Join-Path $TestDrive 'released-mod-validation-valid'
+            $runId = '36736736-7367-4367-8367-367367367367'
+            $lockKey = 'd' * 64
+            $runRoot = Join-Path $repository 'AI Auto Update/In Progress/examplemod-36736736'
+            $statePath = Join-Path $runRoot 'state.json'
+            $plan = [ordered]@{
+                repositoryRoot = $repository
+                modLockPath = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
+                lockKey = $lockKey
+                modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+            }
+            $result = [ordered]@{ result = 'passed'; runId = $runId }
+            $owner = [ordered]@{
+                schemaVersion = 3; state = 'released'; reservationState = 'released'; runId = $runId
+                canonicalModRelativePath = [string]$plan.modRelativePath; modLockKey = $lockKey
+                plannedStatePath = $statePath; statePath = $statePath
+                reservationToken = 'b' * 32; releasedByOwnerToken = 'b' * 32; workerToken = $null
+                releaseReceiptPath = Join-Path (Split-Path -Parent ([string]$plan.modLockPath)) ((Split-Path -Leaf ([string]$plan.modLockPath)) + '.released-' + ('b' * 32) + '.json')
+                releaseReceiptSha256 = 'c' * 64
+                cleanup = [ordered]@{
+                    schemaVersion = 1; runId = $runId
+                    evidencePath = Join-Path $repository "AI Auto Update/Finished/.evidence/$runId"
+                    claimDirectory = Join-Path $repository "AI Auto Update/.claims/$runId"
+                    runRoot = $runRoot; finalizationResult = $result
+                    finalizationResultSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                            [Text.UTF8Encoding]::new($false).GetBytes(($result | ConvertTo-Json -Depth 40 -Compress))
+                        )).ToLowerInvariant()
+                    startedAt = [DateTimeOffset]::UtcNow.ToString('o')
+                    writerLockReleased = $true; claimDirectoryRemoved = $true; runRootRemoved = $true
+                }
+            }
+            $newOwner = & $module {
+                param($planValue,$ownerValue,$stateValue)
+                $script:snapshot = [ordered]@{ exists = $true; value = $ownerValue }
+                $value = Enter-ModReservation -Plan $planValue -ActualRunId 'new-valid-claim' -PlannedStatePath $stateValue
+                [ordered]@{ value = $value; writes = $script:writes }
+            } $plan $owner $statePath
+            $newOwner.value.state | Should -BeExactly 'held'
+            $newOwner.value.runId | Should -BeExactly 'new-valid-claim'
+            $newOwner.value.reservationToken | Should -Not -BeExactly ('b' * 32)
+            $newOwner.writes | Should -BeGreaterOrEqual 2
+        }
+        finally { Remove-Module $module -Force }
     }
 
     It 'UnitT215_ResolvesOnlyUniqueIgnoreCaseGitNormalizationPaths' {

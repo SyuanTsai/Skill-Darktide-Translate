@@ -807,4 +807,43 @@ $null = Exit-SharedCoordinationLease -Lease $lease
         }
         finally { $null = Exit-SharedCoordinationLease -Lease $newLease }
     }
+
+    # Scenario: a released shared owner names a missing or byte-tampered immutable terminal receipt.
+    # Purpose: A new acquisition must preserve the released owner bytes and fail closed before reuse.
+    It 'InterT397_RejectsReleasedOwnerWithInvalidTerminalReceipt_<Case>' -ForEach @(
+        @{ Case = 'Missing' }
+        @{ Case = 'Tampered' }
+    ) {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive "released-receipt-invalid-$Case"
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId "released-$Case"
+        $null = Exit-SharedCoordinationLease -Lease $lease
+        [byte[]]$ownerBytes = [IO.File]::ReadAllBytes([string]$lease.path)
+        $owner = Get-Content -LiteralPath $lease.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $receiptPath = [string]$owner.releaseReceiptPath
+        [byte[]]$receiptBytes = [IO.File]::ReadAllBytes($receiptPath)
+        try {
+            if ($Case -ceq 'Missing') { [IO.File]::Delete($receiptPath) }
+            else { [IO.File]::WriteAllBytes($receiptPath, [byte[]]($receiptBytes + 0x20)) }
+            { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' `
+                    -RunId "replacement-$Case" -TimeoutSeconds 1 } | Should -Throw '*terminal receipt*'
+            [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$lease.path)) |
+                Should -BeExactly ([Convert]::ToHexString($ownerBytes))
+        }
+        finally { [IO.File]::WriteAllBytes($receiptPath, $receiptBytes) }
+    }
+
+    # Scenario: a released shared owner and immutable receipt are both intact.
+    # Purpose: Positive control proves validated released state remains reusable by a distinct acquisition.
+    It 'InterT398_ReusesReleasedOwnerAfterTerminalReceiptValidation' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'released-receipt-valid'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $first = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'released-valid-first'
+        $null = Exit-SharedCoordinationLease -Lease $first
+        $second = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'released-valid-second'
+        try { $second.token | Should -Not -BeExactly $first.token }
+        finally { $null = Exit-SharedCoordinationLease -Lease $second }
+    }
 }

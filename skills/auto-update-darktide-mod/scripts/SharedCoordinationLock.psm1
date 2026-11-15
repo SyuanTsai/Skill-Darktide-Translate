@@ -147,6 +147,102 @@ function Write-CoordinationAtomicJson {
     }
 }
 
+function Start-SharedCoordinationAcquisitionAttempt {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $RepositoryRoot,
+        [Parameter(Mandatory)][ValidateSet('source-acquisition', 'git-coordination')][string] $ResourceKey,
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9._-]+$')][string] $RunId,
+        [string] $ReceiptRoot
+    )
+    $repository = Resolve-PortableTrustedRoot -Path ([IO.Path]::GetFullPath($RepositoryRoot))
+    $logicalRoot = if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
+        Join-Path $repository ("AI Auto Update/In Progress/.coordination-attempts/$RunId")
+    }
+    else { [IO.Path]::GetFullPath($ReceiptRoot) }
+    $null = Assert-CoordinationPath -Path $logicalRoot -RepositoryRoot $repository -AllowMissing
+    $relativeRoot = [IO.Path]::GetRelativePath($repository, $logicalRoot)
+    $attemptRoot = if ($relativeRoot -ceq '.') { $repository } else {
+        Open-CoordinationPrivateDirectory -Root $repository -RelativePath $relativeRoot
+    }
+    $attemptDirectory = Open-CoordinationPrivateDirectory -Root $attemptRoot -RelativePath 'coordination-locks'
+    $recordPath = Join-Path $attemptDirectory "$ResourceKey-acquisition-attempt.json"
+    $guard = Enter-PortableFileLock -Root $attemptDirectory -Leaf "$ResourceKey-acquisition-attempt.guard" `
+        -TimeoutMilliseconds 15000 -Label "$ResourceKey acquisition attempt journal"
+    try {
+        $record = if (Test-Path -LiteralPath $recordPath -PathType Leaf) {
+            Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json -AsHashtable
+        }
+        else { $null }
+        if ($record) {
+            if (@($record.Keys).Count -ne 7 -or [int]$record.schemaVersion -ne 1 -or
+                [string]$record.resourceKey -cne $ResourceKey -or [string]$record.runId -cne $RunId -or
+                [string]$record.attemptToken -notmatch '^[0-9a-f]{32}$' -or
+                [string]$record.status -notin @('pending', 'acquired') -or
+                [string]$record.createdAt -notmatch '^\d{4}-\d{2}-\d{2}T' -or
+                [string]$record.updatedAt -notmatch '^\d{4}-\d{2}-\d{2}T') {
+                throw 'Shared coordination acquisition attempt journal is invalid.'
+            }
+        }
+        $now = Get-CoordinationUtcTimestamp
+        if ($record -and [string]$record.status -ceq 'pending') {
+            $attemptToken = [string]$record.attemptToken
+            $createdAt = [string]$record.createdAt
+        }
+        else {
+            $attemptToken = [guid]::NewGuid().ToString('N')
+            $createdAt = $now
+        }
+        $pending = [ordered]@{
+            schemaVersion = 1
+            resourceKey = $ResourceKey
+            runId = $RunId
+            attemptToken = $attemptToken
+            status = 'pending'
+            createdAt = $createdAt
+            updatedAt = $now
+        }
+        Write-CoordinationAtomicJson -Path $recordPath -Value $pending
+        [ordered]@{
+            path = [IO.Path]::GetFullPath($recordPath)
+            attemptToken = $attemptToken
+            resourceKey = $ResourceKey
+            runId = $RunId
+        }
+    }
+    finally { $guard.Dispose() }
+}
+
+function Complete-SharedCoordinationAcquisitionAttempt {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][Collections.IDictionary] $Attempt)
+    foreach ($field in @('path', 'attemptToken', 'resourceKey', 'runId')) {
+        if (-not $Attempt.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$Attempt[$field])) {
+            throw "Shared coordination acquisition attempt is missing $field."
+        }
+    }
+    $recordPath = [IO.Path]::GetFullPath([string]$Attempt.path)
+    $attemptDirectory = Split-Path -Parent $recordPath
+    $resourceKey = [string]$Attempt.resourceKey
+    $guard = Enter-PortableFileLock -Root $attemptDirectory -Leaf "$resourceKey-acquisition-attempt.guard" `
+        -TimeoutMilliseconds 15000 -Label "$resourceKey acquisition attempt journal"
+    try {
+        $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json -AsHashtable
+        if ([int]$record.schemaVersion -ne 1 -or [string]$record.resourceKey -cne $resourceKey -or
+            [string]$record.runId -cne [string]$Attempt.runId -or
+            [string]$record.attemptToken -cne [string]$Attempt.attemptToken -or
+            [string]$record.status -notin @('pending', 'acquired')) {
+            throw 'Shared coordination acquisition attempt journal changed before completion.'
+        }
+        if ([string]$record.status -ceq 'pending') {
+            $record.status = 'acquired'
+            $record.updatedAt = Get-CoordinationUtcTimestamp
+            Write-CoordinationAtomicJson -Path $recordPath -Value $record
+        }
+    }
+    finally { $guard.Dispose() }
+}
+
 function Get-CoordinationFileSha256 {
     param([Parameter(Mandatory)][string] $Path)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -514,6 +610,24 @@ function Get-CoordinationTerminalReceipt {
     [ordered]@{ path = Join-Path $LockRoot $leaf; sha256 = [string]$published.state.sha256 }
 }
 
+function Assert-ReleasedCoordinationOwnerReceipt {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary] $Owner,
+        [Parameter(Mandatory)][string] $LockRoot,
+        [Parameter(Mandatory)][string] $ResourceKey
+    )
+    $lease = [ordered]@{
+        runId = [string]$Owner.owner.runId
+        resourceKey = $ResourceKey
+        token = [string]$Owner.owner.token
+    }
+    $terminal = Get-CoordinationTerminalReceipt -Lease $lease -LockRoot $LockRoot
+    if ([IO.Path]::GetFullPath([string]$Owner.releaseReceiptPath) -cne [IO.Path]::GetFullPath([string]$terminal.path) -or
+        [string]$Owner.releaseReceiptSha256 -cne [string]$terminal.sha256) {
+        throw 'Released coordination owner differs from its immutable terminal receipt.'
+    }
+}
+
 function New-CoordinationLeaseRecord {
     param(
         [Parameter(Mandatory)][string] $LockPath,
@@ -608,6 +722,9 @@ function Enter-SharedCoordinationLease {
             if ([bool]$snapshot.exists) {
                 $existing = $snapshot.value
                 Assert-CoordinationOwner -Owner $existing -ResourceKey $ResourceKey
+                if ([string]$existing.state -ceq 'released') {
+                    Assert-ReleasedCoordinationOwnerReceipt -Owner $existing -LockRoot $lockRoot -ResourceKey $ResourceKey
+                }
                 if ([string]$existing.state -ceq 'held' -and [string]$existing.owner.token -ceq $token) {
                     if ([string]$existing.owner.runId -cne $RunId) { throw 'Shared coordination owner token is bound to another run.' }
                     $existingIdentity = [ordered]@{
@@ -802,5 +919,6 @@ function Exit-SharedCoordinationLease {
     Write-CoordinationReceipt -Lease $Lease -Disposition 'released'
 }
 
-Export-ModuleMember -Function Enter-SharedCoordinationLease, Update-SharedCoordinationLease, Exit-SharedCoordinationLease,
+Export-ModuleMember -Function Start-SharedCoordinationAcquisitionAttempt, Complete-SharedCoordinationAcquisitionAttempt,
+    Enter-SharedCoordinationLease, Update-SharedCoordinationLease, Exit-SharedCoordinationLease,
     Test-CoordinationProcessStartMatch

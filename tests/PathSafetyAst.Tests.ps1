@@ -242,6 +242,7 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-RunWriterLock|Test-
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Exit-RunWriterLock|IO.File::Delete|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Exit-RunWriterLock|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-CompletedStageResult|Test-Path|1
+skills/auto-update-darktide-mod/scripts/mod-update.ps1|Resolve-InitialState|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-FileSha256|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-ZipEntries|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Import-SecurityOverrides|Get-Item|1
@@ -342,6 +343,7 @@ skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Copy-ModUpda
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Copy-ModUpdateEvidenceTree|New-Item|2
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Copy-ModUpdateEvidenceTree|Test-Path|3
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Get-ModUpdateEvidenceManifest|Get-ChildItem|1
+skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Get-ReleasedModUpdateFinalizationResult|Test-Path|2
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateChangedHeadReconciliation|New-Item|1
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateChangedHeadReconciliation|Test-Path|1
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateMergeTopologyReconciliation|Test-Path|1
@@ -350,6 +352,8 @@ skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUp
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|IO.File::Move|1
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|New-Item|3
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|Test-Path|11
+skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Remove-ModUpdateOwnedDirectory|Test-Path|2
+skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Resolve-ModUpdateFinalizationStateFromOwner|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|<script>|Test-Path|3
 skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|Read-QueueTextWithHeartbeat|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|Get-Item|1
@@ -358,6 +362,7 @@ skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-Coord
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Enter-CoordinationOwnerGuard|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Enter-SharedCoordinationLease|New-Item|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Get-CoordinationFileSha256|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Start-SharedCoordinationAcquisitionAttempt|Test-Path|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Write-CoordinationAtomicJson|IO.File::Delete|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Write-CoordinationAtomicJson|IO.File::Move|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Write-CoordinationAtomicJson|IO.File::WriteAllText|1

@@ -1822,7 +1822,7 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
     if ((Get-FileSha256 -Path $worksetPath) -cne [string]$state.localizationWorkset.sha256) { throw 'Localization workset SHA-256 changed.' }
     $worksetFull = [IO.Path]::GetFullPath($worksetPath)
     $worktreeFull = [IO.Path]::GetFullPath([string]$state.worktreePath).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-    if ($worksetFull.StartsWith($worktreeFull, (Get-PortablePathComparison -Paths @($worktreeFull, $worksetFull)))) { throw 'Localization workset must never be inside the Git worktree.' }
+    if ($worksetFull.StartsWith($worktreeFull, (Get-PortablePathComparison -Paths @($worktreeFull, $worksetFull) -Purpose Exclusion))) { throw 'Localization workset must never be inside the Git worktree.' }
     $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
     if ([int]$workset.workflowSchemaVersion -ne 15 -or [string]$workset.status -cne 'applied') { throw 'Localization workset is not an applied Schema 15 artifact.' }
     if (-not $workset.Contains('apply') -or -not $workset.apply -or [string]$workset.apply.status -cne 'applied') {

@@ -517,44 +517,17 @@ function Invoke-ModUpdateCleanupFaultInjection {
     if ($hook -is [scriptblock]) { & $hook $Point }
 }
 
-function Write-ModUpdatePreservedDirectoryMarker {
+function Remove-ModUpdateOwnedDirectory {
     param(
         [Parameter(Mandatory)][string] $Path,
         [Parameter(Mandatory)][string] $Root,
-        [Parameter(Mandatory)][string] $Label,
-        [Parameter(Mandatory)][Collections.IDictionary] $State,
-        [Parameter(Mandatory)][string] $EvidencePath
+        [Parameter(Mandatory)][string] $Label
     )
-    $directory = Assert-NoReparsePath -Path $Path -Root $Root -Label $Label
-    $leaf = '.mod-update-finalized.json'
-    $snapshot = Get-PortableLeaseFileState -ParentPath $directory -Leaf $leaf -AllowMissing
-    if ([bool]$snapshot.exists) {
-        try {
-            $existing = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$snapshot.bytes) |
-                ConvertFrom-Json -AsHashtable
-        }
-        catch { throw "$Label preservation marker is unreadable." }
-        if ([int]$existing.schemaVersion -ne 1 -or [string]$existing.runId -cne [string]$State.runId -or
-            [string]$existing.label -cne $Label -or
-            [IO.Path]::GetFullPath([string]$existing.evidencePath) -cne [IO.Path]::GetFullPath($EvidencePath)) {
-            throw "$Label preservation marker belongs to a different cleanup tuple."
-        }
-        return [IO.Path]::GetFullPath((Join-Path $directory $leaf))
-    }
-    $record = [ordered]@{
-        schemaVersion = 1
-        disposition = 'finalized-directory-preserved'
-        runId = [string]$State.runId
-        label = $Label
-        evidencePath = [IO.Path]::GetFullPath($EvidencePath)
-        preservedAt = Get-UtcTimestamp
-    }
-    [byte[]]$bytes = [Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Depth 10 -Compress) + "`n")
-    $idMaterial = [Text.UTF8Encoding]::new($false).GetBytes("finalization-marker:$($State.runId):$Label")
-    $transactionId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($idMaterial)).ToLowerInvariant().Substring(0, 32)
-    $null = Publish-PortableLeaseFile -ParentPath $directory -Leaf $leaf -Bytes $bytes -ExpectedState $snapshot `
-        -TransactionId $transactionId -NoReplace
-    [IO.Path]::GetFullPath((Join-Path $directory $leaf))
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $fullPath)) { return }
+    $null = Assert-NoReparsePath -Path $fullPath -Root $Root -Label $Label
+    Remove-DirectoryTreeWithHeartbeat -Path $fullPath -Root $Root
+    if (Test-Path -LiteralPath $fullPath) { throw "$Label remains after owner-checked cleanup." }
 }
 
 function Invoke-ModUpdateTerminalCleanup {
@@ -583,20 +556,86 @@ function Invoke-ModUpdateTerminalCleanup {
         Invoke-ModUpdateCleanupFaultInjection -Point 'writer-lock-released'
         $owner = Set-ModReservationCleanupStep -State $State -Step writerLockReleased
     }
-    if (-not [bool]$owner.cleanup.claimDirectoryPreserved) {
-        $null = Write-ModUpdatePreservedDirectoryMarker -Path $ClaimDirectory -Root $ClaimRoot `
-            -Label 'Finalized claim directory' -State $State -EvidencePath $EvidencePath
-        Invoke-ModUpdateCleanupFaultInjection -Point 'claim-directory-preserved'
-        $owner = Set-ModReservationCleanupStep -State $State -Step claimDirectoryPreserved
+    if (-not [bool]$owner.cleanup.claimDirectoryRemoved) {
+        Remove-ModUpdateOwnedDirectory -Path $ClaimDirectory -Root $ClaimRoot -Label 'Finalized claim directory'
+        Invoke-ModUpdateCleanupFaultInjection -Point 'claim-directory-removed'
+        $owner = Set-ModReservationCleanupStep -State $State -Step claimDirectoryRemoved
     }
-    if (-not [bool]$owner.cleanup.runRootPreserved) {
-        $null = Write-ModUpdatePreservedDirectoryMarker -Path $RunRoot -Root $InProgressRoot `
-            -Label 'Finalized run root' -State $State -EvidencePath $EvidencePath
-        Invoke-ModUpdateCleanupFaultInjection -Point 'run-root-preserved'
-        $owner = Set-ModReservationCleanupStep -State $State -Step runRootPreserved
+    if (-not [bool]$owner.cleanup.runRootRemoved) {
+        Remove-ModUpdateOwnedDirectory -Path $RunRoot -Root $InProgressRoot -Label 'Finalized run root'
+        Invoke-ModUpdateCleanupFaultInjection -Point 'run-root-removed'
+        $owner = Set-ModReservationCleanupStep -State $State -Step runRootRemoved
     }
     Invoke-ModUpdateCleanupFaultInjection -Point 'before-reservation-release'
     Release-ModReservation -State $State -FinalizationResult $FinalizationResult
+}
+
+function Resolve-ModUpdateFinalizationStateFromOwner {
+    param(
+        [Parameter(Mandatory)][string] $Repository,
+        [Parameter(Mandatory)][string] $MissingStatePath
+    )
+    $repositoryFull = [IO.Path]::GetFullPath($Repository)
+    $stateFull = [IO.Path]::GetFullPath($MissingStatePath)
+    $runRoot = Split-Path -Parent $stateFull
+    $lockRoot = Join-Path $repositoryFull 'AI Auto Update/In Progress/.locks/mod'
+    $null = Assert-NoReparsePath -Path $lockRoot -Root $repositoryFull -Label 'MOD reservation recovery root'
+    $matches = [Collections.Generic.List[object]]::new()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $lockRoot -Force -File)) {
+        if ([string]$entry.Name -cnotmatch '^[0-9a-f]{64}\.lock$') { continue }
+        $snapshot = Get-ModReservationSnapshot -ModLockPath $entry.FullName -Repository $repositoryFull
+        if (-not [bool]$snapshot.exists -or $snapshot.value -isnot [Collections.IDictionary]) { continue }
+        $owner = $snapshot.value
+        if (-not $owner.Contains('cleanup') -or $owner.cleanup -isnot [Collections.IDictionary] -or
+            -not $owner.Contains('statePath') -or [string]::IsNullOrWhiteSpace([string]$owner.statePath)) { continue }
+        if ([IO.Path]::GetFullPath([string]$owner.statePath) -ceq $stateFull -and
+            [IO.Path]::GetFullPath([string]$owner.cleanup.runRoot) -ceq [IO.Path]::GetFullPath($runRoot)) {
+            $matches.Add([ordered]@{ path = [string]$entry.FullName; owner = $owner })
+        }
+    }
+    if ($matches.Count -ne 1) {
+        throw 'Missing finalization state did not resolve to exactly one terminal reservation owner.'
+    }
+    $match = $matches[0]
+    $owner = $match.owner
+    $expectedEvidence = [IO.Path]::GetFullPath((Join-Path $repositoryFull ("AI Auto Update/Finished/.evidence/$([string]$owner.runId)")))
+    if ([IO.Path]::GetFullPath([string]$owner.cleanup.evidencePath) -cne $expectedEvidence) {
+        throw 'Terminal reservation evidence path differs from its deterministic archive path.'
+    }
+    $null = Assert-ModUpdateFinalEvidence -EvidencePath $expectedEvidence -RunId ([string]$owner.runId)
+    $archivedStatePath = Join-Path $expectedEvidence 'supporting/state-merged.json'
+    $archivedState = Get-Content -LiteralPath $archivedStatePath -Raw | ConvertFrom-Json -AsHashtable
+    if ([string]$archivedState.runId -cne [string]$owner.runId -or
+        [IO.Path]::GetFullPath([string]$archivedState.repositoryRoot) -cne $repositoryFull -or
+        [IO.Path]::GetFullPath([string]$archivedState.statePath) -cne $stateFull -or
+        [IO.Path]::GetFullPath([string]$archivedState.runRoot) -cne [IO.Path]::GetFullPath($runRoot) -or
+        [IO.Path]::GetFullPath([string]$archivedState.modLockPath) -cne [IO.Path]::GetFullPath([string]$match.path) -or
+        [string]$archivedState.reservationToken -cne [string]$owner.reservationToken) {
+        throw 'Archived finalization state differs from the terminal reservation owner tuple.'
+    }
+    if ($archivedState.Contains('workflowSourcePinPath')) {
+        $archivedState.workflowSourcePinPath = Join-Path $expectedEvidence 'review-artifacts/skill-source-pin.json'
+    }
+    $archivedState['_resolvedFromTerminalOwner'] = $true
+    $archivedState['_terminalEvidencePath'] = $expectedEvidence
+    $archivedState
+}
+
+function Complete-ModUpdateTerminalCleanupFromOwner {
+    param([Parameter(Mandatory)][Collections.IDictionary] $State)
+    $owner = Read-ModReservationOwner -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
+    if ([string]$owner.state -ceq 'released') { return }
+    if ([string]$owner.state -cne 'held' -or [string]$owner.reservationState -cne 'cleanup-pending' -or
+        $owner.cleanup -isnot [Collections.IDictionary] -or
+        $owner.cleanup.finalizationResult -isnot [Collections.IDictionary]) {
+        throw 'Terminal reservation owner is not recoverable after its run state was removed.'
+    }
+    Invoke-ModUpdateTerminalCleanup -State $State -EvidencePath ([string]$owner.cleanup.evidencePath) `
+        -ClaimDirectory ([string]$owner.cleanup.claimDirectory) `
+        -ClaimRoot (Split-Path -Parent ([string]$owner.cleanup.claimDirectory)) `
+        -RunRoot ([string]$owner.cleanup.runRoot) `
+        -InProgressRoot (Split-Path -Parent ([string]$owner.cleanup.runRoot)) `
+        -FinalizationResult $owner.cleanup.finalizationResult
 }
 
 function Invoke-ModUpdateReviewedHeadFinalization {
@@ -845,8 +884,8 @@ function Get-ReleasedModUpdateFinalizationResult {
     }
     if ([string]$owner.reservationState -cne 'released' -or
         -not $owner.Contains('cleanup') -or $owner.cleanup -isnot [Collections.IDictionary] -or
-        -not [bool]$owner.cleanup.writerLockReleased -or -not [bool]$owner.cleanup.claimDirectoryPreserved -or
-        -not [bool]$owner.cleanup.runRootPreserved -or
+        -not [bool]$owner.cleanup.writerLockReleased -or -not [bool]$owner.cleanup.claimDirectoryRemoved -or
+        -not [bool]$owner.cleanup.runRootRemoved -or
         $owner.cleanup.finalizationResult -isnot [Collections.IDictionary]) {
         throw 'Released finalization lacks the completed cleanup tuple and result.'
     }
@@ -858,6 +897,13 @@ function Get-ReleasedModUpdateFinalizationResult {
         [IO.Path]::GetFullPath([string]$owner.cleanup.claimDirectory) -cne $expectedClaimDirectory -or
         [IO.Path]::GetFullPath([string]$owner.cleanup.runRoot) -cne [IO.Path]::GetFullPath([string]$State.runRoot)) {
         throw 'Released finalization cleanup tuple differs from the immutable run paths.'
+    }
+    if ((Get-ModFinalizationResultSha256 -Value $owner.cleanup.finalizationResult) -cne
+        [string]$owner.cleanup.finalizationResultSha256) {
+        throw 'Released finalization result hash differs from the cleanup tuple.'
+    }
+    if ((Test-Path -LiteralPath $expectedClaimDirectory) -or (Test-Path -LiteralPath ([string]$State.runRoot))) {
+        throw 'Released finalization retained a claim directory or run root after cleanup.'
     }
     $null = Assert-ModUpdateFinalEvidence -EvidencePath $expectedEvidence -RunId ([string]$State.runId)
     $result = $owner.cleanup.finalizationResult
