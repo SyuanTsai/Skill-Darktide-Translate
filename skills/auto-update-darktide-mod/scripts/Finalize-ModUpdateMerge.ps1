@@ -415,7 +415,9 @@ function Invoke-ModUpdateChangedHeadReconciliation {
     New-Item -ItemType Directory -Path $rejectedRoot -Force | Out-Null
     Copy-FileWithHeartbeat -SourcePath ([string]$State.statePath) -DestinationPath (Join-Path $rejectedRoot 'state.before.json')
     $ownerPath = Get-ModReservationOwnerPath -ModLockPath ([string]$State.modLockPath) -Repository ([string]$State.repositoryRoot)
-    Copy-FileWithHeartbeat -SourcePath $ownerPath -DestinationPath (Join-Path $rejectedRoot 'reservation-owner.before.json')
+    Update-ActiveReservationHeartbeat -Force
+    Copy-FileWithHeartbeat -SourcePath $ownerPath -DestinationPath (Join-Path $rejectedRoot 'reservation-owner.before.json') `
+        -SuppressReservationHeartbeat
     $diffBytes = Get-ModUpdateGitOutputBytes -WorkingDirectory ([string]$State.repositoryRoot) -Arguments @('diff', '--binary', '--no-ext-diff', '--no-renames', "$reviewedOid..$mergedHeadOid", '--')
     $nameStatusBytes = Get-ModUpdateGitOutputBytes -WorkingDirectory ([string]$State.repositoryRoot) -Arguments @('diff', '--name-status', '--no-renames', "$reviewedOid..$mergedHeadOid", '--')
     Write-AtomicBytes -Path (Join-Path $rejectedRoot 'reviewed-f-to-merged-head.diff') -Bytes $diffBytes
@@ -686,9 +688,22 @@ function Invoke-ModUpdateReviewedHeadFinalization {
     foreach ($item in @(
         [ordered]@{ source = [string]$State.statePath; name = 'state-merged.json' },
         [ordered]@{ source = [string]$State.claimPath; name = 'claim.json' },
-        [ordered]@{ source = (Get-ModReservationOwnerPath -ModLockPath ([string]$State.modLockPath) -Repository $repository); name = 'reservation-owner.json' }
+        [ordered]@{
+            source = (Get-ModReservationOwnerPath -ModLockPath ([string]$State.modLockPath) -Repository $repository)
+            name = 'reservation-owner.json'
+            reservationOwner = $true
+        }
     )) {
-        Copy-FileWithHeartbeat -SourcePath $item.source -DestinationPath (Join-Path $supporting $item.name)
+        $isReservationOwner = $item.Contains('reservationOwner') -and [bool]$item.reservationOwner
+        if ($isReservationOwner) {
+            # The source handle intentionally denies delete sharing so the archived
+            # owner bytes are stable. Refresh before opening it; refreshing while
+            # copying this same file would make the CAS replace conflict with our
+            # own source handle on Windows.
+            Update-ActiveReservationHeartbeat -Force
+        }
+        Copy-FileWithHeartbeat -SourcePath $item.source -DestinationPath (Join-Path $supporting $item.name) `
+            -SuppressReservationHeartbeat:$isReservationOwner
     }
     Write-AtomicJson -Path (Join-Path $evidencePending 'state-final.json') -Value ([ordered]@{
         schemaVersion = 1

@@ -153,14 +153,15 @@ function Get-FileSha256 {
 function Copy-StreamWithHeartbeat {
     param(
         [Parameter(Mandatory)][IO.Stream] $Source,
-        [Parameter(Mandatory)][IO.Stream] $Destination
+        [Parameter(Mandatory)][IO.Stream] $Destination,
+        [switch] $SuppressReservationHeartbeat
     )
-    Update-ActiveReservationHeartbeat -Force
+    if (-not $SuppressReservationHeartbeat) { Update-ActiveReservationHeartbeat -Force }
     Update-ActiveSharedCoordinationHeartbeat -Force
     $buffer = [byte[]]::new(1MB)
     while (($readCount = $Source.Read($buffer, 0, $buffer.Length)) -gt 0) {
         $Destination.Write($buffer, 0, $readCount)
-        Update-ActiveReservationHeartbeat
+        if (-not $SuppressReservationHeartbeat) { Update-ActiveReservationHeartbeat }
         Update-ActiveSharedCoordinationHeartbeat
     }
 }
@@ -183,14 +184,16 @@ function Copy-FileWithHeartbeat {
     param(
         [Parameter(Mandatory)][string] $SourcePath,
         [Parameter(Mandatory)][string] $DestinationPath,
-        [switch] $Overwrite
+        [switch] $Overwrite,
+        [switch] $SuppressReservationHeartbeat
     )
     $source = [IO.File]::Open($SourcePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $destinationMode = if ($Overwrite) { [IO.FileMode]::Create } else { [IO.FileMode]::CreateNew }
     $destination = $null
     try {
         $destination = [IO.File]::Open($DestinationPath, $destinationMode, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        Copy-StreamWithHeartbeat -Source $source -Destination $destination
+        Copy-StreamWithHeartbeat -Source $source -Destination $destination `
+            -SuppressReservationHeartbeat:$SuppressReservationHeartbeat
         $destination.Flush($true)
     }
     finally {

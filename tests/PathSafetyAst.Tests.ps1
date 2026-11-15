@@ -72,7 +72,7 @@ $prProductionPowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Unix.psm1',
     'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Windows.psm1'
 )
-$protectedPrProductionPowerShellInventorySha256 = '6a6d400e48357e5ffb04440b576cd66c07cf915119a51b0bb0bcf678d35b72c4'
+$protectedPrProductionPowerShellInventorySha256 = '09d9afe5b62be42394f41fe3ae97d25db6971a3ea7b8bbf79be515de6473892a'
 
 # These files are byte-exact authority acc3d73 runtime artifacts. Their hashes
 # are verified by PathSafety before loading and consumer changes are forbidden,
@@ -350,6 +350,8 @@ skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUp
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|IO.File::Move|1
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|New-Item|3
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|Test-Path|11
+skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|<script>|Test-Path|3
+skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|Read-QueueTextWithHeartbeat|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|Test-Path|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|type::IO.DirectoryInfo|1
