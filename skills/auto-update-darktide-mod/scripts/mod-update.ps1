@@ -1014,7 +1014,7 @@ function Read-State {
     $repositoryFull = [IO.Path]::GetFullPath($RepositoryRoot)
     $stateFull = [IO.Path]::GetFullPath($Path)
     $physicalPathComparison = Get-PortablePathComparison -Paths @($repositoryFull, $stateFull)
-    $null = Assert-NoReparsePath -Path $stateFull -Root $repositoryFull -Label 'Run state'
+    $null = Assert-NoReparsePath -Path $stateFull -Root $repositoryFull -Label 'Run state' -AllowMissing
     if (-not (Test-Path -LiteralPath $stateFull -PathType Leaf)) {
         throw "State file does not exist: $stateFull"
     }

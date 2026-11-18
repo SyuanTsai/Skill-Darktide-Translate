@@ -1481,7 +1481,7 @@ function Enter-SharedCoordinationLease {
     # Purpose: Its persisted pending attempt token must make retry byte-idempotent, while a later independent call gets a fresh token and contends.
     It 'InterT394_PersistsProductionAttemptTokenAcrossPublishedBeforeReturnRetry' {
         $coordinationPath = Join-Path $skillRoot 'scripts/SharedCoordinationLock.psm1'
-        Import-Module $coordinationPath -Force
+        $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
         $tokens = $null
         $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
@@ -1490,15 +1490,16 @@ function Enter-SharedCoordinationLease {
             param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Enter-SharedCoordinationLock'
         }, $true)
-        $module = New-Module -ArgumentList $wrapper.Extent.Text -ScriptBlock {
-            param($source)
+        $module = New-Module -ArgumentList $wrapper.Extent.Text, $coordinationPath -ScriptBlock {
+            param($source, $coordinationModulePath)
+            Import-Module $coordinationModulePath -Force
             $script:activeStageContext = $null
             $script:activeSharedCoordinationLease = $null
             function Update-ActiveReservationHeartbeat {}
             function Add-StageWait { param($Context,$Reason,$Milliseconds) }
             . ([scriptblock]::Create($source))
         }
-        $coordinationModuleObject = Get-Module SharedCoordinationLock | Select-Object -First 1
+        $coordinationModuleObject = & $module { Get-Module SharedCoordinationLock | Select-Object -First 1 }
         $repository = Join-Path $TestDrive 'production-attempt-token-retry'
         $receiptRoot = Join-Path $repository 'attempt-receipts'
         New-Item -ItemType Directory -Path $repository -Force | Out-Null
@@ -1533,8 +1534,14 @@ function Enter-SharedCoordinationLease {
         }
         finally {
             & $coordinationModuleObject { $script:CoordinationFaultInjectionHook = $null }
-            if ($lease) { $null = Exit-SharedCoordinationLease -Lease $lease }
+            if ($lease) {
+                $null = & $coordinationModuleObject {
+                    param($value)
+                    Exit-SharedCoordinationLease -Lease $value
+                } $lease
+            }
             Remove-Module $module -Force
+            Import-Module $pathSafetyPath -Force
         }
     }
 

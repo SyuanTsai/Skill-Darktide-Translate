@@ -102,7 +102,7 @@ function Assert-ModUpdateGitIdentities {
     }
 }
 
-function Get-ModUpdateArchiveLocations {
+function Get-ModUpdateFinishedArchiveLocation {
     param([Parameter(Mandatory)][Collections.IDictionary] $State)
     $filename = [string]$State.archive.filename
     if ([string]::IsNullOrWhiteSpace($filename) -or [IO.Path]::GetFileName($filename) -cne $filename -or
@@ -110,21 +110,28 @@ function Get-ModUpdateArchiveLocations {
         $filename -match '(?i)^(con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$') {
         throw 'Finalization archive filename is not one safe file name.'
     }
+    $finishedRoot = Join-Path ([string]$State.repositoryRoot) 'AI Auto Update/Finished'
+    $finishedPath = Assert-ContainedPath -Candidate (Join-Path $finishedRoot $filename) -Root $finishedRoot -Label 'Finished archive'
+    $finishedPath = Assert-NoReparsePath -Path $finishedPath -Root ([string]$State.repositoryRoot) -Label 'Finished archive' -AllowMissing
+    [ordered]@{ filename = $filename; finishedRoot = $finishedRoot; finishedPath = $finishedPath }
+}
+
+function Get-ModUpdateArchiveLocations {
+    param([Parameter(Mandatory)][Collections.IDictionary] $State)
+    $finished = Get-ModUpdateFinishedArchiveLocation -State $State
+    $filename = [string]$finished.filename
     $sourceRoot = Join-Path ([string]$State.runRoot) 'source'
     $sourcePath = Assert-ContainedPath -Candidate (Join-Path (Join-Path ([string]$State.runRoot) 'source') $filename) -Root $sourceRoot -Label 'Run-owned archive'
     $sourcePath = Assert-NoReparsePath -Path $sourcePath -Root ([string]$State.runRoot) -Label 'Run-owned archive' -AllowMissing
     if (-not ([IO.Path]::GetFullPath([string]$State.archive.path)).Equals($sourcePath, (Get-PortablePathComparison -Paths @([IO.Path]::GetFullPath([string]$State.archive.path), $sourcePath)))) {
         throw 'Run-owned archive path differs from its canonical location.'
     }
-    $finishedRoot = Join-Path ([string]$State.repositoryRoot) 'AI Auto Update/Finished'
-    $finishedPath = Assert-ContainedPath -Candidate (Join-Path $finishedRoot $filename) -Root $finishedRoot -Label 'Finished archive'
-    $finishedPath = Assert-NoReparsePath -Path $finishedPath -Root ([string]$State.repositoryRoot) -Label 'Finished archive' -AllowMissing
     [ordered]@{
         filename = $filename
         sourceRoot = $sourceRoot
         sourcePath = $sourcePath
-        finishedRoot = $finishedRoot
-        finishedPath = $finishedPath
+        finishedRoot = [string]$finished.finishedRoot
+        finishedPath = [string]$finished.finishedPath
     }
 }
 
@@ -280,9 +287,10 @@ function Get-ModUpdateEvidenceManifest {
 function Assert-ModUpdateFinalEvidence {
     param(
         [Parameter(Mandatory)][string] $EvidencePath,
-        [Parameter(Mandatory)][string] $RunId
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $RepositoryRoot
     )
-    $evidenceFull = Assert-NoReparseTree -Path $EvidencePath -Root ([string]$script:activeReservationState.repositoryRoot) -Label 'Final merge evidence'
+    $evidenceFull = Assert-NoReparseTree -Path $EvidencePath -Root $RepositoryRoot -Label 'Final merge evidence'
     $stateFinalPath = Join-Path $evidenceFull 'state-final.json'
     $manifestPath = Join-Path $evidenceFull 'archive-manifest.json'
     $stateFinal = Get-Content -LiteralPath $stateFinalPath -Raw | ConvertFrom-Json -AsHashtable
@@ -580,7 +588,7 @@ function Resolve-ModUpdateFinalizationStateFromOwner {
     $runRoot = Split-Path -Parent $stateFull
     $lockRoot = Join-Path $repositoryFull 'AI Auto Update/In Progress/.locks/mod'
     $null = Assert-NoReparsePath -Path $lockRoot -Root $repositoryFull -Label 'MOD reservation recovery root'
-    $matches = [Collections.Generic.List[object]]::new()
+    $ownerCandidates = [Collections.Generic.List[object]]::new()
     foreach ($entry in @(Get-ChildItem -LiteralPath $lockRoot -Force -File)) {
         if ([string]$entry.Name -cnotmatch '^[0-9a-f]{64}\.lock$') { continue }
         $snapshot = Get-ModReservationSnapshot -ModLockPath $entry.FullName -Repository $repositoryFull
@@ -590,19 +598,20 @@ function Resolve-ModUpdateFinalizationStateFromOwner {
             -not $owner.Contains('statePath') -or [string]::IsNullOrWhiteSpace([string]$owner.statePath)) { continue }
         if ([IO.Path]::GetFullPath([string]$owner.statePath) -ceq $stateFull -and
             [IO.Path]::GetFullPath([string]$owner.cleanup.runRoot) -ceq [IO.Path]::GetFullPath($runRoot)) {
-            $matches.Add([ordered]@{ path = [string]$entry.FullName; owner = $owner })
+            $ownerCandidates.Add([ordered]@{ path = [string]$entry.FullName; owner = $owner })
         }
     }
-    if ($matches.Count -ne 1) {
+    if ($ownerCandidates.Count -ne 1) {
         throw 'Missing finalization state did not resolve to exactly one terminal reservation owner.'
     }
-    $match = $matches[0]
+    $match = $ownerCandidates[0]
     $owner = $match.owner
     $expectedEvidence = [IO.Path]::GetFullPath((Join-Path $repositoryFull ("AI Auto Update/Finished/.evidence/$([string]$owner.runId)")))
     if ([IO.Path]::GetFullPath([string]$owner.cleanup.evidencePath) -cne $expectedEvidence) {
         throw 'Terminal reservation evidence path differs from its deterministic archive path.'
     }
-    $null = Assert-ModUpdateFinalEvidence -EvidencePath $expectedEvidence -RunId ([string]$owner.runId)
+    $null = Assert-ModUpdateFinalEvidence -EvidencePath $expectedEvidence -RunId ([string]$owner.runId) `
+        -RepositoryRoot $repositoryFull
     $archivedStatePath = Join-Path $expectedEvidence 'supporting/state-merged.json'
     $archivedState = Get-Content -LiteralPath $archivedStatePath -Raw | ConvertFrom-Json -AsHashtable
     if ([string]$archivedState.runId -cne [string]$owner.runId -or
@@ -889,11 +898,14 @@ function Get-ReleasedModUpdateFinalizationResult {
         $owner.cleanup.finalizationResult -isnot [Collections.IDictionary]) {
         throw 'Released finalization lacks the completed cleanup tuple and result.'
     }
-    $archiveLocations = Get-ModUpdateArchiveLocations -State $State
-    $expectedEvidence = [IO.Path]::GetFullPath((Join-Path (Join-Path ([string]$archiveLocations.finishedRoot) '.evidence') ([string]$State.runId)))
+    $finishedArchive = Get-ModUpdateFinishedArchiveLocation -State $State
+    $expectedEvidence = [IO.Path]::GetFullPath((Join-Path (Join-Path ([string]$finishedArchive.finishedRoot) '.evidence') ([string]$State.runId)))
     $expectedClaimDirectory = [IO.Path]::GetFullPath((Split-Path -Parent ([string]$State.claimPath)))
     if ([string]$owner.cleanup.runId -cne [string]$State.runId -or
-        [IO.Path]::GetFullPath([string]$owner.cleanup.evidencePath) -cne $expectedEvidence -or
+        [IO.Path]::GetFullPath([string]$owner.cleanup.evidencePath) -cne $expectedEvidence) {
+        throw 'Terminal reservation evidence path differs from its deterministic archive path.'
+    }
+    if (
         [IO.Path]::GetFullPath([string]$owner.cleanup.claimDirectory) -cne $expectedClaimDirectory -or
         [IO.Path]::GetFullPath([string]$owner.cleanup.runRoot) -cne [IO.Path]::GetFullPath([string]$State.runRoot)) {
         throw 'Released finalization cleanup tuple differs from the immutable run paths.'
@@ -905,7 +917,17 @@ function Get-ReleasedModUpdateFinalizationResult {
     if ((Test-Path -LiteralPath $expectedClaimDirectory) -or (Test-Path -LiteralPath ([string]$State.runRoot))) {
         throw 'Released finalization retained a claim directory or run root after cleanup.'
     }
-    $null = Assert-ModUpdateFinalEvidence -EvidencePath $expectedEvidence -RunId ([string]$State.runId)
+    $finalEvidence = Assert-ModUpdateFinalEvidence -EvidencePath $expectedEvidence -RunId ([string]$State.runId) `
+        -RepositoryRoot ([string]$State.repositoryRoot)
+    if ([string]$finalEvidence.stateFinal.archive.filename -cne [string]$State.archive.filename -or
+        [int64]$finalEvidence.stateFinal.archive.size -ne [int64]$State.archive.size -or
+        [string]$finalEvidence.stateFinal.archive.sha256 -cne [string]$State.archive.sha256 -or
+        [IO.Path]::GetFullPath([string]$finalEvidence.stateFinal.archive.finishedPath) -cne
+            [IO.Path]::GetFullPath([string]$finishedArchive.finishedPath)) {
+        throw 'Released finalization archive differs from the verified terminal evidence.'
+    }
+    $null = Assert-MergeFileTuple -Path ([string]$finishedArchive.finishedPath) `
+        -Size ([int64]$State.archive.size) -Sha256 ([string]$State.archive.sha256)
     $result = $owner.cleanup.finalizationResult
     $artifactPath = Join-Path $expectedEvidence 'artifacts/merge-finalization.json'
     $fingerprintPath = Join-Path $expectedEvidence 'artifacts/merge-fingerprint.json'
@@ -928,7 +950,7 @@ function Get-ReleasedModUpdateFinalizationResult {
         [string]$State.mergeFingerprintSha256 -cne (Get-FileSha256 -Path $fingerprintPath) -or
         [string]$result.data.fingerprintBlobSha256 -cne [string]$fingerprint.fingerprintBlobSha256 -or
         [string]$result.data.archiveSha256 -cne [string]$State.archive.sha256 -or
-        [IO.Path]::GetFullPath([string]$result.data.finishedArchive) -cne [IO.Path]::GetFullPath([string]$archiveLocations.finishedPath) -or
+        [IO.Path]::GetFullPath([string]$result.data.finishedArchive) -cne [IO.Path]::GetFullPath([string]$finishedArchive.finishedPath) -or
         [string]$result.data.archiveDisposition -notin @('moved-to-finished', 'deduplicated-same-name-same-sha', 'already-in-finished') -or
         [IO.Path]::GetFullPath([string]$result.data.evidencePath) -cne $expectedEvidence -or
         -not [bool]$result.data.reservationReleased) {
