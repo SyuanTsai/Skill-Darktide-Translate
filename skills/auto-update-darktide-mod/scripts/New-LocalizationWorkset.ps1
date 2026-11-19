@@ -313,7 +313,10 @@ if ($existingWorkset -and [string]$existingWorkset.status -in @('applying', 'app
         [string]$existingWorkset.apply.outputSha256 -notmatch '^[0-9a-f]{64}$' -or [int64]$existingWorkset.apply.outputSize -lt 0) {
         throw 'Existing applying or applied localization workset review contract or apply receipt changed.'
     }
-    if ([IO.Path]::GetFullPath([string]$existingWorkset.new.root) -cne $stagingRoot) { throw 'Existing applied workset staging root changed.' }
+    if (-not ([IO.Path]::GetFullPath([string]$existingWorkset.new.root)).Equals(
+            $stagingRoot, (Get-PortablePathComparison -Paths @($stagingRoot, [string]$existingWorkset.new.root)))) {
+        throw 'Existing applied workset staging root changed.'
+    }
     $existingNewPath = Assert-ContainedPath -Candidate ([string]$existingWorkset.new.path) -Root $stagingRoot
     Assert-NoReparsePath -Path $existingNewPath -Root $stagingRoot
     if (-not (Test-Path -LiteralPath $existingNewPath -PathType Leaf)) { throw 'Existing applying or applied localization workset output is missing.' }

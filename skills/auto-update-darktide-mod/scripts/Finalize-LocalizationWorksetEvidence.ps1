@@ -112,8 +112,10 @@ if (-not $state.candidateGate -or [string]$state.candidateGate.status -cne 'pass
 $stateRunRoot = Split-Path -Parent $stateFull
 if (-not $state.Contains('runRoot') -or [string]::IsNullOrWhiteSpace([string]$state.runRoot) -or
     -not $state.Contains('statePath') -or [string]::IsNullOrWhiteSpace([string]$state.statePath) -or
-    [IO.Path]::GetFullPath([string]$state.runRoot) -cne $stateRunRoot -or
-    [IO.Path]::GetFullPath([string]$state.statePath) -cne $stateFull) {
+    -not ([IO.Path]::GetFullPath([string]$state.runRoot)).Equals(
+        $stateRunRoot, (Get-PortablePathComparison -Paths @($stateRunRoot, [string]$state.runRoot))) -or
+    -not ([IO.Path]::GetFullPath([string]$state.statePath)).Equals(
+        $stateFull, (Get-PortablePathComparison -Paths @($stateFull, [string]$state.statePath)))) {
     throw 'Schema 15 state path differs from its fixed run root tuple.'
 }
 $runRoot = $stateRunRoot
@@ -170,10 +172,13 @@ if (-not $receipt) {
     Write-AtomicJson -Path $receiptPath -Value $receipt
 }
 else {
+    $receiptPathComparison = Get-PortablePathComparison -Paths @($securityRoot, $worksetPath, $reportPath)
     if ([int]$receipt.schemaVersion -ne 1 -or [int]$receipt.workflowSchemaVersion -ne 15 -or
-        [string]$receipt.runId -cne [string]$state.runId -or [string]$receipt.worksetPath -cne $worksetPath -or
+        [string]$receipt.runId -cne [string]$state.runId -or
+        -not ([IO.Path]::GetFullPath([string]$receipt.worksetPath)).Equals($worksetPath, $receiptPathComparison) -or
         [string]$receipt.worksetSha256 -cne [string]$state.localizationWorkset.sha256 -or
-        [string]$receipt.validationReportPath -cne $reportPath -or [string]$receipt.status -notin @('pending', 'deleted')) {
+        -not ([IO.Path]::GetFullPath([string]$receipt.validationReportPath)).Equals($reportPath, $receiptPathComparison) -or
+        [string]$receipt.status -notin @('pending', 'deleted')) {
         throw 'Localization workset deletion receipt does not match the current run tuple.'
     }
 }

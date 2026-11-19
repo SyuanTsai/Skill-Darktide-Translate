@@ -580,7 +580,9 @@ function Assert-ReleasedCoordinationOwnerReceipt {
         token = [string]$Owner.owner.token
     }
     $terminal = Get-CoordinationTerminalReceipt -Lease $lease -LockRoot $LockRoot
-    if ([IO.Path]::GetFullPath([string]$Owner.releaseReceiptPath) -cne [IO.Path]::GetFullPath([string]$terminal.path) -or
+    if (-not ([IO.Path]::GetFullPath([string]$Owner.releaseReceiptPath)).Equals(
+            [IO.Path]::GetFullPath([string]$terminal.path),
+            (Get-PortablePathComparison -Paths @($LockRoot, [string]$Owner.releaseReceiptPath, [string]$terminal.path))) -or
         [string]$Owner.releaseReceiptSha256 -cne [string]$terminal.sha256) {
         throw 'Released coordination owner differs from its immutable terminal receipt.'
     }
@@ -843,7 +845,9 @@ function Exit-SharedCoordinationLease {
                 throw 'Shared coordination lease was released by another owner token.'
             }
             $terminal = Get-CoordinationTerminalReceipt -Lease $Lease -LockRoot $lockRoot
-            if ([IO.Path]::GetFullPath([string]$owner.releaseReceiptPath) -cne [IO.Path]::GetFullPath([string]$terminal.path) -or
+            if (-not ([IO.Path]::GetFullPath([string]$owner.releaseReceiptPath)).Equals(
+                    [IO.Path]::GetFullPath([string]$terminal.path),
+                    (Get-PortablePathComparison -Paths @($lockRoot, [string]$owner.releaseReceiptPath, [string]$terminal.path))) -or
                 [string]$owner.releaseReceiptSha256 -cne [string]$terminal.sha256) {
                 throw 'Released coordination owner differs from its immutable terminal receipt.'
             }

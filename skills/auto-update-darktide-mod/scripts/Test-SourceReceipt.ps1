@@ -242,8 +242,11 @@ $null = Assert-NoReparsePath -Path $sourceRunRoot -Root $sourceRunRoot -Label 'S
 $null = Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt'
 $null = Assert-NoReparsePath -Path $requestFull -Root $sourceRunRoot -Label 'Source request'
 if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
-    if ($receiptFull -cne [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-receipt.json')) -or
-        $requestFull -cne [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-request.json'))) {
+    $expectedReceiptPath = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-receipt.json'))
+    $expectedRequestPath = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-request.json'))
+    $sourcePathComparison = Get-PortablePathComparison -Paths @($sourceRunRoot, $receiptFull, $requestFull)
+    if (-not $receiptFull.Equals($expectedReceiptPath, $sourcePathComparison) -or
+        -not $requestFull.Equals($expectedRequestPath, $sourcePathComparison)) {
         throw 'Source receipt verification requires the fixed run-local review artifact paths.'
     }
 }
@@ -342,7 +345,8 @@ if ($isRetainedNonDelivered) {
     $retainedParent = Split-Path -Parent $retainedFull
     if (-not (Test-Path -LiteralPath $retainedFull -PathType Leaf) -or
         (Split-Path -Leaf $retainedParent).StartsWith('.incoming-', [StringComparison]::Ordinal) -ne $true -or
-        [IO.Path]::GetFullPath((Split-Path -Parent $retainedParent)) -cne $sourceRunRoot) {
+        -not ([IO.Path]::GetFullPath((Split-Path -Parent $retainedParent))).Equals(
+            $sourceRunRoot, (Get-PortablePathComparison -Paths @($sourceRunRoot, $retainedParent)))) {
         throw 'Retained source is outside a fixed run-local incoming directory.'
     }
     $archiveEvidence = Get-ArchiveEvidence -Path $retainedFull

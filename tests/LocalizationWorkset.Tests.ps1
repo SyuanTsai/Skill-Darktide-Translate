@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Schema 15 localization workset' {
     BeforeAll {
@@ -1128,8 +1128,8 @@ return localization
         $finalizer = Get-Content -LiteralPath (Join-Path $scriptRoot 'Finalize-LocalizationWorksetEvidence.ps1') -Raw
 
         $finalizer | Should -Match '(?s)\$stateFull = \[IO\.Path\]::GetFullPath\(\$StatePath\).*Assert-NoReparsePath -Path \$stateFull -Root \(\[IO\.Path\]::GetPathRoot\(\$stateFull\)\) -Label ''Schema 15 state''.*\$state = Get-Content'
-        $finalizer | Should -Match '\[IO\.Path\]::GetFullPath\(\[string\]\$state\.runRoot\) -cne \$stateRunRoot'
-        $finalizer | Should -Match '\[IO\.Path\]::GetFullPath\(\[string\]\$state\.statePath\) -cne \$stateFull'
+        $finalizer | Should -Match '(?s)GetFullPath\(\[string\]\$state\.runRoot\)\)\.Equals\(.*?Get-PortablePathComparison'
+        $finalizer | Should -Match '(?s)GetFullPath\(\[string\]\$state\.statePath\)\)\.Equals\(.*?Get-PortablePathComparison'
     }
 
     # Scenario: a case-only path variant is tested on the current test volume.
@@ -1160,7 +1160,9 @@ return localization
             else {
                 [StringComparison]::Ordinal
             })
-        $comparisonFunction | Should -Match 'GetFileSystemEntries'
+        $comparisonFunction | Should -Match '\.casecheck-'
+        $comparisonFunction | Should -Match '\[IO\.File\]::Delete'
+        $comparisonFunction | Should -Not -Match 'GetFileSystemEntries'
         $comparisonFunction | Should -Not -Match 'Get-PortablePlatformName'
     }
 

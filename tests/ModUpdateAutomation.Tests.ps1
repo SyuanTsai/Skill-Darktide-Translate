@@ -51,6 +51,34 @@ Describe 'Deterministic Darktide MOD update automation' {
             }
             New-Module -ScriptBlock ([scriptblock]::Create($texts -join "`n"))
         }
+
+        function New-TerminalOwnerRecoveryModuleForTest {
+            param([Parameter(Mandatory)][Collections.IDictionary] $Owner)
+            $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
+            if (@($parseErrors).Count -ne 0) { throw 'The finalizer does not parse.' }
+            $functionAst = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Resolve-ModUpdateFinalizationStateFromOwner'
+            }, $true)
+            if ($null -eq $functionAst) { throw 'The terminal-owner recovery function is missing.' }
+            New-Module -ArgumentList $functionAst.Extent.Text, $Owner,
+                (Join-Path $skillRoot 'scripts/PathSafety.psm1') -ScriptBlock {
+                param($functionSource, $initialOwner, $pathSafety)
+                Import-Module $pathSafety -Force
+                $script:terminalOwner = $initialOwner
+                function Assert-NoReparsePath { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+                function Get-ModReservationSnapshot {
+                    param($ModLockPath,$Repository)
+                    [ordered]@{ exists = $true; value = $script:terminalOwner }
+                }
+                function Assert-ModUpdateFinalEvidence { param($EvidencePath,$RunId,$RepositoryRoot) }
+                . ([scriptblock]::Create($functionSource))
+            }
+        }
     }
 
     # Scenario: An agent selects the Skill for an archive-backed MOD update or recovery.
@@ -144,6 +172,24 @@ Describe 'Deterministic Darktide MOD update automation' {
             $prefix = (Join-Path $root 'Mods') + [IO.Path]::DirectorySeparatorChar
             (Join-Path $root 'mods/Escape.lua').StartsWith($prefix, $containment) | Should -Be $filesystemIsCaseInsensitive
             (Join-Path $root 'Mods/Inside.lua').StartsWith($prefix, $containment) | Should -BeTrue
+        }
+
+        # Scenario: A case-sensitive volume contains two real sibling directories whose names differ only by case.
+        # Purpose: Prove case detection uses a unique temporary file instead of mistaking the sibling for an alias.
+        It 'InterT407_DoesNotConflateCaseSensitiveSiblingDirectoriesDuringCaseDetection' {
+            Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+            $parent = Join-Path $TestDrive 'case-sensitive-siblings'
+            $upper = Join-Path $parent 'CaseRoot'
+            $lower = Join-Path $parent 'caseRoot'
+            [void][IO.Directory]::CreateDirectory($upper)
+            [void][IO.Directory]::CreateDirectory($lower)
+            if ([IO.Directory]::Exists((Join-Path $parent 'CASEROOT'))) {
+                throw 'This native-host case requires a case-sensitive filesystem.'
+            }
+
+            Get-PortablePathComparison -Paths @($upper) | Should -Be ([StringComparison]::Ordinal)
+            @(Get-ChildItem -LiteralPath $upper -Force -Filter '.casecheck-*').Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $lower -Force -Filter '.casecheck-*').Count | Should -Be 0
         }
     }
 
@@ -318,6 +364,102 @@ catch [TimeoutException] { [Console]::Out.Write('TIMEOUT') }
         $residue = Get-PortableTransactionResidue -LockRoot $root -OwnerLeaf 'owner.lock'
         $residue.hasResidue | Should -BeTrue
         @($residue.entries) | Should -BeExactly @($residueLeaf)
+    }
+
+    # Scenario: A child process is terminated after an owned directory is renamed but before its quarantine is deleted.
+    # Purpose: Make the quarantine name restart-stable and require the real helper to finish it on the next invocation.
+    It 'InterT408_ResumesDeterministicDirectoryQuarantineAfterProcessTermination' -Tag 'MultiProcess' {
+        $runnerTokens = $null
+        $runnerErrors = $null
+        $runnerAst = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$runnerTokens, [ref]$runnerErrors)
+        @($runnerErrors).Count | Should -Be 0
+        $functionNames = @('Remove-DirectoryTreeWithHeartbeat')
+        $runnerFunctions = @($runnerAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $functionNames
+        }, $true))
+        $runnerFunctions.Count | Should -Be $functionNames.Count
+        $removalSource = $runnerFunctions[0].Extent.Text
+
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $finalizerTokens = $null
+        $finalizerErrors = $null
+        $finalizerAst = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$finalizerTokens, [ref]$finalizerErrors)
+        @($finalizerErrors).Count | Should -Be 0
+        $ownedDirectorySource = $finalizerAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Remove-ModUpdateOwnedDirectory'
+        }, $true).Extent.Text
+
+        $root = Join-Path $TestDrive 'deterministic-removal-root'
+        $owned = Join-Path $root 'run-owned'
+        [void][IO.Directory]::CreateDirectory($owned)
+        [IO.File]::WriteAllText((Join-Path $owned 'payload.txt'), 'payload')
+        $quarantine = $owned + '.codex-removal'
+        $ready = Join-Path $TestDrive 'directory-quarantined.ready'
+        $childPath = Join-Path $TestDrive 'directory-removal-child.ps1'
+        [IO.File]::WriteAllText($childPath, @'
+param([string] $RemovalSourceBase64, [string] $OwnedPath, [string] $RootPath, [string] $ReadyPath)
+$ErrorActionPreference = 'Stop'
+function Update-ActiveReservationHeartbeat { param([switch] $Force) }
+function Update-ActiveSharedCoordinationHeartbeat { param([switch] $Force) }
+function Assert-NoReparseTree { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+function Assert-NoReparsePath { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+$source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RemovalSourceBase64))
+$move = '[IO.Directory]::Move($removalRoot, $quarantine)'
+$pause = $move + [Environment]::NewLine +
+    '[IO.File]::WriteAllText($ReadyPath, ''ready'')' + [Environment]::NewLine +
+    'while ($true) { [Threading.Thread]::Sleep(50) }'
+$source = $source.Replace($move, $pause)
+. ([scriptblock]::Create($source))
+Remove-DirectoryTreeWithHeartbeat -Path $OwnedPath -Root $RootPath
+'@, [Text.UTF8Encoding]::new($false))
+        $sourceBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($removalSource))
+        $start = [Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = (Get-Process -Id $PID).Path
+        $start.UseShellExecute = $false
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $childPath,
+                '-RemovalSourceBase64', $sourceBase64, '-OwnedPath', $owned, '-RootPath', $root,
+                '-ReadyPath', $ready)) { $start.ArgumentList.Add($argument) }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $start
+        try {
+            $process.Start() | Should -BeTrue
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            while (-not [IO.File]::Exists($ready)) {
+                if ($process.HasExited) { throw "Directory-removal child exited before quarantine: $($process.ExitCode)" }
+                if ($watch.ElapsedMilliseconds -ge 30000) { throw 'Directory-removal child did not reach quarantine within 30 seconds.' }
+                [Threading.Thread]::Sleep(20)
+            }
+            $process.Kill($true)
+            $process.WaitForExit()
+            [IO.Directory]::Exists($owned) | Should -BeFalse
+            [IO.Directory]::Exists($quarantine) | Should -BeTrue
+
+            $module = New-Module -ArgumentList $removalSource, $ownedDirectorySource -ScriptBlock {
+                param($removeSource, $ownedSource)
+                function Update-ActiveReservationHeartbeat { param([switch] $Force) }
+                function Update-ActiveSharedCoordinationHeartbeat { param([switch] $Force) }
+                function Assert-NoReparseTree { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+                function Assert-NoReparsePath { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+                . ([scriptblock]::Create($removeSource))
+                . ([scriptblock]::Create($ownedSource))
+            }
+            try {
+                & $module {
+                    param($ownedPath, $rootPath)
+                    Remove-ModUpdateOwnedDirectory -Path $ownedPath -Root $rootPath -Label 'Recovered run root'
+                } $owned $root
+            }
+            finally { Remove-Module $module -Force }
+            [IO.Directory]::Exists($owned) | Should -BeFalse
+            [IO.Directory]::Exists($quarantine) | Should -BeFalse
+        }
+        finally {
+            if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+            $process.Dispose()
+        }
     }
 
     # Scenario: A live owner's process start time is read again later on each platform.
@@ -959,7 +1101,10 @@ catch [TimeoutException] { [Console]::Out.Write('TIMEOUT') }
             param($functionSource, $pathSafety)
             Import-Module $pathSafety -Force
             function Assert-NoReparsePath { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
-            function Remove-DirectoryTreeWithHeartbeat { param($Path,$Root) [IO.Directory]::Delete($Path, $true) }
+            function Remove-DirectoryTreeWithHeartbeat {
+                param($Path,$Root)
+                if ([IO.Directory]::Exists($Path)) { [IO.Directory]::Delete($Path, $true) }
+            }
             . ([scriptblock]::Create($functionSource))
         }
         try {
@@ -1000,6 +1145,129 @@ catch [TimeoutException] { [Console]::Out.Write('TIMEOUT') }
             } $root
         }
         finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: Final evidence is already in its deterministic archive while later finalization steps are incomplete.
+    # Purpose: Execute the real evidence validator through the retry call and bind its mandatory repository root.
+    It 'UnitT129A_ValidatesExistingFinalEvidenceWithItsRepositoryRootOnRetry' {
+        $finalizerPath = Join-Path (Join-Path $skillRoot 'scripts') 'Finalize-ModUpdateMerge.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($finalizerPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $validator = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Assert-ModUpdateFinalEvidence'
+        }, $true)
+        $retryCall = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -eq 'Assert-ModUpdateFinalEvidence' -and
+                $node.Extent.StartLineNumber -gt 650 -and $node.Extent.StartLineNumber -lt 720
+        }, $true)
+        $validator | Should -Not -BeNullOrEmpty
+        $retryCall | Should -Not -BeNullOrEmpty
+
+        $repository = Join-Path $TestDrive 'existing-final-evidence-repository'
+        $evidenceFinal = Join-Path $repository 'AI Auto Update/Finished/.evidence/retry-run'
+        [void][IO.Directory]::CreateDirectory($evidenceFinal)
+        [IO.File]::WriteAllText((Join-Path $evidenceFinal 'state-final.json'),
+            (@{ schemaVersion = 1; runId = 'retry-run'; disposition = 'merge-evidence-archived' } |
+                ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $evidenceFinal 'archive-manifest.json'),
+            (@{ schemaVersion = 1; runId = 'retry-run'; files = @() } |
+                ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        $module = New-Module -ArgumentList $validator.Extent.Text, $retryCall.Extent.Text,
+            (Join-Path $skillRoot 'scripts/PathSafety.psm1') -ScriptBlock {
+            param($validatorSource, $retrySource, $pathSafety)
+            Import-Module $pathSafety -Force
+            function Assert-NoReparseTree { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+            function Assert-MergeFileTuple { param($Path,$Size,$Sha256) }
+            function Assert-ContainedPath { param($Candidate,$Root,$Label) $Candidate }
+            . ([scriptblock]::Create($validatorSource))
+            $script:retrySource = $retrySource
+        }
+        try {
+            & $module {
+                param($evidencePath, $runIdentifier, $repositoryPath)
+                $evidenceFinal = $evidencePath
+                $runId = $runIdentifier
+                $repository = $repositoryPath
+                { & ([scriptblock]::Create($script:retrySource)) } | Should -Not -Throw
+            } $evidenceFinal 'retry-run' $repository
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: Terminal-owner recovery receives differently-cased aliases on a case-insensitive native filesystem.
+    # Purpose: Accept aliases that the filesystem identifies as the same repository, state, run, and lock paths.
+    if ($IsWindows) {
+        It 'InterT129B_RecoversTerminalOwnerThroughCaseInsensitivePathAliases' {
+            $parent = Join-Path $TestDrive 'terminal-owner-alias'
+            $repository = Join-Path $parent 'CaseRepository'
+            $repositoryAlias = Join-Path $parent 'caserepository'
+            $runRoot = Join-Path $repository 'AI Auto Update/In Progress/CaseRun'
+            $statePath = Join-Path $runRoot 'state.json'
+            $stateAlias = Join-Path $repositoryAlias 'ai auto update/in progress/caserun/STATE.JSON'
+            $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod'
+            [void][IO.Directory]::CreateDirectory($lockRoot)
+            $lockPath = Join-Path $lockRoot (('a' * 64) + '.lock')
+            [IO.File]::WriteAllText($lockPath, '{}')
+            $evidence = Join-Path $repository 'AI Auto Update/Finished/.evidence/alias-run'
+            $supporting = Join-Path $evidence 'supporting'
+            [void][IO.Directory]::CreateDirectory($supporting)
+            $owner = [ordered]@{
+                runId = 'alias-run'; reservationToken = 'b' * 32; statePath = $statePath
+                cleanup = [ordered]@{ runRoot = $runRoot; evidencePath = $evidence }
+            }
+            $archived = [ordered]@{
+                runId = 'alias-run'; reservationToken = 'b' * 32; repositoryRoot = $repository
+                statePath = $statePath; runRoot = $runRoot; modLockPath = $lockPath
+            }
+            [IO.File]::WriteAllText((Join-Path $supporting 'state-merged.json'),
+                ($archived | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+            $module = New-TerminalOwnerRecoveryModuleForTest -Owner $owner
+            try {
+                $recovered = & $module {
+                    param($repo, $state)
+                    Resolve-ModUpdateFinalizationStateFromOwner -Repository $repo -MissingStatePath $state
+                } $repositoryAlias $stateAlias
+                $recovered.runId | Should -BeExactly 'alias-run'
+            }
+            finally { Remove-Module $module -Force }
+        }
+    }
+
+    # Scenario: Terminal-owner recovery sees case-only sibling repositories on a case-sensitive native filesystem.
+    # Purpose: Keep distinct sibling state and run paths from resolving to the wrong terminal owner.
+    if (-not $IsWindows) {
+        It 'InterT129C_DoesNotRecoverTerminalOwnerFromACaseSensitiveSibling' {
+            $parent = Join-Path $TestDrive 'terminal-owner-siblings'
+            $repository = Join-Path $parent 'CaseRepository'
+            $sibling = Join-Path $parent 'caseRepository'
+            $runRoot = Join-Path $repository 'AI Auto Update/In Progress/CaseRun'
+            $siblingRunRoot = Join-Path $sibling 'AI Auto Update/In Progress/CaseRun'
+            $statePath = Join-Path $runRoot 'state.json'
+            $siblingStatePath = Join-Path $siblingRunRoot 'state.json'
+            $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod'
+            [void][IO.Directory]::CreateDirectory($lockRoot)
+            [void][IO.Directory]::CreateDirectory($siblingRunRoot)
+            $lockPath = Join-Path $lockRoot (('a' * 64) + '.lock')
+            [IO.File]::WriteAllText($lockPath, '{}')
+            $owner = [ordered]@{
+                runId = 'sibling-run'; reservationToken = 'b' * 32; statePath = $siblingStatePath
+                cleanup = [ordered]@{ runRoot = $siblingRunRoot; evidencePath = (Join-Path $sibling 'evidence') }
+            }
+            $module = New-TerminalOwnerRecoveryModuleForTest -Owner $owner
+            try {
+                { & $module {
+                        param($repo, $state)
+                        Resolve-ModUpdateFinalizationStateFromOwner -Repository $repo -MissingStatePath $state
+                    } $repository $statePath } | Should -Throw '*exactly one terminal reservation owner*'
+            }
+            finally { Remove-Module $module -Force }
+        }
     }
 
     Context 'Released finalization through the formal command entry' {
@@ -1878,6 +2146,7 @@ function Suspend-Stage {
         $runner | Should -Match 'function Read-FileBytesWithHeartbeat'
         $runner | Should -Match 'function Copy-FileWithHeartbeat'
         $runner | Should -Match 'function Remove-DirectoryTreeWithHeartbeat'
+        $runner | Should -Match '\$quarantine = \$removalRoot \+ ''\.codex-removal'''
         $runner | Should -Match '\[IO\.Directory\]::Move\(\$removalRoot, \$quarantine\)'
         $runner | Should -Match 'Assert-NoReparseTree -Path \$quarantine -Root \$containmentRoot'
         $runner | Should -Match 'Assert-NoReparsePath -Path \$item\.FullName -Root \$quarantine'

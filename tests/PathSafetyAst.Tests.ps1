@@ -339,7 +339,7 @@ skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUp
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|IO.File::Move|1
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|New-Item|3
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|Test-Path|11
-skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Remove-ModUpdateOwnedDirectory|Test-Path|2
+skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Remove-ModUpdateOwnedDirectory|Test-Path|3
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Resolve-ModUpdateFinalizationStateFromOwner|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|<script>|Test-Path|3
 skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|Read-QueueTextWithHeartbeat|IO.File::Open|1
@@ -392,11 +392,14 @@ skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Get-FileSha256|IO
 
 # Pure reads/non-filesystem provider operations retained under an already-held owner guard.
 $pureReadExclusions = @'
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.Directory::Exists|4
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.Directory::GetFileSystemEntries|1
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.File::Exists|2
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.Directory::Exists|2
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.File::Delete|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.File::Exists|4
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|type::IO.DirectoryInfo|1
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableTransactionResidue|IO.Directory::GetFileSystemEntries|1
+skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.Directory::Exists|4
+skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.File::Exists|4
 scripts/StandardSourceDriver.psm1|Get-DarktideActiveSkillIds|Get-ChildItem|1
 scripts/StandardSourceDriver.psm1|Get-DarktideOwnedProcessEnvironment|Get-ChildItem|1
 scripts/StandardSourceDriver.psm1|Get-DarktideSourceResolverEnvironment|Remove-Item|1

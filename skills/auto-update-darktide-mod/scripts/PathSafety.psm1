@@ -68,52 +68,42 @@ function Get-PortablePathComparison {
         $null
     }
 
-    $probePath = $probeRoot
-    $probeIsDirectory = $true
-    $trimmedRoot = [IO.Path]::TrimEndingDirectorySeparator($probeRoot)
-    $probeLeaf = [IO.Path]::GetFileName($trimmedRoot)
+    $probeLeaf = ".casecheck-$([guid]::NewGuid().ToString('N'))"
+    $probePath = Join-Path $probeRoot $probeLeaf
     $variantLeaf = & $flipCase $probeLeaf
-    if ([string]::IsNullOrEmpty($variantLeaf)) {
-        foreach ($entry in [IO.Directory]::GetFileSystemEntries($probeRoot)) {
-            $entryLeaf = [IO.Path]::GetFileName([IO.Path]::TrimEndingDirectorySeparator($entry))
-            $entryVariant = & $flipCase $entryLeaf
-            if ([string]::IsNullOrEmpty($entryVariant)) { continue }
-            $probePath = $entry
-            $probeIsDirectory = [IO.Directory]::Exists($entry)
-            $probeLeaf = $entryLeaf
-            $variantLeaf = $entryVariant
-            break
-        }
-    }
-
+    $variantPath = Join-Path $probeRoot $variantLeaf
     $temporaryProbe = $null
-    if ([string]::IsNullOrEmpty($variantLeaf)) {
-        $probeLeaf = ".portable-case-probe-$([guid]::NewGuid().ToString('N')).tmp"
-        $probePath = Join-Path $probeRoot $probeLeaf
-        $temporaryProbe = [IO.FileStream]::new(
+    try {
+        $temporaryProbe = [IO.File]::Open(
             $probePath,
             [IO.FileMode]::CreateNew,
             [IO.FileAccess]::ReadWrite,
-            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete),
-            1,
-            [IO.FileOptions]::DeleteOnClose)
-        $probeIsDirectory = $false
-        $variantLeaf = & $flipCase $probeLeaf
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $temporaryProbe.Flush($true)
+    }
+    catch {
+        if ($null -ne $temporaryProbe) { $temporaryProbe.Dispose() }
+        throw [IO.IOException]::new(
+            "Unable to create filesystem case-sensitivity probe in root: $probeRoot",
+            $_.Exception)
     }
 
     try {
-        $probeParent = [IO.Path]::GetDirectoryName($probePath)
-        if ([string]::IsNullOrEmpty($probeParent)) { $probeParent = $probeRoot }
-        $variantPath = Join-Path $probeParent $variantLeaf
-        $caseInsensitive = if ($probeIsDirectory) {
-            [IO.Directory]::Exists($variantPath)
-        }
-        else {
-            [IO.File]::Exists($variantPath)
-        }
+        $caseInsensitive = [IO.File]::Exists($variantPath)
     }
     finally {
-        if ($null -ne $temporaryProbe) { $temporaryProbe.Dispose() }
+        $temporaryProbe.Dispose()
+        try {
+            [IO.File]::Delete($probePath)
+            if ([IO.File]::Exists($probePath) -or [IO.File]::Exists($variantPath)) {
+                throw [IO.IOException]::new('The filesystem case-sensitivity probe remains after deletion.')
+            }
+        }
+        catch {
+            throw [IO.IOException]::new(
+                "Filesystem case-sensitivity probe cleanup failed for root: $probeRoot",
+                $_.Exception)
+        }
     }
 
     $comparison = if ($caseInsensitive) {

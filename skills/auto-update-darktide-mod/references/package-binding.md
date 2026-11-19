@@ -30,7 +30,7 @@ Never look for these packaged references in the target MOD repository. The targe
 
 ## Local platform primitives
 
-`scripts/PathSafety.psm1` uses only PowerShell and .NET APIs available on Windows, Linux, and macOS. It opens coordination locks with `FileShare.None`, publishes flushed temporary files with a same-directory `File.Move`, applies `GetFullPath` containment with Windows-insensitive or Unix-sensitive comparison, and recognizes only its fixed publication-temporary names as crash residue. The package does not carry or load a separate platform runtime.
+`scripts/PathSafety.psm1` uses only PowerShell and .NET APIs available on Windows, Linux, and macOS. It opens coordination locks with `FileShare.None`, publishes flushed temporary files with a same-directory `File.Move`, and applies `GetFullPath` containment with the actual case semantics probed inside the applicable filesystem root. It recognizes only its fixed publication-temporary names as crash residue. The package does not carry or load a separate platform runtime.
 
 ## Schema 15 extension binding
 

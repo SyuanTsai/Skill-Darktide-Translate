@@ -31,6 +31,8 @@ Before rolling back or forward across this format boundary, stop every process t
 
 An absent shared single-file owner accompanied by a recognizable `.<owner-leaf>.publish-<guid>.tmp` in `.locks`, or an absent MOD owner accompanied by the matching owner-leaf temporary in `.locks/mod`, is not the legacy directory format. The owner-update guard reports `BLOCKED: incomplete owner publication residue exists under '<relative-lock-root>' (...)`. Keep the affected shared namespace or MOD reservation stopped and follow **Manual recovery for incomplete owner publication** in `skills/auto-update-darktide-mod/references/automation.md` before any rollback or forward retry; a temporary for a different MOD does not block this MOD.
 
+An interrupted owner-checked directory cleanup can retain the exact sibling `<owned-directory>.codex-removal`. A same-version retry resumes that quarantine before advancing the persisted cleanup step. If both names exist, either name is not an ordinary owned directory, or deletion fails, keep the reservation cleanup-pending and follow **Manual recovery for interrupted directory cleanup** in `skills/auto-update-darktide-mod/references/automation.md`; never delete a broader claim or `In Progress` root.
+
 ## Safe fallback
 
 If the pinned Workflow, Review Baseline, Schema 15 extension, package binding, source commit, or content hash cannot be verified, treat the Skill as unavailable for new claims. Preserve existing run state, source archives, receipts, acquisition records, reservations, worktrees, branches, PRs, and evidence until the original tuple can be restored.

@@ -359,7 +359,9 @@ $mergedFull = if ([string]::IsNullOrWhiteSpace($RunRoot)) { Assert-RegularFile -
     else { Assert-NoReparsePath -Path $MergedPath -Root $RunRoot -Label 'Merged localization evidence' }
 if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
     $runRootFull = [IO.Path]::GetFullPath($RunRoot)
-    if ($worksetFull -cne [IO.Path]::GetFullPath((Join-Path $runRootFull 'review-artifacts/localization-workset.json')) -or
+    $expectedWorksetPath = [IO.Path]::GetFullPath((Join-Path $runRootFull 'review-artifacts/localization-workset.json'))
+    if (-not $worksetFull.Equals(
+            $expectedWorksetPath, (Get-PortablePathComparison -Paths @($expectedWorksetPath, $worksetFull))) -or
         (Split-Path -Leaf $newFull) -cne 'new.lua' -or (Split-Path -Leaf $mergedFull) -cne 'merged.lua') {
         throw 'Localization receipt verification requires the fixed run-local artifact paths.'
     }
@@ -391,7 +393,9 @@ if ($bindingValueCount -eq 3) {
     }
     if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
         $expectedStagingRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $RunRoot 'staging/localization-workset-input') (Split-Path -Leaf $normalizedExpectedModPath)))
-        if ([IO.Path]::GetFullPath([string]$workset.new.root) -cne $expectedStagingRoot) {
+        if (-not ([IO.Path]::GetFullPath([string]$workset.new.root)).Equals(
+                $expectedStagingRoot,
+                (Get-PortablePathComparison -Paths @($expectedStagingRoot, [string]$workset.new.root)))) {
             throw 'Localization workset NEW root differs from the fixed run-local staging path.'
         }
         $stagedOutput = [IO.Path]::GetFullPath([string]$workset.new.path)

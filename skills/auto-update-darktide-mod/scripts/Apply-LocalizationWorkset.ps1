@@ -325,7 +325,8 @@ foreach ($unit in @($workset.units)) {
 $expectedStagingParent = [IO.Path]::GetFullPath((Join-Path $worksetRunRoot 'staging/localization-workset-input'))
 $expectedStagingRoot = [IO.Path]::GetFullPath((Join-Path $expectedStagingParent (Split-Path -Leaf ([string]$workset.modRelativePath))))
 $recordedStagingRoot = [IO.Path]::GetFullPath([string]$workset.new.root)
-if ($recordedStagingRoot -cne $expectedStagingRoot) {
+if (-not $recordedStagingRoot.Equals(
+        $expectedStagingRoot, (Get-PortablePathComparison -Paths @($expectedStagingRoot, $recordedStagingRoot)))) {
     throw 'Workset NEW root differs from its fixed run-local staging path.'
 }
 $newPath = Assert-ContainedPath -Candidate ([string]$workset.new.path) -Root ([string]$workset.new.root)
