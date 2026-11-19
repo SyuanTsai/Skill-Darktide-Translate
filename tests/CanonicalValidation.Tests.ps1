@@ -1128,7 +1128,12 @@ function Invoke-NativeChecked {
                     id = 'AE1'
                     severity = 'HIGH'
                     location = [ordered]@{ file = 'SKILL.md'; start_line = 22 }
-                    finding = 'unsafe token=fixture-super-secret-value reference'
+                    finding = 'scanner-controlled xoxb-fixture-super-secret-value message'
+                }, [ordered]@{
+                    id = 'invalid rule value'
+                    severity = 'HIGH/unsafe'
+                    location = [ordered]@{ file = '../../xoxb-outside-secret.txt'; start_line = 23 }
+                    finding = 'second scanner-controlled xoxb-another-super-secret-value message'
                 })
                 analysis_completeness = [ordered]@{
                     execution_successful = $true
@@ -1138,6 +1143,9 @@ function Invoke-NativeChecked {
                     ledger_exceptions = @([ordered]@{
                         outcome = 'partial'
                         path = 'scripts/mod-update.ps1'
+                    }, [ordered]@{
+                        outcome = 'partial'
+                        path = '../../xoxb-partial-secret.txt'
                     })
                     scope_exclusions = @()
                     limitations = @()
@@ -1164,6 +1172,7 @@ function Invoke-NativeChecked {
                 [void](Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
                     -ReportPath $reportPath -StandardErrorPath $stderrPath -Context 'fixture static scan' `
                     -DiagnosticRoot $root -ChildWritableRoot $root `
+                    -ExpectedInventoryPaths @('SKILL.md', 'scripts/mod-update.ps1') `
                     -ExitCodeResult ([ref]$exitCode) -ExitOneSummaryResult ([ref]$summary))
                 Assert-SkillSpectorScanExitCode -ExitCode $exitCode -Context 'fixture static scan' `
                     -ExitOneSummary $summary
@@ -1173,11 +1182,12 @@ function Invoke-NativeChecked {
 
         $failure | Should -Not -BeNullOrEmpty
         $failure.Message | Should -Match 'exited with code 1 after its report was evaluated'
+        $failure.Message | Should -Match 'findings=2'
         $failure.Message | Should -Match 'rule=AE1; severity=HIGH; file=SKILL\.md:22'
-        $failure.Message | Should -Match 'message=unsafe token=\[redacted\] reference'
-        $failure.Message | Should -Match 'completeness=81\.4%; partialFiles=1; riskScore=95'
+        $failure.Message | Should -Match 'rule=<invalid>; severity=<invalid>; file=<unknown-file>:23'
+        $failure.Message | Should -Match 'completeness=81\.4%; partialFiles=2; riskScore=95'
         $failure.Message | Should -Match 'partialFileList=scripts/mod-update\.ps1'
-        $failure.Message | Should -Not -Match 'fixture-super-secret-value'
+        $failure.Message | Should -Not -Match 'scanner-controlled|message=|xoxb-|outside-secret'
         $failure.Message.Length | Should -BeLessOrEqual 8192
     }
 
@@ -1187,7 +1197,8 @@ function Invoke-NativeChecked {
             Set-SkillSpectorNativeFixture -ExitCode 1 -StandardOutput '{invalid-json'
             Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
                 -ReportPath (Join-Path $root 'invalid.json') -StandardErrorPath (Join-Path $root 'invalid.stderr.txt') `
-                -Context 'fixture invalid scan' -DiagnosticRoot $root -ChildWritableRoot $root
+                -Context 'fixture invalid scan' -DiagnosticRoot $root -ChildWritableRoot $root `
+                -ExpectedInventoryPaths @('SKILL.md')
         } $TestDrive } | Should -Throw '*not valid unambiguous UTF-8 JSON*'
     }
 
@@ -1200,6 +1211,7 @@ function Invoke-NativeChecked {
             $report = Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
                 -ReportPath (Join-Path $root 'clean.json') -StandardErrorPath (Join-Path $root 'clean.stderr.txt') `
                 -Context 'fixture clean scan' -DiagnosticRoot $root -ChildWritableRoot $root `
+                -ExpectedInventoryPaths @('SKILL.md') `
                 -ExitCodeResult ([ref]$exitCode) -ExitOneSummaryResult ([ref]$summary)
             [pscustomobject]@{ report = $report; exitCode = $exitCode; summary = $summary }
         } $TestDrive
@@ -1215,7 +1227,8 @@ function Invoke-NativeChecked {
             Set-SkillSpectorNativeFixture -ExitCode 2 -StandardOutput $json
             Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
                 -ReportPath (Join-Path $root 'exit-two.json') -StandardErrorPath (Join-Path $root 'exit-two.stderr.txt') `
-                -Context 'fixture execution error' -DiagnosticRoot $root -ChildWritableRoot $root
+                -Context 'fixture execution error' -DiagnosticRoot $root -ChildWritableRoot $root `
+                -ExpectedInventoryPaths @('SKILL.md')
         } $TestDrive (New-SkillSpectorExitOneFixtureJson) } | Should -Throw '*exited with code 2*'
     }
 }

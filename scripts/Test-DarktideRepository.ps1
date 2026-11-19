@@ -237,36 +237,105 @@ function Get-DarktideSkillInventory {
 }
 
 function Assert-DarktideProfileCatalog {
-    param([Parameter(Mandatory)][string] $Root)
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)] $SourceInventory
+    )
 
     $catalog = Read-DarktideJson -Path (Join-Path $Root 'catalog/profiles.json')
     Assert-DarktideExactPropertySet -Value $catalog -Expected @('schemaVersion', 'catalogId', 'sources', 'profiles', 'skills') -Context 'catalog/profiles.json'
-    if ([int64]$catalog.schemaVersion -ne 1 -or [string]$catalog.catalogId -cne 'darktide-translate' -or
-        @($catalog.sources).Count -ne 1 -or @($catalog.profiles).Count -ne 1 -or @($catalog.skills).Count -ne 1) {
-        throw 'Profile catalog top-level identity is invalid.'
+    if (($catalog.schemaVersion -isnot [int] -and $catalog.schemaVersion -isnot [long]) -or [int64]$catalog.schemaVersion -ne 1) {
+        throw 'catalog/profiles.json schemaVersion must be integer 1.'
+    }
+    if ($catalog.catalogId -isnot [string] -or [string]$catalog.catalogId -cne 'darktide-translate') {
+        throw 'catalog/profiles.json catalogId must be exact string darktide-translate.'
+    }
+
+    if ($catalog.sources -isnot [array] -or @($catalog.sources).Count -ne 1) {
+        throw 'Profile catalog must contain exactly one source.'
     }
     $source = @($catalog.sources)[0]
-    Assert-DarktideExactPropertySet -Value $source -Expected @('id', 'repository') -Context 'catalog source'
-    if ([string]$source.id -cne 'darktide-translate' -or
-        [string]$source.repository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git') {
+    Assert-DarktideExactPropertySet -Value $source -Expected @('id', 'repository') -Context 'catalog/profiles.json source'
+    if ($source.id -isnot [string] -or [string]$source.id -cne 'darktide-translate' -or
+        $source.repository -isnot [string] -or [string]$source.repository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git') {
         throw 'Profile catalog source identity is invalid.'
     }
+
+    if ($catalog.profiles -isnot [array] -or @($catalog.profiles).Count -ne 1) {
+        throw 'Profile catalog must contain exactly one profile.'
+    }
     $profile = @($catalog.profiles)[0]
-    Assert-DarktideExactPropertySet -Value $profile -Expected @('id', 'description', 'default', 'includes', 'excludes') -Context 'catalog profile'
-    if ([string]$profile.id -cne 'darktide-mod-maintenance' -or $profile.default -ne $false -or
-        (@($profile.includes) -join "`n") -cne 'auto-update-darktide-mod' -or @($profile.excludes).Count -ne 0) {
-        throw 'Profile catalog profile is invalid.'
+    Assert-DarktideExactPropertySet -Value $profile -Expected @('id', 'description', 'default', 'includes', 'excludes') -Context 'catalog/profiles.json profile'
+    if ($profile.id -isnot [string] -or [string]$profile.id -cne 'darktide-mod-maintenance' -or
+        $profile.description -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$profile.description) -or
+        $profile.default -isnot [bool] -or $profile.default -ne $false -or
+        $profile.includes -isnot [array] -or @($profile.includes).Count -ne 1 -or
+        [string]@($profile.includes)[0] -cne 'auto-update-darktide-mod' -or
+        $profile.excludes -isnot [array] -or @($profile.excludes).Count -ne 0) {
+        throw 'Profile catalog profile identity or membership is invalid.'
+    }
+
+    if ($catalog.skills -isnot [array] -or @($catalog.skills).Count -ne 1) {
+        throw 'Profile catalog must contain exactly one Skill.'
     }
     $skill = @($catalog.skills)[0]
-    Assert-DarktideExactPropertySet -Value $skill -Expected @('id', 'group', 'source', 'profiles', 'compatibility', 'dependencies', 'lifecycle') -Context 'catalog Skill'
-    if ([string]$skill.id -cne 'auto-update-darktide-mod' -or [string]$skill.group -cne 'darktide-mod-maintenance' -or
-        (@($skill.profiles) -join "`n") -cne 'darktide-mod-maintenance' -or @($skill.dependencies).Count -ne 0) {
-        throw 'Profile catalog Skill identity is invalid.'
+    Assert-DarktideExactPropertySet -Value $skill -Expected @('id', 'group', 'source', 'profiles', 'compatibility', 'dependencies', 'lifecycle') -Context 'catalog/profiles.json Skill'
+    if ($skill.id -isnot [string] -or [string]$skill.id -cne 'auto-update-darktide-mod' -or
+        $skill.group -isnot [string] -or [string]$skill.group -cne [string]$profile.id -or
+        $skill.profiles -isnot [array] -or @($skill.profiles).Count -ne 1 -or
+        [string]@($skill.profiles)[0] -cne [string]$profile.id -or
+        @($SourceInventory.skills) -cnotcontains [string]$skill.id) {
+        throw 'Profile catalog Skill identity or profile binding is invalid.'
     }
-    Assert-DarktideExactPropertySet -Value $skill.source -Expected @('sourceId', 'path') -Context 'catalog Skill source'
-    if ([string]$skill.source.sourceId -cne 'darktide-translate' -or
-        [string]$skill.source.path -cne 'skills/auto-update-darktide-mod') {
-        throw 'Profile catalog Skill source is invalid.'
+    Assert-DarktideExactPropertySet -Value $skill.source -Expected @('sourceId', 'path') -Context 'catalog/profiles.json Skill source'
+    if ($skill.source.sourceId -isnot [string] -or [string]$skill.source.sourceId -cne [string]$source.id -or
+        $skill.source.path -isnot [string] -or [string]$skill.source.path -cne "skills/$($skill.id)") {
+        throw 'Profile catalog Skill source binding is invalid.'
+    }
+    if ($skill.dependencies -isnot [array] -or @($skill.dependencies).Count -ne 0) {
+        throw 'Profile catalog Skill dependencies must be empty.'
+    }
+
+    Assert-DarktideExactPropertySet -Value $skill.lifecycle -Expected @('status', 'aliases') -Context 'catalog/profiles.json Skill lifecycle'
+    if ($skill.lifecycle.status -isnot [string] -or [string]$skill.lifecycle.status -cne 'active' -or
+        $skill.lifecycle.aliases -isnot [array] -or @($skill.lifecycle.aliases).Count -ne 0) {
+        throw 'Profile catalog Skill lifecycle is invalid.'
+    }
+
+    Assert-DarktideExactPropertySet -Value $skill.compatibility -Expected @('platforms', 'shells', 'requiredCapabilities', 'anyOfCapabilities') -Context 'catalog/profiles.json Skill compatibility'
+    if ($skill.compatibility.platforms -isnot [array] -or @($skill.compatibility.platforms).Count -ne 1 -or
+        [string]@($skill.compatibility.platforms)[0] -cne 'windows' -or
+        $skill.compatibility.shells -isnot [array] -or @($skill.compatibility.shells).Count -ne 1 -or
+        [string]@($skill.compatibility.shells)[0] -cne 'pwsh>=7') {
+        throw 'Profile catalog Skill platform compatibility is invalid.'
+    }
+
+    if ($skill.compatibility.requiredCapabilities -isnot [array] -or @($skill.compatibility.requiredCapabilities).Count -ne 1) {
+        throw 'Profile catalog Skill must declare exactly one required capability.'
+    }
+    $requiredCapability = @($skill.compatibility.requiredCapabilities)[0]
+    Assert-DarktideExactPropertySet -Value $requiredCapability -Expected @('kind', 'id', 'state') -Context 'catalog/profiles.json required capability'
+    if ($requiredCapability.kind -isnot [string] -or [string]$requiredCapability.kind -cne 'command' -or
+        $requiredCapability.id -isnot [string] -or [string]$requiredCapability.id -cne 'git' -or
+        $requiredCapability.state -isnot [string] -or [string]$requiredCapability.state -cne 'available') {
+        throw 'Profile catalog required capability is invalid.'
+    }
+
+    if ($skill.compatibility.anyOfCapabilities -isnot [array] -or @($skill.compatibility.anyOfCapabilities).Count -ne 2) {
+        throw 'Profile catalog Skill must declare exactly two alternative capabilities.'
+    }
+    $alternativeCapabilityKeys = @()
+    foreach ($capability in @($skill.compatibility.anyOfCapabilities)) {
+        Assert-DarktideExactPropertySet -Value $capability -Expected @('kind', 'id', 'state') -Context 'catalog/profiles.json alternative capability'
+        if ($capability.kind -isnot [string] -or $capability.id -isnot [string] -or $capability.state -isnot [string]) {
+            throw 'Profile catalog alternative capability contract is invalid.'
+        }
+        $alternativeCapabilityKeys += "{0}|{1}|{2}" -f $capability.kind, $capability.id, $capability.state
+    }
+    foreach ($expectedCapability in @('connector|github|configured', 'command|gh|authenticated')) {
+        if ($alternativeCapabilityKeys -cnotcontains $expectedCapability) {
+            throw 'Profile catalog alternative capability contract is invalid.'
+        }
     }
 }
 
@@ -282,16 +351,19 @@ function Assert-DarktideConsumerConfiguration {
 
     $pin = Read-DarktideJson -Path $pinPath
     Assert-DarktideExactPropertySet -Value $pin -Expected @('schemaVersion', 'repository', 'commit') -Context 'authority pin'
-    if ([int64]$pin.schemaVersion -ne 1 -or
-        [string]$pin.repository -cne 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git' -or
-        [string]$pin.commit -cnotmatch '^[0-9a-f]{40}$') {
+    if (($pin.schemaVersion -isnot [int] -and $pin.schemaVersion -isnot [long]) -or [int64]$pin.schemaVersion -ne 1 -or
+        $pin.repository -isnot [string] -or [string]$pin.repository -cne 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git' -or
+        $pin.commit -isnot [string] -or [string]$pin.commit -cnotmatch '^[0-9a-f]{40}$') {
         throw 'Consumer authority pin is invalid.'
     }
     $gate = Read-DarktideJson -Path $gatePath
     Assert-DarktideExactPropertySet -Value $gate -Expected @('schemaVersion', 'repositoryId', 'sourceRepository', 'activeSkills', 'repositoryChecks') -Context 'consumer gate'
-    if ([int64]$gate.schemaVersion -ne 1 -or [string]$gate.repositoryId -cne 'skill-darktide-translate' -or
-        [string]$gate.sourceRepository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git' -or
-        (@($gate.activeSkills) -join "`n") -cne 'auto-update-darktide-mod') {
+    if (($gate.schemaVersion -isnot [int] -and $gate.schemaVersion -isnot [long]) -or [int64]$gate.schemaVersion -ne 1 -or
+        $gate.repositoryId -isnot [string] -or [string]$gate.repositoryId -cne 'skill-darktide-translate' -or
+        $gate.sourceRepository -isnot [string] -or [string]$gate.sourceRepository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git' -or
+        $gate.activeSkills -isnot [array] -or @($gate.activeSkills).Count -ne 1 -or
+        [string]@($gate.activeSkills)[0] -cne 'auto-update-darktide-mod' -or
+        $gate.repositoryChecks -isnot [array]) {
         throw 'Consumer gate identity is invalid.'
     }
     $checks = @($gate.repositoryChecks)
@@ -302,6 +374,9 @@ function Assert-DarktideConsumerConfiguration {
     )
     $actual = foreach ($check in $checks) {
         Assert-DarktideExactPropertySet -Value $check -Expected @('id', 'kind', 'path') -Context 'consumer repository check'
+        if ($check.id -isnot [string] -or $check.kind -isnot [string] -or $check.path -isnot [string]) {
+            throw 'Consumer repository checks are invalid or out of order.'
+        }
         '{0}|{1}|{2}' -f [string]$check.id, [string]$check.kind, [string]$check.path
     }
     if (($actual -join "`n") -cne ($expected -join "`n")) { throw 'Consumer repository checks are invalid or out of order.' }
@@ -334,12 +409,40 @@ if (-not [IO.Path]::GetFullPath($gitRoot).Equals($repoRoot, $comparison)) {
 
 $source = Read-DarktideJson -Path (Join-Path $repoRoot 'catalog/source.json')
 Assert-DarktideExactPropertySet -Value $source -Expected @('schemaVersion', 'sourceId', 'repository', 'skillsRoot', 'skills') -Context 'catalog/source.json'
-if ([int64]$source.schemaVersion -ne 2 -or [string]$source.sourceId -cne 'darktide-translate' -or
-    [string]$source.repository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git' -or
-    [string]$source.skillsRoot -cne 'skills' -or (@($source.skills) -join "`n") -cne 'auto-update-darktide-mod') {
+if (($source.schemaVersion -isnot [int] -and $source.schemaVersion -isnot [long]) -or [int64]$source.schemaVersion -ne 2) {
+    throw 'catalog/source.json schemaVersion must be integer 2.'
+}
+if ($source.sourceId -isnot [string] -or [string]$source.sourceId -cne 'darktide-translate') {
+    throw "catalog/source.json sourceId must be exact string 'darktide-translate'."
+}
+if ($source.repository -isnot [string] -or [string]$source.repository -cne 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git') {
+    throw 'catalog/source.json repository identity is invalid.'
+}
+if ($source.skillsRoot -isnot [string] -or [string]$source.skillsRoot -cne 'skills') {
+    throw "catalog/source.json skillsRoot must be exact string 'skills'."
+}
+if ($source.skills -isnot [array] -or @($source.skills).Count -eq 0) {
+    throw 'catalog/source.json skills must be a non-empty array.'
+}
+$skillIds = @($source.skills | ForEach-Object {
+    if ($_ -isnot [string] -or [string]$_ -cnotmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$' -or ([string]$_).Length -gt 64) {
+        throw "Invalid Skill ID in source inventory: '$_'."
+    }
+    [string]$_
+})
+[string[]]$sortedSkillIds = @($skillIds)
+[Array]::Sort($sortedSkillIds, [StringComparer]::Ordinal)
+$uniqueSkillIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($skillId in $skillIds) {
+    if (-not $uniqueSkillIds.Add($skillId)) { throw "Duplicate Skill ID '$skillId'." }
+}
+if (($skillIds -join "`n") -cne ($sortedSkillIds -join "`n")) {
+    throw 'catalog/source.json skills must use ordinal ascending order.'
+}
+if ($skillIds.Count -ne 1 -or $skillIds[0] -cne 'auto-update-darktide-mod') {
     throw 'Source inventory identity is invalid.'
 }
-Assert-DarktideProfileCatalog -Root $repoRoot
+Assert-DarktideProfileCatalog -Root $repoRoot -SourceInventory $source
 $layout = Assert-DarktideConsumerConfiguration -Root $repoRoot
 
 $skillsRoot = Join-Path $repoRoot 'skills'
