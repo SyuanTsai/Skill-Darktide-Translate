@@ -1132,10 +1132,30 @@ function Invoke-NativeChecked {
                     location = [ordered]@{ file = 'SKILL.md'; start_line = 22 }
                     finding = 'scanner-controlled xoxb-fixture-super-secret-value message'
                 }, [ordered]@{
-                    id = 'invalid rule value'
-                    severity = 'HIGH/unsafe'
+                    id = 'xoxb-0000-fake'
+                    severity = 'xoxb-0000-fake'
                     location = [ordered]@{ file = '../../xoxb-outside-secret.txt'; start_line = 23 }
                     finding = 'second scanner-controlled xoxb-another-super-secret-value message'
+                }, [ordered]@{
+                    id = 'ghp_000000000000000000000000000000000000'
+                    severity = 'LOW'
+                    location = [ordered]@{ file = 'SKILL.md'; start_line = 24 }
+                    finding = 'third scanner-controlled message'
+                }, [ordered]@{
+                    id = 'AE-1'
+                    severity = 'MEDIUM'
+                    location = [ordered]@{ file = 'SKILL.md'; start_line = 25 }
+                    finding = 'fourth scanner-controlled message'
+                }, [ordered]@{
+                    id = 'AE_1'
+                    severity = 'CRITICAL'
+                    location = [ordered]@{ file = 'SKILL.md'; start_line = 26 }
+                    finding = 'fifth scanner-controlled message'
+                }, [ordered]@{
+                    id = 'ae1'
+                    severity = 'HIGH'
+                    location = [ordered]@{ file = 'SKILL.md'; start_line = 27 }
+                    finding = 'sixth scanner-controlled message'
                 })
                 analysis_completeness = [ordered]@{
                     execution_successful = $true
@@ -1184,12 +1204,17 @@ function Invoke-NativeChecked {
 
         $failure | Should -Not -BeNullOrEmpty
         $failure.Message | Should -Match 'exited with code 1 after its report was evaluated'
-        $failure.Message | Should -Match 'findings=2'
+        $failure.Message | Should -Match 'findings=6'
         $failure.Message | Should -Match 'rule=AE1; severity=HIGH; file=SKILL\.md:22'
-        $failure.Message | Should -Match 'rule=<invalid>; severity=<invalid>; file=<unknown-file>:23'
+        $failure.Message | Should -Match 'rule=<unrecognized>; severity=<unrecognized>; file=<unknown-file>:23'
+        $failure.Message | Should -Match 'rule=<unrecognized>; severity=LOW; file=SKILL\.md:24'
+        $failure.Message | Should -Match 'rule=<unrecognized>; severity=MEDIUM; file=SKILL\.md:25'
+        $failure.Message | Should -Match 'rule=<unrecognized>; severity=CRITICAL; file=SKILL\.md:26'
+        $failure.Message | Should -Match 'rule=<unrecognized>; severity=HIGH; file=SKILL\.md:27'
         $failure.Message | Should -Match 'completeness=81\.4%; partialFiles=2; riskScore=95'
         $failure.Message | Should -Match 'partialFileList=scripts/mod-update\.ps1'
-        $failure.Message | Should -Not -Match 'scanner-controlled|message=|xoxb-|outside-secret'
+        $failure.Message | Should -Not -Match 'scanner-controlled|message=|xoxb-|ghp_|AE-1|AE_1|outside-secret'
+        $failure.Message.IndexOf('ae1', [StringComparison]::Ordinal) | Should -Be -1
         $failure.Message.Length | Should -BeLessOrEqual 8192
     }
 

@@ -3588,6 +3588,33 @@ function Get-SkillSpectorExitOneSummary {
     $safeContext = ConvertTo-BoundedSkillSpectorDiagnosticText -Value $Context -MaximumLength 128
     $safeCoverage = [Convert]::ToString($coverage, [Globalization.CultureInfo]::InvariantCulture)
     $safeRiskScore = [Convert]::ToString($riskScore, [Globalization.CultureInfo]::InvariantCulture)
+    # SkillSpector 2.13.4 deterministic rule identifiers. Semantic identifiers
+    # containing punctuation are intentionally not echoed into validation logs.
+    $knownRuleIds = @(
+        'AE1', 'AE2', 'AE3', 'AE4', 'AE5', 'AE6', 'AE7',
+        'AR1', 'AR2', 'AR3',
+        'AS1', 'AS2', 'AS3',
+        'AST1', 'AST2', 'AST3', 'AST4', 'AST5', 'AST6', 'AST7', 'AST8', 'AST9', 'AST10',
+        'BH1', 'BH2', 'BH3', 'BH4',
+        'DS1', 'DS2', 'DS3', 'DS4',
+        'E1', 'E2', 'E3', 'E4', 'E5',
+        'EA1', 'EA2', 'EA3', 'EA4', 'EA5',
+        'LP1', 'LP2', 'LP3', 'LP4',
+        'MP1', 'MP2', 'MP3',
+        'OH1', 'OH2', 'OH3',
+        'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9',
+        'PE1', 'PE2', 'PE3', 'PE4', 'PE5',
+        'RA1', 'RA2',
+        'RP1', 'RP2', 'RP3',
+        'SC1', 'SC2', 'SC3', 'SC4', 'SC5', 'SC6', 'SC7', 'SC8', 'SC9', 'SC10',
+        'SSRF1', 'SSRF2', 'SSRF3',
+        'TM1', 'TM2', 'TM3', 'TM4',
+        'TP1', 'TP2', 'TP3', 'TP4',
+        'TR1', 'TR2', 'TR3',
+        'TT1', 'TT2', 'TT3', 'TT4', 'TT5', 'TT6',
+        'YR1', 'YR2', 'YR3', 'YR4'
+    )
+    $knownSeverities = @('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')
     $lines = [Collections.Generic.List[string]]::new()
     [void]$lines.Add(
         "SkillSpector exit 1 report summary for ${safeContext}: findings=$(@($issues).Count); " +
@@ -3613,8 +3640,8 @@ function Get-SkillSpectorExitOneSummary {
         if ($file -isnot [string] -or -not $lineIsInteger) {
             throw "$Context report contains an invalid finding file or line."
         }
-        $safeRule = if ($rule -cmatch '^[A-Za-z0-9._-]{1,32}$') { $rule } else { '<invalid>' }
-        $safeSeverity = if ($severity -cmatch '^[A-Za-z0-9._-]{1,32}$') { $severity } else { '<invalid>' }
+        $safeRule = if ($knownRuleIds -ccontains $rule) { $rule } else { '<unrecognized>' }
+        $safeSeverity = if ($knownSeverities -ccontains $severity) { $severity } else { '<unrecognized>' }
         $safeFile = if ($inventoryPaths.Contains($file)) { $file } else { '<unknown-file>' }
         $safeLine = [Convert]::ToString($line, [Globalization.CultureInfo]::InvariantCulture)
         [void]$lines.Add("finding[$index]: rule=$safeRule; severity=$safeSeverity; file=${safeFile}:$safeLine")
