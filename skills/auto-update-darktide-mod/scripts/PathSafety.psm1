@@ -108,6 +108,11 @@ function Get-PortablePathComparison {
     $cached = [StringComparison]::Ordinal
     if ($script:PortablePathComparisonByRoot.TryGetValue($probeRoot, [ref]$cached)) { return $cached }
 
+    $filesystemRoot = [IO.Path]::GetPathRoot($probeRoot)
+    if ($probeRoot.Equals($filesystemRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        return Get-PortablePathComparison -Paths @($probeRoot) -Purpose $Purpose
+    }
+
     $probeLeaf = ".casecheck-$([guid]::NewGuid().ToString('N'))"
     $probePath = Join-Path $probeRoot $probeLeaf
     $variantLeaf = & $flipCase $probeLeaf

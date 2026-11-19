@@ -46,12 +46,19 @@ function Assert-ContainedPath {
 }
 
 function Assert-NoReparsePath {
-    param([string] $Path, [string] $Root, [string] $Label, [switch] $AllowMissingLeaf)
+    param(
+        [string] $Path,
+        [string] $Root,
+        [string] $Label,
+        [switch] $AllowMissingLeaf,
+        [string] $ComparisonRoot
+    )
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    $comparison = Get-PortablePathComparison -Root $rootFull
+    $comparisonSource = if ([string]::IsNullOrWhiteSpace($ComparisonRoot)) { $rootFull } else { [IO.Path]::GetFullPath($ComparisonRoot) }
+    $comparison = Get-PortablePathComparison -Root $comparisonSource
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Label escapes its physical verification root."
@@ -102,7 +109,7 @@ function Write-Result {
 }
 
 $stateFull = [IO.Path]::GetFullPath($StatePath)
-Assert-NoReparsePath -Path $stateFull -Root ([IO.Path]::GetPathRoot($stateFull)) -Label 'Schema 15 state'
+Assert-NoReparsePath -Path $stateFull -Root ([IO.Path]::GetPathRoot($stateFull)) -Label 'Schema 15 state' -ComparisonRoot (Split-Path -Parent $stateFull)
 if (-not (Test-Path -LiteralPath $stateFull -PathType Leaf)) { throw 'Schema 15 state file does not exist.' }
 $state = Get-Content -LiteralPath $stateFull -Raw | ConvertFrom-Json -AsHashtable
 if ([int]$state.schemaVersion -lt 15) { throw 'Localization workset deletion evidence applies only to Schema 15.' }

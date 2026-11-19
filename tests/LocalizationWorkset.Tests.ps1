@@ -1128,6 +1128,8 @@ return localization
         $finalizer = Get-Content -LiteralPath (Join-Path $scriptRoot 'Finalize-LocalizationWorksetEvidence.ps1') -Raw
 
         $finalizer | Should -Match '(?s)\$stateFull = \[IO\.Path\]::GetFullPath\(\$StatePath\).*Assert-NoReparsePath -Path \$stateFull -Root \(\[IO\.Path\]::GetPathRoot\(\$stateFull\)\) -Label ''Schema 15 state''.*\$state = Get-Content'
+        $expectedStateGuard = 'Assert-NoReparsePath -Path $stateFull -Root ([IO.Path]::GetPathRoot($stateFull)) -Label ''Schema 15 state'' -ComparisonRoot (Split-Path -Parent $stateFull)'
+        $finalizer | Should -Match ([regex]::Escape($expectedStateGuard))
         $finalizer | Should -Match '(?s)GetFullPath\(\[string\]\$state\.runRoot\)\)\.Equals\(.*?Get-PortablePathComparison'
         $finalizer | Should -Match '(?s)GetFullPath\(\[string\]\$state\.statePath\)\)\.Equals\(.*?Get-PortablePathComparison'
     }

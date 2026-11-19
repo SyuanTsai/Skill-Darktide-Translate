@@ -242,6 +242,34 @@ Describe 'Deterministic Darktide MOD update automation' {
         $comparisonSource | Should -Match 'IO\.Directory\]::GetFileSystemEntries'
     }
 
+    # Scenario: Any native host explicitly supplies its filesystem root through the writable-root parameter set.
+    # Purpose: Refuse to create a temporary case probe in an unowned filesystem or drive root.
+    It 'UnitT409_DoesNotWriteAWritableCaseProbeIntoTheFilesystemRoot' {
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $filesystemRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($TestDrive))
+        $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
+        $comparisonStart = $pathSafety.IndexOf('function Get-PortablePathComparison')
+        $comparisonEnd = $pathSafety.IndexOf('function Resolve-PortableContainedPath', $comparisonStart)
+        $comparisonSource = $pathSafety.Substring($comparisonStart, $comparisonEnd - $comparisonStart)
+        $writableRootStart = $comparisonSource.IndexOf('$probeRoot = [IO.Path]::GetFullPath($Root)')
+        $rootGuardStart = $comparisonSource.IndexOf('[IO.Path]::GetPathRoot($probeRoot)', $writableRootStart)
+        $writeProbeStart = $comparisonSource.IndexOf('$probeLeaf = ".casecheck-', $writableRootStart)
+
+        $writableRootStart | Should -BeGreaterOrEqual 0
+        $rootGuardStart | Should -BeGreaterThan $writableRootStart
+        $writeProbeStart | Should -BeGreaterThan $rootGuardStart
+        $comparisonSource.Substring($rootGuardStart, $writeProbeStart - $rootGuardStart) |
+            Should -Match 'return Get-PortablePathComparison -Paths @\(\$probeRoot\)'
+
+        $before = @([IO.Directory]::GetFileSystemEntries($filesystemRoot, '.casecheck-*'))
+        $comparison = Get-PortablePathComparison -Root $filesystemRoot
+        $after = @([IO.Directory]::GetFileSystemEntries($filesystemRoot, '.casecheck-*'))
+
+        $comparison | Should -BeIn @([StringComparison]::Ordinal, [StringComparison]::OrdinalIgnoreCase)
+        $after.Count | Should -Be $before.Count
+        ($after -join "`0") | Should -BeExactly ($before -join "`0")
+    }
+
     # Scenario: the current volume exposes a Git worktree path through a differently-cased prefix.
     # Purpose: The Candidate Gate must request the filesystem-aware exclusion comparer before evaluating the workset path.
     It 'UnitT393_UsesExclusionComparisonForLocalizationWorksetBoundary' {
