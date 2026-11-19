@@ -34,7 +34,7 @@ Describe 'Repository clean-head validation' {
         $result.headOid | Should -Be $expectedHead
     }
 
-    It 'UnitT20_RejectsTrackedAndUntrackedChangesBeforeValidation' -ForEach @(
+    It 'UnitT20_RejectsTrackedAndUntrackedChangesBeforeValidation_<Case>' -ForEach @(
         @{ Case = 'tracked'; Mutate = { param($root) Set-Content -LiteralPath (Join-Path $root 'tracked.txt') -Value 'changed' } }
         @{ Case = 'untracked'; Mutate = { param($root) Set-Content -LiteralPath (Join-Path $root 'untracked.txt') -Value 'new' } }
     ) {

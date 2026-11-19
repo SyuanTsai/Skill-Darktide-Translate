@@ -1531,6 +1531,12 @@ Invoke-Install -State $state
             $LASTEXITCODE | Should -Be 0
             $releasedRemote = Join-Path $TestDrive 'released-finalization-remote.git'
             & git init --bare --quiet $releasedRemote
+            & git -C $releasedRemote config maintenance.auto false
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to disable maintenance.auto for the released finalization remote fixture.' }
+            & git -C $releasedRemote config gc.autoDetach false
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to disable gc.autoDetach for the released finalization remote fixture.' }
+            & git -C $releasedRemote config receive.autogc false
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to disable receive.autogc for the released finalization remote fixture.' }
             & git -C $releasedRepository remote add origin $releasedRemote
             & git -C $releasedRepository push --quiet --set-upstream origin main
             $LASTEXITCODE | Should -Be 0
