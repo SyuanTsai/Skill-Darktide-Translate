@@ -144,6 +144,18 @@ function Get-DarktideGitBlobSha256 {
     }
 }
 
+function Get-DarktideSnapshotFileMode {
+    param([Parameter(Mandatory)][string] $Path)
+
+    if ([OperatingSystem]::IsWindows()) { return '100644' }
+    $mode = [IO.File]::GetUnixFileMode($Path)
+    $executeBits = [IO.UnixFileMode]::UserExecute -bor
+        [IO.UnixFileMode]::GroupExecute -bor
+        [IO.UnixFileMode]::OtherExecute
+    if (($mode -band $executeBits) -ne 0) { return '100755' }
+    '100644'
+}
+
 function Assert-DarktideRegularTree {
     param([Parameter(Mandatory)][string] $Root, [Parameter(Mandatory)][string] $Context)
 
@@ -444,7 +456,8 @@ function Assert-DarktideSkillMetadata {
 function Get-DarktideSkillInventory {
     param(
         [Parameter(Mandatory)][string] $Root,
-        [Parameter(Mandatory)][string] $GitPath
+        [Parameter(Mandatory)][ValidateSet('git', 'snapshot')][string] $InventoryMode,
+        [string] $GitPath
     )
 
     $skillRelative = 'skills/auto-update-darktide-mod'
@@ -453,41 +466,58 @@ function Get-DarktideSkillInventory {
     Assert-DarktideSkillMetadata -SkillRoot $skillRoot
 
     $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    $records = ((Invoke-DarktideGitText -GitPath $GitPath -Root $Root -Arguments @('ls-files', '-s', '-z', '--', $skillRelative)) -join '')
-    foreach ($record in @($records.Split([char]0) | Where-Object { -not [string]::IsNullOrEmpty($_) })) {
-        if ($record -cnotmatch '^(?<mode>100644|100755) (?<oid>[0-9a-f]{40}) 0\t(?<path>[^\x00\r\n]+)$') {
-            throw "Git returned an unsupported Skill index entry: $record"
-        }
-        $packagePath = ([string]$Matches.path).Substring($skillRelative.Length + 1)
-        if (-not $tracked.TryAdd($packagePath, [pscustomobject]@{ mode = [string]$Matches.mode; oid = [string]$Matches.oid })) {
-            throw "Git returned a duplicate Skill path: $packagePath"
+    if ($InventoryMode -ceq 'git') {
+        if ([string]::IsNullOrWhiteSpace($GitPath)) { throw 'Git inventory mode requires a bound Git executable.' }
+        $records = ((Invoke-DarktideGitText -GitPath $GitPath -Root $Root -Arguments @('ls-files', '-s', '-z', '--', $skillRelative)) -join '')
+        foreach ($record in @($records.Split([char]0) | Where-Object { -not [string]::IsNullOrEmpty($_) })) {
+            if ($record -cnotmatch '^(?<mode>100644|100755) (?<oid>[0-9a-f]{40}) 0\t(?<path>[^\x00\r\n]+)$') {
+                throw "Git returned an unsupported Skill index entry: $record"
+            }
+            $packagePath = ([string]$Matches.path).Substring($skillRelative.Length + 1)
+            if (-not $tracked.TryAdd($packagePath, [pscustomobject]@{ mode = [string]$Matches.mode; oid = [string]$Matches.oid })) {
+                throw "Git returned a duplicate Skill path: $packagePath"
+            }
         }
     }
 
     $entries = [Collections.Generic.List[object]]::new()
     foreach ($file in @(Get-ChildItem -LiteralPath $skillRoot -Recurse -File -Force)) {
         $relative = [IO.Path]::GetRelativePath($skillRoot, $file.FullName).Replace('\', '/')
-        if ($relative -match '(^|/)\.\.?(/|$)' -or $relative.Contains(':') -or -not $tracked.ContainsKey($relative)) {
-            throw "Skill filesystem inventory is not safely tracked: $relative"
+        if ($relative -match '(^|/)\.\.?(/|$)' -or $relative.Contains(':')) {
+            throw "Skill filesystem inventory contains an unsafe path: $relative"
         }
-        $repositoryPath = "$skillRelative/$relative"
-        $workingOid = @(
-            Invoke-DarktideGitText -GitPath $GitPath -Root $Root `
-                -Arguments @('hash-object', "--path=$repositoryPath", '--', $file.FullName)
-        )[0].Trim()
-        if ($workingOid -cne [string]$tracked[$relative].oid) {
-            throw "Skill working-tree bytes differ from the Git index: $relative"
+        [void](Read-DarktideStrictUtf8File -Path $file.FullName)
+
+        if ($InventoryMode -ceq 'git') {
+            if (-not $tracked.ContainsKey($relative)) {
+                throw "Skill filesystem inventory is not safely tracked: $relative"
+            }
+            $repositoryPath = "$skillRelative/$relative"
+            $workingOid = @(
+                Invoke-DarktideGitText -GitPath $GitPath -Root $Root `
+                    -Arguments @('hash-object', "--path=$repositoryPath", '--', $file.FullName)
+            )[0].Trim()
+            if ($workingOid -cne [string]$tracked[$relative].oid) {
+                throw "Skill working-tree bytes differ from the Git index: $relative"
+            }
+            $mode = [string]$tracked[$relative].mode
+            $sha256 = Get-DarktideGitBlobSha256 -GitPath $GitPath -Root $Root -ObjectId ([string]$tracked[$relative].oid)
+        }
+        else {
+            $mode = Get-DarktideSnapshotFileMode -Path $file.FullName
+            $sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         }
         $entries.Add([pscustomobject][ordered]@{
             path = $relative
-            mode = [string]$tracked[$relative].mode
-            sha256 = Get-DarktideGitBlobSha256 -GitPath $GitPath -Root $Root -ObjectId ([string]$tracked[$relative].oid)
+            mode = $mode
+            sha256 = $sha256
             rawSha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         })
     }
-    if ($entries.Count -ne $tracked.Count -or $entries.Count -eq 0) {
+    if ($InventoryMode -ceq 'git' -and $entries.Count -ne $tracked.Count) {
         throw 'Skill filesystem inventory does not exactly match the Git index.'
     }
+    if ($entries.Count -eq 0) { throw 'Skill filesystem inventory must not be empty.' }
     @(Sort-DarktideInventoryEntries -Entries $entries.ToArray())
 }
 
@@ -652,14 +682,32 @@ if (-not $repoItem.PSIsContainer -or ($repoItem.Attributes -band [IO.FileAttribu
     throw 'RepositoryRoot must be a regular non-reparse directory.'
 }
 
-$gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
-$gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
-$gitRoot = @(
-    Invoke-DarktideGitText -GitPath $gitPath -Root $repoRoot -Arguments @('rev-parse', '--show-toplevel')
-)[0].Trim()
 $comparison = if ([OperatingSystem]::IsWindows()) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
-if (-not [IO.Path]::GetFullPath($gitRoot).Equals($repoRoot, $comparison)) {
-    throw 'RepositoryRoot must be the Git repository root.'
+$gitMetadataEntries = @(Get-ChildItem -LiteralPath $repoRoot -Force | Where-Object {
+        ([string]$_.Name).Equals('.git', $comparison)
+    })
+if ($gitMetadataEntries.Count -gt 1) { throw 'RepositoryRoot contains ambiguous .git entries.' }
+$inventoryMode = if ($gitMetadataEntries.Count -eq 0) { 'snapshot' } else { 'git' }
+$gitPath = $null
+if ($inventoryMode -ceq 'git') {
+    try {
+        $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $gitPath = [IO.Path]::GetFullPath([string]$gitCommand.Path)
+    }
+    catch {
+        throw "RepositoryRoot contains .git but the Git executable is unavailable: $($_.Exception.Message)"
+    }
+    try {
+        $gitRoot = @(
+            Invoke-DarktideGitText -GitPath $gitPath -Root $repoRoot -Arguments @('rev-parse', '--show-toplevel')
+        )[0].Trim()
+    }
+    catch {
+        throw "RepositoryRoot contains .git but is not a valid Git repository root: $($_.Exception.Message)"
+    }
+    if (-not [IO.Path]::GetFullPath($gitRoot).Equals($repoRoot, $comparison)) {
+        throw 'RepositoryRoot contains .git but does not identify RepositoryRoot as the Git repository root.'
+    }
 }
 
 $source = Read-DarktideJson -Path (Join-Path $repoRoot 'catalog/source.json')
@@ -713,7 +761,7 @@ foreach ($entry in $skillsRootEntries) {
 }
 $skillDirectories = @($skillsRootEntries | ForEach-Object { [string]$_.Name })
 if (($skillDirectories -join "`n") -cne 'auto-update-darktide-mod') { throw 'Source Skill directories do not match catalog/source.json.' }
-$files = @(Get-DarktideSkillInventory -Root $repoRoot -GitPath $gitPath)
+$files = @(Get-DarktideSkillInventory -Root $repoRoot -InventoryMode $inventoryMode -GitPath $gitPath)
 
 $discoverable = @(Get-ChildItem -LiteralPath $repoRoot -Recurse -File -Filter 'SKILL.md' -Force |
         Where-Object { $_.FullName -notmatch '[\\/]\.git(?:[\\/]|$)' } |
@@ -731,6 +779,7 @@ $result = [pscustomobject][ordered]@{
     report = 'darktide-repository-check-v1'
     sourceId = 'darktide-translate'
     layout = $layout
+    inventoryMode = $inventoryMode
     activeSkillCount = 1
     skills = @([pscustomobject][ordered]@{
         skillId = 'auto-update-darktide-mod'
