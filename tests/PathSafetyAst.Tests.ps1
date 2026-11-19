@@ -460,6 +460,14 @@ Describe 'Epic pathname safety AST boundary' {
         }
 
         if (Test-Path -LiteralPath (Join-Path $repositoryRoot '.git')) {
+            $null = & git -C $repositoryRoot rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}'
+            $originMainResolveExitCode = $LASTEXITCODE
+        }
+        else {
+            $originMainResolveExitCode = 1
+        }
+
+        if ($originMainResolveExitCode -eq 0) {
             $branchChanged = @(& git -C $repositoryRoot diff --name-only origin/main...HEAD -- '*.ps1' '*.psm1')
             $LASTEXITCODE | Should -Be 0
             $worktreeChanged = @(& git -C $repositoryRoot diff --name-only -- '*.ps1' '*.psm1')
@@ -468,8 +476,11 @@ Describe 'Epic pathname safety AST boundary' {
             [string[]]$expected = @($changed | Where-Object { $_ -like 'skills/*' })
             [Array]::Sort($expected, [StringComparer]::Ordinal)
         }
-        else {
+        elseif ($originMainResolveExitCode -eq 1) {
             [string[]]$expected = @($actual)
+        }
+        else {
+            $originMainResolveExitCode | Should -Be 0
         }
         ($actual -join "`n") | Should -BeExactly ($expected -join "`n")
     }

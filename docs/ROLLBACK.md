@@ -29,7 +29,7 @@ Version 0.4.0 changes shared coordination and MOD reservation leases from the le
 
 Before rolling back or forward across this format boundary, stop every process that can use the affected Skill state. Preserve the legacy directory as evidence, verify independently that no owner is active, and have an operator move it to a separately retained migration archive outside the live `.locks` namespace. Do not rename its contents into the new lease file or synthesize a released receipt. Resume only after the live lease path is absent and all participants run the same pinned Skill version. If ownership cannot be established, leave the state stopped and retain the directory for manual recovery.
 
-An absent single-file owner accompanied by `.ai-instructions-txn/<transaction-id>/previous-*` is not the legacy directory format. Keep the affected lock root stopped and follow **Manual recovery for incomplete owner publication** in `skills/auto-update-darktide-mod/references/automation.md` before any rollback or forward retry.
+An absent shared single-file owner accompanied by any residue in the shared `.locks/.ai-instructions-txn` namespace, or an absent MOD owner accompanied by residue in that MOD lock's own transaction ID under `.locks/mod/.ai-instructions-txn`, is not the legacy directory format. The owner-update guard reports `BLOCKED: incomplete owner publication residue exists under '<relative-lock-root>/.ai-instructions-txn' (...)`. Keep the affected shared namespace or MOD reservation stopped and follow **Manual recovery for incomplete owner publication** in `skills/auto-update-darktide-mod/references/automation.md` before any rollback or forward retry; residue for a different MOD does not block this MOD.
 
 ## Safe fallback
 

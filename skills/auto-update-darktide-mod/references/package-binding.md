@@ -28,6 +28,30 @@ The packaged files are byte-exact source-derived copies kept under `assets/` so 
 
 Never look for these packaged references in the target MOD repository. The target MOD repository remains the location for queue/state/worktree/Git evidence and MOD changes; the Skill source is the location for Workflow and Review policy.
 
+## Vendored platform runtime binding
+
+The Skill vendors the complete registry-bound platform runtime used by `scripts/PathSafety.psm1`. Agents do not invoke its internal files as independent entrypoints: the verifier hashes the inventory, loads the manifest-bound root module, and revalidates every source file with identity checks. The files remain explicit here so their roles and discovery path are part of the package contract.
+
+| Vendored path | Role |
+| --- | --- |
+| `scripts/platform-runtime/Resolve-StandardValidationTool.ps1` | Resolves and verifies the pinned validation tools used by runtime preparation. |
+| `scripts/platform-runtime/WindowsDacl.psm1` | Normalizes and verifies Windows DACL policy. |
+| `scripts/platform-runtime/installer-safe-mutation.psm1` | Provides handle-bound installer mutation primitives. |
+| `scripts/platform-runtime/platform-runtime.psd1` | Declares the platform runtime manifest, exports, file inventory, and hashes. |
+| `scripts/platform-runtime/platform-runtime.psm1` | Loads the verified native sources and dispatches the public platform API. |
+| `scripts/platform-runtime/platform/Linux.psm1` | Adapts the shared Unix implementation and preparation flow for Linux. |
+| `scripts/platform-runtime/platform/MacOS.psm1` | Adapts the shared Unix implementation and preparation flow for macOS. |
+| `scripts/platform-runtime/platform/Unix.psm1` | Implements the shared Unix publication, removal, permission, and process operations. |
+| `scripts/platform-runtime/platform/Windows.psm1` | Implements the Windows platform adapter and preparation flow. |
+| `scripts/platform-runtime/platform/RuntimePreparation.psm1` | Prepares verified PowerShell and Pester runtimes in private roots. |
+| `scripts/platform-runtime/platform/PlatformNative.cs` | Defines common runtime identity, path, hashing, and platform primitives. |
+| `scripts/platform-runtime/platform/OwnedProcess.cs` | Defines the cross-platform owned-process lease and cleanup contract. |
+| `scripts/platform-runtime/platform/UnixNative.cs` | Implements Unix handle, identity, lock, publication, and permission primitives. |
+| `scripts/platform-runtime/platform/UnixProcess.cs` | Implements Unix owned-process control and process-group cleanup. |
+| `scripts/platform-runtime/platform/WindowsInstallerMutation.cs` | Implements handle-bound Windows installer mutations. |
+| `scripts/platform-runtime/platform/WindowsNative.cs` | Implements Windows handle, identity, lock, publication, and permission primitives. |
+| `scripts/platform-runtime/platform/WindowsProcess.cs` | Implements Windows owned-process and job-object control. |
+
 ## Schema 15 extension binding
 
 New automatic-source runs also bind `references/schema-15.md`. It is a repository-native normative extension derived from the byte-exact Schema 14 Workflow and Review Baseline, not a replacement source document. `references/schema-15-provenance.json` records its exact size, SHA-256, repository-local contract identity, and the Schema 14 Workflow/Baseline hashes it extends. `scripts/Test-ReferenceIntegrity.ps1` verifies all three references together before acquisition or claim.
