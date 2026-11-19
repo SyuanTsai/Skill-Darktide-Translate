@@ -161,6 +161,269 @@ function Assert-DarktideRegularTree {
     }
 }
 
+function Read-DarktideStrictUtf8File {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $offset = if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF) {
+        3
+    }
+    else {
+        0
+    }
+    [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset)
+}
+
+function Get-DarktideUnicodeScalarCount {
+    param(
+        [Parameter(Mandatory)][string] $Value,
+        [Parameter(Mandatory)][string] $Context
+    )
+
+    $count = 0
+    for ($index = 0; $index -lt $Value.Length; $index++) {
+        $character = $Value[$index]
+        if ([char]::IsHighSurrogate($character)) {
+            if ($index + 1 -ge $Value.Length -or -not [char]::IsLowSurrogate($Value[$index + 1])) {
+                throw "$Context contains an invalid UTF-16 surrogate sequence."
+            }
+            $index++
+        }
+        elseif ([char]::IsLowSurrogate($character)) {
+            throw "$Context contains an invalid UTF-16 surrogate sequence."
+        }
+        $count++
+    }
+    $count
+}
+
+function ConvertFrom-DarktideRestrictedYamlString {
+    param(
+        [Parameter(Mandatory)][string] $Value,
+        [Parameter(Mandatory)][string] $Context
+    )
+
+    if ($Value -cmatch '^"(?:[^"\\]|\\.)*"$') {
+        try {
+            $decoded = $Value | ConvertFrom-Json
+            if ($decoded -isnot [string]) { throw 'not a string' }
+            return [string]$decoded
+        }
+        catch { throw "$Context contains an invalid double-quoted YAML string." }
+    }
+    if ($Value.StartsWith("'", [StringComparison]::Ordinal)) {
+        if ($Value -cnotmatch "^'(?:[^']|'')*'$" ) { throw "$Context contains an invalid single-quoted YAML string." }
+        return $Value.Substring(1, $Value.Length - 2).Replace("''", "'")
+    }
+    if ($Value -cmatch '^[\[\]{},&*!|>"%@`]' -or $Value -cmatch '^[?:-](?:\s|$)' -or
+        $Value -cmatch ':\s' -or $Value -cmatch '(?:^|\s)#' -or
+        $Value -cmatch '^(?i:~|null|true|false|yes|no|on|off|[-+]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?|\d{4}-\d{2}-\d{2}(?:[Tt ].*)?)$') {
+        throw "$Context must be a YAML string scalar, not a collection, tag, comment, or implicitly typed value."
+    }
+    $Value
+}
+
+function Read-DarktideSkillFrontmatter {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $ExpectedSkillId
+    )
+
+    $text = (Read-DarktideStrictUtf8File -Path $Path).Replace("`r`n", "`n").Replace("`r", "`n")
+    if ($text -cnotmatch '(?s)\A---\n(?<frontmatter>.*?)\n---\n(?<body>.*)\z') {
+        throw "SKILL.md for '$ExpectedSkillId' must contain closed YAML frontmatter."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Matches.body)) {
+        throw "SKILL.md for '$ExpectedSkillId' must contain a non-empty Markdown body."
+    }
+
+    $values = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    foreach ($line in ([string]$Matches.frontmatter).Split("`n")) {
+        if ($line -cnotmatch '^(?<key>[a-z][a-z-]*):\s+(?<value>\S.*)$') {
+            throw "SKILL.md for '$ExpectedSkillId' has unsupported or malformed frontmatter syntax: '$line'."
+        }
+        $key = [string]$Matches.key
+        $value = ConvertFrom-DarktideRestrictedYamlString -Value ([string]$Matches.value).Trim() -Context "SKILL.md $key for '$ExpectedSkillId'"
+        if ($key -cnotin @('name', 'description', 'license', 'allowed-tools') -or -not $values.TryAdd($key, $value)) {
+            throw "SKILL.md for '$ExpectedSkillId' has an unsupported or duplicate frontmatter key '$key'."
+        }
+    }
+    if ($values.Count -lt 2 -or $values.Count -gt 4 -or -not $values.ContainsKey('name') -or -not $values.ContainsKey('description')) {
+        throw "SKILL.md for '$ExpectedSkillId' must define name and description, with only the allowed optional fields."
+    }
+    if ($values['name'] -cne $ExpectedSkillId) {
+        throw "SKILL.md name '$($values['name'])' does not match package '$ExpectedSkillId'."
+    }
+    $description = $values['description']
+    $descriptionLength = Get-DarktideUnicodeScalarCount -Value $description -Context "$ExpectedSkillId description"
+    if ([string]::IsNullOrWhiteSpace($description) -or $descriptionLength -gt 1024 -or $description.Contains('<') -or $description.Contains('>')) {
+        throw "SKILL.md description for '$ExpectedSkillId' violates the Standard v1 text contract."
+    }
+    if ($values.ContainsKey('allowed-tools') -and [string]::IsNullOrWhiteSpace($values['allowed-tools'])) {
+        throw "SKILL.md allowed-tools for '$ExpectedSkillId' must be a non-empty string."
+    }
+    [pscustomobject]@{
+        name = $values['name']
+        description = $description
+        allowedTools = if ($values.ContainsKey('allowed-tools')) { $values['allowed-tools'] } else { $null }
+    }
+}
+
+function Read-DarktideOpenAiMetadata {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $ExpectedSkillId
+    )
+
+    $text = (Read-DarktideStrictUtf8File -Path $Path).Replace("`r`n", "`n").Replace("`r", "`n")
+    if ($text.Contains("`t")) { throw "agents/openai.yaml for '$ExpectedSkillId' must not contain tabs." }
+
+    $topSections = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $interface = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $tools = [Collections.Generic.List[object]]::new()
+    $policy = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $section = ''
+    $inTools = $false
+    $sawTools = $false
+    $currentTool = $null
+
+    foreach ($line in $text.Split("`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -cmatch '^# SPDX-FileCopyrightText: 2026 SyuanTsai$' -or
+            $line -cmatch '^# SPDX-License-Identifier: Apache-2\.0$') { continue }
+        if ($line -cmatch '^\s*["'']') {
+            throw "agents/openai.yaml for '$ExpectedSkillId' contains a quoted mapping key."
+        }
+        if ($line -cmatch '^(?<section>[a-z_]+):$') {
+            if ($null -ne $currentTool) {
+                $tools.Add([pscustomobject]$currentTool)
+                $currentTool = $null
+            }
+            $section = [string]$Matches.section
+            if ($section -cnotin @('interface', 'dependencies', 'policy') -or -not $topSections.Add($section)) {
+                throw "agents/openai.yaml for '$ExpectedSkillId' has unsupported or duplicate section '$section'."
+            }
+            $inTools = $false
+            continue
+        }
+
+        if ($section -ceq 'interface' -and $line -cmatch '^  (?<key>[a-z_]+): (?<json>"(?:[^"\\]|\\.)*")$') {
+            $key = [string]$Matches.key
+            if ($key -cnotin @('display_name', 'short_description', 'default_prompt', 'icon_small', 'icon_large', 'brand_color') -or $interface.ContainsKey($key)) {
+                throw "agents/openai.yaml for '$ExpectedSkillId' has unsupported or duplicate interface key '$key'."
+            }
+            try { $interface.Add($key, [string](([string]$Matches.json) | ConvertFrom-Json)) }
+            catch { throw "agents/openai.yaml for '$ExpectedSkillId' has invalid quoted string '$key'." }
+            continue
+        }
+
+        if ($section -ceq 'dependencies' -and $line -ceq '  tools:') {
+            if ($inTools) { throw "agents/openai.yaml for '$ExpectedSkillId' has duplicate dependencies.tools." }
+            $inTools = $true
+            $sawTools = $true
+            continue
+        }
+        if ($section -ceq 'dependencies' -and $inTools -and $line -cmatch '^    - type: (?<json>"(?:[^"\\]|\\.)*")$') {
+            if ($null -ne $currentTool) { $tools.Add([pscustomobject]$currentTool) }
+            $currentTool = [ordered]@{}
+            try { $currentTool.type = [string](([string]$Matches.json) | ConvertFrom-Json) }
+            catch { throw "agents/openai.yaml for '$ExpectedSkillId' has invalid dependency type." }
+            continue
+        }
+        if ($section -ceq 'dependencies' -and $inTools -and $null -ne $currentTool -and $line -cmatch '^      (?<key>[a-z_]+): (?<json>"(?:[^"\\]|\\.)*")$') {
+            $key = [string]$Matches.key
+            if ($key -cnotin @('value', 'description', 'transport', 'url') -or $currentTool.Contains($key)) {
+                throw "agents/openai.yaml for '$ExpectedSkillId' has unsupported or duplicate dependency key '$key'."
+            }
+            try { $currentTool[$key] = [string](([string]$Matches.json) | ConvertFrom-Json) }
+            catch { throw "agents/openai.yaml for '$ExpectedSkillId' has invalid dependency string '$key'." }
+            continue
+        }
+
+        if ($section -ceq 'policy' -and $line -cmatch '^  (?<key>[a-z_]+): (?<value>true|false)$') {
+            $key = [string]$Matches.key
+            if (-not $policy.TryAdd($key, ([string]$Matches.value -ceq 'true'))) {
+                throw "agents/openai.yaml for '$ExpectedSkillId' has duplicate policy key '$key'."
+            }
+            continue
+        }
+
+        throw "agents/openai.yaml for '$ExpectedSkillId' has unsupported or malformed syntax: '$line'."
+    }
+    if ($null -ne $currentTool) { $tools.Add([pscustomobject]$currentTool) }
+
+    foreach ($required in @('display_name', 'short_description', 'default_prompt')) {
+        if (-not $interface.ContainsKey($required) -or [string]::IsNullOrWhiteSpace($interface[$required])) {
+            throw "agents/openai.yaml for '$ExpectedSkillId' is missing interface.$required."
+        }
+    }
+    $shortLength = Get-DarktideUnicodeScalarCount -Value $interface['short_description'] -Context "$ExpectedSkillId short_description"
+    if ($shortLength -lt 25 -or $shortLength -gt 64) {
+        throw "agents/openai.yaml interface.short_description for '$ExpectedSkillId' must contain 25 to 64 Unicode scalar values."
+    }
+    $token = '$' + $ExpectedSkillId
+    if ($interface['default_prompt'] -cnotmatch ("(?<![A-Za-z0-9-]){0}(?![A-Za-z0-9-])" -f [regex]::Escape($token))) {
+        throw "agents/openai.yaml interface.default_prompt for '$ExpectedSkillId' must reference exact token '$token'."
+    }
+    if ($topSections.Contains('dependencies') -and (-not $sawTools -or $tools.Count -eq 0)) {
+        throw "agents/openai.yaml dependencies for '$ExpectedSkillId' must contain a non-empty tools list."
+    }
+    if ($topSections.Contains('policy') -and
+        ($policy.Count -ne 1 -or -not $policy.ContainsKey('allow_implicit_invocation'))) {
+        throw "agents/openai.yaml policy for '$ExpectedSkillId' must contain only allow_implicit_invocation."
+    }
+
+    $skillRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent (Split-Path -Parent $Path)) '.'))
+    foreach ($iconKey in @('icon_small', 'icon_large')) {
+        if ($interface.ContainsKey($iconKey)) {
+            $iconValue = [string]$interface[$iconKey]
+            if ($iconValue -cnotmatch '^\./assets/[^\r\n]+$') {
+                throw "agents/openai.yaml interface.$iconKey for '$ExpectedSkillId' must be a relative ./assets/ path."
+            }
+            $relativeIconPath = $iconValue.Substring(2).Replace('/', [IO.Path]::DirectorySeparatorChar)
+            $iconSegments = $relativeIconPath.Split([IO.Path]::DirectorySeparatorChar)
+            if ($iconValue.Contains('\') -or $relativeIconPath.Contains(':') -or
+                $iconSegments -contains '' -or $iconSegments -contains '.' -or $iconSegments -contains '..') {
+                throw "agents/openai.yaml interface.$iconKey for '$ExpectedSkillId' contains an unsafe asset path."
+            }
+            $iconPath = [IO.Path]::GetFullPath((Join-Path $skillRoot $relativeIconPath))
+            $rootPrefix = $skillRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            if (-not $iconPath.StartsWith($rootPrefix, [StringComparison]::Ordinal) -or
+                -not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+                throw "agents/openai.yaml interface.$iconKey for '$ExpectedSkillId' must identify an existing file inside ./assets/."
+            }
+            $iconItem = Get-Item -LiteralPath $iconPath -Force
+            if (($iconItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "agents/openai.yaml interface.$iconKey for '$ExpectedSkillId' must not identify a reparse point."
+            }
+        }
+    }
+    if ($interface.ContainsKey('brand_color') -and [string]$interface['brand_color'] -cnotmatch '^#[0-9A-Fa-f]{6}$') {
+        throw "agents/openai.yaml interface.brand_color for '$ExpectedSkillId' must be a six-digit hexadecimal color."
+    }
+    foreach ($tool in $tools) {
+        if ($tool.type -cne 'mcp' -or $null -eq $tool.PSObject.Properties['value'] -or [string]::IsNullOrWhiteSpace([string]$tool.value)) {
+            throw "agents/openai.yaml dependency for '$ExpectedSkillId' must declare quoted type 'mcp' and a non-empty value."
+        }
+        foreach ($name in @('description', 'transport')) {
+            if ($null -ne $tool.PSObject.Properties[$name] -and [string]::IsNullOrWhiteSpace([string]$tool.$name)) {
+                throw "agents/openai.yaml dependency.$name for '$ExpectedSkillId' cannot be empty."
+            }
+        }
+        if ($null -ne $tool.PSObject.Properties['url']) {
+            $uri = $null
+            if ([string]::IsNullOrWhiteSpace([string]$tool.url) -or
+                -not [Uri]::TryCreate([string]$tool.url, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -cne 'https') {
+                throw "agents/openai.yaml dependency.url for '$ExpectedSkillId' must be absolute HTTPS."
+            }
+        }
+    }
+    [pscustomobject]@{ interface = [pscustomobject]$interface; tools = @($tools); policy = [pscustomobject]$policy }
+}
+
 function Assert-DarktideSkillMetadata {
     param([Parameter(Mandatory)][string] $SkillRoot)
 
@@ -171,17 +434,9 @@ function Assert-DarktideSkillMetadata {
         $item = Get-Item -LiteralPath $path -Force
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Skill metadata is a reparse point: $path" }
     }
-    $skillText = [IO.File]::ReadAllText($skillPath, [Text.UTF8Encoding]::new($false, $true)).Replace("`r`n", "`n")
-    if ($skillText -cnotmatch '(?s)\A---\n(?<frontmatter>.*?)\n---\n\S') { throw 'SKILL.md frontmatter or body is invalid.' }
-    $frontmatter = [string]$Matches.frontmatter
-    if ($frontmatter -cnotmatch '(?m)^name:\s+auto-update-darktide-mod\s*$' -or
-        $frontmatter -cnotmatch '(?m)^description:\s+\S.+$') {
-        throw 'SKILL.md identity or description is invalid.'
-    }
-    $metadata = [IO.File]::ReadAllText($metadataPath, [Text.UTF8Encoding]::new($false, $true))
-    if ($metadata.Contains("`t") -or
-        $metadata -cnotmatch '(?m)^\s*display_name:\s+"Auto Update Darktide MOD"\s*$' -or
-        $metadata -cnotmatch '(?m)^\s*default_prompt:\s+"[^"]*\$auto-update-darktide-mod[^"]*"\s*$') {
+    [void](Read-DarktideSkillFrontmatter -Path $skillPath -ExpectedSkillId 'auto-update-darktide-mod')
+    $metadata = Read-DarktideOpenAiMetadata -Path $metadataPath -ExpectedSkillId 'auto-update-darktide-mod'
+    if ([string]$metadata.interface.display_name -cne 'Auto Update Darktide MOD') {
         throw 'agents/openai.yaml identity is invalid.'
     }
 }
@@ -450,7 +705,13 @@ $layout = Assert-DarktideConsumerConfiguration -Root $repoRoot
 
 $skillsRoot = Join-Path $repoRoot 'skills'
 Assert-DarktideRegularTree -Root $skillsRoot -Context 'Source Skill root'
-$skillDirectories = @(Get-ChildItem -LiteralPath $skillsRoot -Directory -Force | ForEach-Object { [string]$_.Name })
+$skillsRootEntries = @(Get-ChildItem -LiteralPath $skillsRoot -Force)
+foreach ($entry in $skillsRootEntries) {
+    if (-not $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Source Skill root contains a non-package or reparse entry '$($entry.Name)'."
+    }
+}
+$skillDirectories = @($skillsRootEntries | ForEach-Object { [string]$_.Name })
 if (($skillDirectories -join "`n") -cne 'auto-update-darktide-mod') { throw 'Source Skill directories do not match catalog/source.json.' }
 $files = @(Get-DarktideSkillInventory -Root $repoRoot -GitPath $gitPath)
 

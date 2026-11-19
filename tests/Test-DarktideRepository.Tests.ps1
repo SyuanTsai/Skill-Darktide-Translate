@@ -49,6 +49,10 @@ Describe 'Darktide consumer repository check' {
             if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the Darktide repository check fixture.' }
             $script:ProfilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
             $script:SourcePath = Join-Path $script:FixtureRoot 'catalog/source.json'
+            $script:SkillsRoot = Join-Path $script:FixtureRoot 'skills'
+            $script:SkillRoot = Join-Path $script:SkillsRoot 'auto-update-darktide-mod'
+            $script:SkillPath = Join-Path $script:SkillRoot 'SKILL.md'
+            $script:MetadataPath = Join-Path $script:SkillRoot 'agents/openai.yaml'
         }
 
         It 'rejects profile membership drift in the product-local catalog' {
@@ -227,6 +231,210 @@ Describe 'Darktide consumer repository check' {
 
             { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } |
                 Should -Throw '*Legacy source-owned cross-source catalog must not coexist with catalog/source.json*'
+        }
+
+        It 'UnitT47_RejectsNonPackageEntriesAtTheSkillsRoot' {
+            [IO.File]::WriteAllText(
+                (Join-Path $script:SkillsRoot 'README.md'),
+                'not a package',
+                [Text.UTF8Encoding]::new($false)
+            )
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } |
+                Should -Throw '*Source Skill root contains a non-package or reparse entry*'
+        }
+
+        It 'UnitT48_RejectsInvalidStructuredSkillFrontmatter_<scenario>' -ForEach @(
+            @{ scenario = 'duplicate-key'; mutation = 'duplicate'; expected = '*unsupported or duplicate frontmatter key*' },
+            @{ scenario = 'unsupported-key'; mutation = 'unsupported'; expected = '*unsupported or duplicate frontmatter key*' },
+            @{ scenario = 'implicit-type'; mutation = 'implicit'; expected = '*must be a YAML string scalar*' },
+            @{ scenario = 'invalid-double-quoted-string'; mutation = 'double-quoted'; expected = '*invalid double-quoted YAML string*' },
+            @{ scenario = 'invalid-single-quoted-string'; mutation = 'single-quoted'; expected = '*invalid single-quoted YAML string*' },
+            @{ scenario = 'missing-required-key'; mutation = 'missing'; expected = '*must define name and description*' },
+            @{ scenario = 'wrong-name'; mutation = 'identity'; expected = '*does not match package*' },
+            @{ scenario = 'malformed-syntax'; mutation = 'syntax'; expected = '*unsupported or malformed frontmatter syntax*' },
+            @{ scenario = 'invalid-description'; mutation = 'description'; expected = '*violates the Standard v1 text contract*' },
+            @{ scenario = 'empty-allowed-tools'; mutation = 'allowed-tools'; expected = '*must be a non-empty string*' },
+            @{ scenario = 'unclosed-frontmatter'; mutation = 'unclosed'; expected = '*closed YAML frontmatter*' },
+            @{ scenario = 'empty-body'; mutation = 'body'; expected = '*non-empty Markdown body*' }
+        ) {
+            $text = (Get-Content -LiteralPath $script:SkillPath -Raw).Replace("`r`n", "`n")
+            switch ($mutation) {
+                'duplicate' { $text = $text.Replace("name: auto-update-darktide-mod`n", "name: auto-update-darktide-mod`nname: auto-update-darktide-mod`n") }
+                'unsupported' { $text = $text.Replace("name: auto-update-darktide-mod`n", "name: auto-update-darktide-mod`nversion: `"1`"`n") }
+                'implicit' { $text = $text -replace '(?m)^allowed-tools:.*$', 'allowed-tools: true' }
+                'double-quoted' { $text = $text -replace '(?m)^allowed-tools:.*$', 'allowed-tools: "\q"' }
+                'single-quoted' { $text = $text -replace '(?m)^allowed-tools:.*$', "allowed-tools: 'unterminated" }
+                'missing' { $text = $text -replace '(?m)^description:.*\n', '' }
+                'identity' { $text = $text.Replace('name: auto-update-darktide-mod', 'name: other-skill') }
+                'syntax' { $text = $text.Replace('name: auto-update-darktide-mod', 'Name: auto-update-darktide-mod') }
+                'description' { $text = $text -replace '(?m)^description:.*$', 'description: bad <tag>' }
+                'allowed-tools' { $text = $text -replace '(?m)^allowed-tools:.*$', 'allowed-tools: " "' }
+                'unclosed' { $text = $text.Substring(4) }
+                'body' {
+                    $closing = $text.IndexOf("`n---`n", 4, [StringComparison]::Ordinal)
+                    $text = $text.Substring(0, $closing + 5)
+                }
+            }
+            [IO.File]::WriteAllText($script:SkillPath, $text, [Text.UTF8Encoding]::new($false))
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } | Should -Throw $expected
+        }
+
+        It 'UnitT49_RejectsInvalidOrIncompleteStructuredOpenAiMetadata_<scenario>' -ForEach @(
+            @{ scenario = 'duplicate-interface-key'; mutation = 'duplicate-interface'; expected = '*unsupported or duplicate interface key*' },
+            @{ scenario = 'unsupported-interface-key'; mutation = 'unsupported-interface'; expected = '*unsupported or duplicate interface key*' },
+            @{ scenario = 'tab'; mutation = 'tab'; expected = '*must not contain tabs*' },
+            @{ scenario = 'quoted-key'; mutation = 'quoted-key'; expected = '*contains a quoted mapping key*' },
+            @{ scenario = 'invalid-quoted-string'; mutation = 'invalid-string'; expected = '*invalid quoted string*' },
+            @{ scenario = 'missing-required-key'; mutation = 'missing-default'; expected = '*missing interface.default_prompt*' },
+            @{ scenario = 'wrong-value-type'; mutation = 'non-string'; expected = '*unsupported or malformed syntax*' },
+            @{ scenario = 'short-description-length'; mutation = 'short-description'; expected = '*25 to 64 Unicode scalar values*' },
+            @{ scenario = 'unbound-default-prompt'; mutation = 'default-prompt'; expected = '*must reference exact token*' },
+            @{ scenario = 'duplicate-section'; mutation = 'duplicate-section'; expected = '*unsupported or duplicate section*' },
+            @{ scenario = 'empty-dependencies'; mutation = 'empty-dependencies'; expected = '*non-empty tools list*' },
+            @{ scenario = 'duplicate-dependencies-tools'; mutation = 'duplicate-tools'; expected = '*duplicate dependencies.tools*' },
+            @{ scenario = 'invalid-dependency-type-string'; mutation = 'dependency-type-string'; expected = '*invalid dependency type*' },
+            @{ scenario = 'unsupported-dependency-key'; mutation = 'dependency-key'; expected = '*unsupported or duplicate dependency key*' },
+            @{ scenario = 'invalid-dependency-string'; mutation = 'dependency-string'; expected = '*invalid dependency string*' },
+            @{ scenario = 'unsupported-policy-key'; mutation = 'policy'; expected = '*must contain only allow_implicit_invocation*' },
+            @{ scenario = 'duplicate-policy-key'; mutation = 'duplicate-policy'; expected = '*duplicate policy key*' },
+            @{ scenario = 'invalid-dependency-contract'; mutation = 'dependency'; expected = '*must declare quoted type*' },
+            @{ scenario = 'empty-dependency-description'; mutation = 'dependency-description'; expected = '*dependency.description*cannot be empty*' },
+            @{ scenario = 'non-https-dependency-url'; mutation = 'dependency-url'; expected = '*must be absolute HTTPS*' },
+            @{ scenario = 'non-relative-icon-path'; mutation = 'icon-relative'; expected = '*must be a relative ./assets/ path*' },
+            @{ scenario = 'unsafe-icon-path'; mutation = 'icon-unsafe'; expected = '*contains an unsafe asset path*' },
+            @{ scenario = 'invalid-icon-path'; mutation = 'icon'; expected = '*must identify an existing file*' },
+            @{ scenario = 'invalid-brand-color'; mutation = 'brand'; expected = '*six-digit hexadecimal color*' },
+            @{ scenario = 'wrong-display-name'; mutation = 'display-name'; expected = '*identity is invalid*' }
+        ) {
+            $text = (Get-Content -LiteralPath $script:MetadataPath -Raw).Replace("`r`n", "`n")
+            switch ($mutation) {
+                'duplicate-interface' { $text += "  display_name: `"Auto Update Darktide MOD`"`n" }
+                'unsupported-interface' { $text += "  unsupported: `"value`"`n" }
+                'tab' { $text = $text.Replace('  display_name:', "`tdisplay_name:") }
+                'quoted-key' { $text += "  `"quoted`": `"value`"`n" }
+                'invalid-string' { $text = $text -replace '(?m)^  display_name:.*$', '  display_name: "\q"' }
+                'missing-default' { $text = $text -replace '(?m)^  default_prompt:.*\n?', '' }
+                'non-string' { $text = $text -replace '(?m)^  default_prompt:.*$', '  default_prompt: true' }
+                'short-description' { $text = $text -replace '(?m)^  short_description:.*$', '  short_description: "short"' }
+                'default-prompt' { $text = $text.Replace('$auto-update-darktide-mod', '$other-skill') }
+                'duplicate-section' { $text += "interface:`n" }
+                'empty-dependencies' { $text += "dependencies:`n" }
+                'duplicate-tools' { $text += "dependencies:`n  tools:`n  tools:`n" }
+                'dependency-type-string' { $text += "dependencies:`n  tools:`n    - type: `"\q`"`n" }
+                'dependency-key' { $text += "dependencies:`n  tools:`n    - type: `"mcp`"`n      unsupported: `"value`"`n" }
+                'dependency-string' { $text += "dependencies:`n  tools:`n    - type: `"mcp`"`n      value: `"\q`"`n" }
+                'policy' { $text += "policy:`n  other: true`n" }
+                'duplicate-policy' { $text += "policy:`n  allow_implicit_invocation: true`n  allow_implicit_invocation: false`n" }
+                'dependency' { $text += "dependencies:`n  tools:`n    - type: `"http`"`n      value: `"example`"`n" }
+                'dependency-description' { $text += "dependencies:`n  tools:`n    - type: `"mcp`"`n      value: `"example`"`n      description: `"`"`n" }
+                'dependency-url' { $text += "dependencies:`n  tools:`n    - type: `"mcp`"`n      value: `"example`"`n      url: `"http://example.com`"`n" }
+                'icon-relative' { $text += "  icon_small: `"assets/icon.svg`"`n" }
+                'icon-unsafe' { $text += "  icon_small: `"./assets/../icon.svg`"`n" }
+                'icon' { $text += "  icon_small: `"./assets/missing.svg`"`n" }
+                'brand' { $text += "  brand_color: `"blue`"`n" }
+                'display-name' { $text = $text.Replace('"Auto Update Darktide MOD"', '"Other"') }
+            }
+            [IO.File]::WriteAllText($script:MetadataPath, $text, [Text.UTF8Encoding]::new($false))
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } | Should -Throw $expected
+        }
+
+        It 'UnitT50_RejectsMalformedOrDuplicateProductJson_<scenario>' -ForEach @(
+            @{ scenario = 'invalid-json'; mutation = 'invalid'; expected = '*JSON is invalid*' },
+            @{ scenario = 'duplicate-key'; mutation = 'duplicate'; expected = '*duplicate JSON property*' },
+            @{ scenario = 'missing-file'; mutation = 'missing'; expected = '*Required JSON file is missing*' }
+        ) {
+            switch ($mutation) {
+                'invalid' { [IO.File]::WriteAllText($script:SourcePath, '{', [Text.UTF8Encoding]::new($false)) }
+                'duplicate' {
+                    $text = Get-Content -LiteralPath $script:SourcePath -Raw
+                    $text = $text -replace '^\s*\{', '{ "schemaVersion": 2,'
+                    [IO.File]::WriteAllText($script:SourcePath, $text, [Text.UTF8Encoding]::new($false))
+                }
+                'missing' { Remove-Item -LiteralPath $script:ProfilePath -Force }
+            }
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } | Should -Throw $expected
+        }
+
+        It 'UnitT51_RejectsUnexpectedProductCatalogProperties_<scenario>' -ForEach @(
+            @{ scenario = 'source-root'; target = 'source-root' },
+            @{ scenario = 'profile-root'; target = 'profile-root' },
+            @{ scenario = 'profile-source'; target = 'profile-source' },
+            @{ scenario = 'profile'; target = 'profile' },
+            @{ scenario = 'skill'; target = 'skill' },
+            @{ scenario = 'skill-source'; target = 'skill-source' },
+            @{ scenario = 'lifecycle'; target = 'lifecycle' },
+            @{ scenario = 'compatibility'; target = 'compatibility' },
+            @{ scenario = 'required-capability'; target = 'required-capability' },
+            @{ scenario = 'alternative-capability'; target = 'alternative-capability' }
+        ) {
+            if ($target -ceq 'source-root') {
+                $document = Get-Content -LiteralPath $script:SourcePath -Raw | ConvertFrom-Json
+                $document | Add-Member -NotePropertyName unexpected -NotePropertyValue 'value'
+                $path = $script:SourcePath
+            }
+            else {
+                $document = Get-Content -LiteralPath $script:ProfilePath -Raw | ConvertFrom-Json
+                $node = switch ($target) {
+                    'profile-root' { $document }
+                    'profile-source' { $document.sources[0] }
+                    'profile' { $document.profiles[0] }
+                    'skill' { $document.skills[0] }
+                    'skill-source' { $document.skills[0].source }
+                    'lifecycle' { $document.skills[0].lifecycle }
+                    'compatibility' { $document.skills[0].compatibility }
+                    'required-capability' { $document.skills[0].compatibility.requiredCapabilities[0] }
+                    'alternative-capability' { $document.skills[0].compatibility.anyOfCapabilities[0] }
+                }
+                $node | Add-Member -NotePropertyName unexpected -NotePropertyValue 'value'
+                $path = $script:ProfilePath
+            }
+            $document | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $path -Encoding utf8NoBOM -NoNewline
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } | Should -Throw '*invalid property set*'
+        }
+
+        It 'UnitT52_RejectsInvalidSourceSkillInventory_<scenario>' -ForEach @(
+            @{ scenario = 'invalid-id'; skills = @('Invalid') ; expected = '*Invalid Skill ID*' },
+            @{ scenario = 'duplicate-id'; skills = @('auto-update-darktide-mod', 'auto-update-darktide-mod'); expected = '*Duplicate Skill ID*' },
+            @{ scenario = 'non-ordinal-order'; skills = @('z-skill', 'auto-update-darktide-mod'); expected = '*ordinal ascending order*' },
+            @{ scenario = 'wrong-identity'; skills = @('other-skill'); expected = '*Source inventory identity is invalid*' }
+        ) {
+            $source = Get-Content -LiteralPath $script:SourcePath -Raw | ConvertFrom-Json
+            $source.skills = $skills
+            $source | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $script:SourcePath -Encoding utf8NoBOM -NoNewline
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } | Should -Throw $expected
+        }
+
+        It 'UnitT53_RejectsAdditionalPublisherDiscoverableSkills' {
+            $otherRoot = Join-Path $script:FixtureRoot 'other'
+            [void](New-Item -ItemType Directory -Path $otherRoot)
+            [IO.File]::WriteAllText(
+                (Join-Path $otherRoot 'SKILL.md'),
+                "---`nname: other`ndescription: other`n---`nbody`n",
+                [Text.UTF8Encoding]::new($false)
+            )
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } |
+                Should -Throw '*Publisher-discoverable Skill inventory is invalid*'
+        }
+
+        It 'UnitT54_RejectsIncompleteOrExtraCanonicalPackages_<scenario>' -ForEach @(
+            @{ scenario = 'missing-skill-file'; mutation = 'missing-skill'; expected = '*Required Skill metadata is missing*' },
+            @{ scenario = 'missing-openai-metadata'; mutation = 'missing-metadata'; expected = '*Required Skill metadata is missing*' },
+            @{ scenario = 'extra-package-directory'; mutation = 'extra-package'; expected = '*Source Skill directories do not match catalog/source.json*' }
+        ) {
+            switch ($mutation) {
+                'missing-skill' { Remove-Item -LiteralPath $script:SkillPath -Force }
+                'missing-metadata' { Remove-Item -LiteralPath $script:MetadataPath -Force }
+                'extra-package' { [void](New-Item -ItemType Directory -Path (Join-Path $script:SkillsRoot 'other-skill')) }
+            }
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } | Should -Throw $expected
         }
     }
 }
