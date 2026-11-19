@@ -10,5 +10,3 @@
 *.yaml text eol=lf
 *.yml text eol=lf
 VERSION text eol=lf
-# Vendored authority platform runtime: preserve the reviewed raw bytes exactly.
-/skills/auto-update-darktide-mod/scripts/platform-runtime/** -text

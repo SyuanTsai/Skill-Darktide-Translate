@@ -32,13 +32,11 @@ Describe 'Schema 15 multi-process coordination contract' {
         }
     }
 
-    # Scenario: Lease publication reports either an authority-defined create/CAS race or an unrelated storage failure.
+    # Scenario: Lease publication reports either a local no-replace/CAS race or an unrelated storage failure.
     # Purpose: Retry only genuine publication contention while surfacing every other failure immediately with its cause intact.
-    It 'UnitT20_WaitsOnlyForAuthorityPublicationContention_<Case>' -ForEach @(
-        @{ Case = 'NoReplaceEexist'; Competition = $true }
-        @{ Case = 'NoReplaceWin32'; Competition = $true }
-        @{ Case = 'CasExpectedStateMismatchUnix'; Competition = $true }
-        @{ Case = 'CasExpectedStateMismatchWindows'; Competition = $true }
+    It 'UnitT20_WaitsOnlyForLocalPublicationContention_<Case>' -ForEach @(
+        @{ Case = 'NoReplaceTargetExists'; Competition = $true }
+        @{ Case = 'CasExpectedStateMismatch'; Competition = $true }
         @{ Case = 'IoFailure'; Competition = $false }
     ) {
         Import-Module -Name $coordinationModule -Force
@@ -55,23 +53,13 @@ Describe 'Schema 15 multi-process coordination contract' {
             }
             Mock Publish-CoordinationLeaseSnapshot {
                 switch ($Case) {
-                    'NoReplaceEexist' {
-                        throw [SyuanTsai.AIInstructions.PlatformRuntime.PlatformErrnoException]::new(
-                            'publication-create-target', 17, 'EEXIST')
-                    }
-                    'NoReplaceWin32' {
-                        throw [SyuanTsai.AIInstructions.PlatformRuntime.PlatformWin32Exception]::new(
-                            'SetFileInformationByHandle(FileRenameInfo NoReplace)', 183)
-                    }
-                    'CasExpectedStateMismatchUnix' {
-                        throw [SyuanTsai.AIInstructions.PlatformRuntime.PlatformVerificationException]::new(
-                            'publication-target', 'linux',
-                            'identity, type, link count, length, or SHA-256 differs from expected state')
-                    }
-                    'CasExpectedStateMismatchWindows' {
-                        throw [SyuanTsai.AIInstructions.PlatformRuntime.PlatformVerificationException]::new(
-                            'publication', 'windows',
-                            'The target identity, hash, or length differs from ExpectedState.')
+                    { $_ -in @('NoReplaceTargetExists', 'CasExpectedStateMismatch') } {
+                        $failure = [IO.IOException]::new('injected local publication contention')
+                        $failure.Data['PortablePublicationKind'] = if ($Case -ceq 'NoReplaceTargetExists') {
+                            'no-replace-target-exists'
+                        }
+                        else { 'cas-expected-state-mismatch' }
+                        throw $failure
                     }
                     default { throw [IO.IOException]::new('injected coordination storage failure') }
                 }
@@ -340,7 +328,7 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
         $receiptRecord = Get-Content -LiteralPath ([string]$receipt.path) -Raw | ConvertFrom-TestJson -AsHashtable
         [string]$newLease.staleEvidencePath | Should -Not -BeNullOrEmpty
         [string]$receiptRecord.staleEvidencePath | Should -Be ([string]$newLease.staleEvidencePath)
-        [string]$newLease.staleEvidencePath | Should -Match '[\\/]\.ai-instructions-txn[\\/][0-9a-f]{32}[\\/]previous-[0-9a-f]{32}$'
+        [string]$newLease.staleEvidencePath | Should -Match '[\\/]\.git-coordination\.lock\.stale-[0-9a-f]{64}\.json$'
         Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Leaf | Should -BeTrue
         [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$newLease.staleEvidencePath)) |
             Should -BeExactly ([Convert]::ToHexString($staleOwnerBytes))
@@ -490,7 +478,7 @@ finally {
         $receiptRoot = Join-Path $repository 'receipts'
         New-Item -ItemType Directory -Path $receiptRoot -Force | Out-Null
         $expectedPlatform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
-        $expectedPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+        $expectedPrimitive = 'dotnet-fileshare-none'
 
         $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'evidence-run' -ReceiptRoot $receiptRoot -TimeoutSeconds 10
         $lease.platform | Should -BeExactly $expectedPlatform
@@ -510,7 +498,7 @@ finally {
 
         $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks'
         $guardPath = Join-Path $lockRoot 'git-coordination.owner-update.guard'
-        Test-Path -LiteralPath $guardPath -PathType Leaf | Should -BeTrue -Because 'the vendored lock keeps a fixed guard inode'
+        Test-Path -LiteralPath $guardPath -PathType Leaf | Should -BeTrue -Because 'the native lock keeps a fixed guard file'
         $emptyLease = Join-Path $lockRoot 'git-coordination.lock'
         [IO.File]::Delete($emptyLease)
         New-Item -ItemType Directory -Path $emptyLease | Out-Null
@@ -848,7 +836,7 @@ $null = Exit-SharedCoordinationLease -Lease $lease
     }
 }
 
-Describe 'Incomplete owner publication transaction residue guard' {
+Describe 'Incomplete owner publication temporary-file residue guard' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
@@ -887,40 +875,37 @@ Describe 'Incomplete owner publication transaction residue guard' {
         }
     }
 
-    # Scenario: Shared-owner replacement crashed after displacing owner.lock but before publishing the stage file.
-    # Purpose: Block a new shared acquisition without publishing an owner or changing the transaction namespace.
-    It 'InterT399_BlocksSharedAcquireWhenPreviousOwnerResidueExistsWithoutOwner' {
+    # Scenario: Shared-owner publication crashed after flushing its recognizable temporary and before the move.
+    # Purpose: Block a new shared acquisition without publishing an owner or changing the residue namespace.
+    It 'InterT399_BlocksSharedAcquireWhenPublicationTemporaryExistsWithoutOwner' {
         Import-Module -Name $coordinationModule -Force
-        $repository = Join-Path $TestDrive 'shared-previous-residue'
+        $repository = Join-Path $TestDrive 'shared-publication-residue'
         [void][IO.Directory]::CreateDirectory($repository)
         $first = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'guard-first'
         $lockRoot = Split-Path -Parent ([string]$first.path)
-        [byte[]]$transactionBytes = [Text.UTF8Encoding]::new($false).GetBytes('coordination:source-acquisition')
-        $transactionId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($transactionBytes)).ToLowerInvariant().Substring(0, 32)
-        $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') $transactionId
-        [void][IO.Directory]::CreateDirectory($transactionDirectory)
-        $previousPath = Join-Path $transactionDirectory ('previous-' + ('8' * 32))
         [byte[]]$ownerBytes = [IO.File]::ReadAllBytes([string]$first.path)
-        [IO.File]::Move([string]$first.path, $previousPath)
-        [string[]]$namespaceBefore = [IO.Directory]::GetFileSystemEntries((Join-Path $lockRoot '.ai-instructions-txn'), '*', [IO.SearchOption]::AllDirectories)
+        [IO.File]::Delete([string]$first.path)
+        $residuePath = Join-Path $lockRoot ('.source-acquisition.lock.publish-' + ('8' * 32) + '.tmp')
+        [IO.File]::WriteAllBytes($residuePath, $ownerBytes)
+        [string[]]$namespaceBefore = [IO.Directory]::GetFileSystemEntries($lockRoot)
 
         { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' `
                 -RunId 'guard-second' -TimeoutSeconds 2 } |
             Should -Throw '*BLOCKED*AI Auto Update/In Progress/.locks*Manual recovery for incomplete owner publication*'
 
         Test-Path -LiteralPath ([string]$first.path) | Should -BeFalse
-        [Convert]::ToHexString([IO.File]::ReadAllBytes($previousPath)) |
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($residuePath)) |
             Should -BeExactly ([Convert]::ToHexString($ownerBytes))
-        [string[]]$namespaceAfter = [IO.Directory]::GetFileSystemEntries((Join-Path $lockRoot '.ai-instructions-txn'), '*', [IO.SearchOption]::AllDirectories)
+        [string[]]$namespaceAfter = [IO.Directory]::GetFileSystemEntries($lockRoot)
         ($namespaceAfter -join "`n") | Should -BeExactly ($namespaceBefore -join "`n")
     }
 
-    # Scenario: MOD-owner replacement crashed after displacing the reservation owner but before publishing its stage file.
-    # Purpose: Block canonical-MOD acquisition without recreating owner or mutating the transaction residue.
-    It 'InterT400_BlocksModAcquireWhenPreviousOwnerResidueExistsWithoutOwner' {
+    # Scenario: MOD-owner publication crashed after flushing its recognizable temporary and before the move.
+    # Purpose: Block canonical-MOD acquisition without recreating owner or mutating the residue.
+    It 'InterT400_BlocksModAcquireWhenPublicationTemporaryExistsWithoutOwner' {
         $module = New-ModReservationGuardModuleForTest
         try {
-            $repository = Join-Path $TestDrive 'mod-previous-residue'
+            $repository = Join-Path $TestDrive 'mod-publication-residue'
             $lockKey = 'd' * 64
             $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod'
             [void][IO.Directory]::CreateDirectory($lockRoot)
@@ -935,12 +920,11 @@ Describe 'Incomplete owner publication transaction residue guard' {
                 param($path, $root)
                 Write-ModReservationOwner -ModLockPath $path -Repository $root -Value ([ordered]@{ seed = 'owner' })
             } $lockPath $repository
-            $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('d' * 32)
-            [void][IO.Directory]::CreateDirectory($transactionDirectory)
-            $previousPath = Join-Path $transactionDirectory ('previous-' + ('6' * 32))
             [byte[]]$ownerBytes = [IO.File]::ReadAllBytes($lockPath)
-            [IO.File]::Move($lockPath, $previousPath)
-            [string[]]$namespaceBefore = [IO.Directory]::GetFileSystemEntries((Join-Path $lockRoot '.ai-instructions-txn'), '*', [IO.SearchOption]::AllDirectories)
+            [IO.File]::Delete($lockPath)
+            $residuePath = Join-Path $lockRoot (".$lockKey.lock.publish-" + ('6' * 32) + '.tmp')
+            [IO.File]::WriteAllBytes($residuePath, $ownerBytes)
+            [string[]]$namespaceBefore = [IO.Directory]::GetFileSystemEntries($lockRoot)
 
             { & $module {
                     param($planValue, $statePath)
@@ -949,25 +933,25 @@ Describe 'Incomplete owner publication transaction residue guard' {
                 Should -Throw '*BLOCKED*AI Auto Update/In Progress/.locks/mod*Manual recovery for incomplete owner publication*'
 
             Test-Path -LiteralPath $lockPath | Should -BeFalse
-            [Convert]::ToHexString([IO.File]::ReadAllBytes($previousPath)) |
+            [Convert]::ToHexString([IO.File]::ReadAllBytes($residuePath)) |
                 Should -BeExactly ([Convert]::ToHexString($ownerBytes))
-            [string[]]$namespaceAfter = [IO.Directory]::GetFileSystemEntries((Join-Path $lockRoot '.ai-instructions-txn'), '*', [IO.SearchOption]::AllDirectories)
+            [string[]]$namespaceAfter = [IO.Directory]::GetFileSystemEntries($lockRoot)
             ($namespaceAfter -join "`n") | Should -BeExactly ($namespaceBefore -join "`n")
         }
         finally { Remove-Module $module -Force }
     }
 
-    # Scenario: A previous-* leaf is a directory or a native reparse/symlink entry instead of one regular evidence file.
-    # Purpose: Treat every non-regular transaction entry as residue and fail closed on every native host.
-    It 'InterT401_TreatsNonRegularTransactionEntryAsResidue_<Case>' -ForEach @(
+    # Scenario: A recognizable publication temporary is a directory or native reparse/symlink entry.
+    # Purpose: Treat every matching non-regular entry as residue on every native host.
+    It 'InterT401_TreatsNonRegularPublicationTemporaryAsResidue_<Case>' -ForEach @(
         @{ Case = 'Directory' }
         @{ Case = 'ReparseOrSymlink' }
     ) {
         Import-Module -Name $pathSafetyModule -Force
         $lockRoot = Join-Path $TestDrive "non-regular-residue-$Case"
-        $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('5' * 32)
-        [void][IO.Directory]::CreateDirectory($transactionDirectory)
-        $entry = Join-Path $transactionDirectory ('previous-' + ('4' * 32))
+        [void][IO.Directory]::CreateDirectory($lockRoot)
+        $entryLeaf = '.owner.lock.publish-' + ('4' * 32) + '.tmp'
+        $entry = Join-Path $lockRoot $entryLeaf
         if ($Case -ceq 'Directory') {
             [void][IO.Directory]::CreateDirectory($entry)
         }
@@ -977,14 +961,14 @@ Describe 'Incomplete owner publication transaction residue guard' {
             $null = New-TestReparsePoint -Path $entry -Target $target
         }
 
-        $result = Get-PortableTransactionResidue -LockRoot $lockRoot
+        $result = Get-PortableTransactionResidue -LockRoot $lockRoot -OwnerLeaf 'owner.lock'
 
         $result.hasResidue | Should -BeTrue
         @($result.entries).Count | Should -BeGreaterOrEqual 1
-        (@($result.entries) -join "`n") | Should -Match ([regex]::Escape(".ai-instructions-txn/$('5' * 32)/previous-$('4' * 32)"))
+        (@($result.entries) -join "`n") | Should -Match ([regex]::Escape($entryLeaf))
     }
 
-    # Scenario: A stale shared owner is successfully replaced and retained as previous-* evidence beside the new owner.
+    # Scenario: A stale shared owner is successfully replaced and retained as fixed-name evidence beside the new owner.
     # Purpose: Preserve acquire, heartbeat, and release behavior when residue belongs to a completed stale takeover.
     It 'InterT402_AllowsCompletedStaleTakeoverWithOwnerPresent' {
         Import-Module -Name $coordinationModule -Force
@@ -999,7 +983,7 @@ Describe 'Incomplete owner publication transaction residue guard' {
         [IO.File]::WriteAllText([string]$oldLease.path, ($owner | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
 
         $newLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'stale-new'
-        $newLease.staleEvidencePath | Should -Match '[\\/]\.ai-instructions-txn[\\/][0-9a-f]{32}[\\/]previous-[0-9a-f]{32}$'
+        $newLease.staleEvidencePath | Should -Match '[\\/]\.git-coordination\.lock\.stale-[0-9a-f]{64}\.json$'
         Test-Path -LiteralPath ([string]$newLease.path) -PathType Leaf | Should -BeTrue
         Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Leaf | Should -BeTrue
         { Update-SharedCoordinationLease -Lease $newLease -Force } | Should -Not -Throw
@@ -1007,8 +991,8 @@ Describe 'Incomplete owner publication transaction residue guard' {
         $script:completedTakeoverReceipt | Should -Not -BeNullOrEmpty
     }
 
-    # Scenario: One owner is between displacement and publication while holding its owner-update guard, and another owner acquires in the same transaction namespace.
-    # Purpose: Wait for the shared namespace guard or ignore another MOD's scoped transaction without weakening target-owner crash blocking.
+    # Scenario: One owner has a publication temporary while holding its owner-update guard, and another owner acquires in the same lock root.
+    # Purpose: Wait for the shared namespace guard or ignore another MOD's owner-scoped temporary without weakening target-owner crash blocking.
     It 'InterT403_AllowsAcquisitionDuringAnotherGuardedOwnerReplacement_<Case>' -ForEach @(
         @{ Case = 'Shared' }
         @{ Case = 'Mod' }
@@ -1025,12 +1009,8 @@ Describe 'Incomplete owner publication transaction residue guard' {
                 param($root)
                 Enter-CoordinationOwnerGuard -LockRoot $root -ResourceKey 'source-acquisition'
             } $lockRoot
-            [byte[]]$transactionBytes = [Text.UTF8Encoding]::new($false).GetBytes('coordination:source-acquisition')
-            $transactionId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($transactionBytes)).ToLowerInvariant().Substring(0, 32)
-            $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') $transactionId
-            [void][IO.Directory]::CreateDirectory($transactionDirectory)
-            $previousPath = Join-Path $transactionDirectory ('previous-' + ('3' * 32))
-            [IO.File]::Move([string]$sourceLease.path, $previousPath)
+            $temporaryPath = Join-Path $lockRoot ('.source-acquisition.lock.publish-' + ('3' * 32) + '.tmp')
+            [IO.File]::WriteAllText($temporaryPath, 'in-flight owner')
             $childPath = Join-Path $TestDrive 'shared-in-flight-contender.ps1'
             $readyPath = Join-Path $TestDrive 'shared-in-flight-contender.ready'
             @'
@@ -1067,7 +1047,7 @@ $lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey 
                 [IO.File]::Exists($readyPath) | Should -BeTrue
                 Start-Sleep -Milliseconds 300
                 $process.HasExited | Should -BeFalse -Because 'the contender must wait for the shared owner-update namespace guard'
-                [IO.File]::Move($previousPath, [string]$sourceLease.path)
+                [IO.File]::Delete($temporaryPath)
                 $guard.Dispose()
                 $guard = $null
                 $process.WaitForExit(20000) | Should -BeTrue
@@ -1075,9 +1055,7 @@ $lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey 
                 $stdout.Result | Should -Not -Match 'BLOCKED'
             }
             finally {
-                if ([IO.File]::Exists($previousPath) -and -not [IO.File]::Exists([string]$sourceLease.path)) {
-                    [IO.File]::Move($previousPath, [string]$sourceLease.path)
-                }
+                if ([IO.File]::Exists($temporaryPath)) { [IO.File]::Delete($temporaryPath) }
                 if ($guard) { $guard.Dispose() }
                 if ($started -and -not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
                 $process.Dispose()
@@ -1105,10 +1083,8 @@ $lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey 
                     -Leaf $leaf -TimeoutMilliseconds 2000 `
                     -Label 'MOD in-flight owner test guard'
             } $repository "$firstKey.lock.owner-update.guard"
-            $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('b' * 32)
-            [void][IO.Directory]::CreateDirectory($transactionDirectory)
-            $previousPath = Join-Path $transactionDirectory ('previous-' + ('2' * 32))
-            [IO.File]::Move($firstPath, $previousPath)
+            $temporaryPath = Join-Path $lockRoot (".$firstKey.lock.publish-" + ('2' * 32) + '.tmp')
+            [IO.File]::WriteAllText($temporaryPath, 'in-flight first MOD owner')
             try {
                 & $module {
                     param($path, $root)
@@ -1117,9 +1093,7 @@ $lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey 
                 Test-Path -LiteralPath $secondPath -PathType Leaf | Should -BeTrue
             }
             finally {
-                if ([IO.File]::Exists($previousPath) -and -not [IO.File]::Exists($firstPath)) {
-                    [IO.File]::Move($previousPath, $firstPath)
-                }
+                if ([IO.File]::Exists($temporaryPath)) { [IO.File]::Delete($temporaryPath) }
                 $guard.Dispose()
             }
         }

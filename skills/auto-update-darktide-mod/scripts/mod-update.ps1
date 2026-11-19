@@ -807,7 +807,6 @@ function Write-ModReservationOwner {
         [AllowNull()][string] $ExpectedWorkerToken
     )
     $ownerPath = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository -AllowMissingOwner
-    $transactionId = ([IO.Path]::GetFileNameWithoutExtension($ownerPath) -replace '[^0-9a-f]', '').PadRight(32, '0').Substring(0, 32)
     $snapshot = Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository
     $ownerExists = [bool]$snapshot.exists
     $guardStream = $null
@@ -831,10 +830,10 @@ function Write-ModReservationOwner {
         $snapshot = Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository
         $ownerExists = [bool]$snapshot.exists
         if (-not $ownerExists -and [string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
-            $transactionResidue = Get-PortableTransactionResidue -LockRoot $lockRoot -TransactionId $transactionId
+            $transactionResidue = Get-PortableTransactionResidue -LockRoot $lockRoot -OwnerLeaf ([IO.Path]::GetFileName($ownerPath))
             if ([bool]$transactionResidue.hasResidue) {
                 $residueEntries = @($transactionResidue.entries) -join ', '
-                $residueMessage = "BLOCKED: incomplete owner publication residue exists under 'AI Auto Update/In Progress/.locks/mod/.ai-instructions-txn' ($residueEntries). Follow 'Manual recovery for incomplete owner publication' in references/automation.md."
+                $residueMessage = "BLOCKED: incomplete owner publication residue exists under 'AI Auto Update/In Progress/.locks/mod' ($residueEntries). Follow 'Manual recovery for incomplete owner publication' in references/automation.md."
                 throw [IO.InvalidDataException]::new($residueMessage)
             }
         }
@@ -857,7 +856,6 @@ function Write-ModReservationOwner {
             Leaf = [IO.Path]::GetFileName($ownerPath)
             Bytes = $bytes
             ExpectedState = $snapshot
-            TransactionId = $transactionId
             NoReplace = -not $ownerExists
         }
         $null = Publish-PortableLeaseFile @publishParameters
@@ -903,8 +901,7 @@ function Get-ModReservationReleaseReceipt {
         return [ordered]@{ path = Join-Path $parent $leaf; sha256 = [string]$snapshot.sha256; value = $value }
     }
     if (-not $Publish) { throw 'MOD reservation terminal receipt is missing.' }
-    $transactionId = (Get-ModReservationActorToken -Value "release-receipt:$leaf")
-    $result = Publish-PortableLeaseFile -ParentPath $parent -Leaf $leaf -Bytes $bytes -ExpectedState $snapshot -TransactionId $transactionId -NoReplace
+    $result = Publish-PortableLeaseFile -ParentPath $parent -Leaf $leaf -Bytes $bytes -ExpectedState $snapshot -NoReplace
     [ordered]@{ path = Join-Path $parent $leaf; sha256 = [string]$result.state.sha256; value = $value }
 }
 
@@ -2012,8 +2009,7 @@ function Assert-LockOwner {
     $allowedOwnerState = [string]$owner.state -ceq 'held' -or ($AllowReleased -and [string]$owner.state -ceq 'released')
     if ([int]$owner.schemaVersion -ne 3 -or -not $allowedOwnerState -or
         [string]$owner.platform -notin @('windows', 'linux', 'macos') -or
-        ([string]$owner.platform -ceq 'windows' -and [string]$owner.lockPrimitive -cne 'windows-fileshare') -or
-        ([string]$owner.platform -in @('linux', 'macos') -and [string]$owner.lockPrimitive -cne 'flock') -or
+        [string]$owner.lockPrimitive -cne 'dotnet-fileshare-none' -or
         [string]$owner.reservationToken -notmatch '^[0-9a-f]{32}$' -or
         [string]$owner.leaseMode -notin @('active', 'reserved')) {
         throw 'MOD identity lock owner contract is invalid.'

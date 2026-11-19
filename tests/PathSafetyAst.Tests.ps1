@@ -61,34 +61,10 @@ $prProductionPowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/Test-ModUpdateCandidate.ps1',
     'skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1',
     'skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1',
-    'skills/auto-update-darktide-mod/scripts/mod-update.ps1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/Resolve-StandardValidationTool.ps1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/WindowsDacl.psm1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/installer-safe-mutation.psm1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform-runtime.psm1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Linux.psm1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/MacOS.psm1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/RuntimePreparation.psm1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Unix.psm1',
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Windows.psm1'
+    'skills/auto-update-darktide-mod/scripts/mod-update.ps1'
 )
-$protectedPrProductionPowerShellInventorySha256 = '09d9afe5b62be42394f41fe3ae97d25db6971a3ea7b8bbf79be515de6473892a'
-
-# These files are byte-exact authority acc3d73 runtime artifacts. Their hashes
-# are verified by PathSafety before loading and consumer changes are forbidden,
-# so they are intentionally excluded from the consumer pathname-call policy.
-$vendoredAuthorityAllowlist = [ordered]@{
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/Resolve-StandardValidationTool.ps1' = 'authority acc3d73 immutable bytes'
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/WindowsDacl.psm1' = 'authority acc3d73 immutable bytes'
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/installer-safe-mutation.psm1' = 'authority acc3d73 immutable bytes'
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform-runtime.psm1' = 'authority acc3d73 immutable bytes'
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Linux.psm1' = 'authority acc3d73 immutable bytes'
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/MacOS.psm1' = 'authority acc3d73 immutable bytes'
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/RuntimePreparation.psm1' = 'authority acc3d73 immutable bytes'
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Unix.psm1' = 'authority acc3d73 immutable bytes'
-    'skills/auto-update-darktide-mod/scripts/platform-runtime/platform/Windows.psm1' = 'authority acc3d73 immutable bytes'
-}
-$scopedFiles = @($prProductionPowerShellFiles | Where-Object { -not $vendoredAuthorityAllowlist.Contains($_) })
+$protectedPrProductionPowerShellInventorySha256 = '71abeabf1c4115c711584514d6279531ff293576c3998bc18b2989a3f21ae927'
+$scopedFiles = @($prProductionPowerShellFiles)
 
 # Exact origin/main function-level inventory. Format: file|function|call|count.
 $originMainExclusions = @'
@@ -313,9 +289,20 @@ skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Write-Atomic
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Write-AtomicJson|IO.File::WriteAllText|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Write-AtomicJson|New-Item|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Write-AtomicJson|Test-Path|1
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-WindowsPathCaseSensitivity|type::IO.DirectoryInfo|1
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Test-PortableReparseItem|type::IO.DirectoryInfo|2
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Test-PortableReparseItem|type::IO.FileInfo|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Enter-PortableFileLock|IO.Directory::Exists|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Enter-PortableFileLock|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableLeaseFileState|IO.Directory::Exists|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableLeaseFileState|IO.File::Exists|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableLeaseFileState|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Publish-PortableLeaseFile|IO.File::Delete|2
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Publish-PortableLeaseFile|IO.File::Exists|5
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Publish-PortableLeaseFile|IO.File::Move|2
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Resolve-PortableTrustedRoot|IO.Directory::Exists|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Test-PortablePhysicalIdentity|IO.Directory::Exists|2
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Test-PortablePhysicalIdentity|IO.File::Exists|2
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Test-PortableReparseItem|Get-Item|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Test-PortableReparseItem|type::IO.DirectoryInfo|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Write-PortableTemporaryFile|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|<script>|Get-Item|2
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|<script>|IO.File::Delete|2
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|<script>|IO.File::Move|1
@@ -359,9 +346,10 @@ skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|Read-QueueText
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|Test-Path|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|type::IO.DirectoryInfo|1
-skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Enter-CoordinationOwnerGuard|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Enter-SharedCoordinationLease|New-Item|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Get-CoordinationFileSha256|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Open-CoordinationPrivateDirectory|IO.Directory::CreateDirectory|1
+skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Open-CoordinationPrivateDirectory|IO.Directory::Exists|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Start-SharedCoordinationAcquisitionAttempt|Test-Path|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Write-CoordinationAtomicJson|IO.File::Delete|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Write-CoordinationAtomicJson|IO.File::Move|1
@@ -402,9 +390,9 @@ skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Get-ArchiveEviden
 skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Get-FileSha256|IO.File::Open|1
 '@ -split "`r?`n" | Where-Object { $_ }
 
-# Pure reads/non-filesystem provider operations retained under an already-held lease.
+# Pure reads/non-filesystem provider operations retained under an already-held owner guard.
 $pureReadExclusions = @'
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableTransactionResidue|IO.Directory::GetFileSystemEntries|2
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableTransactionResidue|IO.Directory::GetFileSystemEntries|1
 scripts/StandardSourceDriver.psm1|Get-DarktideActiveSkillIds|Get-ChildItem|1
 scripts/StandardSourceDriver.psm1|Get-DarktideOwnedProcessEnvironment|Get-ChildItem|1
 scripts/StandardSourceDriver.psm1|Get-DarktideSourceResolverEnvironment|Remove-Item|1
@@ -414,17 +402,6 @@ scripts/Prepare-WorkflowPowerShell.ps1|<script>|IO.File::AppendAllText|3
 scripts/Invoke-CorePester.ps1|<script>|Get-ChildItem|1
 scripts/CorePesterIntegrity.psm1|Test-CorePesterClosure|Get-ChildItem|1
 scripts/CorePesterIntegrity.psm1|Get-CorePesterTreeSnapshot|Get-ChildItem|1
-'@ -split "`r?`n" | Where-Object { $_ }
-
-# F8 residual-risk allowance: these exact registry verification reads are the
-# three pre-load operations that hash and inventory the vendored authority.
-# The verified path is loaded only after these checks, then every runtime file
-# is revalidated by inventory plus SingleLink identity; automation.md records
-# why the remaining verification-to-load replacement interval adds no power.
-$f8VerifiedImportAllowances = @'
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-VendoredPlatformRuntimeSha256|IO.File::ReadAllBytes|1
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Assert-VendoredPlatformRuntime|Get-Item|1
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Assert-VendoredPlatformRuntime|Get-ChildItem|1
 '@ -split "`r?`n" | Where-Object { $_ }
 
 $corePesterBootstrapAllowances = [ordered]@{
@@ -487,7 +464,8 @@ Describe 'Epic pathname safety AST boundary' {
 
     It 'contains no unreviewed pathname command, static IO method, or FileInfo/DirectoryInfo check' {
         $allowances = @{}
-        foreach ($row in @($originMainExclusions + $pureReadExclusions + $f8VerifiedImportAllowances + @($corePesterBootstrapAllowances.Keys))) {
+        $reviewedRows = @($originMainExclusions) + @($pureReadExclusions) + @($corePesterBootstrapAllowances.Keys)
+        foreach ($row in $reviewedRows) {
             $parts = $row -split '\|'
             $allowances["$($parts[0])|$($parts[1])|$($parts[2])"] = [int]$parts[3]
         }

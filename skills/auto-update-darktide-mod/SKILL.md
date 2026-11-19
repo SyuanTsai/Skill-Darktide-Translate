@@ -15,6 +15,7 @@ SPDX-License-Identifier: Apache-2.0
 Use the packaged Schema 14 workflow as the normative base. For a new automatic-source run, also use the verified Schema 15 extension. The Skill routes each operation through the evidence needed for a trustworthy, recoverable result.
 
 Local installation, execution, and validation require Windows with PowerShell 7; Linux, macOS, and WSL are unsupported.
+The coordination helpers themselves use only local .NET locking, same-directory publication, lexical containment, and recognizable crash-residue names so their primitive contract can be verified on Windows, Linux, and macOS without a packaged runtime.
 
 ## Load the authoritative instructions
 

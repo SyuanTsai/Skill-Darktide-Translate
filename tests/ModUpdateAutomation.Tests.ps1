@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Deterministic Darktide MOD update automation' {
     BeforeAll {
@@ -10,7 +10,7 @@ Describe 'Deterministic Darktide MOD update automation' {
         $validatorPath = Join-Path $skillRoot 'scripts/Test-ModUpdateCandidate.ps1'
         $script:skillSourcePinPath = New-TestSkillSourcePin -SkillRoot $skillRoot -OutputPath (Join-Path $TestDrive 'skill-source-pin.json')
 
-        # Unix/cross-platform fixture helpers for the vendored platform runtime cases.
+        # Native-host fixture helpers for cross-platform process cases.
         function Invoke-ChildPowerShellForTest {
             param(
                 [Parameter(Mandatory)][string] $ScriptPath,
@@ -83,106 +83,56 @@ Describe 'Deterministic Darktide MOD update automation' {
         }
     }
 
-    # Scenario: A tree iterator passes the provider's authoritative directory entry.
-    # Purpose: Avoid repeating an ancestor walk for every existing item while keeping
-    # the missing-path fallback responsible for detecting broken-link ancestors.
-    It 'UnitT106_InspectsRawAncestorsAfterProviderResolution' {
+    # Scenario: A caller supplies a provider item while one of its lexical ancestors is a link.
+    # Purpose: Keep the lightweight local helper walking every ancestor to the declared root.
+    It 'UnitT106_InspectsEachLexicalAncestorForReparseMetadata' {
         $pathSafetyPath = Join-Path $skillRoot 'scripts/PathSafety.psm1'
         $pathSafety = Get-Content -LiteralPath $pathSafetyPath -Raw
-        $pathSafety | Should -Match '(?s)if \(& \$inspectProviderItem \$Item\) \{ return \$true \}.*?always walk raw lexical ancestors even when \$Item exists'
-        $pathSafety | Should -Not -Match 'if \(\$null -ne \$Item\) \{ return \$false \}'
+        $pathSafety | Should -Match '(?s)\$current = \$full.*?for \(\$depth = 0; \$depth -lt 2048; \$depth\+\+\).*?FileAttributes\]::ReparsePoint'
+        $pathSafety | Should -Match '(?s)\$current\.Equals\(\$root, \$comparison\).*?\{ break \}'
         $pathSafety | Should -Not -Match 'knownSafePhysicalPaths'
     }
 
-    It 'UnitT107_UsesKernelIdentityForCaseOnlyPhysicalNormalization' {
-        $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
-        $runner = Get-Content -LiteralPath $runnerPath -Raw
+    # Scenario: A candidate path contains parent traversal that normalizes outside its declared root.
+    # Purpose: Keep the local primitive's authorization boundary to platform-aware lexical containment.
+    It 'UnitT368_RejectsParentTraversalOutsideTheContainingRoot' {
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $root = Join-Path $TestDrive 'contained-root'
+        [void][IO.Directory]::CreateDirectory($root)
 
-        $pathSafety | Should -Match 'TryGetPhysicalFileIdentity'
-        $pathSafety | Should -Match 'Test-PortablePhysicalIdentity'
-        $runner | Should -Match 'Test-PortablePhysicalIdentity'
-        $runner | Should -Match '\$samePhysicalPath'
+        Resolve-PortableContainedPath -Root $root -Path 'inside/file.json' |
+            Should -BeExactly ([IO.Path]::GetFullPath((Join-Path $root 'inside/file.json')))
+        { Resolve-PortableContainedPath -Root $root -Path '../escape.json' } |
+            Should -Throw '*escapes its containing root*'
     }
 
-    # Register only on the native host: these cases exercise Win32 native types,
-    # case-sensitivity information classes, and MAX_PATH semantics.
-    if ($IsWindows) {
-        # Scenario: The native case-sensitivity query is unavailable and the Win32 fallback is used.
-        # Purpose: Pass each API its own information-class enum value; the numeric values are not interchangeable.
-        It 'UnitT108_UsesDistinctNativeAndWin32CaseSensitivityClasses' {
-            $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
-
-            $pathSafety | Should -Match 'private const int NtFileCaseSensitiveInformation = 71;'
-            $pathSafety | Should -Match 'private const int Win32FileCaseSensitiveInformation = 23;'
-            $pathSafety | Should -Match '(?s)NtQueryInformationFile\(.*?NtFileCaseSensitiveInformation\)'
-            $pathSafety | Should -Match '(?s)GetFileInformationByHandleEx\(.*?Win32FileCaseSensitiveInformation\s*,'
-            $pathSafety | Should -Not -Match '(?s)GetFileInformationByHandleEx\(\s*handle,\s*FileCaseSensitiveInformation\s*,'
-        }
-
-        # Scenario: Native metadata opens receive canonical long drive/UNC paths or paths with Win32 normalization semantics.
-        # Purpose: Extend only ordinary canonical long paths, preserving short, relative, device, dot/space, and stream inputs.
-        It 'UnitT109_PreservesNativePathSemanticsWhileExtendingCanonicalLongPaths' {
-            Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-            $formatter = [SyuanTsai.PathSafetyNative].GetMethod('GetNativeOpenPath', [Reflection.BindingFlags]'NonPublic,Static')
-            $formatter | Should -Not -BeNullOrEmpty
-            $longDrive = 'C:\' + ('a' * 270)
-            $longUnc = '\\server\share\' + ('a' * 270)
-            $formatter.Invoke($null, @($longDrive)) | Should -BeExactly ('\\?\' + $longDrive)
-            $formatter.Invoke($null, @($longUnc)) | Should -BeExactly ('\\?\UNC\' + $longUnc.Substring(2))
-            foreach ($unchanged in @(
-                'C:\short\file.txt',
-                ('relative\' + ('a' * 270)),
-                ('C:relative\' + ('a' * 270)),
-                ('C:/' + ('a' * 270)),
-                ('C:\dot\..\' + ('a' * 270)),
-                ('C:\trailing.\' + ('a' * 270)),
-                ('C:\trailing \'+ ('a' * 270)),
-                ($longDrive + ':stream'),
-                ('\\?\' + $longDrive),
-                ('\\.\' + $longDrive)
-            )) {
-                $formatter.Invoke($null, @($unchanged)) | Should -BeExactly $unchanged
-            }
-        }
-
-        # Scenario: Case aliases and a distinct file exist below a real Windows directory longer than MAX_PATH.
-        # Purpose: Prove native metadata can identify long-path aliases without conflating different files or changing short paths.
-        It 'InterT109_QueriesRealLongPathCaseSemanticsAndPhysicalIdentity' {
-            Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-            $longRoot = Join-Path $TestDrive ('native-long-' + ('a' * 100))
-            $longRoot = Join-Path $longRoot ('b' * 100)
-            $directory = Join-Path $longRoot 'ui'
-            [void][IO.Directory]::CreateDirectory($directory)
-            $original = Join-Path $directory 'Same.txt'
-            $alias = Join-Path (Join-Path $longRoot 'UI') 'Same.txt'
-            $distinct = Join-Path $directory 'Other.txt'
-            [IO.File]::WriteAllText($original, 'same physical file')
-            [IO.File]::WriteAllText($distinct, 'distinct file')
-            $directory.Length | Should -BeGreaterOrEqual 260
-            Get-PortablePathComparison -Paths @($directory) | Should -Be ([StringComparison]::OrdinalIgnoreCase)
-            Test-PortablePhysicalIdentity -PathA $original -PathB $alias | Should -BeTrue
-            Test-PortablePhysicalIdentity -PathA $original -PathB $distinct | Should -BeFalse
-            $shortDirectory = Join-Path $TestDrive 'native-short'
-            [void][IO.Directory]::CreateDirectory($shortDirectory)
-            $shortFile = Join-Path $shortDirectory 'same.txt'
-            [IO.File]::WriteAllText($shortFile, 'short control')
-            $shortFile.Length | Should -BeLessThan 260
-            Test-PortablePhysicalIdentity -PathA $shortFile -PathB $shortFile | Should -BeTrue
-            Test-PortableReparseItem -Path $directory | Should -BeFalse
-        }
+    # Scenario: The package uses only the local lock, publication, containment, and residue primitives.
+    # Purpose: Prevent the deleted authority runtime from returning through a manifest, registry, or platform API call.
+    It 'UnitT369_UsesOnlyLocalPortablePrimitives' {
+        $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
+        $pathSafety | Should -Match '\[IO\.File\]::Open\('
+        $pathSafety | Should -Match '\[IO\.FileShare\]::None'
+        $pathSafety | Should -Match '\[IO\.File\]::Move\('
+        $pathSafety | Should -Match 'Resolve-PortableContainedPath'
+        $pathSafety | Should -Match 'publish-\[0-9a-f\]'
+        $deletedRuntimeTokens = @(
+            ('Platform' + 'Runtime'), ('Open-' + 'Platform'), ('Assert-' + 'Platform'),
+            ('Enter-' + 'Platform'), ('Publish-' + 'Platform'), ('Resolve-' + 'Platform')
+        ) -join '|'
+        $pathSafety | Should -Not -Match $deletedRuntimeTokens
     }
 
     # Scenario: A Unix-like host compares managed paths that differ only by case.
-    # Purpose: Keep containment strict on Unix volumes and never weaken exclusion checks with a case-sensitive comparer on any host.
+    # Purpose: Keep both containment and exclusion comparisons aligned with native Unix path casing.
     if (-not $IsWindows) {
-        It 'UnitT108U_UsesStrictUnixContainmentAndCaseInsensitiveExclusion' {
+        It 'UnitT108U_UsesStrictUnixContainmentAndNativeExclusionComparison' {
             Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
             $root = Join-Path $TestDrive 'unix-case-policy'
             [void][IO.Directory]::CreateDirectory((Join-Path $root 'Mods'))
             $containment = Get-PortablePathComparison -Paths @($root)
             $containment | Should -Be ([StringComparison]::Ordinal)
             Get-PortablePathComparison -Paths @($root) -Purpose Containment | Should -Be ([StringComparison]::Ordinal)
-            Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be ([StringComparison]::OrdinalIgnoreCase)
+            Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be ([StringComparison]::Ordinal)
             $prefix = (Join-Path $root 'Mods') + [IO.Path]::DirectorySeparatorChar
             (Join-Path $root 'mods/Escape.lua').StartsWith($prefix, $containment) | Should -BeFalse
             (Join-Path $root 'Mods/Inside.lua').StartsWith($prefix, $containment) | Should -BeTrue
@@ -190,14 +140,15 @@ Describe 'Deterministic Darktide MOD update automation' {
     }
 
     # Scenario: Any host checks that a path is outside a protected root.
-    # Purpose: Use case-insensitive comparison for exclusion so a case alias cannot escape it when volume case semantics are uncertain.
-    It 'UnitT360_UsesCaseInsensitiveComparisonForEveryExclusionCheck' {
+    # Purpose: Use Windows-insensitive and Unix-sensitive comparisons consistently for local containment.
+    It 'UnitT360_UsesTheNativePlatformComparisonForExclusionChecks' {
         Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
         $root = Join-Path $TestDrive 'exclusion-policy'
         [void][IO.Directory]::CreateDirectory($root)
-        Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be ([StringComparison]::OrdinalIgnoreCase)
-        Get-PortablePathComparison -Purpose Exclusion | Should -Be ([StringComparison]::OrdinalIgnoreCase)
-        Get-PortablePathComparison | Should -Be ([StringComparison]::Ordinal)
+        $expectedComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be $expectedComparison
+        Get-PortablePathComparison -Purpose Exclusion | Should -Be $expectedComparison
+        Get-PortablePathComparison | Should -Be $expectedComparison
         $expander = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Expand-Schema14Reference.ps1') -Raw
         $expander | Should -Match 'Get-PortablePathComparison -Paths @\(\$resolvedSkillRoot, \$resolvedOutputRoot\) -Purpose Exclusion'
         $expander | Should -Not -Match '\[StringComparison\]::Ordinal\s*\r?\n\s*\}'
@@ -214,90 +165,6 @@ Describe 'Deterministic Darktide MOD update automation' {
         $caseAlias = [IO.Path]::GetFullPath((Join-Path $TestDrive 'worktree/review-artifacts/localization-workset.json'))
         $caseAlias.StartsWith($worktreePrefix, [StringComparison]::Ordinal) | Should -BeFalse
         $caseAlias.StartsWith($worktreePrefix, [StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
-    }
-
-    # Scenario: A Unix-like host compares two names of managed regular files by kernel identity.
-    # Purpose: Use the vendored (st_dev, st_ino) identity, require exactly one link, and reject symlinks instead of treating them as the same file.
-    if (-not $IsWindows) {
-        It 'InterT109U_QueriesUnixDeviceInodeIdentityAndRejectsHardLinksAndSymlinks' {
-            Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-            $directory = Join-Path $TestDrive 'unix-identity'
-            [void][IO.Directory]::CreateDirectory($directory)
-            $original = Join-Path $directory 'Same.txt'
-            $distinct = Join-Path $directory 'Other.txt'
-            [IO.File]::WriteAllText($original, 'same physical file')
-            [IO.File]::WriteAllText($distinct, 'distinct file')
-            Test-PortablePhysicalIdentity -PathA $original -PathB $original | Should -BeTrue
-            Test-PortablePhysicalIdentity -PathA $original -PathB $distinct | Should -BeFalse
-            Test-PortablePhysicalIdentity -PathA $original -PathB (Join-Path $directory 'Missing.txt') | Should -BeFalse
-            $caseAlias = Join-Path $directory 'same.txt'
-            if (Test-Path -LiteralPath $caseAlias) {
-                # Case-insensitive volume (for example macOS APFS): the alias is the same inode.
-                Test-PortablePhysicalIdentity -PathA $original -PathB $caseAlias | Should -BeTrue
-            }
-            else {
-                Test-PortablePhysicalIdentity -PathA $original -PathB $caseAlias | Should -BeFalse
-            }
-            Test-PortablePhysicalIdentity -PathA $directory -PathB $directory | Should -BeTrue
-
-            $symlink = Join-Path $directory 'Link.txt'
-            New-Item -ItemType SymbolicLink -Path $symlink -Target $original | Out-Null
-            Test-PortableReparseItem -Path $symlink -Item (Get-Item -LiteralPath $symlink -Force) | Should -BeTrue
-            { Test-PortablePhysicalIdentity -PathA $original -PathB $symlink } | Should -Throw '*Unix physical identity*'
-
-            $hardLink = Join-Path $directory 'Hard.txt'
-            New-TestHardLink -Path $hardLink -Target $distinct | Out-Null
-            { Test-PortablePhysicalIdentity -PathA $distinct -PathB $hardLink } | Should -Throw '*Unix physical identity*'
-            { Test-PortablePhysicalIdentity -PathA $original -PathB $hardLink } | Should -Throw '*Unix physical identity*'
-        }
-    }
-
-    # Scenario: A repository sits below a symlinked ancestor, as macOS temporary roots do with /var -> /private/var.
-    # Purpose: Reject links inside the root while keeping the flock lease and receipt below its physically canonical path.
-    if (-not $IsWindows) {
-        It 'InterT110U_StopsAncestorChecksAtThePhysicallyCanonicalTrustedRoot' {
-            Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-            $real = Join-Path $TestDrive 'var-real'
-            $alias = Join-Path $TestDrive 'var-alias'
-            $lockRelative = 'AI Auto Update/In Progress/.locks'
-            [void][IO.Directory]::CreateDirectory((Join-Path (Join-Path $real 'repo') $lockRelative))
-            New-TestReparsePoint -Path $alias -Target $real | Out-Null
-            $repository = Join-Path $alias 'repo'
-            $physicalRepository = Resolve-TestPhysicalPath -Path (Join-Path $real 'repo')
-
-            Test-PortableReparseItem -Path (Join-Path $repository 'AI Auto Update') -TrustedRoot $repository | Should -BeFalse
-            Test-PortableReparseItem -Path $repository -TrustedRoot $repository | Should -BeFalse
-            # Without a trusted root the parent entry is still inspected, so the alias is reported.
-            Test-PortableReparseItem -Path $repository | Should -BeTrue
-            { Test-PortableReparseItem -Path $real -TrustedRoot $repository } | Should -Throw '*outside its trusted root*'
-            Resolve-PortableTrustedRoot -Path $repository | Should -BeExactly $physicalRepository
-
-            New-TestReparsePoint -Path (Join-Path (Join-Path $real 'repo') 'linked') -Target $real | Out-Null
-            Test-PortableReparseItem -Path (Join-Path $repository 'linked/child') -TrustedRoot $repository | Should -BeTrue
-
-            $first = Enter-PortableFileLock -Root $repository -RelativeDirectory $lockRelative -Leaf 'probe.guard' -TimeoutMilliseconds 200
-            try {
-                $first.platform | Should -BeIn @('linux', 'macos')
-                $first.lockPrimitive | Should -BeExactly 'flock'
-                $first.path.StartsWith($physicalRepository + '/', [StringComparison]::Ordinal) | Should -BeTrue
-                { Enter-PortableFileLock -Root $repository -RelativeDirectory $lockRelative -Leaf 'probe.guard' -TimeoutMilliseconds 100 } |
-                    Should -Throw '*Unable to acquire*'
-            }
-            finally { $first.Dispose() }
-            $second = Enter-PortableFileLock -Root $repository -RelativeDirectory $lockRelative -Leaf 'probe.guard' -TimeoutMilliseconds 200
-            $second.Dispose()
-            { Enter-PortableFileLock -Root $repository -RelativeDirectory 'linked' -Leaf 'probe.guard' -TimeoutMilliseconds 100 } | Should -Throw
-
-            Import-Module (Join-Path $skillRoot 'scripts/SharedCoordinationLock.psm1') -Force
-            $receiptRoot = Join-Path $repository 'coordination-receipts'
-            $lease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' `
-                -RunId 'unix-alias-run' -ReceiptRoot $receiptRoot -TimeoutSeconds 10
-            $lease.lockPrimitive | Should -BeExactly 'flock'
-            $lease.platform | Should -BeIn @('linux', 'macos')
-            $lease.path.StartsWith($physicalRepository + '/', [StringComparison]::Ordinal) | Should -BeTrue
-            $receipt = Exit-SharedCoordinationLease -Lease $lease
-            $receipt.path.StartsWith($physicalRepository + '/', [StringComparison]::Ordinal) | Should -BeTrue
-        }
     }
 
     # Scenario: The runner's ancestor walk is executed without the PathSafety module, as the legacy harness extracts it.
@@ -335,169 +202,101 @@ Describe 'Deterministic Darktide MOD update automation' {
         { & $module $invoke (Join-Path $repository 'linked') $repository } | Should -Throw '*symlink or reparse point*'
     }
 
-    # Scenario: The Skill runtime loads the authority platform runtime that is vendored inside the Skill package.
-    # Purpose: Bind every vendored file to the reviewed authority revision and its own manifest inventory before any lock or identity primitive is used.
-    It 'UnitT362_BindsEveryVendoredPlatformRuntimeFileToTheAuthorityRegistry' {
+    # Scenario: Two native-host child processes start together and compete for one FileShare.None lock.
+    # Purpose: Prove exactly one process enters the critical section on Windows, Linux, and macOS.
+    It 'InterT404_AllowsOnlyOneConcurrentNativeFileLockHolder' -Tag 'MultiProcess' {
         Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-        $runtimeRoot = Join-Path $skillRoot 'scripts/platform-runtime'
-        $binding = Get-VendoredPlatformRuntimeBinding
-        $binding.authorityRepository | Should -BeExactly 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
-        $binding.authorityCommit | Should -BeExactly 'acc3d731164f0965bd4730b32695194972a6a49b'
-        $binding.authoritySourceDirectory | Should -BeExactly 'scripts'
-        $binding.hashMode | Should -BeExactly 'sha256-raw-bytes'
-        $binding.manifestSha256 | Should -BeExactly 'e9465c136582eccd03222530a6c9ef173c2d506e09ebccdb087c3a555609ab75'
-        @($binding.files).Count | Should -Be 17
-
-        $manifest = Import-PowerShellDataFile -LiteralPath (Join-Path $runtimeRoot 'platform-runtime.psd1')
-        $inventory = @($manifest.PrivateData.PlatformRuntime.Inventory)
-        $inventory.Count | Should -Be 16
-        foreach ($entry in $inventory) {
-            $bound = @($binding.files | Where-Object { $_.path -ceq ([string]$entry.Path) })
-            $bound.Count | Should -Be 1 -Because $entry.Path
-            $bound[0].sha256 | Should -BeExactly ([string]$entry.Sha256) -Because $entry.Path
-        }
-        [string[]]$fileList = @($manifest.FileList)
-        [string[]]$bindingPaths = @($binding.files | ForEach-Object { [string]$_.path })
-        [Array]::Sort($fileList, [StringComparer]::Ordinal)
-        [Array]::Sort($bindingPaths, [StringComparer]::Ordinal)
-        ($bindingPaths -join "`n") | Should -BeExactly ($fileList -join "`n")
-        foreach ($file in @($binding.files)) {
-            $bytes = [IO.File]::ReadAllBytes((Join-Path $runtimeRoot $file.path))
-            @($bytes | Where-Object { $_ -eq 13 }).Count | Should -Be 0 -Because "$($file.path) must stay LF on every checkout"
-            [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant() |
-                Should -BeExactly $file.sha256 -Because $file.path
-        }
-        $attributes = (Get-Content -LiteralPath (Join-Path $repoRoot '.gitattributes') -Raw).Replace("`r`n", "`n")
-        $attributes | Should -Match '(?m)^/skills/auto-update-darktide-mod/scripts/platform-runtime/\*\* -text$'
-    }
-
-    # Scenario: A vendored runtime file is changed, added, removed, or checked out with CRLF line endings.
-    # Purpose: Fail closed on any exact-byte or file-set drift, including newline conversion away from the authority blob bytes.
-    It 'InterT363_RejectsTamperedExtraOrMissingVendoredRuntimeFiles' {
-        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-        $runtimeRoot = Join-Path $skillRoot 'scripts/platform-runtime'
-        $copyRuntime = {
-            param([string] $Name)
-            $destination = Join-Path $TestDrive $Name
-            Copy-Item -LiteralPath $runtimeRoot -Destination $destination -Recurse
-            $destination
-        }
-
-        $tampered = & $copyRuntime 'runtime-tampered'
-        [IO.File]::AppendAllText((Join-Path $tampered 'platform/Linux.psm1'), "`n# tamper`n", [Text.UTF8Encoding]::new($false))
-        { Assert-VendoredPlatformRuntime -Root $tampered } | Should -Throw '*hash mismatch: platform/Linux.psm1*'
-
-        $extra = & $copyRuntime 'runtime-extra'
-        [IO.File]::WriteAllText((Join-Path $extra 'platform/Extra.psm1'), '# extra', [Text.UTF8Encoding]::new($false))
-        { Assert-VendoredPlatformRuntime -Root $extra } | Should -Throw '*file set differs*'
-
-        $missing = & $copyRuntime 'runtime-missing'
-        Remove-Item -LiteralPath (Join-Path $missing 'WindowsDacl.psm1')
-        { Assert-VendoredPlatformRuntime -Root $missing } | Should -Throw '*file set differs*'
-
-        $bom = & $copyRuntime 'runtime-bom'
-        $bomPath = Join-Path $bom 'platform/MacOS.psm1'
-        [IO.File]::WriteAllBytes($bomPath, [byte[]](@(0xef, 0xbb, 0xbf) + [IO.File]::ReadAllBytes($bomPath)))
-        { Assert-VendoredPlatformRuntime -Root $bom } | Should -Throw '*without BOM*'
-
-        $crlf = & $copyRuntime 'runtime-crlf'
-        $crlfPath = Join-Path $crlf 'platform/UnixNative.cs'
-        [IO.File]::WriteAllText($crlfPath, ([IO.File]::ReadAllText($crlfPath).Replace("`n", "`r`n")), [Text.UTF8Encoding]::new($false))
-        { Assert-VendoredPlatformRuntime -Root $crlf } | Should -Throw '*hash mismatch: platform/UnixNative.cs*'
-    }
-
-    # Scenario: An installed Skill copy carries a tampered vendored runtime file and a fresh process loads PathSafety.
-    # Purpose: Prove the runtime stops instead of falling back to any local implementation when verification fails.
-    It 'InterT364_StopsTheSkillRuntimeWhenTheVendoredRuntimeFailsVerification' {
-        $fixtureSkill = Join-Path $TestDrive 'tampered-runtime-skill'
-        Copy-Item -LiteralPath $skillRoot -Destination $fixtureSkill -Recurse
-        [IO.File]::AppendAllText((Join-Path $fixtureSkill 'scripts/platform-runtime/platform/Linux.psm1'), "`n# tamper`n", [Text.UTF8Encoding]::new($false))
-        $childPath = Join-Path $TestDrive 'load-tampered-path-safety.ps1'
-        [IO.File]::WriteAllText($childPath, @'
-param([string] $ModulePath)
-$ErrorActionPreference = 'Stop'
-try { Import-Module -Name $ModulePath -Force }
-catch {
-    $failure = $_.Exception
-    while ($null -ne $failure) {
-        [Console]::Error.WriteLine($failure.Message)
-        $failure = $failure.InnerException
-    }
-    exit 97
-}
-'LOADED'
-'@, [Text.UTF8Encoding]::new($false))
-        $result = Invoke-ChildPowerShellForTest -ScriptPath $childPath -ArgumentList @((Join-Path $fixtureSkill 'scripts/PathSafety.psm1'))
-        $result.ExitCode | Should -Not -Be 0
-        $result.Stdout | Should -Not -Match 'LOADED'
-        ($result.Stdout + $result.Stderr) | Should -Match 'failed verification or loading'
-        ($result.Stdout + $result.Stderr) | Should -Match 'hash mismatch: platform/Linux\.psm1'
-    }
-
-    # Scenario: Every vendored blob still has the pinned bytes, but one runtime file is a hard link.
-    # Purpose: Reject a multi-link runtime through provider metadata when exposed, or through the post-load authority identity check.
-    It 'InterT364A_RejectsAMultiLinkVendoredRuntimeFile' {
-        $fixtureSkill = Join-Path $TestDrive 'hard-linked-runtime-skill'
-        Copy-Item -LiteralPath $skillRoot -Destination $fixtureSkill -Recurse
-        $runtimeFile = Join-Path $fixtureSkill 'scripts/platform-runtime/platform/UnixNative.cs'
-        $linkTarget = Join-Path $TestDrive 'hard-linked-UnixNative.cs'
-        [IO.File]::Copy($runtimeFile, $linkTarget)
-        [IO.File]::Delete($runtimeFile)
-        New-TestHardLink -Path $runtimeFile -Target $linkTarget | Out-Null
-        $childPath = Join-Path $TestDrive 'load-hard-linked-path-safety.ps1'
-        [IO.File]::WriteAllText($childPath, @'
-param([string] $ModulePath)
-$ErrorActionPreference = 'Stop'
-try { Import-Module -Name $ModulePath -Force }
-catch {
-    $failure = $_.Exception
-    while ($null -ne $failure) {
-        [Console]::Error.WriteLine($failure.Message)
-        $failure = $failure.InnerException
-    }
-    exit 97
-}
-'LOADED'
-'@, [Text.UTF8Encoding]::new($false))
-
-        $result = Invoke-ChildPowerShellForTest -ScriptPath $childPath -ArgumentList @((Join-Path $fixtureSkill 'scripts/PathSafety.psm1'))
-        $result.ExitCode | Should -Not -Be 0
-        $result.Stdout | Should -Not -Match 'LOADED'
-        ($result.Stdout + $result.Stderr) | Should -Match 'failed verification or loading'
-        ($result.Stdout + $result.Stderr) | Should -Match 'contains a link or reparse point|regular file with exactly one link'
-    }
-
-    # Scenario: A participant holds the coordination owner guard while another process disables .NET advisory file locking.
-    # Purpose: Keep owner-guard exclusion on the vendored OS primitive so DOTNET_SYSTEM_IO_DISABLEFILELOCKING cannot create a second holder.
-    It 'InterT365_KeepsOwnerGuardExclusionWhenDotNetFileLockingIsDisabled' {
-        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-        $lockRoot = Join-Path $TestDrive 'guard-root/.locks'
+        $lockRoot = Join-Path $TestDrive 'native-lock-race'
         [void][IO.Directory]::CreateDirectory($lockRoot)
-        $leaf = 'source-acquisition.owner-update.guard'
-        $holder = Enter-PortableFileLock -Root $lockRoot -Leaf $leaf -TimeoutMilliseconds 1000
-        try {
-            $holder.lockPrimitive | Should -BeExactly $(if ($IsWindows) { 'windows-fileshare' } else { 'flock' })
-            $childPath = Join-Path $TestDrive 'contend-owner-guard.ps1'
-            [IO.File]::WriteAllText($childPath, @'
-param([string] $ModulePath, [string] $LockRoot, [string] $Leaf)
+        $startPath = Join-Path $TestDrive 'native-lock-race.start'
+        $childPath = Join-Path $TestDrive 'native-lock-race.ps1'
+        [IO.File]::WriteAllText($childPath, @'
+param([string] $ModulePath, [string] $LockRoot, [string] $StartPath)
 $ErrorActionPreference = 'Stop'
 Import-Module -Name $ModulePath -Force
+[IO.File]::WriteAllText((Join-Path $LockRoot "ready-$PID.gate"), 'ready', [Text.UTF8Encoding]::new($false))
+while (-not [IO.File]::Exists($StartPath)) { [Threading.Thread]::Sleep(10) }
 try {
-    $lock = Enter-PortableFileLock -Root $LockRoot -Leaf $Leaf -TimeoutMilliseconds 500
-    $lock.Dispose()
-    'ACQUIRED'
+    $lock = Enter-PortableFileLock -Root $LockRoot -Leaf 'race.guard' -TimeoutMilliseconds 250
+    try { [Threading.Thread]::Sleep(800); [Console]::Out.Write('ACQUIRED') }
+    finally { $lock.Dispose() }
 }
-catch [TimeoutException] { 'TIMEOUT' }
+catch [TimeoutException] { [Console]::Out.Write('TIMEOUT') }
 '@, [Text.UTF8Encoding]::new($false))
-            $result = Invoke-ChildPowerShellForTest -ScriptPath $childPath -Environment @{ DOTNET_SYSTEM_IO_DISABLEFILELOCKING = '1' } -ArgumentList @(
-                (Join-Path $skillRoot 'scripts/PathSafety.psm1'), $lockRoot, $leaf)
-            $result.ExitCode | Should -Be 0 -Because $result.Stderr
-            $result.Stdout | Should -Match 'TIMEOUT'
-            $result.Stdout | Should -Not -Match 'ACQUIRED'
+        $processes = [Collections.Generic.List[Diagnostics.Process]]::new()
+        try {
+            foreach ($index in 1..2) {
+                $start = [Diagnostics.ProcessStartInfo]::new()
+                $start.FileName = (Get-Process -Id $PID).Path
+                $start.UseShellExecute = $false
+                $start.RedirectStandardOutput = $true
+                $start.RedirectStandardError = $true
+                foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $childPath,
+                        '-ModulePath', (Join-Path $skillRoot 'scripts/PathSafety.psm1'), '-LockRoot', $lockRoot,
+                        '-StartPath', $startPath)) { $start.ArgumentList.Add($argument) }
+                $process = [Diagnostics.Process]::new()
+                $process.StartInfo = $start
+                $process.Start() | Should -BeTrue
+                $processes.Add($process)
+            }
+            $readyWatch = [Diagnostics.Stopwatch]::StartNew()
+            while ([IO.Directory]::GetFiles($lockRoot, 'ready-*.gate').Count -ne 2) {
+                if ($readyWatch.ElapsedMilliseconds -ge 30000) { throw 'Native lock children did not become ready within 30 seconds.' }
+                [Threading.Thread]::Sleep(20)
+            }
+            [IO.File]::WriteAllText($startPath, 'start')
+            $results = foreach ($process in $processes) {
+                $stdout = $process.StandardOutput.ReadToEndAsync()
+                $stderr = $process.StandardError.ReadToEndAsync()
+                $process.WaitForExit(10000) | Should -BeTrue
+                $process.ExitCode | Should -Be 0 -Because $stderr.Result
+                $stdout.Result
+            }
+            @($results | Where-Object { $_ -eq 'ACQUIRED' }).Count | Should -Be 1
+            @($results | Where-Object { $_ -eq 'TIMEOUT' }).Count | Should -Be 1
         }
-        finally { $holder.Dispose() }
-        $after = Enter-PortableFileLock -Root $lockRoot -Leaf $leaf -TimeoutMilliseconds 1000
-        $after.Dispose()
+        finally {
+            foreach ($process in $processes) {
+                if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+                $process.Dispose()
+            }
+        }
+    }
+
+    # Scenario: A target is created without replacement, rejected on a second no-replace move, then overwritten.
+    # Purpose: Exercise both File.Move publication modes and verify no normal-operation temporary residue remains.
+    It 'InterT405_PublishesWithOverwriteAndNoOverwriteMoves' {
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $root = Join-Path $TestDrive 'native-publication'
+        [void][IO.Directory]::CreateDirectory($root)
+        $missing = Get-PortableLeaseFileState -ParentPath $root -Leaf 'owner.lock' -AllowMissing
+        $firstBytes = [Text.UTF8Encoding]::new($false).GetBytes('first')
+        $secondBytes = [Text.UTF8Encoding]::new($false).GetBytes('second')
+
+        $null = Publish-PortableLeaseFile -ParentPath $root -Leaf 'owner.lock' -Bytes $firstBytes -ExpectedState $missing -NoReplace
+        { Publish-PortableLeaseFile -ParentPath $root -Leaf 'owner.lock' -Bytes $secondBytes -ExpectedState $missing -NoReplace } |
+            Should -Throw '*target already exists*'
+        $first = Get-PortableLeaseFileState -ParentPath $root -Leaf 'owner.lock'
+        $null = Publish-PortableLeaseFile -ParentPath $root -Leaf 'owner.lock' -Bytes $secondBytes -ExpectedState $first
+
+        [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes((Join-Path $root 'owner.lock'))) |
+            Should -BeExactly 'second'
+        @(Get-ChildItem -LiteralPath $root -Filter '*.tmp' -Force).Count | Should -Be 0
+    }
+
+    # Scenario: An owner is absent while a recognizable publication temporary remains after a crash.
+    # Purpose: Report only this Skill's fixed temporary naming as BLOCKED residue.
+    It 'InterT406_DetectsOnlyRecognizableCrashPublicationResidue' {
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $root = Join-Path $TestDrive 'native-residue'
+        [void][IO.Directory]::CreateDirectory($root)
+        $residueLeaf = '.owner.lock.publish-' + [guid]::NewGuid().ToString('N') + '.tmp'
+        [IO.File]::WriteAllText((Join-Path $root $residueLeaf), 'staged owner')
+        [IO.File]::WriteAllText((Join-Path $root '.other-tool.tmp'), 'unrelated')
+
+        $residue = Get-PortableTransactionResidue -LockRoot $root -OwnerLeaf 'owner.lock'
+        $residue.hasResidue | Should -BeTrue
+        @($residue.entries) | Should -BeExactly @($residueLeaf)
     }
 
     # Scenario: A live owner's process start time is read again later on each platform.
@@ -2212,7 +2011,7 @@ function Suspend-Stage {
             $owner['state'] = 'held'
             $owner['expiresAt'] = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
             $owner['platform'] = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
-            $owner['lockPrimitive'] = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+            $owner['lockPrimitive'] = 'dotnet-fileshare-none'
             [IO.File]::Delete($legacyOwnerPath)
             [IO.Directory]::Delete($singleFilePath)
             [IO.File]::WriteAllText($singleFilePath, ($owner | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
@@ -3257,7 +3056,7 @@ function Get-SourceTupleContractSha256 {
             function Get-CurrentProcessIdentity { [ordered]@{ machineName='test-machine'; processId=123; processStartTicks=[int64]456 } }
             function Get-ModReservationActorToken { param($Value) 'a' * 32 }
             function Get-PortablePlatformName { 'windows' }
-            function Get-PortableLockPrimitive { 'windows-fileshare' }
+            function Get-PortableLockPrimitive { 'dotnet-fileshare-none' }
             function Get-UtcTimestamp { [DateTimeOffset]::UtcNow.ToString('o') }
             function Test-ReservationLeaseMatchesOwner { param($Lease,$Owner) $false }
             function Get-ModReservationSnapshot { param($ModLockPath,$Repository)
@@ -3549,7 +3348,7 @@ function Get-SourceTupleContractSha256 {
             }
             function Read-ModReservationOwner { param($ModLockPath,$Repository) $script:snapshot.value }
             function Get-PortablePlatformName { 'Windows' }
-            function Get-PortableLockPrimitive { 'test-lock' }
+            function Get-PortableLockPrimitive { 'dotnet-fileshare-none' }
             function Test-ReservationLeaseMatchesOwner { param($Lease,$Owner) $false }
             function Get-UtcTimestamp { [DateTimeOffset]::UtcNow.ToString('o') }
             . ([scriptblock]::Create($functionSource))
@@ -4381,7 +4180,7 @@ function Get-SourceTupleContractSha256 {
             leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
             expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
             platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
-            lockPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+            lockPrimitive = 'dotnet-fileshare-none'
         }
         [IO.File]::WriteAllText($lockPath, ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 
@@ -4458,7 +4257,7 @@ function Get-SourceTupleContractSha256 {
                 leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
                 expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
                 platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
-                lockPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+                lockPrimitive = 'dotnet-fileshare-none'
             }
             [IO.File]::WriteAllText($lockPath, ($owner | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
             $expected = switch ($case) {
@@ -4524,7 +4323,7 @@ function Get-SourceTupleContractSha256 {
             leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
             expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
             platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
-            lockPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+            lockPrimitive = 'dotnet-fileshare-none'
         } | ConvertTo-Json | Set-Content -LiteralPath $lockPath -NoNewline
 
         (& $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru).result | Should -Be 'passed'
@@ -4652,7 +4451,7 @@ function Get-SourceTupleContractSha256 {
             leaseMode = 'reserved'; reservationState = 'between-stages'; heartbeat = [DateTimeOffset]::UtcNow.ToString('o')
             expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(30).ToString('o')
             platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
-            lockPrimitive = if ($IsWindows) { 'windows-fileshare' } else { 'flock' }
+            lockPrimitive = 'dotnet-fileshare-none'
         } | ConvertTo-Json | Set-Content -LiteralPath $lockPath -NoNewline
 
         { & $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru } |

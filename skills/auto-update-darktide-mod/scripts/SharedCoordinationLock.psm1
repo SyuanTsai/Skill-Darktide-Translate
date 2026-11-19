@@ -74,21 +74,13 @@ function Open-CoordinationPrivateDirectory {
         [Parameter(Mandatory)][string] $Root,
         [Parameter(Mandatory)][string] $RelativePath
     )
-    & $script:pathSafetyModule {
-        param($PhysicalRoot, $Relative)
-        $directoryLease = $null
-        try {
-            $directoryLease = Open-PlatformDirectory -Root $PhysicalRoot -RelativePath $Relative -CreatePrivate
-            $observation = Assert-PlatformFileIdentity -Lease $directoryLease -Expected $directoryLease.Observation -VerifyPath
-            if ([string]$observation.Kind -cne 'directory') {
-                throw 'Shared coordination receipt root is not a directory.'
-            }
-            [IO.Path]::GetFullPath((Join-Path $PhysicalRoot $Relative))
-        }
-        finally {
-            if ($null -ne $directoryLease) { $directoryLease.Dispose() }
-        }
-    } $Root $RelativePath
+    $rootFull = Resolve-PortableTrustedRoot -Path $Root
+    $directory = Resolve-PortableContainedPath -Root $rootFull -Path $RelativePath
+    [void][IO.Directory]::CreateDirectory($directory)
+    if (-not [IO.Directory]::Exists($directory)) {
+        throw 'Shared coordination receipt root is not a directory.'
+    }
+    $directory
 }
 
 function Assert-CoordinationPath {
@@ -314,8 +306,8 @@ function Enter-CoordinationOwnerGuard {
     $guardPath = Join-Path $LockRoot $guardLeaf
     $null = Assert-CoordinationPath -Path $namespaceGuardPath -RepositoryRoot $LockRoot -AllowMissing
     $null = Assert-CoordinationPath -Path $guardPath -RepositoryRoot $LockRoot -AllowMissing
-    # The vendored authority lock is a Windows share-mode handle or a Unix
-    # flock on a fixed inode; it does not depend on .NET FileShare emulation.
+    # The short owner guards use the same FileShare.None primitive on every
+    # supported host, and the namespace guard serializes residue inspection.
     $namespaceGuard = $null
     $resourceGuard = $null
     try {
@@ -357,35 +349,9 @@ function Get-CoordinationPublicationContentionKind {
 
     $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { $Failure }
     for ($depth = 0; $depth -lt 32 -and $null -ne $exception; $depth++) {
-        $typeName = $exception.GetType().FullName
-        $operationProperty = $exception.PSObject.Properties['Operation']
-        $operation = if ($null -eq $operationProperty) { '' } else { [string]$operationProperty.Value }
-
-        # Authority NoReplace reports EEXIST on Unix and ERROR_FILE_EXISTS /
-        # ERROR_ALREADY_EXISTS on Windows. Restrict the operation as well as the
-        # native code so unrelated filesystem failures remain fail closed.
-        if ($typeName -ceq 'SyuanTsai.AIInstructions.PlatformRuntime.PlatformErrnoException' -and
-            [int]$exception.PSObject.Properties['Errno'].Value -eq 17 -and
-            $operation -in @('publication-create-target', 'rename-stage-to-target')) {
-            return 'no-replace-target-exists'
-        }
-        if ($typeName -ceq 'SyuanTsai.AIInstructions.PlatformRuntime.PlatformWin32Exception' -and
-            [int]$exception.PSObject.Properties['Win32Error'].Value -in @(80, 183) -and
-            $operation -match 'NoReplace') {
-            return 'no-replace-target-exists'
-        }
-
-        # Authority CAS mismatches are PlatformVerificationException values.
-        # Match only the publication capability and its documented expected-state
-        # messages; permission, durability, path, and I/O verification failures
-        # must never be converted into apparent lock contention.
-        if ($typeName -ceq 'SyuanTsai.AIInstructions.PlatformRuntime.PlatformVerificationException') {
-            $capability = [string]$exception.PSObject.Properties['Capability'].Value
-            $message = [string]$exception.Message
-            if ($capability -match '^publication(?:-target(?:-post-preflight)?)?$' -and
-                $message -match '(?i)(expected target is absent|ExpectedState does not describe an existing Windows file|target identity, hash, or length differs from ExpectedState|identity, type, link count, length, or SHA-256 differs from expected state|retained file identity is no longer named by its parent directory)') {
-                return 'cas-expected-state-mismatch'
-            }
+        if ($exception.Data.Contains('PortablePublicationKind')) {
+            $kind = [string]$exception.Data['PortablePublicationKind']
+            if ($kind -in @('no-replace-target-exists', 'cas-expected-state-mismatch')) { return $kind }
         }
         $exception = $exception.InnerException
     }
@@ -420,8 +386,7 @@ function Assert-CoordinationOwner {
         [string]$Owner.owner.runId -notmatch '^[A-Za-z0-9._-]+$' -or
         [string]$Owner.resourceKey -cne $ResourceKey -or
         [string]$Owner.platform -notin @('windows', 'linux', 'macos') -or
-        ([string]$Owner.platform -ceq 'windows' -and [string]$Owner.lockPrimitive -cne 'windows-fileshare') -or
-        ([string]$Owner.platform -in @('linux', 'macos') -and [string]$Owner.lockPrimitive -cne 'flock') -or
+        [string]$Owner.lockPrimitive -cne 'dotnet-fileshare-none' -or
         [string]$Owner.owner.token -notmatch '^[0-9a-f]{32}$') {
         throw "Existing $ResourceKey coordination lock owner contract is invalid."
     }
@@ -487,52 +452,17 @@ function Publish-CoordinationLeaseSnapshot {
         [Collections.IDictionary] $Value,
         [Collections.IDictionary] $ExpectedState,
         [switch] $NoReplace,
-        [switch] $PreserveDisplaced,
-        $TransactionId,
-        $DisplacedLeaf
+        [switch] $PreserveDisplaced
     )
-    $requestedTransactionId = $null
-    if ($null -ne $TransactionId) {
-        if ($TransactionId -isnot [string]) {
-            throw [ArgumentException]::new('TransactionId must be a string when provided.')
-        }
-        if (-not [string]::IsNullOrWhiteSpace($TransactionId)) {
-            if ($TransactionId -notmatch '^[0-9a-f]{32}$') {
-                throw [ArgumentException]::new('TransactionId must match ^[0-9a-f]{32}$ when provided.')
-            }
-            $requestedTransactionId = $TransactionId
-        }
-    }
-    $requestedDisplacedLeaf = $null
-    if ($null -ne $DisplacedLeaf) {
-        if ($DisplacedLeaf -isnot [string]) {
-            throw [ArgumentException]::new('DisplacedLeaf must be a string when provided.')
-        }
-        if (-not [string]::IsNullOrWhiteSpace($DisplacedLeaf)) {
-            if ($DisplacedLeaf -notmatch '^previous-[0-9a-f]{32}$') {
-                throw [ArgumentException]::new('DisplacedLeaf must match ^previous-[0-9a-f]{32}$ when provided.')
-            }
-            $requestedDisplacedLeaf = $DisplacedLeaf
-        }
-    }
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 30 -Compress) + "`n")
-    $idBytes = [Text.UTF8Encoding]::new($false).GetBytes("coordination:$ResourceKey")
-    $effectiveTransactionId = $requestedTransactionId
-    if ($null -eq $effectiveTransactionId) {
-        $sha256 = [Security.Cryptography.SHA256]::Create()
-        try { $effectiveTransactionId = ([BitConverter]::ToString($sha256.ComputeHash($idBytes))).Replace('-', '').ToLowerInvariant().Substring(0, 32) }
-        finally { $sha256.Dispose() }
-    }
     $publicationParameters = @{
         ParentPath = $LockRoot
         Leaf = "$ResourceKey.lock"
         Bytes = $bytes
         ExpectedState = $ExpectedState
-        TransactionId = $effectiveTransactionId
         NoReplace = [bool]$NoReplace
         PreserveDisplaced = [bool]$PreserveDisplaced
     }
-    if ($null -ne $requestedDisplacedLeaf) { $publicationParameters.DisplacedLeaf = $requestedDisplacedLeaf }
     Publish-PortableLeaseFile @publicationParameters
 }
 
@@ -547,12 +477,11 @@ function Get-CoordinationTakeoverEvidence {
     $takeover = $Owner.takeover
     if ([string]$takeover.staleSha256 -notmatch '^[0-9a-f]{64}$' -or
         [int64]$takeover.staleLength -lt 1 -or
-        [string]$takeover.transactionId -notmatch '^[0-9a-f]{32}$' -or
-        [string]$takeover.displacedLeaf -notmatch '^previous-[0-9a-f]{32}$' -or
+        [string]$takeover.evidenceLeaf -notmatch '^\.[A-Za-z0-9._-]+\.lock\.stale-[0-9a-f]{64}\.json$' -or
         [int64]$takeover.waitingMilliseconds -lt 0) {
         throw 'Persisted coordination takeover metadata is invalid.'
     }
-    $path = [IO.Path]::GetFullPath((Join-Path (Join-Path (Join-Path $LockRoot '.ai-instructions-txn') ([string]$takeover.transactionId)) ([string]$takeover.displacedLeaf)))
+    $path = Resolve-PortableContainedPath -Root $LockRoot -Path ([string]$takeover.evidenceLeaf)
     $evidence = Get-PortableLeaseFileState -ParentPath (Split-Path -Parent $path) -Leaf (Split-Path -Leaf $path)
     if ([string]$evidence.sha256 -cne [string]$takeover.staleSha256 -or
         [int64]$evidence.length -ne [int64]$takeover.staleLength) {
@@ -635,8 +564,7 @@ function Get-CoordinationTerminalReceipt {
         return [ordered]@{ path = Join-Path $LockRoot $leaf; sha256 = [string]$snapshot.sha256 }
     }
     if (-not $Publish) { throw 'Shared coordination terminal receipt is missing.' }
-    $transactionId = Get-CoordinationActorToken -RunId ([string]$Lease.token) -ResourceKey ('release-' + [string]$Lease.resourceKey)
-    $published = Publish-PortableLeaseFile -ParentPath $LockRoot -Leaf $leaf -Bytes $bytes -ExpectedState $snapshot -TransactionId $transactionId -NoReplace
+    $published = Publish-PortableLeaseFile -ParentPath $LockRoot -Leaf $leaf -Bytes $bytes -ExpectedState $snapshot -NoReplace
     [ordered]@{ path = Join-Path $LockRoot $leaf; sha256 = [string]$published.state.sha256 }
 }
 
@@ -753,7 +681,7 @@ function Enter-SharedCoordinationLease {
                 $transactionResidue = Get-PortableTransactionResidue -LockRoot $lockRoot
                 if ([bool]$transactionResidue.hasResidue) {
                     throw [IO.InvalidDataException]::new(
-                        "BLOCKED: incomplete owner publication residue exists under 'AI Auto Update/In Progress/.locks/.ai-instructions-txn' ($(@($transactionResidue.entries) -join ', ')). Follow 'Manual recovery for incomplete owner publication' in references/automation.md.")
+                        "BLOCKED: incomplete owner publication residue exists under 'AI Auto Update/In Progress/.locks' ($(@($transactionResidue.entries) -join ', ')). Follow 'Manual recovery for incomplete owner publication' in references/automation.md.")
                 }
             }
             if ([bool]$snapshot.exists) {
@@ -793,14 +721,9 @@ function Enter-SharedCoordinationLease {
                     $waitingMilliseconds = if ($waitStartedMilliseconds -lt 0) { [int64]0 } else {
                         [Math]::Max([int64]0, [Environment]::TickCount64 - $waitStartedMilliseconds)
                     }
-                    $takeoverTransactionId = $null
-                    $takeoverDisplacedLeaf = $null
                     if ($preserveStaleEvidence) {
-                        $takeoverTransactionId = Get-CoordinationActorToken -RunId $token -ResourceKey ("takeover-$ResourceKey-$([string]$snapshot.sha256)")
-                        $takeoverDisplacedLeaf = 'previous-' + ([string]$snapshot.sha256).Substring(0, 32)
                         $owner['takeover'] = [ordered]@{
-                            transactionId = $takeoverTransactionId
-                            displacedLeaf = $takeoverDisplacedLeaf
+                            evidenceLeaf = ".$ResourceKey.lock.stale-$([string]$snapshot.sha256).json"
                             staleSha256 = [string]$snapshot.sha256
                             staleLength = [int64]$snapshot.length
                             waitingMilliseconds = $waitingMilliseconds
@@ -813,10 +736,6 @@ function Enter-SharedCoordinationLease {
                         ExpectedState = $snapshot
                         NoReplace = -not [bool]$snapshot.exists
                         PreserveDisplaced = $preserveStaleEvidence
-                    }
-                    if ($takeoverTransactionId) {
-                        $publicationParameters.TransactionId = $takeoverTransactionId
-                        $publicationParameters.DisplacedLeaf = $takeoverDisplacedLeaf
                     }
                     $publication = Publish-CoordinationLeaseSnapshot @publicationParameters
                     Invoke-CoordinationFaultInjection -Point 'acquire-published-before-evidence-verification'

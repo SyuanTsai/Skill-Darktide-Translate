@@ -5,784 +5,78 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and
-    $null -eq ('SyuanTsai.PathSafetyNative' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.IO;
-using Microsoft.Win32.SafeHandles;
-using System.Runtime.InteropServices;
-
-namespace SyuanTsai {
-    public static class PathSafetyNative {
-        // A zero desired-access handle is sufficient for the case-sensitivity
-        // query and also works for user-profile directories whose ACLs reject
-        // FILE_READ_ATTRIBUTES even though the directory itself is traversable.
-        private const uint FileReadAttributes = 0x00000000;
-        private const uint FileShareRead = 0x00000001;
-        private const uint FileShareWrite = 0x00000002;
-        private const uint FileShareDelete = 0x00000004;
-        private const uint OpenExisting = 3;
-        private const uint FileFlagBackupSemantics = 0x02000000;
-        // NtQueryInformationFile uses the native FILE_INFORMATION_CLASS value,
-        // while GetFileInformationByHandleEx uses the Win32
-        // FILE_INFO_BY_HANDLE_CLASS value for the same information.
-        private const int NtFileCaseSensitiveInformation = 71;
-        private const int Win32FileCaseSensitiveInformation = 23;
-        private const uint CaseSensitiveDirectoryFlag = 0x00000001;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct FileCaseSensitiveInformationBuffer {
-            public uint Flags;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct IoStatusBlock {
-            public IntPtr Status;
-            public IntPtr Information;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct NativeFileTime {
-            public uint LowDateTime;
-            public uint HighDateTime;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct ByHandleFileInformationBuffer {
-            public uint FileAttributes;
-            public NativeFileTime CreationTime;
-            public NativeFileTime LastAccessTime;
-            public NativeFileTime LastWriteTime;
-            public uint VolumeSerialNumber;
-            public uint FileSizeHigh;
-            public uint FileSizeLow;
-            public uint NumberOfLinks;
-            public uint FileIndexHigh;
-            public uint FileIndexLow;
-        }
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")]
-        private static extern SafeFileHandle CreateFile(
-            string path,
-            uint desiredAccess,
-            uint shareMode,
-            IntPtr securityAttributes,
-            uint creationDisposition,
-            uint flagsAndAttributes,
-            IntPtr templateFile);
-
-        [DllImport("ntdll.dll")]
-        private static extern int NtQueryInformationFile(
-            SafeFileHandle fileHandle,
-            out IoStatusBlock ioStatusBlock,
-            out FileCaseSensitiveInformationBuffer fileInformation,
-            uint length,
-            int fileInformationClass);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "GetFileInformationByHandleEx")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GetFileInformationByHandleEx(
-            SafeFileHandle fileHandle,
-            int fileInformationClass,
-            out FileCaseSensitiveInformationBuffer fileInformation,
-            uint bufferSize);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "GetFileInformationByHandle")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GetFileInformationByHandle(
-            SafeFileHandle fileHandle,
-            out ByHandleFileInformationBuffer fileInformation);
-
-        private static string GetNativeOpenPath(string path) {
-            if (path == null || path.Length < 260 || path.IndexOf('/') >= 0 ||
-                path.StartsWith(@"\\?\", StringComparison.Ordinal) ||
-                path.StartsWith(@"\\.\", StringComparison.Ordinal)) {
-                return path;
-            }
-            bool drivePath = path.Length >= 3 &&
-                ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
-                path[1] == ':' && path[2] == '\\';
-            bool uncPath = path.StartsWith(@"\\", StringComparison.Ordinal);
-            if ((!drivePath && !uncPath) || path.IndexOf(':', drivePath ? 2 : 0) >= 0) {
-                return path;
-            }
-            // Extended syntax bypasses Win32 normalization. Preserve the old
-            // open semantics for inputs that are not ordinary canonical paths.
-            string[] components = path.Substring(drivePath ? 3 : 2).Split('\\');
-            foreach (string component in components) {
-                if (component.EndsWith(".", StringComparison.Ordinal) ||
-                    component.EndsWith(" ", StringComparison.Ordinal)) {
-                    return path;
-                }
-            }
-            try {
-                if (!String.Equals(Path.GetFullPath(path), path, StringComparison.Ordinal)) {
-                    return path;
-                }
-            }
-            catch (ArgumentException) { return path; }
-            catch (NotSupportedException) { return path; }
-            catch (PathTooLongException) { return path; }
-            return uncPath ? @"\\?\UNC\" + path.Substring(2) : @"\\?\" + path;
-        }
-
-        public static bool TryGetDirectoryCaseSensitive(string path, out bool caseSensitive) {
-            caseSensitive = false;
-            using (SafeFileHandle handle = CreateFile(
-                GetNativeOpenPath(path),
-                FileReadAttributes,
-                FileShareRead | FileShareWrite | FileShareDelete,
-                IntPtr.Zero,
-                OpenExisting,
-                FileFlagBackupSemantics,
-                IntPtr.Zero)) {
-                if (handle == null || handle.IsInvalid) {
-                    return false;
-                }
-
-                FileCaseSensitiveInformationBuffer information;
-                IoStatusBlock ioStatusBlock;
-                int status = NtQueryInformationFile(
-                    handle,
-                    out ioStatusBlock,
-                    out information,
-                    (uint)Marshal.SizeOf(typeof(FileCaseSensitiveInformationBuffer)),
-                    NtFileCaseSensitiveInformation);
-                if (status != 0 && !GetFileInformationByHandleEx(
-                    handle,
-                    Win32FileCaseSensitiveInformation,
-                    out information,
-                    (uint)Marshal.SizeOf(typeof(FileCaseSensitiveInformationBuffer)))) {
-                    return false;
-                }
-
-                caseSensitive = (information.Flags & CaseSensitiveDirectoryFlag) != 0;
-                return true;
-            }
-        }
-
-        public static bool TryGetPhysicalFileIdentity(
-            string path,
-            out ulong volumeSerialNumber,
-            out ulong fileIndex) {
-            volumeSerialNumber = 0;
-            fileIndex = 0;
-            using (SafeFileHandle handle = CreateFile(
-                GetNativeOpenPath(path),
-                0,
-                FileShareRead | FileShareWrite | FileShareDelete,
-                IntPtr.Zero,
-                OpenExisting,
-                FileFlagBackupSemantics,
-                IntPtr.Zero)) {
-                if (handle == null || handle.IsInvalid) {
-                    return false;
-                }
-
-                ByHandleFileInformationBuffer information;
-                if (!GetFileInformationByHandle(handle, out information)) {
-                    return false;
-                }
-
-                volumeSerialNumber = information.VolumeSerialNumber;
-                fileIndex = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
-                return true;
-            }
-        }
-    }
-}
-'@
-}
-
-# The Skill runtime has no access to the AI-Instructions authority checkout at
-# run time. The authority platform runtime is therefore vendored byte-for-byte
-# below scripts/platform-runtime and every file is bound to the reviewed
-# authority revision before the module is imported. Any missing, extra, or
-# changed file, or any load failure, stops the Skill (fail closed); there is no
-# local substitute implementation of the Unix identity or lock primitives.
-$script:VendoredPlatformRuntimeAuthority = [ordered]@{
-    repository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
-    commit = 'acc3d731164f0965bd4730b32695194972a6a49b'
-    sourceDirectory = 'scripts'
-    hashMode = 'sha256-raw-bytes'
-    manifestPath = 'platform-runtime.psd1'
-    manifestSha256 = 'e9465c136582eccd03222530a6c9ef173c2d506e09ebccdb087c3a555609ab75'
-}
-$script:VendoredPlatformRuntimeFiles = [ordered]@{
-    'platform-runtime.psd1' = 'e9465c136582eccd03222530a6c9ef173c2d506e09ebccdb087c3a555609ab75'
-    'platform-runtime.psm1' = 'ad051b2794ce4dc10108404201735d02f7b032ed0e633c5f22f73c884fb10370'
-    'installer-safe-mutation.psm1' = 'dc031edcc2f48968df83cd68ad52eacb7f7b05d3ca6a0cc622658cf6151c8293'
-    'WindowsDacl.psm1' = 'ffa1f85d94bb6bce9bf8353f8c7733bdbe59880a3d0d075191938cc28aebb5f6'
-    'Resolve-StandardValidationTool.ps1' = 'c0d68b227fc04e19d710a89c4559fe45e0cc979eead846006261dc2dc5bfa14f'
-    'platform/Linux.psm1' = '52c261d577ee7b3946771d1112030996896fdd119e06ac3849e430a3d56fb38c'
-    'platform/MacOS.psm1' = '8f25edfbee5ab36b5e1c42eb55c6dbab44db0bc29896c180612b1248920c7c47'
-    'platform/OwnedProcess.cs' = '097061ad5902f896ff74b3f60b0ecaf63f3d58f357aed8fdbf80a8586564de58'
-    'platform/PlatformNative.cs' = 'f9da23bf3e6e3c8960b26d534e14873f6b4fc98b3d13f5b6cdfdd5f7716a4514'
-    'platform/RuntimePreparation.psm1' = 'dc254c04e7e2caf280726e66f67434776bc7df12a210a38c80596e41344fd077'
-    'platform/Unix.psm1' = 'c55944c9ece57c9ba62b78d1bd563271fc9f660508d3725ab5821d5444cb5fd5'
-    'platform/UnixNative.cs' = '171da4acded889da89ab4e7af2729e9bbf4f3639cf1e63fe08a4c046f7545c74'
-    'platform/UnixProcess.cs' = '125d2b3eecdad6a6c201d5f5d61a6efd0ad55ba93822c7b83a679a5397005db1'
-    'platform/Windows.psm1' = '9b7442178083a9b165ed3bf53367d5c3ce1b1f09d56f0f6efe964b524e17be0b'
-    'platform/WindowsInstallerMutation.cs' = 'b88b4b09c7bb5c3e71b762ddc6ebe72007ed0cca99977ab7a7272529c3ff9218'
-    'platform/WindowsNative.cs' = '6eea8ca2701b6a6de88ee4a3348f053d07a0543d607832e667335c838bb7d433'
-    'platform/WindowsProcess.cs' = '7b8a0cddd3b9809b861801fe1d6a618684e2ca6fa13f9334825c5c9da5b2d8d6'
-}
-$script:VendoredPlatformRuntimeRoot = Join-Path $PSScriptRoot 'platform-runtime'
-
-function Get-VendoredPlatformRuntimeSha256 {
-    param([Parameter(Mandatory)][string] $LiteralPath)
-    [byte[]]$bytes = [IO.File]::ReadAllBytes($LiteralPath)
-    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) {
-        throw [IO.InvalidDataException]::new('Vendored platform runtime files must be UTF-8 without BOM.')
-    }
-    $sha256 = [Security.Cryptography.SHA256]::Create()
-    try { ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
-    finally { $sha256.Dispose() }
-}
-
-function Assert-VendoredPlatformRuntime {
-    [CmdletBinding()]
-    param([string] $Root = $script:VendoredPlatformRuntimeRoot)
-
-    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction SilentlyContinue
-    if ($null -eq $rootItem -or -not $rootItem.PSIsContainer -or
-        ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $null -ne $rootItem.LinkType) {
-        throw [IO.InvalidDataException]::new('Vendored platform runtime directory is missing or is not a regular directory.')
-    }
-    $actualFiles = [Collections.Generic.List[string]]::new()
-    foreach ($entry in @(Get-ChildItem -LiteralPath $rootFull -Recurse -Force)) {
-        $relative = [IO.Path]::GetRelativePath($rootFull, $entry.FullName).Replace('\', '/')
-        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $null -ne $entry.LinkType) {
-            throw [IO.InvalidDataException]::new("Vendored platform runtime contains a link or reparse point: $relative")
-        }
-        if ($entry.PSIsContainer) {
-            if ($relative -cne 'platform') {
-                throw [IO.InvalidDataException]::new("Vendored platform runtime contains an unexpected directory: $relative")
-            }
-            continue
-        }
-        $actualFiles.Add($relative)
-    }
-    [string[]]$expected = @($script:VendoredPlatformRuntimeFiles.Keys)
-    [string[]]$actual = $actualFiles.ToArray()
-    [Array]::Sort($expected, [StringComparer]::Ordinal)
-    [Array]::Sort($actual, [StringComparer]::Ordinal)
-    if (($expected -join "`n") -cne ($actual -join "`n")) {
-        throw [IO.InvalidDataException]::new('Vendored platform runtime file set differs from its authority registry.')
-    }
-    $verified = [Collections.Generic.List[object]]::new()
-    foreach ($relative in $expected) {
-        $actualHash = Get-VendoredPlatformRuntimeSha256 -LiteralPath (Join-Path $rootFull $relative)
-        if ($actualHash -cne [string]$script:VendoredPlatformRuntimeFiles[$relative]) {
-            throw [IO.InvalidDataException]::new("Vendored platform runtime hash mismatch: $relative")
-        }
-        $verified.Add([pscustomobject][ordered]@{ path = $relative; sha256 = $actualHash })
-    }
-    $manifestHash = Get-VendoredPlatformRuntimeSha256 -LiteralPath (Join-Path $rootFull $script:VendoredPlatformRuntimeAuthority.manifestPath)
-    if ($manifestHash -cne [string]$script:VendoredPlatformRuntimeAuthority.manifestSha256) {
-        throw [IO.InvalidDataException]::new('Vendored platform runtime manifest pin mismatch.')
-    }
-    [pscustomobject][ordered]@{
-        authorityRepository = [string]$script:VendoredPlatformRuntimeAuthority.repository
-        authorityCommit = [string]$script:VendoredPlatformRuntimeAuthority.commit
-        authoritySourceDirectory = [string]$script:VendoredPlatformRuntimeAuthority.sourceDirectory
-        hashMode = [string]$script:VendoredPlatformRuntimeAuthority.hashMode
-        manifestSha256 = $manifestHash
-        root = $rootFull
-        files = [object[]]$verified.ToArray()
-    }
-}
-
-function Assert-VendoredPlatformRuntimePostLoad {
-    param([Parameter(Mandatory)][string] $Root)
-
-    $manifestPath = Join-Path $Root ([string]$script:VendoredPlatformRuntimeAuthority.manifestPath)
-    $null = Assert-PlatformRuntimeInventory -Root $Root -ManifestPath $manifestPath
-    foreach ($relative in @($script:VendoredPlatformRuntimeFiles.Keys)) {
-        $parentLease = $null
-        $fileLease = $null
-        try {
-            $parentRelative = [IO.Path]::GetDirectoryName([string]$relative)
-            $parentLease = if ([string]::IsNullOrWhiteSpace($parentRelative)) {
-                Open-PlatformDirectory -Root $Root -RootOnly
-            }
-            else {
-                Open-PlatformDirectory -Root $Root -RelativePath $parentRelative.Replace('\', '/')
-            }
-            $fileLease = Open-PlatformFile -ParentLease $parentLease -Leaf ([IO.Path]::GetFileName([string]$relative)) `
-                -Access Read -CreateMode OpenExisting
-            $null = Assert-PlatformFileIdentity -Lease $fileLease -Expected $fileLease.Observation -SingleLink -VerifyPath
-        }
-        finally {
-            if ($null -ne $fileLease) { $fileLease.Dispose() }
-            if ($null -ne $parentLease) { $parentLease.Dispose() }
-        }
-    }
-}
-
-function ConvertTo-PortablePlatformFileIdentity {
-    param([Parameter(Mandatory)] $Observation)
-    if ((Get-PortablePlatformName) -ceq 'windows') {
-        return [pscustomobject][ordered]@{
-            kind = 'windows-file-id'
-            device = ('0x{0:x}' -f [uint64]$Observation.Device)
-            fileId = ('0x{0:x}' -f [uint64]$Observation.Inode)
-        }
-    }
-    [pscustomobject][ordered]@{
-        kind = 'unix-device-inode'
-        device = ('0x{0:x}' -f [uint64]$Observation.Device)
-        fileId = ('0x{0:x}' -f [uint64]$Observation.Inode)
-    }
-}
-
-function Get-PortableLeaseFileState {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string] $ParentPath,
-        [Parameter(Mandatory)][string] $Leaf,
-        [ValidateRange(1, 16777216)][int] $MaximumBytes = 1048576,
-        [switch] $AllowMissing,
-        [string] $LegacyDirectoryMessage
-    )
-    $physicalParentPath = Resolve-PortableTrustedRoot -Path $ParentPath
-    $parentLease = $null
-    $fileLease = $null
-    try {
-        $parentLease = Open-PlatformDirectory -Root $physicalParentPath -RootOnly
-        try {
-            $fileLease = Open-PlatformFile -ParentLease $parentLease -Leaf $Leaf -Access Read -CreateMode OpenExisting
-        }
-        catch {
-            $fileFailure = $_
-            $legacyDirectory = $null
-            try { $legacyDirectory = Open-PlatformDirectory -Root $physicalParentPath -RelativePath $Leaf }
-            catch { }
-            if ($null -ne $legacyDirectory) {
-                $legacyDirectory.Dispose()
-                if ([string]::IsNullOrWhiteSpace($LegacyDirectoryMessage)) {
-                    throw [IO.InvalidDataException]::new("The lease path is a legacy directory: $Leaf")
-                }
-                throw [IO.InvalidDataException]::new($LegacyDirectoryMessage)
-            }
-            if ($AllowMissing) {
-                return [ordered]@{
-                    exists = $false
-                    bytes = $null
-                    sha256 = $null
-                    length = $null
-                    identity = $null
-                }
-            }
-            throw $fileFailure
-        }
-        [byte[]]$bytes = $fileLease.ReadAllBytes($MaximumBytes)
-        $observation = Assert-PlatformFileIdentity -Lease $fileLease -Expected $fileLease.Observation -SingleLink -VerifyPath
-        $sha256 = [Security.Cryptography.SHA256]::Create()
-        try { $digest = ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
-        finally { $sha256.Dispose() }
-        [ordered]@{
-            exists = $true
-            bytes = $bytes
-            sha256 = $digest
-            length = [int64]$bytes.Length
-            identity = ConvertTo-PortablePlatformFileIdentity -Observation $observation
-        }
-    }
-    finally {
-        if ($null -ne $fileLease) { $fileLease.Dispose() }
-        if ($null -ne $parentLease) { $parentLease.Dispose() }
-    }
-}
-
-function Get-PortableTransactionResidue {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string] $LockRoot,
-        [ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId
-    )
-
-    $physicalLockRoot = Resolve-PortableTrustedRoot -Path $LockRoot
-    $transactionRootPath = [IO.Path]::GetFullPath((Join-Path $physicalLockRoot '.ai-instructions-txn'))
-    $transactionRootLease = $null
-    $residue = [Collections.Generic.List[string]]::new()
-    try {
-        try {
-            $transactionRootLease = Open-PlatformDirectory -Root $physicalLockRoot -RelativePath '.ai-instructions-txn'
-            $null = Assert-PlatformFileIdentity -Lease $transactionRootLease `
-                -Expected $transactionRootLease.Observation -VerifyPath
-        }
-        catch {
-            $candidate = $_.Exception
-            $missing = $false
-            for ($depth = 0; $depth -lt 32 -and $null -ne $candidate; $depth++) {
-                $errnoProperty = $candidate.PSObject.Properties['Errno']
-                $win32ErrorProperty = $candidate.PSObject.Properties['Win32Error']
-                $nativeErrorProperty = $candidate.PSObject.Properties['NativeErrorCode']
-                if ($candidate -is [IO.DirectoryNotFoundException] -or $candidate -is [IO.FileNotFoundException] -or
-                    ($null -ne $errnoProperty -and [int]$errnoProperty.Value -eq 2) -or
-                    ($null -ne $win32ErrorProperty -and [int]$win32ErrorProperty.Value -in @(2, 3)) -or
-                    ($null -ne $nativeErrorProperty -and [int]$nativeErrorProperty.Value -in @(2, 3))) {
-                    $missing = $true
-                    break
-                }
-                $candidate = $candidate.InnerException
-            }
-            if ($missing) {
-                return [ordered]@{ hasResidue = $false; entries = [string[]]@() }
-            }
-            $residue.Add('.ai-instructions-txn')
-            return [ordered]@{ hasResidue = $true; entries = [string[]]$residue.ToArray() }
-        }
-
-        foreach ($transactionEntry in @([IO.Directory]::GetFileSystemEntries($transactionRootPath))) {
-            $transactionLeaf = [IO.Path]::GetFileName([IO.Path]::TrimEndingDirectorySeparator($transactionEntry))
-            $transactionRelative = ".ai-instructions-txn/$transactionLeaf"
-            if (-not [string]::IsNullOrWhiteSpace($TransactionId) -and $transactionLeaf -cne $TransactionId) {
-                continue
-            }
-            $expectedTransactionPath = [IO.Path]::GetFullPath((Join-Path $transactionRootPath $transactionLeaf))
-            if ([IO.Path]::GetFullPath($transactionEntry) -cne $expectedTransactionPath -or
-                $transactionLeaf -notmatch '^[0-9a-f]{32}$') {
-                $residue.Add($transactionRelative)
-                continue
-            }
-
-            $transactionLease = $null
-            try {
-                try {
-                    $transactionLease = Open-PlatformDirectory -Root $transactionRootPath -RelativePath $transactionLeaf
-                    $null = Assert-PlatformFileIdentity -Lease $transactionLease `
-                        -Expected $transactionLease.Observation -VerifyPath
-                }
-                catch {
-                    $residue.Add($transactionRelative)
-                    continue
-                }
-
-                foreach ($entryPath in @([IO.Directory]::GetFileSystemEntries($expectedTransactionPath))) {
-                    $entryLeaf = [IO.Path]::GetFileName([IO.Path]::TrimEndingDirectorySeparator($entryPath))
-                    $entryRelative = "$transactionRelative/$entryLeaf"
-                    $expectedEntryPath = [IO.Path]::GetFullPath((Join-Path $expectedTransactionPath $entryLeaf))
-                    if ([IO.Path]::GetFullPath($entryPath) -cne $expectedEntryPath) {
-                        $residue.Add($entryRelative)
-                        continue
-                    }
-                    try {
-                        $snapshot = Get-PortableLeaseFileState -ParentPath $expectedTransactionPath -Leaf $entryLeaf
-                        if (-not [bool]$snapshot.exists -or $entryLeaf -notmatch '^previous-[0-9a-f]{32}$') {
-                            $residue.Add($entryRelative)
-                            continue
-                        }
-                        $residue.Add($entryRelative)
-                    }
-                    catch {
-                        # Directories, reparse points, symlinks, hard links, and
-                        # entries that change while inspected are all residue.
-                        $residue.Add($entryRelative)
-                    }
-                }
-            }
-            catch {
-                $residue.Add($transactionRelative)
-            }
-            finally {
-                if ($null -ne $transactionLease) { $transactionLease.Dispose() }
-            }
-        }
-    }
-    catch {
-        $residue.Add('.ai-instructions-txn')
-    }
-    finally {
-        if ($null -ne $transactionRootLease) { $transactionRootLease.Dispose() }
-    }
-
-    [string[]]$entries = @($residue.ToArray() | Sort-Object -Unique)
-    [ordered]@{ hasResidue = $entries.Count -gt 0; entries = $entries }
-}
-
-function Remove-PortableTransactionFile {
-    param(
-        [Parameter(Mandatory)] $TransactionLease,
-        [Parameter(Mandatory)][string] $Leaf,
-        [Parameter(Mandatory)] $ExpectedState
-    )
-    # Authority cleanup mode applies only to a file already inside the
-    # .ai-instructions-txn/<id> directory. Omitting both optional tombstone
-    # parameters is intentional; supplying only one is invalid on Unix.
-    $parameters = @{
-        ParentLease = $TransactionLease
-        Leaf = $Leaf
-        ExpectedState = $ExpectedState
-    }
-    $null = Remove-PlatformOwnedFile @parameters
-}
-
-function Publish-PortableLeaseFile {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string] $ParentPath,
-        [Parameter(Mandatory)][string] $Leaf,
-        [Parameter(Mandatory)][byte[]] $Bytes,
-        [Parameter(Mandatory)][Collections.IDictionary] $ExpectedState,
-        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId,
-        [switch] $NoReplace,
-        [switch] $PreserveDisplaced,
-        $DisplacedLeaf
-    )
-    $requestedDisplacedLeaf = $null
-    if ($null -ne $DisplacedLeaf) {
-        if ($DisplacedLeaf -isnot [string]) {
-            throw [ArgumentException]::new('DisplacedLeaf must be a string when provided.')
-        }
-        if (-not [string]::IsNullOrWhiteSpace($DisplacedLeaf)) {
-            if ($DisplacedLeaf -notmatch '^previous-[0-9a-f]{32}$') {
-                throw [ArgumentException]::new('DisplacedLeaf must match ^previous-[0-9a-f]{32}$ when provided.')
-            }
-            $requestedDisplacedLeaf = $DisplacedLeaf
-        }
-    }
-    if ($PreserveDisplaced -and -not [bool]$ExpectedState.exists) {
-        throw [ArgumentException]::new('A displaced file can be preserved only for an existing expected state.')
-    }
-    $physicalParentPath = Resolve-PortableTrustedRoot -Path $ParentPath
-    $parentLease = $null
-    $transactionRootLease = $null
-    $transactionLease = $null
-    $stageLease = $null
-    $stageLeaf = 'stage-' + [guid]::NewGuid().ToString('N')
-    $effectiveDisplacedLeaf = if ([bool]$ExpectedState.exists) {
-        if ($null -eq $requestedDisplacedLeaf) { 'previous-' + [guid]::NewGuid().ToString('N') }
-        else { $requestedDisplacedLeaf }
-    }
-    elseif ($null -ne $requestedDisplacedLeaf) {
-        throw [ArgumentException]::new('DisplacedLeaf requires an existing expected state.')
-    }
-    else { $null }
-    $transactionRootPath = Join-Path $physicalParentPath '.ai-instructions-txn'
-    $stageState = $null
-    $published = $false
-    $displacedPath = $null
-    try {
-        $parentLease = Open-PlatformDirectory -Root $physicalParentPath -RootOnly
-        try { $transactionRootLease = Open-PlatformDirectory -Root $physicalParentPath -RelativePath '.ai-instructions-txn' -CreatePrivate }
-        catch { $transactionRootLease = Open-PlatformDirectory -Root $physicalParentPath -RelativePath '.ai-instructions-txn' }
-        try { $transactionLease = Open-PlatformDirectory -Root $transactionRootPath -RelativePath $TransactionId -CreatePrivate }
-        catch { $transactionLease = Open-PlatformDirectory -Root $transactionRootPath -RelativePath $TransactionId }
-        $stageLease = Open-PlatformFile -ParentLease $transactionLease -Leaf $stageLeaf -Access ReadWrite -CreateMode CreateNew
-        $stageLease.WriteNewBytes($Bytes)
-        $stageObservation = Assert-PlatformFileIdentity -Lease $stageLease -Expected $stageLease.Observation -SingleLink -VerifyPath
-        $sha256 = [Security.Cryptography.SHA256]::Create()
-        try { $digest = ([BitConverter]::ToString($sha256.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
-        finally { $sha256.Dispose() }
-        $stageState = [ordered]@{
-            exists = $true
-            sha256 = $digest
-            length = [int64]$Bytes.Length
-            identity = ConvertTo-PortablePlatformFileIdentity -Observation $stageObservation
-        }
-        $parameters = @{
-            ParentLease = $parentLease
-            Leaf = $Leaf
-            TransactionLease = $transactionLease
-            StageLease = $stageLease
-            ExpectedState = $ExpectedState
-            ExpectedStage = $stageState
-        }
-        if ($NoReplace) { $parameters.NoReplace = $true }
-        if ($null -ne $effectiveDisplacedLeaf) { $parameters.DisplacedLeaf = $effectiveDisplacedLeaf }
-        $receipt = Publish-PlatformFile @parameters
-        $published = $true
-        if ([string]$receipt.durability -cne 'confirmed') {
-            throw [IO.IOException]::new('Lease publication durability was not confirmed.')
-        }
-        if ($null -ne $effectiveDisplacedLeaf) {
-            if ([string]$receipt.displacedLeaf -cne $effectiveDisplacedLeaf -or $null -eq $receipt.displacedIdentity) {
-                throw [IO.InvalidDataException]::new('Lease CAS publication did not return the exact displaced file evidence.')
-            }
-            $displacedState = [ordered]@{
-                exists = $true
-                sha256 = [string]$ExpectedState.sha256
-                length = [int64]$ExpectedState.length
-                identity = $receipt.displacedIdentity
-            }
-            if ($PreserveDisplaced) {
-                $displacedPath = [IO.Path]::GetFullPath((Join-Path (Join-Path $transactionRootPath $TransactionId) $effectiveDisplacedLeaf))
-            }
-            else {
-                Remove-PortableTransactionFile -TransactionLease $transactionLease -Leaf $effectiveDisplacedLeaf -ExpectedState $displacedState
-            }
-        }
-        [ordered]@{
-            receipt = $receipt
-            displacedPath = $displacedPath
-            state = [ordered]@{
-                exists = $true
-                sha256 = $digest
-                length = [int64]$Bytes.Length
-                identity = $receipt.appliedIdentity
-            }
-        }
-    }
-    catch {
-        $publicationFailure = $_
-        if (-not $published -and $null -ne $stageState) {
-            try {
-                if ($null -ne $stageLease) { $stageLease.Dispose(); $stageLease = $null }
-                Remove-PortableTransactionFile -TransactionLease $transactionLease -Leaf $stageLeaf -ExpectedState $stageState
-            }
-            catch { }
-        }
-        throw $publicationFailure
-    }
-    finally {
-        if ($null -ne $stageLease) { $stageLease.Dispose() }
-        if ($null -ne $transactionLease) { $transactionLease.Dispose() }
-        if ($null -ne $transactionRootLease) { $transactionRootLease.Dispose() }
-        if ($null -ne $parentLease) { $parentLease.Dispose() }
-    }
-}
-
-try {
-    $script:VendoredPlatformRuntimeBinding = Assert-VendoredPlatformRuntime
-    $vendoredManifestPath = Join-Path $script:VendoredPlatformRuntimeRoot 'platform-runtime.psd1'
-    $loadedPlatformRuntime = @(Import-Module -Name $vendoredManifestPath -PassThru -ErrorAction Stop)
-    $expectedPlatformRuntimePath = [IO.Path]::GetFullPath((Join-Path $script:VendoredPlatformRuntimeRoot 'platform-runtime.psm1'))
-    $platformRuntimePathComparer = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-        [StringComparer]::OrdinalIgnoreCase
-    }
-    else { [StringComparer]::Ordinal }
-    if ($loadedPlatformRuntime.Count -ne 1 -or
-        -not $platformRuntimePathComparer.Equals([IO.Path]::GetFullPath([string]$loadedPlatformRuntime[0].Path), $expectedPlatformRuntimePath)) {
-        throw [IO.InvalidDataException]::new('The vendored platform runtime did not load from its registry-bound path.')
-    }
-    Assert-VendoredPlatformRuntimePostLoad -Root $script:VendoredPlatformRuntimeRoot
-    $script:VendoredPlatformRuntimeModule = $loadedPlatformRuntime[0]
-}
-catch {
-    throw [IO.InvalidDataException]::new(
-        ('The vendored authority platform runtime failed verification or loading; the Skill runtime stops: {0}' -f $_.Exception.Message),
-        $_.Exception)
-}
-
-function Get-VendoredPlatformRuntimeBinding {
-    $script:VendoredPlatformRuntimeBinding
-}
-
 function Get-PortablePlatformName {
     [OutputType([string])]
     param()
-    [string][SyuanTsai.AIInstructions.PlatformRuntime.PlatformNative]::GetOperatingSystem()
-}
 
-
-function Get-WindowsPathCaseSensitivity {
-    [OutputType([bool])]
-    param(
-        [Parameter(Mandatory)][string] $Path
-    )
-
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
-        return $false
+    if ([Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([Runtime.InteropServices.OSPlatform]::Windows)) {
+        return 'windows'
     }
-
-    $probe = [IO.Path]::GetFullPath($Path)
-    # This comparison only terminates the lexical ancestor walk; it does not
-    # authorize containment. The authorization result is returned by the
-    # filesystem case-sensitivity queries below.
-    for ($depth = 0; $depth -lt 2048; $depth++) {
-        $directory = [IO.DirectoryInfo]::new($probe)
-        if ($directory.Exists) {
-            $caseSensitive = $false
-            if (-not [SyuanTsai.PathSafetyNative]::TryGetDirectoryCaseSensitive($directory.FullName, [ref]$caseSensitive)) {
-                # An unsupported or inaccessible filesystem cannot prove its
-                # comparison semantics, so callers must use strict comparison.
-                return $null
-            }
-            if ($caseSensitive) {
-                return $true
-            }
-        }
-
-        $parent = $directory.Parent
-        if ($null -eq $parent -or
-            $parent.FullName.Equals($directory.FullName, [StringComparison]::OrdinalIgnoreCase)) {
-            break
-        }
-        $probe = $parent.FullName
+    if ([Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([Runtime.InteropServices.OSPlatform]::Linux)) {
+        return 'linux'
     }
-    $false
+    if ([Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([Runtime.InteropServices.OSPlatform]::OSX)) {
+        return 'macos'
+    }
+    throw [PlatformNotSupportedException]::new('The local path runtime supports Windows, Linux, and macOS only.')
 }
 
 function Get-PortablePathComparison {
     param(
         [AllowEmptyCollection()][string[]] $Paths = @(),
-        # Containment proves that a path is inside a root, so an unknown case
-        # policy must use strict comparison. Exclusion proves that a path is
-        # outside a root, so an unknown case policy must ignore case; otherwise
-        # a case alias on a case-insensitive volume would escape the check.
         [ValidateSet('Containment', 'Exclusion')][string] $Purpose = 'Containment'
     )
 
-    if ($Purpose -ceq 'Exclusion') {
-        # Exclusion is never weakened by a case-sensitive comparer on any host:
-        # Linux volumes may be case-insensitive (for example vfat), macOS APFS is
-        # usually case-insensitive, and Windows directories may be either.
+    if ((Get-PortablePlatformName) -ceq 'windows') {
         return [StringComparison]::OrdinalIgnoreCase
     }
+    [StringComparison]::Ordinal
+}
 
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
-        # Linux is case-sensitive. macOS case sensitivity is per volume; strict
-        # comparison is the conservative containment choice there as well.
-        return [StringComparison]::Ordinal
-    }
+function Resolve-PortableContainedPath {
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Path
+    )
 
-    if (@($Paths).Count -eq 0) {
-        # No path context means that the filesystem semantics are unknown.
-        # Strict comparison is the safe default for security-sensitive checks.
-        return [StringComparison]::Ordinal
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    $rootPath = [IO.Path]::GetPathRoot($rootFull)
+    if (-not $rootFull.Equals($rootPath, (Get-PortablePathComparison))) {
+        $rootFull = $rootFull.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     }
-
-    foreach ($path in @($Paths)) {
-        if ([string]::IsNullOrWhiteSpace($path)) {
-            return [StringComparison]::Ordinal
-        }
-        $caseSensitive = Get-WindowsPathCaseSensitivity -Path $path
-        if ($null -eq $caseSensitive -or $caseSensitive) {
-            return [StringComparison]::Ordinal
-        }
+    $candidateFull = if ([string]::IsNullOrEmpty($Path)) {
+        $rootFull
     }
-    [StringComparison]::OrdinalIgnoreCase
+    elseif ([IO.Path]::IsPathFullyQualified($Path)) {
+        [IO.Path]::GetFullPath($Path)
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path $rootFull $Path))
+    }
+    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
+    $prefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar)) {
+        $rootFull
+    }
+    else {
+        $rootFull + [IO.Path]::DirectorySeparatorChar
+    }
+    if (-not $candidateFull.Equals($rootFull, $comparison) -and
+        -not $candidateFull.StartsWith($prefix, $comparison)) {
+        throw [UnauthorizedAccessException]::new("Path escapes its containing root: $candidateFull")
+    }
+    $candidateFull
 }
 
 function Resolve-PortableTrustedRoot {
     [OutputType([string])]
     param([Parameter(Mandatory)][string] $Path)
 
-    # A trusted root is canonicalized to its physical path before it anchors
-    # any descriptor walk. Operating-system aliases above the selected root,
-    # such as macOS /var -> /private/var or /tmp -> /private/tmp, are resolved
-    # here instead of being reported as managed-path symlinks.
     $full = [IO.Path]::GetFullPath($Path)
-    $physical = [string](Resolve-PlatformPhysicalPath -Path $full)
-    if ([string]::IsNullOrWhiteSpace($physical) -or -not [IO.Path]::IsPathFullyQualified($physical)) {
-        throw "Trusted root could not be physically canonicalized: $full"
+    if (-not [IO.Directory]::Exists($full)) {
+        throw [IO.DirectoryNotFoundException]::new("Trusted root is not an existing directory: $full")
     }
-    $rootLease = $null
-    try {
-        $rootLease = Open-PlatformDirectory -Root $physical -RootOnly
-        $observation = Assert-PlatformFileIdentity -Lease $rootLease -Expected $rootLease.Observation -VerifyPath
-        if ([string]$observation.Kind -cne 'directory') {
-            throw "Trusted root is not an existing directory: $full"
-        }
-    }
-    finally {
-        if ($null -ne $rootLease) { $rootLease.Dispose() }
-    }
-    $physical
+    $full
 }
 
 function Test-PortableReparseItem {
@@ -791,173 +85,42 @@ function Test-PortableReparseItem {
         [Parameter(Mandatory)][string] $Path,
         [AllowNull()][object] $Item,
         [string] $Label = 'path',
-        # Unix-like hosts stop the raw ancestor walk at this trusted root. The
-        # root entry itself is still inspected; its own ancestors are trusted
-        # operating-system aliases that physical canonicalization resolves.
         [AllowEmptyString()][string] $TrustedRoot
     )
 
-    $inspectProviderItem = {
-        param([AllowNull()][object] $Candidate)
-        if ($null -eq $Candidate) { return $false }
-        try {
-            $attributesProperty = $Candidate.PSObject.Properties['Attributes']
-            if ($null -ne $attributesProperty -and
-                (($attributesProperty.Value -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-                return $true
-            }
-            $modeProperty = $Candidate.PSObject.Properties['Mode']
-            if ($null -ne $modeProperty -and [string]$modeProperty.Value -match '^l') {
-                return $true
-            }
-            foreach ($propertyName in @('LinkType', 'LinkTarget', 'Target')) {
-                $property = $Candidate.PSObject.Properties[$propertyName]
-                if ($null -eq $property) { continue }
-                if ($propertyName -eq 'LinkType') {
-                    if (-not [string]::IsNullOrWhiteSpace([string]$property.Value)) { return $true }
-                }
-                elseif (-not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = $null
+    if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
+        $root = [IO.Path]::GetFullPath($TrustedRoot)
+        $null = Resolve-PortableContainedPath -Root $root -Path $full
+    }
+    $comparison = Get-PortablePathComparison -Paths @($root, $full)
+    $current = $full
+    for ($depth = 0; $depth -lt 2048; $depth++) {
+        $candidate = if ($current.Equals($full, $comparison) -and $null -ne $Item) {
+            $Item
+        }
+        else {
+            Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $candidate) {
+            try {
+                if (($candidate.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                    -not [string]::IsNullOrWhiteSpace([string]$candidate.LinkType) -or
+                    -not [string]::IsNullOrWhiteSpace([string]$candidate.LinkTarget)) {
                     return $true
                 }
             }
-        }
-        catch {
-            throw "Unable to inspect $Label reparse metadata: $($_.Exception.Message)"
-        }
-        $false
-    }
-
-    if (& $inspectProviderItem $Item) { return $true }
-
-    # FileInfo/DirectoryInfo.LinkTarget reads the directory entry itself and does
-    # not follow a symlink. Some Unix providers return the symlink target as the
-    # provider item, so always walk raw lexical ancestors even when $Item exists.
-    # This also ensures a missing child below a symlink is rejected before it can
-    # be treated as ordinary absence.
-    $probe = [IO.Path]::GetFullPath($Path)
-    $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
-    $stopRoot = $null
-    if (-not $isWindows) {
-        # Unix ancestor checks stop at the trusted root. Without an explicit
-        # root the walk covers the entry and its parent directory; callers that
-        # prove containment walk every component up to their own root.
-        $stopRoot = if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
-            $parentPath = [IO.Path]::GetDirectoryName($probe)
-            if ([string]::IsNullOrWhiteSpace($parentPath)) { $probe } else { $parentPath }
-        }
-        else {
-            $candidateRoot = [IO.Path]::GetFullPath($TrustedRoot)
-            if ($candidateRoot -cne [IO.Path]::GetPathRoot($candidateRoot)) {
-                $candidateRoot = $candidateRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-            }
-            $rootPrefix = if ($candidateRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) { $candidateRoot } else { $candidateRoot + [IO.Path]::DirectorySeparatorChar }
-            if (-not $probe.Equals($candidateRoot, [StringComparison]::Ordinal) -and
-                -not $probe.StartsWith($rootPrefix, [StringComparison]::Ordinal)) {
-                throw "$Label is outside its trusted root."
-            }
-            $candidateRoot
-        }
-    }
-    # On Windows this comparison only terminates the lexical ancestor walk; it
-    # does not authorize containment. Containment is established by the caller's
-    # boundary-aware path checks.
-    $pathComparison = if ($isWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
-    for ($depth = 0; $depth -lt 2048; $depth++) {
-        foreach ($info in @([IO.FileInfo]::new($probe), [IO.DirectoryInfo]::new($probe))) {
-            try {
-                if (-not [string]::IsNullOrWhiteSpace([string]$info.LinkTarget)) { return $true }
-                if ($info.Exists -and (($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $true }
-            }
-            catch [IO.FileNotFoundException] { }
-            catch [IO.DirectoryNotFoundException] { }
             catch {
-                throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message))
+                throw "Unable to inspect $Label reparse metadata: $($_.Exception.Message)"
             }
         }
-        if ($null -ne $stopRoot -and $probe.Equals($stopRoot, $pathComparison)) {
-            break
-        }
-        $parent = [IO.DirectoryInfo]::new($probe).Parent
-        if ($null -eq $parent -or $parent.FullName.Equals($probe, $pathComparison)) {
-            break
-        }
-        $probe = $parent.FullName
+        if ($null -ne $root -and $current.Equals($root, $comparison)) { break }
+        $parent = [IO.DirectoryInfo]::new($current).Parent
+        if ($null -eq $parent -or $parent.FullName.Equals($current, $comparison)) { break }
+        $current = $parent.FullName
     }
     $false
-}
-
-function Get-PortablePlatformErrno {
-    [OutputType([Nullable[int]])]
-    param([Parameter(Mandatory)] $Failure)
-
-    $candidate = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { $Failure }
-    for ($depth = 0; $depth -lt 32 -and $null -ne $candidate; $depth++) {
-        $errnoProperty = $candidate.PSObject.Properties['Errno']
-        if ($null -ne $errnoProperty -and $null -ne $errnoProperty.Value) {
-            $errno = 0
-            if ([int]::TryParse([string]$errnoProperty.Value, [ref]$errno)) { return $errno }
-        }
-        $candidate = $candidate.InnerException
-    }
-    $null
-}
-
-function Get-PortableUnixObservation {
-    param([Parameter(Mandatory)][string] $Path)
-
-    # The vendored descriptor API opens every component with O_NOFOLLOW and
-    # reports the kernel (st_dev, st_ino, st_nlink) tuple of the opened entry.
-    $full = [IO.Path]::GetFullPath($Path)
-    $parent = [IO.Path]::GetDirectoryName($full)
-    $leaf = [IO.Path]::GetFileName($full)
-    if ([string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($leaf)) {
-        throw "Physical identity requires a path below a filesystem root: $full"
-    }
-    try { $physicalParent = Resolve-PortableTrustedRoot -Path $parent }
-    catch {
-        $failure = $_.Exception
-        for ($depth = 0; $depth -lt 16 -and $null -ne $failure; $depth++) {
-            if ($failure -is [Management.Automation.ItemNotFoundException] -or
-                $failure -is [IO.DirectoryNotFoundException] -or
-                $failure -is [IO.FileNotFoundException]) {
-                # A missing parent proves that the candidate currently has no
-                # physical identity. Creation is separately containment-checked.
-                return $null
-            }
-            $failure = $failure.InnerException
-        }
-        throw
-    }
-    $lease = $null
-    try { $lease = Open-PlatformDirectory -Root $physicalParent -RelativePath $leaf }
-    catch {
-        $errno = Get-PortablePlatformErrno -Failure $_
-        if ($errno -eq 2) { return $null }
-        if ($errno -ne 20) { throw }
-    }
-    if ($null -ne $lease) {
-        try {
-            $observation = Assert-PlatformFileIdentity -Lease $lease -Expected $lease.Observation
-        }
-        finally { $lease.Dispose() }
-        return $observation
-    }
-    $directory = Open-PlatformDirectory -Root $physicalParent -RootOnly
-    try {
-        # Open-PlatformFile rejects symlinks, non-regular files, and any managed
-        # regular file whose link count is not exactly one (hard-link aliases).
-        try { $file = Open-PlatformFile -ParentLease $directory -Leaf $leaf -Access Read -CreateMode OpenExisting }
-        catch {
-            if ((Get-PortablePlatformErrno -Failure $_) -eq 2) { return $null }
-            throw
-        }
-        try {
-            $observation = Assert-PlatformFileIdentity -Lease $file -Expected $file.Observation -SingleLink
-        }
-        finally { $file.Dispose() }
-    }
-    finally { $directory.Dispose() }
-    $observation
 }
 
 function Test-PortablePhysicalIdentity {
@@ -967,40 +130,18 @@ function Test-PortablePhysicalIdentity {
         [Parameter(Mandatory)][string] $PathB
     )
 
-    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-        if ($null -eq ('SyuanTsai.PathSafetyNative' -as [type])) {
-            return $false
-        }
-        [ulong]$volumeA = 0
-        [ulong]$fileA = 0
-        [ulong]$volumeB = 0
-        [ulong]$fileB = 0
-        if (-not [SyuanTsai.PathSafetyNative]::TryGetPhysicalFileIdentity($PathA, [ref]$volumeA, [ref]$fileA) -or
-            -not [SyuanTsai.PathSafetyNative]::TryGetPhysicalFileIdentity($PathB, [ref]$volumeB, [ref]$fileB)) {
-            return $false
-        }
-        return ($volumeA -eq $volumeB -and $fileA -eq $fileB)
-    }
-
-    # Unix physical identity is the kernel (st_dev, st_ino) pair from the
-    # vendored authority runtime. A missing path has no identity.
-    try {
-        $observationA = Get-PortableUnixObservation -Path $PathA
-        $observationB = Get-PortableUnixObservation -Path $PathB
-    }
-    catch {
-        throw ('Unable to prove Unix physical identity: {0}' -f $_.Exception.Message)
-    }
-    if ($null -eq $observationA -or $null -eq $observationB) { return $false }
-    [uint64]$observationA.Device -eq [uint64]$observationB.Device -and
-        [uint64]$observationA.Inode -eq [uint64]$observationB.Inode -and
-        [string]$observationA.Kind -ceq [string]$observationB.Kind
+    $fullA = [IO.Path]::GetFullPath($PathA)
+    $fullB = [IO.Path]::GetFullPath($PathB)
+    if (-not [IO.File]::Exists($fullA) -and -not [IO.Directory]::Exists($fullA)) { return $false }
+    if (-not [IO.File]::Exists($fullB) -and -not [IO.Directory]::Exists($fullB)) { return $false }
+    $fullA.Equals($fullB, (Get-PortablePathComparison -Paths @($fullA, $fullB)))
 }
 
 function Get-PortableLockPrimitive {
     [OutputType([string])]
     param()
-    if ((Get-PortablePlatformName) -ceq 'windows') { 'windows-fileshare' } else { 'flock' }
+
+    'dotnet-fileshare-none'
 }
 
 function Enter-PortableFileLock {
@@ -1012,51 +153,232 @@ function Enter-PortableFileLock {
         [string] $Label = 'coordination'
     )
 
-    # Windows uses handle share modes; Linux and macOS use flock on a fixed
-    # inode that is never unlinked. Both come from the vendored authority
-    # runtime, so DOTNET_SYSTEM_IO_DISABLEFILELOCKING cannot disable them.
-    $physicalRoot = Resolve-PortableTrustedRoot -Path $Root
-    $relative = $RelativeDirectory.Replace('\', '/').Trim('/')
-    $directory = if ([string]::IsNullOrEmpty($relative)) {
-        Open-PlatformDirectory -Root $physicalRoot -RootOnly
+    if ([string]::IsNullOrWhiteSpace($Leaf) -or $Leaf -cne [IO.Path]::GetFileName($Leaf)) {
+        throw [ArgumentException]::new('Lock leaf must be one file name.')
     }
-    else {
-        Open-PlatformDirectory -Root $physicalRoot -RelativePath $relative
+    $rootFull = Resolve-PortableTrustedRoot -Path $Root
+    $relative = $RelativeDirectory.Replace('\', [IO.Path]::DirectorySeparatorChar).Replace('/', [IO.Path]::DirectorySeparatorChar)
+    $directory = Resolve-PortableContainedPath -Root $rootFull -Path $relative
+    if (-not [IO.Directory]::Exists($directory)) {
+        throw [IO.DirectoryNotFoundException]::new("Lock directory is missing: $directory")
     }
-    $lock = $null
-    try {
-        $lock = Enter-PlatformLock -ParentLease $directory -Leaf $Leaf -Mode Exclusive -Timeout ([TimeSpan]::FromMilliseconds($TimeoutMilliseconds))
-    }
-    catch {
-        $directory.Dispose()
-        $cause = $_.Exception
-        while ($null -ne $cause.InnerException) { $cause = $cause.InnerException }
-        if ($cause -is [TimeoutException]) {
-            throw [TimeoutException]::new("Unable to acquire the $Label lock within $TimeoutMilliseconds milliseconds.")
+    $lockPath = Resolve-PortableContainedPath -Root $rootFull -Path (Join-Path $directory $Leaf)
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $stream = $null
+    while ($null -eq $stream) {
+        try {
+            $stream = [IO.File]::Open(
+                $lockPath,
+                [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None)
         }
-        throw
+        catch [IO.IOException] {
+            if ($stopwatch.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+                throw [TimeoutException]::new("Unable to acquire the $Label lock within $TimeoutMilliseconds milliseconds.", $_.Exception)
+            }
+            [Threading.Thread]::Sleep(50)
+        }
     }
+    $stopwatch.Stop()
     $handle = [pscustomobject][ordered]@{
         platform = Get-PortablePlatformName
         lockPrimitive = Get-PortableLockPrimitive
-        path = [IO.Path]::Combine($physicalRoot, $relative, $Leaf)
-        device = [uint64]$lock.Observation.Device
-        inode = [uint64]$lock.Observation.Inode
-        LockLease = $lock
-        DirectoryLease = $directory
+        path = $lockPath
+        Stream = $stream
     }
     $handle | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
-        try { if ($null -ne $this.LockLease) { $this.LockLease.Dispose() } }
-        finally {
-            if ($null -ne $this.DirectoryLease) { $this.DirectoryLease.Dispose() }
-            $this.LockLease = $null
-            $this.DirectoryLease = $null
+        if ($null -ne $this.Stream) {
+            $this.Stream.Dispose()
+            $this.Stream = $null
         }
     }
     $handle
 }
 
-Export-ModuleMember -Function Get-PortablePathComparison, Test-PortableReparseItem, Test-PortablePhysicalIdentity,
-    Resolve-PortableTrustedRoot, Enter-PortableFileLock, Get-PortableLockPrimitive, Get-PortablePlatformName,
-    Assert-VendoredPlatformRuntime, Get-VendoredPlatformRuntimeBinding, Get-PortableLeaseFileState,
-    Get-PortableTransactionResidue, Publish-PortableLeaseFile
+function Get-PortableLeaseFileState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ParentPath,
+        [Parameter(Mandatory)][string] $Leaf,
+        [ValidateRange(1, 16777216)][int] $MaximumBytes = 1048576,
+        [switch] $AllowMissing,
+        [string] $LegacyDirectoryMessage
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Leaf) -or $Leaf -cne [IO.Path]::GetFileName($Leaf)) {
+        throw [ArgumentException]::new('Lease leaf must be one file name.')
+    }
+    $parent = Resolve-PortableTrustedRoot -Path $ParentPath
+    $path = Resolve-PortableContainedPath -Root $parent -Path $Leaf
+    if ([IO.Directory]::Exists($path)) {
+        if ([string]::IsNullOrWhiteSpace($LegacyDirectoryMessage)) {
+            throw [IO.InvalidDataException]::new("The lease path is a directory: $Leaf")
+        }
+        throw [IO.InvalidDataException]::new($LegacyDirectoryMessage)
+    }
+    if (-not [IO.File]::Exists($path)) {
+        if ($AllowMissing) {
+            return [ordered]@{ exists = $false; bytes = $null; sha256 = $null; length = $null }
+        }
+        throw [IO.FileNotFoundException]::new("Lease file is missing: $path", $path)
+    }
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -gt $MaximumBytes) {
+            throw [IO.InvalidDataException]::new("Lease file exceeds $MaximumBytes bytes: $path")
+        }
+        [byte[]]$bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw [IO.EndOfStreamException]::new("Lease file ended early: $path") }
+            $offset += $read
+        }
+    }
+    finally { $stream.Dispose() }
+    [ordered]@{
+        exists = $true
+        bytes = $bytes
+        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        length = [int64]$bytes.Length
+    }
+}
+
+function New-PortablePublicationException {
+    param([Parameter(Mandatory)][string] $Kind, [Parameter(Mandatory)][string] $Message, [Exception] $InnerException)
+
+    $exception = if ($null -eq $InnerException) {
+        [IO.IOException]::new($Message)
+    }
+    else {
+        [IO.IOException]::new($Message, $InnerException)
+    }
+    $exception.Data['PortablePublicationKind'] = $Kind
+    $exception
+}
+
+function Write-PortableTemporaryFile {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][byte[]] $Bytes)
+
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+}
+
+function Get-PortableTransactionResidue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $LockRoot,
+        [string] $OwnerLeaf
+    )
+
+    $root = Resolve-PortableTrustedRoot -Path $LockRoot
+    if (-not [string]::IsNullOrWhiteSpace($OwnerLeaf) -and $OwnerLeaf -cne [IO.Path]::GetFileName($OwnerLeaf)) {
+        throw [ArgumentException]::new('OwnerLeaf must be one file name when provided.')
+    }
+    $pattern = if ([string]::IsNullOrWhiteSpace($OwnerLeaf)) {
+        '^\..+\.publish-[0-9a-f]{32}\.tmp$'
+    }
+    else {
+        '^\.' + [regex]::Escape($OwnerLeaf) + '\.publish-[0-9a-f]{32}\.tmp$'
+    }
+    $entries = [Collections.Generic.List[string]]::new()
+    foreach ($path in [IO.Directory]::GetFileSystemEntries($root)) {
+        $leaf = [IO.Path]::GetFileName([IO.Path]::TrimEndingDirectorySeparator($path))
+        if ($leaf -match $pattern) { $entries.Add($leaf) }
+    }
+    [string[]]$sorted = @($entries.ToArray() | Sort-Object -Unique)
+    [ordered]@{ hasResidue = $sorted.Count -gt 0; entries = $sorted }
+}
+
+function Publish-PortableLeaseFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ParentPath,
+        [Parameter(Mandatory)][string] $Leaf,
+        [Parameter(Mandatory)][byte[]] $Bytes,
+        [Parameter(Mandatory)][Collections.IDictionary] $ExpectedState,
+        [switch] $NoReplace,
+        [switch] $PreserveDisplaced
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Leaf) -or $Leaf -cne [IO.Path]::GetFileName($Leaf)) {
+        throw [ArgumentException]::new('Publication leaf must be one file name.')
+    }
+    if ($NoReplace -and [bool]$ExpectedState.exists) {
+        throw [ArgumentException]::new('NoReplace requires an absent expected state.')
+    }
+    if ($PreserveDisplaced -and -not [bool]$ExpectedState.exists) {
+        throw [ArgumentException]::new('PreserveDisplaced requires an existing expected state.')
+    }
+    $parent = Resolve-PortableTrustedRoot -Path $ParentPath
+    $target = Resolve-PortableContainedPath -Root $parent -Path $Leaf
+    $current = Get-PortableLeaseFileState -ParentPath $parent -Leaf $Leaf -AllowMissing
+    if ([bool]$current.exists -ne [bool]$ExpectedState.exists -or
+        ([bool]$current.exists -and (
+            [string]$current.sha256 -cne [string]$ExpectedState.sha256 -or
+            [int64]$current.length -ne [int64]$ExpectedState.length))) {
+        if ($NoReplace -and [bool]$current.exists -and -not [bool]$ExpectedState.exists) {
+            throw (New-PortablePublicationException -Kind 'no-replace-target-exists' -Message 'No-replace publication target already exists.')
+        }
+        throw (New-PortablePublicationException -Kind 'cas-expected-state-mismatch' -Message 'Publication target differs from its expected state.')
+    }
+
+    $displacedPath = $null
+    if ($PreserveDisplaced) {
+        $evidenceLeaf = ".$Leaf.stale-$([string]$ExpectedState.sha256).json"
+        $displacedPath = Resolve-PortableContainedPath -Root $parent -Path $evidenceLeaf
+        if ([IO.File]::Exists($displacedPath)) {
+            $evidence = Get-PortableLeaseFileState -ParentPath $parent -Leaf $evidenceLeaf
+            if ([string]$evidence.sha256 -cne [string]$ExpectedState.sha256 -or
+                [int64]$evidence.length -ne [int64]$ExpectedState.length) {
+                throw [IO.InvalidDataException]::new('Existing stale-owner evidence differs from the displaced owner state.')
+            }
+        }
+        else {
+            $evidenceTemporary = Resolve-PortableContainedPath -Root $parent -Path (".$evidenceLeaf.publish-$([guid]::NewGuid().ToString('N')).tmp")
+            try {
+                Write-PortableTemporaryFile -Path $evidenceTemporary -Bytes ([byte[]]$current.bytes)
+                try { [IO.File]::Move($evidenceTemporary, $displacedPath, $false) }
+                catch [IO.IOException] {
+                    if (-not [IO.File]::Exists($displacedPath)) { throw }
+                    $evidence = Get-PortableLeaseFileState -ParentPath $parent -Leaf $evidenceLeaf
+                    if ([string]$evidence.sha256 -cne [string]$ExpectedState.sha256 -or
+                        [int64]$evidence.length -ne [int64]$ExpectedState.length) { throw }
+                }
+            }
+            finally {
+                if ([IO.File]::Exists($evidenceTemporary)) { [IO.File]::Delete($evidenceTemporary) }
+            }
+        }
+    }
+
+    $temporary = Resolve-PortableContainedPath -Root $parent -Path (".$Leaf.publish-$([guid]::NewGuid().ToString('N')).tmp")
+    try {
+        Write-PortableTemporaryFile -Path $temporary -Bytes $Bytes
+        try { [IO.File]::Move($temporary, $target, -not $NoReplace) }
+        catch [IO.IOException] {
+            if ($NoReplace -and [IO.File]::Exists($target)) {
+                throw (New-PortablePublicationException -Kind 'no-replace-target-exists' -Message 'No-replace publication target already exists.' -InnerException $_.Exception)
+            }
+            throw
+        }
+    }
+    finally {
+        if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+    }
+    $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+    [ordered]@{
+        receipt = [ordered]@{ durability = 'flushed'; publication = 'same-directory-move' }
+        displacedPath = $displacedPath
+        state = [ordered]@{ exists = $true; sha256 = $digest; length = [int64]$Bytes.Length }
+    }
+}
+
+Export-ModuleMember -Function Get-PortablePathComparison, Resolve-PortableContainedPath, Test-PortableReparseItem,
+    Test-PortablePhysicalIdentity, Resolve-PortableTrustedRoot, Enter-PortableFileLock, Get-PortableLockPrimitive,
+    Get-PortablePlatformName, Get-PortableLeaseFileState, Get-PortableTransactionResidue, Publish-PortableLeaseFile
