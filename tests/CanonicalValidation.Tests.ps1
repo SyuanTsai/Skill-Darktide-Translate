@@ -1055,3 +1055,167 @@ Describe 'Protected workflow trust binding' {
 
 
 }
+
+Describe 'SkillSpector exit-one report diagnostics' {
+    BeforeAll {
+        $validatorPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Validate.ps1'
+        $validatorSource = Get-Content -LiteralPath $validatorPath -Raw
+        $tokens = $null
+        $parseErrors = $null
+        $validatorAst = [Management.Automation.Language.Parser]::ParseInput(
+            $validatorSource, [ref]$tokens, [ref]$parseErrors)
+        if ($parseErrors.Count -gt 0) { throw 'Validate.ps1 must parse before its SkillSpector exit-one adapter is exercised.' }
+        $functionNames = @(
+            'Read-StrictUtf8File',
+            'Assert-NoDuplicateJsonProperties',
+            'Read-JsonFile',
+            'Get-RequiredProperty',
+            'Read-SkillSpectorJsonReport',
+            'ConvertTo-BoundedSkillSpectorDiagnosticText',
+            'Get-SkillSpectorExitOneSummary',
+            'Assert-SkillSpectorScanExitCode',
+            'Invoke-SkillSpectorScan'
+        )
+        $functions = @($validatorAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -in $functionNames
+        }, $true))
+        if ($functions.Count -ne $functionNames.Count) {
+            throw 'The SkillSpector exit-one probe could not find its production functions.'
+        }
+        $nativeFixture = @'
+function Set-SkillSpectorNativeFixture {
+    param([int] $ExitCode, [string] $StandardOutput, [string] $StandardError = '')
+    $script:FixtureExitCode = $ExitCode
+    $script:FixtureStandardOutput = $StandardOutput
+    $script:FixtureStandardError = $StandardError
+}
+function Invoke-NativeChecked {
+    param(
+        [string] $Command,
+        [string[]] $Arguments,
+        [string] $Context,
+        [string] $DiagnosticRoot,
+        [string] $ChildWritableRoot,
+        [Collections.IDictionary] $AdditionalEnvironmentVariables,
+        [switch] $IsolateRunnerCommandFiles,
+        [switch] $TerminateProcessTree,
+        [switch] $ProtectRunnerCommandFiles,
+        [string] $NetworkProfile,
+        [string] $StandardOutputPath,
+        [string] $StandardErrorPath
+    )
+    [IO.File]::WriteAllText($StandardOutputPath, $script:FixtureStandardOutput, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($StandardErrorPath, $script:FixtureStandardError, [Text.UTF8Encoding]::new($false))
+    if ($script:FixtureExitCode -ne 0) {
+        $failure = [InvalidOperationException]::new("$Context exited with code $($script:FixtureExitCode).")
+        $failure.Data['NativeExitCode'] = [int]$script:FixtureExitCode
+        throw $failure
+    }
+    return ''
+}
+'@
+        $probeSource = $nativeFixture + [Environment]::NewLine +
+            (($functions | Sort-Object { $_.Extent.StartOffset } | ForEach-Object { $_.Extent.Text }) -join "`n")
+        $script:SkillSpectorExitOneProbe = New-Module -Name "SkillSpectorExitOne_$([guid]::NewGuid().ToString('N'))" `
+            -ScriptBlock ([scriptblock]::Create($probeSource))
+
+        function New-SkillSpectorExitOneFixtureJson {
+            return ([ordered]@{
+                execution_successful = $true
+                issues = @([ordered]@{
+                    id = 'AE1'
+                    severity = 'HIGH'
+                    location = [ordered]@{ file = 'SKILL.md'; start_line = 22 }
+                    finding = 'unsafe token=fixture-super-secret-value reference'
+                })
+                analysis_completeness = [ordered]@{
+                    execution_successful = $true
+                    is_complete = $false
+                    status = 'partial'
+                    coverage_percent = 81.4
+                    ledger_exceptions = @([ordered]@{
+                        outcome = 'partial'
+                        path = 'scripts/mod-update.ps1'
+                    })
+                    scope_exclusions = @()
+                    limitations = @()
+                }
+                risk_assessment = [ordered]@{ score = 95 }
+            } | ConvertTo-Json -Depth 20)
+        }
+    }
+
+    AfterAll {
+        Remove-Module -Name $script:SkillSpectorExitOneProbe.Name -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'UnitT38_ParsesAndSummarizesExitOneThenStillFailsClosed' {
+        $failure = $null
+        try {
+            & $script:SkillSpectorExitOneProbe {
+                param($root, $json)
+                $reportPath = Join-Path $root 'report.json'
+                $stderrPath = Join-Path $root 'stderr.txt'
+                Set-SkillSpectorNativeFixture -ExitCode 1 -StandardOutput $json
+                $exitCode = 0
+                $summary = ''
+                [void](Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
+                    -ReportPath $reportPath -StandardErrorPath $stderrPath -Context 'fixture static scan' `
+                    -DiagnosticRoot $root -ChildWritableRoot $root `
+                    -ExitCodeResult ([ref]$exitCode) -ExitOneSummaryResult ([ref]$summary))
+                Assert-SkillSpectorScanExitCode -ExitCode $exitCode -Context 'fixture static scan' `
+                    -ExitOneSummary $summary
+            } $TestDrive (New-SkillSpectorExitOneFixtureJson)
+        }
+        catch { $failure = $_.Exception }
+
+        $failure | Should -Not -BeNullOrEmpty
+        $failure.Message | Should -Match 'exited with code 1 after its report was evaluated'
+        $failure.Message | Should -Match 'rule=AE1; severity=HIGH; file=SKILL\.md:22'
+        $failure.Message | Should -Match 'message=unsafe token=\[redacted\] reference'
+        $failure.Message | Should -Match 'completeness=81\.4%; partialFiles=1; riskScore=95'
+        $failure.Message | Should -Match 'partialFileList=scripts/mod-update\.ps1'
+        $failure.Message | Should -Not -Match 'fixture-super-secret-value'
+        $failure.Message.Length | Should -BeLessOrEqual 8192
+    }
+
+    It 'UnitT39_TreatsExitOneWithInvalidJsonAsAnExecutionError' {
+        { & $script:SkillSpectorExitOneProbe {
+            param($root)
+            Set-SkillSpectorNativeFixture -ExitCode 1 -StandardOutput '{invalid-json'
+            Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
+                -ReportPath (Join-Path $root 'invalid.json') -StandardErrorPath (Join-Path $root 'invalid.stderr.txt') `
+                -Context 'fixture invalid scan' -DiagnosticRoot $root -ChildWritableRoot $root
+        } $TestDrive } | Should -Throw '*not valid unambiguous UTF-8 JSON*'
+    }
+
+    It 'UnitT41_PreservesExitZeroReportBehavior' {
+        $result = & $script:SkillSpectorExitOneProbe {
+            param($root)
+            Set-SkillSpectorNativeFixture -ExitCode 0 -StandardOutput '{"marker":"clean"}'
+            $exitCode = -1
+            $summary = 'unexpected'
+            $report = Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
+                -ReportPath (Join-Path $root 'clean.json') -StandardErrorPath (Join-Path $root 'clean.stderr.txt') `
+                -Context 'fixture clean scan' -DiagnosticRoot $root -ChildWritableRoot $root `
+                -ExitCodeResult ([ref]$exitCode) -ExitOneSummaryResult ([ref]$summary)
+            [pscustomobject]@{ report = $report; exitCode = $exitCode; summary = $summary }
+        } $TestDrive
+
+        $result.report.marker | Should -BeExactly 'clean'
+        $result.exitCode | Should -Be 0
+        $result.summary | Should -BeExactly ''
+    }
+
+    It 'UnitT42_PreservesExitTwoAsAnExecutionError' {
+        { & $script:SkillSpectorExitOneProbe {
+            param($root, $json)
+            Set-SkillSpectorNativeFixture -ExitCode 2 -StandardOutput $json
+            Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
+                -ReportPath (Join-Path $root 'exit-two.json') -StandardErrorPath (Join-Path $root 'exit-two.stderr.txt') `
+                -Context 'fixture execution error' -DiagnosticRoot $root -ChildWritableRoot $root
+        } $TestDrive (New-SkillSpectorExitOneFixtureJson) } | Should -Throw '*exited with code 2*'
+    }
+}
