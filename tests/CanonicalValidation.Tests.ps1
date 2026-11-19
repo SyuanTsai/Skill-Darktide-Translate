@@ -520,8 +520,8 @@ Describe 'Canonical Standard v1 validation adapter' {
         $script:Validator | Should -Match 'Assert-SkillSpectorReport'
         $script:Validator | Should -Match 'ExpectedInventoryPaths'
         $script:Validator | Should -Match 'foreach \(\$skillId in \$skillIds\)'
-        $script:Validator | Should -Match "validate', 'structure', '--allow-dirs=agents', '--allow-nested-paths=scripts/platform-runtime'"
-        $script:Validator | Should -Match "'check', '--strict', '--allow-dirs=agents', '--allow-nested-paths=scripts/platform-runtime'"
+        $script:Validator | Should -Match "validate', 'structure', '--allow-dirs=agents'"
+        $script:Validator | Should -Match "'check', '--strict', '--allow-dirs=agents'"
         $script:Validator | Should -Match ([regex]::Escape("'check', `$skillRoot, '--format', 'sarif'"))
     }
 

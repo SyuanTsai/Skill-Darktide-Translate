@@ -4559,14 +4559,14 @@ foreach ($skillId in $skillIds) {
     $skillIntegrity = @($integrityReport.skills | Where-Object { $_.skillId -ceq $skillId })
     if ($skillIntegrity.Count -ne 1) { throw "Candidate integrity evidence is ambiguous for '$skillId'." }
     $expectedInventoryPaths = @($skillIntegrity[0].files | ForEach-Object { [string]$_.path })
-    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', '--allow-nested-paths=scripts/platform-runtime', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $validatorOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('-o', 'json', 'validate', 'structure', '--allow-dirs=agents', $skillRoot) -Context "skill-validator package validation for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $validatorReportPath = Join-Path $runRoot "skill-validator-$skillId.json"
     [IO.File]::WriteAllText($validatorReportPath, $validatorOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $validatorReport = Read-JsonFile -Path $validatorReportPath -Context "skill-validator package validation report for $skillId"
     Assert-SkillValidatorReport -Report $validatorReport -SkillRoot $skillRoot -ExpectedInventoryPaths $expectedInventoryPaths -SkillId $skillId
     $skillValidatorReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($validatorReportPath) }
 
-    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '--allow-nested-paths=scripts/platform-runtime', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
+    $checkOutput = Invoke-NativeChecked -Command $skillValidatorPath -Arguments @('check', '--strict', '--allow-dirs=agents', '-o', 'json', $skillRoot) -Context "skill-validator full check for $skillId" -DiagnosticRoot $runRoot -ChildWritableRoot $childOutputRoot -IsolateRunnerCommandFiles -TerminateProcessTree -ProtectRunnerCommandFiles
     $checkReportPath = Join-Path $runRoot "skill-validator-check-$skillId.json"
     [IO.File]::WriteAllText($checkReportPath, $checkOutput + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     $checkReport = Read-JsonFile -Path $checkReportPath -Context "skill-validator full check report for $skillId"
