@@ -158,7 +158,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes the source run root."
@@ -170,13 +170,13 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $current -Label $Label) {
+            if (Test-PortableReparseItem -Path $current -Label $Label -TrustedRoot $rootFull) {
                 throw "$Label path contains a symlink or reparse point."
             }
             throw "$Label path component is missing."
         }
         catch { throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message)) }
-        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label -TrustedRoot $rootFull) {
             throw "$Label path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, $comparison)) { return $pathFull }
@@ -242,8 +242,11 @@ $null = Assert-NoReparsePath -Path $sourceRunRoot -Root $sourceRunRoot -Label 'S
 $null = Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt'
 $null = Assert-NoReparsePath -Path $requestFull -Root $sourceRunRoot -Label 'Source request'
 if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
-    if ($receiptFull -cne [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-receipt.json')) -or
-        $requestFull -cne [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-request.json'))) {
+    $expectedReceiptPath = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-receipt.json'))
+    $expectedRequestPath = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-request.json'))
+    $sourcePathComparison = Get-PortablePathComparison -Root $sourceRunRoot
+    if (-not $receiptFull.Equals($expectedReceiptPath, $sourcePathComparison) -or
+        -not $requestFull.Equals($expectedRequestPath, $sourcePathComparison)) {
         throw 'Source receipt verification requires the fixed run-local review artifact paths.'
     }
 }
@@ -342,7 +345,8 @@ if ($isRetainedNonDelivered) {
     $retainedParent = Split-Path -Parent $retainedFull
     if (-not (Test-Path -LiteralPath $retainedFull -PathType Leaf) -or
         (Split-Path -Leaf $retainedParent).StartsWith('.incoming-', [StringComparison]::Ordinal) -ne $true -or
-        [IO.Path]::GetFullPath((Split-Path -Parent $retainedParent)) -cne $sourceRunRoot) {
+        -not ([IO.Path]::GetFullPath((Split-Path -Parent $retainedParent))).Equals(
+            $sourceRunRoot, (Get-PortablePathComparison -Root $sourceRunRoot))) {
         throw 'Retained source is outside a fixed run-local incoming directory.'
     }
     $archiveEvidence = Get-ArchiveEvidence -Path $retainedFull
@@ -399,7 +403,7 @@ $deliveredPath = [IO.Path]::GetFullPath([string]$receipt.deliveredPath)
 $null = Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source'
 if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
     $verifiedRoot = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'verified-source')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    if (-not $deliveredPath.StartsWith($verifiedRoot + [IO.Path]::DirectorySeparatorChar, (Get-PortablePathComparison -Paths @($verifiedRoot, $deliveredPath)))) {
+    if (-not $deliveredPath.StartsWith($verifiedRoot + [IO.Path]::DirectorySeparatorChar, (Get-PortablePathComparison -Root $verifiedRoot))) {
         throw 'Delivered source escapes the fixed run-local verified-source directory.'
     }
 }

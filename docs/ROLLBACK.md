@@ -23,6 +23,16 @@ Version 0.2.x cannot resume a Schema 15 state. Restore an exact compatible 0.3.x
 
 Create a new commit that restores the previous behavior and publish a new patch version. Never move or overwrite an existing release tag.
 
+## K1 coordination-lease rollback
+
+Version 0.4.0 changes shared coordination and MOD reservation leases from the legacy `.locks/<id>/` directory layout to immutable-receipt single-file leases with token-bound acquire, heartbeat, and release operations. The runtime deliberately treats an existing legacy lease directory as held with unknown ownership and fails closed; it never deletes, converts, or reuses that directory automatically.
+
+Before rolling back or forward across this format boundary, stop every process that can use the affected Skill state. Preserve the legacy directory as evidence, verify independently that no owner is active, and have an operator move it to a separately retained migration archive outside the live `.locks` namespace. Do not rename its contents into the new lease file or synthesize a released receipt. Resume only after the live lease path is absent and all participants run the same pinned Skill version. If ownership cannot be established, leave the state stopped and retain the directory for manual recovery.
+
+An absent shared single-file owner accompanied by a recognizable `.<owner-leaf>.publish-<guid>.tmp` in `.locks`, or an absent MOD owner accompanied by the matching owner-leaf temporary in `.locks/mod`, is not the legacy directory format. The owner-update guard reports `BLOCKED: incomplete owner publication residue exists under '<relative-lock-root>' (...)`. Keep the affected shared namespace or MOD reservation stopped and follow **Manual recovery for incomplete owner publication** in `skills/auto-update-darktide-mod/references/automation.md` before any rollback or forward retry; a temporary for a different MOD does not block this MOD.
+
+An interrupted owner-checked directory cleanup can retain the exact sibling `<owned-directory>.codex-removal`. A same-version retry resumes that quarantine before advancing the persisted cleanup step. If both names exist, either name is not an ordinary owned directory, or deletion fails, keep the reservation cleanup-pending and follow **Manual recovery for interrupted directory cleanup** in `skills/auto-update-darktide-mod/references/automation.md`; never delete a broader claim or `In Progress` root.
+
 ## Safe fallback
 
 If the pinned Workflow, Review Baseline, Schema 15 extension, package binding, source commit, or content hash cannot be verified, treat the Skill as unavailable for new claims. Preserve existing run state, source archives, receipts, acquisition records, reservations, worktrees, branches, PRs, and evidence until the original tuple can be restored.

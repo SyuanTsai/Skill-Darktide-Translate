@@ -156,7 +156,7 @@ function Assert-ContainedFilePath {
     param([Parameter(Mandatory)][string] $Candidate, [Parameter(Mandatory)][string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Downloaded file escapes the isolated incoming directory.'
     }
@@ -168,7 +168,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes the isolated source run root."
@@ -185,7 +185,7 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $paths[$index] -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $paths[$index] -Label $Label) {
+            if (Test-PortableReparseItem -Path $paths[$index] -Label $Label -TrustedRoot $rootFull) {
                 throw "$Label path contains a symlink or reparse point."
             }
             if ($AllowMissingLeaf -and $index -eq ($paths.Count - 1)) { continue }
@@ -194,7 +194,7 @@ function Assert-NoReparsePath {
         catch {
             throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]$_.Exception.Message))
         }
-        if (Test-PortableReparseItem -Path $paths[$index] -Item $item -Label $Label) {
+        if (Test-PortableReparseItem -Path $paths[$index] -Item $item -Label $Label -TrustedRoot $rootFull) {
             throw "$Label path contains a symlink or reparse point."
         }
     }
@@ -384,7 +384,7 @@ function Invoke-ApiDownload {
     $handler.AllowAutoRedirect = $false
     $client = [Net.Http.HttpClient]::new($handler, $true)
     $response = $null
-    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.3.13')
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.4.0')
     $apiKey = [Environment]::GetEnvironmentVariable($ApiKeyEnvironmentVariable)
     if (-not [string]::IsNullOrWhiteSpace($apiKey)) { $client.DefaultRequestHeaders.Add('apikey', $apiKey) }
     try {

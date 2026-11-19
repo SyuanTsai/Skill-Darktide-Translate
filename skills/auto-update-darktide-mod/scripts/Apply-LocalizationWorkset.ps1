@@ -156,7 +156,7 @@ function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Workset NEW path escapes its recorded staging root.'
     }
@@ -167,14 +167,14 @@ function Assert-NoReparsePath {
     param([string] $Path, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root)
     $currentPath = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $currentPath)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     for ($depth = 0; $depth -lt 2048; $depth++) {
         $current = $null
         try {
             $current = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $currentPath -Label 'Workset NEW localization') {
+            if (Test-PortableReparseItem -Path $currentPath -Label 'Workset NEW localization' -TrustedRoot $rootFull) {
                 throw 'Workset NEW localization path contains a symlink or reparse point.'
             }
             throw
@@ -182,7 +182,7 @@ function Assert-NoReparsePath {
         catch {
             throw ('Unable to inspect Workset NEW localization physical containment component: {0}' -f $_.Exception.Message)
         }
-        if (Test-PortableReparseItem -Path $currentPath -Item $current -Label 'Workset NEW localization') {
+        if (Test-PortableReparseItem -Path $currentPath -Item $current -Label 'Workset NEW localization' -TrustedRoot $rootFull) {
             throw 'Workset NEW localization path contains a symlink or reparse point.'
         }
         if ($currentPath.Equals($rootFull, $comparison)) { return }
@@ -325,7 +325,8 @@ foreach ($unit in @($workset.units)) {
 $expectedStagingParent = [IO.Path]::GetFullPath((Join-Path $worksetRunRoot 'staging/localization-workset-input'))
 $expectedStagingRoot = [IO.Path]::GetFullPath((Join-Path $expectedStagingParent (Split-Path -Leaf ([string]$workset.modRelativePath))))
 $recordedStagingRoot = [IO.Path]::GetFullPath([string]$workset.new.root)
-if ($recordedStagingRoot -cne $expectedStagingRoot) {
+if (-not $recordedStagingRoot.Equals(
+        $expectedStagingRoot, (Get-PortablePathComparison -Paths @($expectedStagingRoot, $recordedStagingRoot)))) {
     throw 'Workset NEW root differs from its fixed run-local staging path.'
 }
 $newPath = Assert-ContainedPath -Candidate ([string]$workset.new.path) -Root ([string]$workset.new.root)

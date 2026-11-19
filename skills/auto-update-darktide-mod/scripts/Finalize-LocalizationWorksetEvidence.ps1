@@ -38,7 +38,7 @@ function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root, [string] $Label)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes its allowed root."
     }
@@ -46,12 +46,19 @@ function Assert-ContainedPath {
 }
 
 function Assert-NoReparsePath {
-    param([string] $Path, [string] $Root, [string] $Label, [switch] $AllowMissingLeaf)
+    param(
+        [string] $Path,
+        [string] $Root,
+        [string] $Label,
+        [switch] $AllowMissingLeaf,
+        [string] $ComparisonRoot
+    )
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    $comparisonSource = if ([string]::IsNullOrWhiteSpace($ComparisonRoot)) { $rootFull } else { [IO.Path]::GetFullPath($ComparisonRoot) }
+    $comparison = Get-PortablePathComparison -Root $comparisonSource
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Label escapes its physical verification root."
@@ -69,7 +76,7 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $candidate -Label $Label) {
+            if (Test-PortableReparseItem -Path $candidate -Label $Label -TrustedRoot $rootFull) {
                 throw "$Label path contains a symlink or reparse point."
             }
             if ($AllowMissingLeaf -and $index -eq ($paths.Count - 1)) { continue }
@@ -78,7 +85,7 @@ function Assert-NoReparsePath {
         catch {
             throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]($_.Exception.Message)))
         }
-        if (Test-PortableReparseItem -Path $candidate -Item $item -Label $Label) {
+        if (Test-PortableReparseItem -Path $candidate -Item $item -Label $Label -TrustedRoot $rootFull) {
             throw "$Label path contains a symlink or reparse point."
         }
     }
@@ -102,7 +109,7 @@ function Write-Result {
 }
 
 $stateFull = [IO.Path]::GetFullPath($StatePath)
-Assert-NoReparsePath -Path $stateFull -Root ([IO.Path]::GetPathRoot($stateFull)) -Label 'Schema 15 state'
+Assert-NoReparsePath -Path $stateFull -Root ([IO.Path]::GetPathRoot($stateFull)) -Label 'Schema 15 state' -ComparisonRoot (Split-Path -Parent $stateFull)
 if (-not (Test-Path -LiteralPath $stateFull -PathType Leaf)) { throw 'Schema 15 state file does not exist.' }
 $state = Get-Content -LiteralPath $stateFull -Raw | ConvertFrom-Json -AsHashtable
 if ([int]$state.schemaVersion -lt 15) { throw 'Localization workset deletion evidence applies only to Schema 15.' }
@@ -112,8 +119,10 @@ if (-not $state.candidateGate -or [string]$state.candidateGate.status -cne 'pass
 $stateRunRoot = Split-Path -Parent $stateFull
 if (-not $state.Contains('runRoot') -or [string]::IsNullOrWhiteSpace([string]$state.runRoot) -or
     -not $state.Contains('statePath') -or [string]::IsNullOrWhiteSpace([string]$state.statePath) -or
-    [IO.Path]::GetFullPath([string]$state.runRoot) -cne $stateRunRoot -or
-    [IO.Path]::GetFullPath([string]$state.statePath) -cne $stateFull) {
+    -not ([IO.Path]::GetFullPath([string]$state.runRoot)).Equals(
+        $stateRunRoot, (Get-PortablePathComparison -Paths @($stateRunRoot, [string]$state.runRoot))) -or
+    -not ([IO.Path]::GetFullPath([string]$state.statePath)).Equals(
+        $stateFull, (Get-PortablePathComparison -Paths @($stateFull, [string]$state.statePath)))) {
     throw 'Schema 15 state path differs from its fixed run root tuple.'
 }
 $runRoot = $stateRunRoot
@@ -170,10 +179,13 @@ if (-not $receipt) {
     Write-AtomicJson -Path $receiptPath -Value $receipt
 }
 else {
+    $receiptPathComparison = Get-PortablePathComparison -Paths @($securityRoot, $worksetPath, $reportPath)
     if ([int]$receipt.schemaVersion -ne 1 -or [int]$receipt.workflowSchemaVersion -ne 15 -or
-        [string]$receipt.runId -cne [string]$state.runId -or [string]$receipt.worksetPath -cne $worksetPath -or
+        [string]$receipt.runId -cne [string]$state.runId -or
+        -not ([IO.Path]::GetFullPath([string]$receipt.worksetPath)).Equals($worksetPath, $receiptPathComparison) -or
         [string]$receipt.worksetSha256 -cne [string]$state.localizationWorkset.sha256 -or
-        [string]$receipt.validationReportPath -cne $reportPath -or [string]$receipt.status -notin @('pending', 'deleted')) {
+        -not ([IO.Path]::GetFullPath([string]$receipt.validationReportPath)).Equals($reportPath, $receiptPathComparison) -or
+        [string]$receipt.status -notin @('pending', 'deleted')) {
         throw 'Localization workset deletion receipt does not match the current run tuple.'
     }
 }

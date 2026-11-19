@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Schema 15 localization workset' {
     BeforeAll {
@@ -1128,21 +1128,46 @@ return localization
         $finalizer = Get-Content -LiteralPath (Join-Path $scriptRoot 'Finalize-LocalizationWorksetEvidence.ps1') -Raw
 
         $finalizer | Should -Match '(?s)\$stateFull = \[IO\.Path\]::GetFullPath\(\$StatePath\).*Assert-NoReparsePath -Path \$stateFull -Root \(\[IO\.Path\]::GetPathRoot\(\$stateFull\)\) -Label ''Schema 15 state''.*\$state = Get-Content'
-        $finalizer | Should -Match '\[IO\.Path\]::GetFullPath\(\[string\]\$state\.runRoot\) -cne \$stateRunRoot'
-        $finalizer | Should -Match '\[IO\.Path\]::GetFullPath\(\[string\]\$state\.statePath\) -cne \$stateFull'
+        $expectedStateGuard = 'Assert-NoReparsePath -Path $stateFull -Root ([IO.Path]::GetPathRoot($stateFull)) -Label ''Schema 15 state'' -ComparisonRoot (Split-Path -Parent $stateFull)'
+        $finalizer | Should -Match ([regex]::Escape($expectedStateGuard))
+        $finalizer | Should -Match '(?s)GetFullPath\(\[string\]\$state\.runRoot\)\)\.Equals\(.*?Get-PortablePathComparison'
+        $finalizer | Should -Match '(?s)GetFullPath\(\[string\]\$state\.statePath\)\)\.Equals\(.*?Get-PortablePathComparison'
     }
 
-    # Scenario: a case-only path mismatch is tested on a case-sensitive Unix filesystem.
-    # Purpose: Avoid authorizing a different tree while retaining Windows case-insensitive path behavior.
+    # Scenario: a case-only path variant is tested on the current test volume.
+    # Purpose: Treat aliases as identical on case-insensitive filesystems and distinct on case-sensitive filesystems.
     It 'UnitT59_UsesPlatformAppropriatePathContainmentComparison' {
         $finalizer = Get-Content -LiteralPath (Join-Path $scriptRoot 'Finalize-LocalizationWorksetEvidence.ps1') -Raw
         $pathSafety = Get-Content -LiteralPath (Join-Path $scriptRoot 'PathSafety.psm1') -Raw
 
         $finalizer | Should -Match '(?s)function Assert-ContainedPath.*?\$comparison = Get-PortablePathComparison.*?StartsWith\(\$rootFull \+ \[IO\.Path\]::DirectorySeparatorChar, \$comparison\)'
         $finalizer | Should -Match '(?s)function Assert-NoReparsePath.*?\$comparison = Get-PortablePathComparison.*?Equals\(\$rootFull, \$comparison\).*?StartsWith\(\$rootPrefix, \$comparison\)'
-        $pathSafety | Should -Match 'TryGetDirectoryCaseSensitive'
-        $pathSafety | Should -Match 'FileCaseSensitiveInformation'
-        $pathSafety | Should -Match 'Strict comparison is the safe default'
+        Import-Module (Join-Path $scriptRoot 'PathSafety.psm1') -Force
+        $probeParent = Join-Path $TestDrive 'filesystem-case-probe'
+        $probeRoot = Join-Path $probeParent 'CaseRoot'
+        [void][IO.Directory]::CreateDirectory($probeRoot)
+        $caseVariant = Join-Path $probeParent 'caseRoot'
+        $filesystemIsCaseInsensitive = [IO.Directory]::Exists($caseVariant)
+        $comparison = Get-PortablePathComparison -Root $probeRoot -Purpose Containment
+        $comparisonStart = $pathSafety.IndexOf('function Get-PortablePathComparison')
+        $comparisonEnd = $pathSafety.IndexOf('function Resolve-PortableContainedPath', $comparisonStart)
+        $comparisonStart | Should -BeGreaterOrEqual 0
+        $comparisonEnd | Should -BeGreaterThan $comparisonStart
+        $comparisonFunction = $pathSafety.Substring($comparisonStart, $comparisonEnd - $comparisonStart)
+
+        $probeRoot.Equals($caseVariant, $comparison) | Should -Be $filesystemIsCaseInsensitive
+        $comparison | Should -Be $(if ($filesystemIsCaseInsensitive) {
+                [StringComparison]::OrdinalIgnoreCase
+            }
+            else {
+                [StringComparison]::Ordinal
+            })
+        $comparisonFunction | Should -Match '\.casecheck-'
+        $comparisonFunction | Should -Match '\[IO\.File\]::Delete'
+        $comparisonFunction | Should -Match "ParameterSetName -ceq 'ExistingPaths'"
+        $comparisonFunction | Should -Match 'GetFileSystemEntries'
+        $comparisonFunction | Should -Not -Match 'while \(-not \[IO\.Directory\]::Exists\(\$candidate\)\)'
+        $comparisonFunction | Should -Not -Match 'Get-PortablePlatformName'
     }
 
     It 'UnitT60_UsesPlatformAppropriatePathContainmentInTheApplier' {
@@ -1165,7 +1190,10 @@ return localization
         }
 
         $expander = Get-Content -LiteralPath (Join-Path $scriptRoot 'Expand-Schema14Reference.ps1') -Raw
-        $expander | Should -Match '(?s)\$pathComparison = if \(\[Environment\]::OSVersion\.Platform.*?\[StringComparison\]::OrdinalIgnoreCase.*?\[StringComparison\]::Ordinal'
+        # The expander's outside-the-Skill check uses the Skill root's actual
+        # filesystem semantics, so aliases cannot escape on case-insensitive volumes.
+        $expander | Should -Match '\$pathComparison = Get-PortablePathComparison -Paths @\(\$resolvedSkillRoot, \$resolvedOutputRoot\) -Purpose Exclusion'
+        $expander | Should -Not -Match 'exclusion always ignores case'
     }
 
     # Scenario: review-artifacts is swapped for a junction after validation and before transient workset deletion.

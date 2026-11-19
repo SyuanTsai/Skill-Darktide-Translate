@@ -128,7 +128,7 @@ Describe 'Schema 15 source acquisition contract' {
             -RunId $runId -SourceRequestPath $requestPath -SkillSourcePinPath $script:skillSourcePinPath `
             -Provider browser -PassThru
         $first.status | Should -Be 'waiting-user'
-        $ownerPath = Join-Path $first.modLockPath 'owner.json'
+        $ownerPath = [string]$first.modLockPath
         $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
         $owner.leaseMode | Should -Be 'reserved'
         $owner.reservationState | Should -Be 'waiting-user'
@@ -144,8 +144,8 @@ Describe 'Schema 15 source acquisition contract' {
                 -Provider browser -PassThru } | Should -Throw '*owner tuple changed*'
     }
 
-    # Scenario: The process stops while preparing a new canonical MOD reservation before its owner tuple is published.
-    # Purpose: Publish the fixed reservation only as one atomic directory rename so a crash cannot leave an ownerless lock that permanently blocks same-run recovery.
+    # Scenario: The process stops while publishing a new canonical MOD reservation.
+    # Purpose: Publish one complete owner file with create-only/CAS semantics and never expose an ownerless directory.
     It 'UnitT28A_PublishesOnlyCompleteModReservationsAtomically' {
         $runner = Get-Content -LiteralPath (Join-Path $scriptRoot 'mod-update.ps1') -Raw
         $start = $runner.IndexOf('function Enter-ModReservation')
@@ -153,11 +153,59 @@ Describe 'Schema 15 source acquisition contract' {
         $start | Should -BeGreaterOrEqual 0
         $end | Should -BeGreaterThan $start
         $reservation = $runner.Substring($start, $end - $start)
+        $writerStart = $runner.IndexOf('function Write-ModReservationOwner')
+        $writerEnd = $runner.IndexOf('function Invoke-ModReservationFaultInjection', $writerStart)
+        $writerStart | Should -BeGreaterOrEqual 0
+        $writerEnd | Should -BeGreaterThan $writerStart
+        $ownerWriter = $runner.Substring($writerStart, $writerEnd - $writerStart)
 
-        $reservation | Should -Match '\$preparedLockPath'
-        $reservation | Should -Match 'Write-ModReservationOwner\s+-ModLockPath\s+\$preparedLockPath'
-        $reservation | Should -Match '\[IO\.Directory\]::Move\(\$preparedLockPath, \[string\]\$Plan\.modLockPath\)'
+        $reservation | Should -Match 'Get-ModReservationSnapshot'
+        $reservation | Should -Match 'Write-ModReservationOwner\s+-ModLockPath\s+\(\[string\]\$Plan\.modLockPath\)'
+        $reservation | Should -Not -Match '\$preparedLockPath'
+        $ownerWriter | Should -Match '(?s)NoReplace\s*=\s*-not \$ownerExists.*?Publish-PortableLeaseFile\s+@publishParameters'
+        $pathSafety = Get-Content -LiteralPath (Join-Path $scriptRoot 'PathSafety.psm1') -Raw
+        $pathSafety | Should -Match '(?s)\[IO\.File\]::Move\(\$temporary, \$target, -not \$NoReplace\)'
+        $pathSafety | Should -Match '(?s)if \(\$NoReplace -and \[IO\.File\]::Exists\(\$target\)\).*?no-replace-target-exists'
+        $reservation | Should -Not -Match '\[IO\.Directory\]::Move'
         $reservation | Should -Not -Match 'New-Item\s+-ItemType\s+Directory\s+-Path\s+\(\[string\]\$Plan\.modLockPath\)'
+    }
+
+    # Scenario: An upgrade encounters the former .locks/mod/<key>.lock/owner.json directory layout.
+    # Purpose: Preserve every legacy byte and fail with explicit manual migration guidance before reservation or claim mutation.
+    It 'InterT28B_PreservesLegacyModReservationDirectoryAndRequiresManualMigration' {
+        $repository = Join-Path $TestDrive 'legacy-mod-reservation-repository'
+        New-Item -ItemType Directory -Path $repository -Force | Out-Null
+        $requestPath = Join-Path $TestDrive 'legacy-mod-reservation-request.json'
+        [ordered]@{
+            schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
+            version = '2.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+        } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
+
+        $modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $lockKey = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($modRelativePath.ToLowerInvariant()))
+        ).ToLowerInvariant()
+        $legacyDirectory = Join-Path $repository "AI Auto Update/In Progress/.locks/mod/$lockKey.lock"
+        New-Item -ItemType Directory -Path $legacyDirectory -Force | Out-Null
+        $legacyOwnerPath = Join-Path $legacyDirectory 'owner.json'
+        [byte[]]$legacyBytes = [Text.UTF8Encoding]::new($false).GetBytes('{"schemaVersion":2,"state":"held","runId":"legacy-run"}')
+        [IO.File]::WriteAllBytes($legacyOwnerPath, $legacyBytes)
+        $beforeEntries = @(Get-ChildItem -LiteralPath $legacyDirectory -Force | ForEach-Object Name)
+
+        { & (Join-Path $scriptRoot 'mod-update.ps1') acquire-source `
+                -RepositoryRoot $repository -ModDirectory 'ExampleMod' `
+                -RunId '47474747-5555-4666-8777-888888888888' `
+                -SourceRequestPath $requestPath -SkillSourcePinPath $script:skillSourcePinPath `
+                -Provider browser -PassThru } |
+            Should -Throw '*Legacy MOD reservation directory format*move this directory*outside .locks*Automatic deletion or migration is forbidden*'
+
+        Test-Path -LiteralPath $legacyDirectory -PathType Container | Should -BeTrue
+        Test-Path -LiteralPath $legacyOwnerPath -PathType Leaf | Should -BeTrue
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($legacyOwnerPath)) |
+            Should -BeExactly ([Convert]::ToHexString($legacyBytes))
+        @(Get-ChildItem -LiteralPath $legacyDirectory -Force | ForEach-Object Name) |
+            Should -BeExactly $beforeEntries
+        @(Get-ChildItem -LiteralPath (Split-Path -Parent $legacyDirectory) -Force -File).Count | Should -Be 0
     }
 
     # Scenario: Untrusted orchestration supplies a path-like MOD identity or an off-domain source page.
@@ -409,7 +457,7 @@ Describe 'Schema 15 source acquisition contract' {
         Test-Path -LiteralPath $first.receiptPath -PathType Leaf | Should -Be $true
         Test-Path -LiteralPath $first.acquisitionPath -PathType Leaf | Should -Be $true
         [IO.File]::Delete($first.acquisitionPath)
-        $ownerPath = Join-Path $first.modLockPath 'owner.json'
+        $ownerPath = [string]$first.modLockPath
         $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json -AsHashtable
         $owner.leaseMode = 'active'
         $owner.machineName = [Environment]::MachineName
@@ -418,6 +466,7 @@ Describe 'Schema 15 source acquisition contract' {
         $owner.workerToken = [guid]::NewGuid().ToString('N')
         $owner.reservationState = 'running'
         $owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-31).ToString('o')
+        $owner.expiresAt = [DateTimeOffset]::UtcNow.AddMinutes(-1).ToString('o')
         $null = $owner.Remove('waitingReason')
         $owner | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $ownerPath -NoNewline
 
@@ -602,6 +651,75 @@ Describe 'Schema 15 source acquisition contract' {
         $runner | Should -Match 'Test-SourceReceipt\.ps1'
         $runner | Should -Match 'schemaVersion = if \(\$sourceReceipt\) \{ 15 \} else \{ 14 \}'
         $runner | Should -Match '(?s)elseif \(\$Command -eq ''run''\).*?Invoke-AcquireSource.*?Invoke-Claim'
+    }
+
+    # Scenario: A fresh manual claim supplies a deterministic state path before its run directory exists.
+    # Purpose: Keep containment bound to the planned run root while probing case behavior from the existing repository root.
+    It 'InterT65_AllowsFreshManualClaimWithExplicitMissingStatePath' {
+        $repository = Join-Path $TestDrive 'manual-state-path-repository'
+        $modRoot = Join-Path $repository 'Warhammer 40,000 DARKTIDE/mods/ManualStateMod'
+        $queueRoot = Join-Path $repository 'AI Auto Update'
+        New-Item -ItemType Directory -Path $modRoot, $queueRoot -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $modRoot 'file.txt'), "old bytes`n", [Text.UTF8Encoding]::new($false))
+
+        $archivePath = Join-Path $queueRoot 'ManualStateMod.zip'
+        $archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew)
+        $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $entry = $archive.CreateEntry('ManualStateMod/file.txt')
+            $writer = [IO.StreamWriter]::new($entry.Open(), [Text.UTF8Encoding]::new($false))
+            try { $writer.Write('new bytes') } finally { $writer.Dispose() }
+        }
+        finally { $archive.Dispose(); $archiveStream.Dispose() }
+
+        $sourceRequestPath = Join-Path $TestDrive 'manual-state-path-request.json'
+        [ordered]@{
+            schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 987; mainFileId = 654
+            version = '2.0.0'; fileName = 'ManualStateMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/987'
+            pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'; mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
+        } | ConvertTo-Json | Set-Content -LiteralPath $sourceRequestPath -NoNewline
+        $archiveSha = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $archiveSize = (Get-Item -LiteralPath $archivePath).Length
+        (@(
+            '- Nexus MOD ID: 987', '- Nexus URL: https://www.nexusmods.com/warhammer40kdarktide/mods/987',
+            '- Nexus page version: 2.0.0', '- Nexus last updated: 2026-01-02T00:00:00.0000000+00:00',
+            '- Main file ID: 654', '- Main file version: 2.0.0',
+            '- Main file uploaded at UTC: 2026-01-01T00:00:00.0000000+00:00',
+            '- Archive filename: ManualStateMod.zip', "- Archive size bytes: $archiveSize",
+            "- Archive SHA-256: $archiveSha", '- Acquisition method: manual-queue'
+        ) -join "`n") | Set-Content -LiteralPath (Join-Path $repository 'README.md') -NoNewline
+        $hashRoot = Join-Path $repository '.hash'
+        New-Item -ItemType Directory -Path $hashRoot -Force | Out-Null
+        (@(
+            'nexus_id=987', 'nexus_url=https://www.nexusmods.com/warhammer40kdarktide/mods/987',
+            'nexus_page_version=2.0.0', 'nexus_last_updated=2026-01-02T00:00:00.0000000+00:00',
+            'main_file_id=654', 'version=2.0.0', 'main_file_uploaded_at_utc=2026-01-01T00:00:00.0000000+00:00',
+            'filename=ManualStateMod.zip', "size_bytes=$archiveSize", "sha256=$archiveSha", 'acquisition_method=manual-queue'
+        ) -join "`n") | Set-Content -LiteralPath (Join-Path $hashRoot 'manualstatemod.hash') -NoNewline
+
+        & git -C $repository init --quiet --initial-branch=main
+        & git -C $repository config --local core.longpaths true
+        & git -C $repository config user.name 'Manual State Path Test'
+        & git -C $repository config user.email 'manual-state-path@example.invalid'
+        & git -C $repository add README.md .hash/manualstatemod.hash 'Warhammer 40,000 DARKTIDE/mods/ManualStateMod/file.txt'
+        $LASTEXITCODE | Should -Be 0
+        & git -C $repository commit --quiet -m 'manual state path fixture'
+        $LASTEXITCODE | Should -Be 0
+
+        $runId = '60606060-7070-4080-9090-101010101010'
+        $runRoot = Join-Path $queueRoot 'In Progress/manualstatemod-60606060'
+        $statePath = Join-Path $runRoot 'explicit-state.json'
+        Test-Path -LiteralPath $runRoot | Should -BeFalse
+        Test-Path -LiteralPath $statePath | Should -BeFalse
+
+        $claim = & (Join-Path $scriptRoot 'mod-update.ps1') claim `
+            -RepositoryRoot $repository -ModDirectory 'ManualStateMod' -RunId $runId `
+            -ArchivePath $archivePath -SourceRequestPath $sourceRequestPath -StatePath $statePath `
+            -SkillSourcePinPath $script:skillSourcePinPath -BaseRef HEAD -WorktreeParent $TestDrive -PassThru
+
+        $claim.result | Should -BeExactly 'passed'
+        $claim.statePath | Should -BeExactly ([IO.Path]::GetFullPath($statePath))
+        Test-Path -LiteralPath $statePath -PathType Leaf | Should -BeTrue
     }
 
     # Scenario: The immutable base contains only a localization loader and Schema 15 source bytes have already been verified.
@@ -1055,7 +1173,7 @@ Describe 'Schema 15 source acquisition contract' {
         $state.sourceTuple.contractSha256 | Should -Match '^[0-9a-f]{64}$'
         @($state.completedStages) | Should -Contain 'acquire-source'
         @($state.completedStages) | Should -Contain 'claim'
-        (Get-Content -LiteralPath (Join-Path $state.modLockPath 'owner.json') -Raw | ConvertFrom-Json).runId | Should -Be $runId
+        (Get-Content -LiteralPath $state.modLockPath -Raw | ConvertFrom-Json).runId | Should -Be $runId
     }
 
     # Scenario: A Schema 15 candidate reaches the independent Final Candidate Gate after the claimed archive has been copied into run ownership.

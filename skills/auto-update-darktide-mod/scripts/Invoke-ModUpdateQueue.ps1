@@ -39,13 +39,18 @@ function Read-QueueTextWithHeartbeat {
 
 $queueRunId = [guid]::NewGuid().ToString()
 $queueReceiptRoot = Join-Path $repository "AI Auto Update/In Progress/.queue-coordination/$queueRunId"
-$sourceInventoryLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId $queueRunId -ReceiptRoot $queueReceiptRoot
+$sourceInventoryAttempt = Start-SharedCoordinationAcquisitionAttempt -RepositoryRoot $repository `
+    -ResourceKey 'source-acquisition' -RunId $queueRunId -ReceiptRoot $queueReceiptRoot
+$sourceInventoryLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' `
+    -RunId $queueRunId -AttemptToken ([string]$sourceInventoryAttempt.attemptToken) -ReceiptRoot $queueReceiptRoot
+Complete-SharedCoordinationAcquisitionAttempt -Attempt $sourceInventoryAttempt
 try {
     $queue = Read-QueueTextWithHeartbeat -Path $queueFull -Lease $sourceInventoryLease | ConvertFrom-Json -AsHashtable
     if ([int]$queue.schemaVersion -ne 1) { throw 'Queue schemaVersion must be 1.' }
     $rawItems = @($queue.items)
     if ($rawItems.Count -eq 0) { throw 'Queue must contain at least one source acquisition item.' }
     $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $explicitRunIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $items = @(
         foreach ($item in $rawItems) {
             Update-SharedCoordinationLease -Lease $sourceInventoryLease
@@ -55,13 +60,17 @@ try {
             if ([string]$item.provider -notin @('api', 'browser')) { throw 'Queue provider must be api or browser.' }
             $canonicalMod = ([string]$item.modDirectory).Trim()
             if (-not $identities.Add($canonicalMod)) { throw 'Queue contains a duplicate canonical MOD identity.' }
+            $explicitRunId = if ($item.Contains('runId') -and -not [string]::IsNullOrWhiteSpace([string]$item.runId)) {
+                [guid]::Parse([string]$item.runId).ToString()
+            } else { $null }
+            if ($null -ne $explicitRunId -and -not $explicitRunIds.Add($explicitRunId)) {
+                throw "Queue contains a duplicate explicit runId: $explicitRunId"
+            }
             [ordered]@{
                 modDirectory = $canonicalMod
                 sourceRequestPath = [IO.Path]::GetFullPath([string]$item.sourceRequestPath)
                 provider = [string]$item.provider
-                runId = if ($item.Contains('runId') -and -not [string]::IsNullOrWhiteSpace([string]$item.runId)) {
-                    [guid]::Parse([string]$item.runId).ToString()
-                } else { $null }
+                runId = $explicitRunId
                 downloadedFilePath = if ($item.Contains('downloadedFilePath') -and -not [string]::IsNullOrWhiteSpace([string]$item.downloadedFilePath)) {
                     [IO.Path]::GetFullPath([string]$item.downloadedFilePath)
                 } else { $null }

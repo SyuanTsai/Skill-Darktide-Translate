@@ -11,7 +11,7 @@ Local development, installation, execution, testing, validation, and CI acceptan
 - Stable source ID: `darktide-translate`
 - Source inventory: `catalog/source.json`
 - Profile catalog extension: `catalog/profiles.json`
-- Current repository version: `0.3.13`
+- Current repository version: `0.4.0`
 - Delivery tracking is maintained outside this public source and does not change the repository licensing boundary.
 
 ## Skill
@@ -37,6 +37,7 @@ skills/auto-update-darktide-mod/
   scripts/Test-SourceReceipt.ps1
   scripts/Invoke-ModUpdateQueue.ps1
   scripts/SharedCoordinationLock.psm1
+  scripts/PathSafety.psm1
   scripts/LuaLocalizationScanner.psm1
   scripts/New-LocalizationWorkset.ps1
   scripts/Apply-LocalizationWorkset.ps1

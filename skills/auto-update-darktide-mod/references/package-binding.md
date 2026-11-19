@@ -28,6 +28,10 @@ The packaged files are byte-exact source-derived copies kept under `assets/` so 
 
 Never look for these packaged references in the target MOD repository. The target MOD repository remains the location for queue/state/worktree/Git evidence and MOD changes; the Skill source is the location for Workflow and Review policy.
 
+## Local platform primitives
+
+`scripts/PathSafety.psm1` uses only PowerShell and .NET APIs available on Windows, Linux, and macOS. It opens coordination locks with `FileShare.None`, publishes flushed temporary files with a same-directory `File.Move`, and applies `GetFullPath` containment with the actual case semantics probed inside the applicable filesystem root. It recognizes only its fixed publication-temporary names as crash residue. The package does not carry or load a separate platform runtime.
+
 ## Schema 15 extension binding
 
 New automatic-source runs also bind `references/schema-15.md`. It is a repository-native normative extension derived from the byte-exact Schema 14 Workflow and Review Baseline, not a replacement source document. `references/schema-15-provenance.json` records its exact size, SHA-256, repository-local contract identity, and the Schema 14 Workflow/Baseline hashes it extends. `scripts/Test-ReferenceIntegrity.ps1` verifies all three references together before acquisition or claim.
@@ -37,6 +41,10 @@ A Schema 15 state records `workflowSchemaVersion = 15`, `schema15Path`, `schema1
 ## Translation-quality extension binding
 
 Schema 14 and Schema 15 translation decisions also bind `references/translation-quality.md` through the complete run-local Skill source pin. Read it after the packaged Workflow and with the packaged Review Baseline. It is a repository-native normative refinement of semantic translation quality: English/in-game meaning authority, independent zh-tw wording, curated existing-translation preservation, and functional rather than word-for-word completeness. It does not alter archive/source identity, deterministic target classification, byte authorization, Lua structure, security, Git evidence, Candidate Gate, publication, or merge-finalization boundaries.
+
+## Coordination-format extension binding
+
+Schema 14 and Schema 15 runs also bind `references/coordination-format.md` through the complete run-local Skill source pin. Read it immediately after the packaged Workflow. It is the repository-native normative contract for the persistent single-file shared coordination leases and canonical-MOD reservation introduced in version 0.4.0. It overrides only Schema 14 §3.2's `.locks` layout, §3.3's lock storage and transitions, §3.4's lock scanning/recovery/tombstones, §5.1's coordination format, and §13 steps 7–9's reservation-release format. The remaining Workflow requirements, including evidence archival followed by owner-checked claim/run cleanup, remain normative.
 
 ## State and evidence mapping
 
@@ -55,4 +63,4 @@ The `f2912...` commit in `source-provenance.json` belongs to the original Warham
 
 ## Precedence
 
-For package-location questions, this binding overrides the original `AI Prompt` paths and workflow-branch lookup commands. `references/translation-quality.md` controls semantic translation authority, curated unchanged-source preservation, functional completeness, and the corresponding Review Finding threshold for both schemas. `references/schema-15.md` controls automatic acquisition, receipt-bound claim, status distinctions, localization workset, and workset lifecycle for new Schema 15 states. These extensions preserve content scope, safety checks, Git normalization, C0/C1/C2/C3/F evidence, Candidate Gate, append-only refresh, main-advance handling, and finalization requirements.
+For package-location questions, this binding overrides the original `AI Prompt` paths and workflow-branch lookup commands. `references/coordination-format.md` controls only the Schema 14 lock/reservation-format clauses enumerated in its scope and above. `references/translation-quality.md` controls semantic translation authority, curated unchanged-source preservation, functional completeness, and the corresponding Review Finding threshold for both schemas. `references/schema-15.md` controls automatic acquisition, receipt-bound claim, status distinctions, localization workset, and workset lifecycle for new Schema 15 states. These extensions preserve every Workflow requirement outside their explicit scopes, including content scope, safety checks, Git normalization, C0/C1/C2/C3/F evidence, Candidate Gate, append-only refresh, main-advance handling, evidence archival, and owner-checked claim/run cleanup.

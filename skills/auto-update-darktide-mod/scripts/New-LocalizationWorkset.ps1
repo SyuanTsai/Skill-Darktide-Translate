@@ -176,7 +176,7 @@ function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'NEW localization path escapes the staging MOD root.'
     }
@@ -188,7 +188,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $current = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $current)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $current.Equals($rootFull, $comparison) -and
         -not $current.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Localization workset path escapes its verification root.'
@@ -200,13 +200,13 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $current -Label 'Localization workset') {
+            if (Test-PortableReparseItem -Path $current -Label 'Localization workset' -TrustedRoot $rootFull) {
                 throw 'Localization workset path contains a symlink or reparse point.'
             }
             if (-not $AllowMissing) { throw 'Localization workset path component is missing.' }
         }
         catch { throw ('Unable to inspect Localization workset physical containment component: {0}' -f ([string]$_.Exception.Message)) }
-        if (Test-PortableReparseItem -Path $current -Item $item -Label 'Localization workset') { throw 'Localization workset path contains a symlink or reparse point.' }
+        if (Test-PortableReparseItem -Path $current -Item $item -Label 'Localization workset' -TrustedRoot $rootFull) { throw 'Localization workset path contains a symlink or reparse point.' }
         if ($current.Equals($rootFull, $comparison)) {
             if ($null -eq $item) { throw 'Unable to prove NEW localization containment.' }
             return
@@ -313,7 +313,10 @@ if ($existingWorkset -and [string]$existingWorkset.status -in @('applying', 'app
         [string]$existingWorkset.apply.outputSha256 -notmatch '^[0-9a-f]{64}$' -or [int64]$existingWorkset.apply.outputSize -lt 0) {
         throw 'Existing applying or applied localization workset review contract or apply receipt changed.'
     }
-    if ([IO.Path]::GetFullPath([string]$existingWorkset.new.root) -cne $stagingRoot) { throw 'Existing applied workset staging root changed.' }
+    if (-not ([IO.Path]::GetFullPath([string]$existingWorkset.new.root)).Equals(
+            $stagingRoot, (Get-PortablePathComparison -Paths @($stagingRoot, [string]$existingWorkset.new.root)))) {
+        throw 'Existing applied workset staging root changed.'
+    }
     $existingNewPath = Assert-ContainedPath -Candidate ([string]$existingWorkset.new.path) -Root $stagingRoot
     Assert-NoReparsePath -Path $existingNewPath -Root $stagingRoot
     if (-not (Test-Path -LiteralPath $existingNewPath -PathType Leaf)) { throw 'Existing applying or applied localization workset output is missing.' }

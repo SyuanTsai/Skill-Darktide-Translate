@@ -95,7 +95,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes the source run root."
@@ -107,13 +107,13 @@ function Assert-NoReparsePath {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
         }
         catch [Management.Automation.ItemNotFoundException] {
-            if (Test-PortableReparseItem -Path $current -Label $Label) {
+            if (Test-PortableReparseItem -Path $current -Label $Label -TrustedRoot $rootFull) {
                 throw "$Label path contains a symlink or reparse point."
             }
             throw "$Label path component is missing."
         }
         catch { throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]($_.Exception.Message))) }
-        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label) {
+        if (Test-PortableReparseItem -Path $current -Item $item -Label $Label -TrustedRoot $rootFull) {
             throw "$Label path contains a symlink or reparse point."
         }
         if ($current.Equals($rootFull, $comparison)) { return $pathFull }
@@ -359,7 +359,9 @@ $mergedFull = if ([string]::IsNullOrWhiteSpace($RunRoot)) { Assert-RegularFile -
     else { Assert-NoReparsePath -Path $MergedPath -Root $RunRoot -Label 'Merged localization evidence' }
 if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
     $runRootFull = [IO.Path]::GetFullPath($RunRoot)
-    if ($worksetFull -cne [IO.Path]::GetFullPath((Join-Path $runRootFull 'review-artifacts/localization-workset.json')) -or
+    $expectedWorksetPath = [IO.Path]::GetFullPath((Join-Path $runRootFull 'review-artifacts/localization-workset.json'))
+    if (-not $worksetFull.Equals(
+            $expectedWorksetPath, (Get-PortablePathComparison -Paths @($expectedWorksetPath, $worksetFull))) -or
         (Split-Path -Leaf $newFull) -cne 'new.lua' -or (Split-Path -Leaf $mergedFull) -cne 'merged.lua') {
         throw 'Localization receipt verification requires the fixed run-local artifact paths.'
     }
@@ -391,7 +393,9 @@ if ($bindingValueCount -eq 3) {
     }
     if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
         $expectedStagingRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $RunRoot 'staging/localization-workset-input') (Split-Path -Leaf $normalizedExpectedModPath)))
-        if ([IO.Path]::GetFullPath([string]$workset.new.root) -cne $expectedStagingRoot) {
+        if (-not ([IO.Path]::GetFullPath([string]$workset.new.root)).Equals(
+                $expectedStagingRoot,
+                (Get-PortablePathComparison -Paths @($expectedStagingRoot, [string]$workset.new.root)))) {
             throw 'Localization workset NEW root differs from the fixed run-local staging path.'
         }
         $stagedOutput = [IO.Path]::GetFullPath([string]$workset.new.path)

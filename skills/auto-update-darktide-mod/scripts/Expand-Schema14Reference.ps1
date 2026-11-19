@@ -31,12 +31,11 @@ $resolvedOutputRoot = $outputRoot.TrimEnd(
     [IO.Path]::AltDirectorySeparatorChar
 )
 $skillPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
-$pathComparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-    [StringComparison]::OrdinalIgnoreCase
-}
-else {
-    [StringComparison]::Ordinal
-}
+# This is an exclusion check (the output must be OUTSIDE the Skill source).
+# Resolve comparison semantics from the Skill root's actual filesystem so a
+# case alias on a case-insensitive volume (for example macOS APFS) cannot escape.
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+$pathComparison = Get-PortablePathComparison -Paths @($resolvedSkillRoot, $resolvedOutputRoot) -Purpose Exclusion
 if (
     $resolvedOutputRoot.Equals($resolvedSkillRoot, $pathComparison) -or
     $resolvedOutputRoot.StartsWith($skillPrefix, $pathComparison)
