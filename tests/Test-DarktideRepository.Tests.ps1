@@ -89,7 +89,13 @@ Describe 'Darktide consumer repository check' {
         $evidence.schemaVersion | Should -Be 1
         $evidence.report | Should -Be 'darktide-repository-check-v1'
         $evidence.result | Should -Be 'passed'
-        $evidence.inventoryMode | Should -Be 'git'
+        $expectedInventoryMode = if (Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.git')) {
+            'git'
+        }
+        else {
+            'snapshot'
+        }
+        $evidence.inventoryMode | Should -Be $expectedInventoryMode
         $evidence.activeSkillCount | Should -Be 1
         @($evidence.skills[0].files).Count | Should -BeGreaterThan 0
         $after = @(Get-DarktideTestSnapshot -Root $script:RepositoryRoot)
@@ -110,12 +116,18 @@ Describe 'Darktide consumer repository check' {
         ) {
             $snapshot = New-DarktideGitlessSnapshot -Destination (Join-Path $TestDrive $layout) -ConsumerLayout:$consumer
 
-            $evidence = (& $script:RepositoryCheck -RepositoryRoot $snapshot -ReadOnlySnapshot | Out-String) |
-                ConvertFrom-TestJson
+            $powerShell = Get-TestPowerShellExecutablePath
+            $output = @(& $powerShell -NoProfile -NonInteractive -File $script:RepositoryCheck `
+                    -RepositoryRoot $snapshot -ReadOnlySnapshot)
+            $LASTEXITCODE | Should -Be 0
+            $evidence = $output[-1] | ConvertFrom-TestJson
 
+            $evidence.schemaVersion | Should -Be 1
+            $evidence.report | Should -Be 'darktide-repository-check-v1'
             $evidence.result | Should -Be 'passed'
             $evidence.layout | Should -Be $layout
             $evidence.inventoryMode | Should -Be 'snapshot'
+            $evidence.activeSkillCount | Should -Be 1
             @($evidence.skills[0].files).Count | Should -BeGreaterThan 0
         }
 

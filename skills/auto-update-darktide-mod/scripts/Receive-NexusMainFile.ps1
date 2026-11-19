@@ -384,7 +384,7 @@ function Invoke-ApiDownload {
     $handler.AllowAutoRedirect = $false
     $client = [Net.Http.HttpClient]::new($handler, $true)
     $response = $null
-    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.4.0')
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('Skill-Darktide-Translate/0.4.1')
     $apiKey = [Environment]::GetEnvironmentVariable($ApiKeyEnvironmentVariable)
     if (-not [string]::IsNullOrWhiteSpace($apiKey)) { $client.DefaultRequestHeaders.Add('apikey', $apiKey) }
     try {
