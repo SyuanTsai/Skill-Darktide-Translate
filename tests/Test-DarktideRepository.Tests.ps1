@@ -287,7 +287,7 @@ Describe 'Darktide consumer repository check' {
             else { { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw }
         }
 
-        It 'UnitT40_RejectsStringSourceAndProfileSchemaVersions' -ForEach @(
+        It 'UnitT40_RejectsStringSourceAndProfileSchemaVersions_<target>' -ForEach @(
             @{ target = 'source' },
             @{ target = 'profile' }
         ) {
