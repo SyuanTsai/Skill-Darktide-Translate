@@ -17,7 +17,9 @@ Describe 'Darktide consumer repository check' {
 
     It 'InterT20_ValidatesTheTrackedRepositoryAsAReadOnlySnapshot' {
         $before = @(git -C $script:RepositoryRoot status --porcelain=v1 --untracked-files=all)
-        $output = @(& $script:RepositoryCheck -RepositoryRoot $script:RepositoryRoot -ReadOnlySnapshot)
+        $powerShell = Get-TestPowerShellExecutablePath
+        $output = @(& $powerShell -NoProfile -NonInteractive -File $script:RepositoryCheck `
+                -RepositoryRoot $script:RepositoryRoot -ReadOnlySnapshot)
         $LASTEXITCODE | Should -Be 0
         $evidence = $output[-1] | ConvertFrom-TestJson
         $evidence.schemaVersion | Should -Be 1
