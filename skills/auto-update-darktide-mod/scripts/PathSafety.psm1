@@ -399,7 +399,10 @@ function Get-PortableLeaseFileState {
 
 function Get-PortableTransactionResidue {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string] $LockRoot)
+    param(
+        [Parameter(Mandatory)][string] $LockRoot,
+        [ValidatePattern('^[0-9a-f]{32}$')][string] $TransactionId
+    )
 
     $physicalLockRoot = Resolve-PortableTrustedRoot -Path $LockRoot
     $transactionRootPath = [IO.Path]::GetFullPath((Join-Path $physicalLockRoot '.ai-instructions-txn'))
@@ -437,6 +440,9 @@ function Get-PortableTransactionResidue {
         foreach ($transactionEntry in @([IO.Directory]::GetFileSystemEntries($transactionRootPath))) {
             $transactionLeaf = [IO.Path]::GetFileName([IO.Path]::TrimEndingDirectorySeparator($transactionEntry))
             $transactionRelative = ".ai-instructions-txn/$transactionLeaf"
+            if (-not [string]::IsNullOrWhiteSpace($TransactionId) -and $transactionLeaf -cne $TransactionId) {
+                continue
+            }
             $expectedTransactionPath = [IO.Path]::GetFullPath((Join-Path $transactionRootPath $transactionLeaf))
             if ([IO.Path]::GetFullPath($transactionEntry) -cne $expectedTransactionPath -or
                 $transactionLeaf -notmatch '^[0-9a-f]{32}$') {

@@ -308,17 +308,47 @@ function Test-CoordinationProcessActive {
 
 function Enter-CoordinationOwnerGuard {
     param([Parameter(Mandatory)][string] $LockRoot, [Parameter(Mandatory)][string] $ResourceKey)
+    $namespaceGuardLeaf = 'shared-owner-update.guard'
     $guardLeaf = "$ResourceKey.owner-update.guard"
+    $namespaceGuardPath = Join-Path $LockRoot $namespaceGuardLeaf
     $guardPath = Join-Path $LockRoot $guardLeaf
+    $null = Assert-CoordinationPath -Path $namespaceGuardPath -RepositoryRoot $LockRoot -AllowMissing
     $null = Assert-CoordinationPath -Path $guardPath -RepositoryRoot $LockRoot -AllowMissing
     # The vendored authority lock is a Windows share-mode handle or a Unix
     # flock on a fixed inode; it does not depend on .NET FileShare emulation.
+    $namespaceGuard = $null
+    $resourceGuard = $null
     try {
-        Enter-PortableFileLock -Root $LockRoot -Leaf $guardLeaf -TimeoutMilliseconds 15000 -Label "$ResourceKey owner update guard"
+        $namespaceGuard = Enter-PortableFileLock -Root $LockRoot -Leaf $namespaceGuardLeaf `
+            -TimeoutMilliseconds 15000 -Label 'shared owner update namespace guard'
+        $resourceGuard = Enter-PortableFileLock -Root $LockRoot -Leaf $guardLeaf `
+            -TimeoutMilliseconds 15000 -Label "$ResourceKey owner update guard"
     }
     catch [TimeoutException] {
+        if ($null -ne $resourceGuard) { $resourceGuard.Dispose() }
+        if ($null -ne $namespaceGuard) { $namespaceGuard.Dispose() }
         throw "Unable to acquire the short $ResourceKey owner update guard."
     }
+    catch {
+        if ($null -ne $resourceGuard) { $resourceGuard.Dispose() }
+        if ($null -ne $namespaceGuard) { $namespaceGuard.Dispose() }
+        throw
+    }
+    $handle = [pscustomobject][ordered]@{
+        NamespaceGuard = $namespaceGuard
+        ResourceGuard = $resourceGuard
+    }
+    $handle | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+        if ($null -ne $this.ResourceGuard) {
+            $this.ResourceGuard.Dispose()
+            $this.ResourceGuard = $null
+        }
+        if ($null -ne $this.NamespaceGuard) {
+            $this.NamespaceGuard.Dispose()
+            $this.NamespaceGuard = $null
+        }
+    }
+    $handle
 }
 
 function Get-CoordinationPublicationContentionKind {

@@ -895,7 +895,9 @@ Describe 'Incomplete owner publication transaction residue guard' {
         [void][IO.Directory]::CreateDirectory($repository)
         $first = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'guard-first'
         $lockRoot = Split-Path -Parent ([string]$first.path)
-        $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('9' * 32)
+        [byte[]]$transactionBytes = [Text.UTF8Encoding]::new($false).GetBytes('coordination:source-acquisition')
+        $transactionId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($transactionBytes)).ToLowerInvariant().Substring(0, 32)
+        $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') $transactionId
         [void][IO.Directory]::CreateDirectory($transactionDirectory)
         $previousPath = Join-Path $transactionDirectory ('previous-' + ('8' * 32))
         [byte[]]$ownerBytes = [IO.File]::ReadAllBytes([string]$first.path)
@@ -933,7 +935,7 @@ Describe 'Incomplete owner publication transaction residue guard' {
                 param($path, $root)
                 Write-ModReservationOwner -ModLockPath $path -Repository $root -Value ([ordered]@{ seed = 'owner' })
             } $lockPath $repository
-            $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('7' * 32)
+            $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('d' * 32)
             [void][IO.Directory]::CreateDirectory($transactionDirectory)
             $previousPath = Join-Path $transactionDirectory ('previous-' + ('6' * 32))
             [byte[]]$ownerBytes = [IO.File]::ReadAllBytes($lockPath)
@@ -1003,5 +1005,124 @@ Describe 'Incomplete owner publication transaction residue guard' {
         { Update-SharedCoordinationLease -Lease $newLease -Force } | Should -Not -Throw
         { $script:completedTakeoverReceipt = Exit-SharedCoordinationLease -Lease $newLease } | Should -Not -Throw
         $script:completedTakeoverReceipt | Should -Not -BeNullOrEmpty
+    }
+
+    # Scenario: One owner is between displacement and publication while holding its owner-update guard, and another owner acquires in the same transaction namespace.
+    # Purpose: Wait for the shared namespace guard or ignore another MOD's scoped transaction without weakening target-owner crash blocking.
+    It 'InterT403_AllowsAcquisitionDuringAnotherGuardedOwnerReplacement_<Case>' -ForEach @(
+        @{ Case = 'Shared' }
+        @{ Case = 'Mod' }
+    ) {
+        $pathSafetyModuleObject = Import-Module -Name $pathSafetyModule -Force -PassThru
+        if ($Case -ceq 'Shared') {
+            $coordinationModuleObject = Import-Module -Name $coordinationModule -Force -PassThru
+            $repository = Join-Path $TestDrive 'shared-in-flight-other-owner'
+            [void][IO.Directory]::CreateDirectory($repository)
+            $sourceLease = Enter-SharedCoordinationLease -RepositoryRoot $repository `
+                -ResourceKey 'source-acquisition' -RunId 'source-in-flight'
+            $lockRoot = Split-Path -Parent ([string]$sourceLease.path)
+            $guard = & $coordinationModuleObject {
+                param($root)
+                Enter-CoordinationOwnerGuard -LockRoot $root -ResourceKey 'source-acquisition'
+            } $lockRoot
+            [byte[]]$transactionBytes = [Text.UTF8Encoding]::new($false).GetBytes('coordination:source-acquisition')
+            $transactionId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($transactionBytes)).ToLowerInvariant().Substring(0, 32)
+            $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') $transactionId
+            [void][IO.Directory]::CreateDirectory($transactionDirectory)
+            $previousPath = Join-Path $transactionDirectory ('previous-' + ('3' * 32))
+            [IO.File]::Move([string]$sourceLease.path, $previousPath)
+            $childPath = Join-Path $TestDrive 'shared-in-flight-contender.ps1'
+            $readyPath = Join-Path $TestDrive 'shared-in-flight-contender.ready'
+            @'
+param([string] $ModulePath, [string] $Repository, [string] $ReadyPath)
+$ErrorActionPreference = 'Stop'
+Import-Module -Name $ModulePath -Force
+[IO.File]::WriteAllText($ReadyPath, 'ready', [Text.UTF8Encoding]::new($false))
+$lease = Enter-SharedCoordinationLease -RepositoryRoot $Repository -ResourceKey 'git-coordination' -RunId 'git-during-source-replace' -TimeoutSeconds 10
+[Console]::Out.Write(($lease | ConvertTo-Json -Depth 10 -Compress))
+'@ | Set-Content -LiteralPath $childPath -Encoding utf8NoBOM
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = (Get-Process -Id $PID).Path
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $childPath,
+                    '-ModulePath', $coordinationModule, '-Repository', $repository, '-ReadyPath', $readyPath)) {
+                $start.ArgumentList.Add($argument)
+            }
+            $process = [Diagnostics.Process]::new()
+            $process.StartInfo = $start
+            $stdout = $null
+            $stderr = $null
+            $started = $false
+            try {
+                $process.Start() | Should -BeTrue
+                $started = $true
+                $stdout = $process.StandardOutput.ReadToEndAsync()
+                $stderr = $process.StandardError.ReadToEndAsync()
+                $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
+                while (-not [IO.File]::Exists($readyPath) -and [DateTimeOffset]::UtcNow -lt $deadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                [IO.File]::Exists($readyPath) | Should -BeTrue
+                Start-Sleep -Milliseconds 300
+                $process.HasExited | Should -BeFalse -Because 'the contender must wait for the shared owner-update namespace guard'
+                [IO.File]::Move($previousPath, [string]$sourceLease.path)
+                $guard.Dispose()
+                $guard = $null
+                $process.WaitForExit(20000) | Should -BeTrue
+                $process.ExitCode | Should -Be 0 -Because $stderr.Result
+                $stdout.Result | Should -Not -Match 'BLOCKED'
+            }
+            finally {
+                if ([IO.File]::Exists($previousPath) -and -not [IO.File]::Exists([string]$sourceLease.path)) {
+                    [IO.File]::Move($previousPath, [string]$sourceLease.path)
+                }
+                if ($guard) { $guard.Dispose() }
+                if ($started -and -not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+                $process.Dispose()
+            }
+            return
+        }
+
+        $module = New-ModReservationGuardModuleForTest
+        try {
+            $repository = Join-Path $TestDrive 'mod-in-flight-other-owner'
+            $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod'
+            [void][IO.Directory]::CreateDirectory($lockRoot)
+            $firstKey = 'b' * 64
+            $secondKey = 'c' * 64
+            $firstPath = Join-Path $lockRoot "$firstKey.lock"
+            $secondPath = Join-Path $lockRoot "$secondKey.lock"
+            & $module {
+                param($path, $root)
+                Write-ModReservationOwner -ModLockPath $path -Repository $root -Value ([ordered]@{ seed = 'first' })
+            } $firstPath $repository
+            $guard = & $pathSafetyModuleObject {
+                param($root, $leaf)
+                Enter-PortableFileLock -Root $root `
+                    -RelativeDirectory 'AI Auto Update/In Progress/.locks/mod' `
+                    -Leaf $leaf -TimeoutMilliseconds 2000 `
+                    -Label 'MOD in-flight owner test guard'
+            } $repository "$firstKey.lock.owner-update.guard"
+            $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('b' * 32)
+            [void][IO.Directory]::CreateDirectory($transactionDirectory)
+            $previousPath = Join-Path $transactionDirectory ('previous-' + ('2' * 32))
+            [IO.File]::Move($firstPath, $previousPath)
+            try {
+                & $module {
+                    param($path, $root)
+                    Write-ModReservationOwner -ModLockPath $path -Repository $root -Value ([ordered]@{ seed = 'second' })
+                } $secondPath $repository
+                Test-Path -LiteralPath $secondPath -PathType Leaf | Should -BeTrue
+            }
+            finally {
+                if ([IO.File]::Exists($previousPath) -and -not [IO.File]::Exists($firstPath)) {
+                    [IO.File]::Move($previousPath, $firstPath)
+                }
+                $guard.Dispose()
+            }
+        }
+        finally { Remove-Module $module -Force }
     }
 }

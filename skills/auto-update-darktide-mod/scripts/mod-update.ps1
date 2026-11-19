@@ -803,6 +803,7 @@ function Write-ModReservationOwner {
         [AllowNull()][string] $ExpectedWorkerToken
     )
     $ownerPath = Get-ModReservationOwnerPath -ModLockPath $ModLockPath -Repository $Repository -AllowMissingOwner
+    $transactionId = ([IO.Path]::GetFileNameWithoutExtension($ownerPath) -replace '[^0-9a-f]', '').PadRight(32, '0').Substring(0, 32)
     $snapshot = Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository
     $ownerExists = [bool]$snapshot.exists
     $guardStream = $null
@@ -826,7 +827,7 @@ function Write-ModReservationOwner {
         $snapshot = Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository
         $ownerExists = [bool]$snapshot.exists
         if (-not $ownerExists -and [string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
-            $transactionResidue = Get-PortableTransactionResidue -LockRoot $lockRoot
+            $transactionResidue = Get-PortableTransactionResidue -LockRoot $lockRoot -TransactionId $transactionId
             if ([bool]$transactionResidue.hasResidue) {
                 throw [IO.InvalidDataException]::new(
                     "BLOCKED: incomplete owner publication residue exists under 'AI Auto Update/In Progress/.locks/mod/.ai-instructions-txn' ($(@($transactionResidue.entries) -join ', ')). Follow 'Manual recovery for incomplete owner publication' in references/automation.md.")
@@ -846,7 +847,6 @@ function Write-ModReservationOwner {
             throw 'MOD reservation owner disappeared before its guarded update.'
         }
         $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 30 -Compress) + "`n")
-        $transactionId = ([IO.Path]::GetFileNameWithoutExtension($ownerPath) -replace '[^0-9a-f]', '').PadRight(32, '0').Substring(0, 32)
         $null = Publish-PortableLeaseFile -ParentPath (Split-Path -Parent $ownerPath) -Leaf ([IO.Path]::GetFileName($ownerPath)) `
             -Bytes $bytes -ExpectedState $snapshot -TransactionId $transactionId -NoReplace:(-not $ownerExists)
         $written = (Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository).value
