@@ -9,7 +9,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$resolvedRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
+$resolvedRoot = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $RepositoryRoot).Path)
 
 function Invoke-GitText {
     param([Parameter(Mandatory = $true)] [string[]] $Arguments)
@@ -22,8 +22,14 @@ function Invoke-GitText {
 }
 
 $gitRoot = @(Invoke-GitText -Arguments @('rev-parse', '--show-toplevel'))[0].Trim()
-$resolvedGitRoot = (Resolve-Path -LiteralPath $gitRoot).Path
-if (-not $resolvedGitRoot.Equals($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+$resolvedGitRoot = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $gitRoot).Path)
+$pathComparison = if ([OperatingSystem]::IsWindows()) {
+    [StringComparison]::OrdinalIgnoreCase
+}
+else {
+    [StringComparison]::Ordinal
+}
+if (-not $resolvedGitRoot.Equals($resolvedRoot, $pathComparison)) {
     throw 'RepositoryRoot must be the Git repository root.'
 }
 
