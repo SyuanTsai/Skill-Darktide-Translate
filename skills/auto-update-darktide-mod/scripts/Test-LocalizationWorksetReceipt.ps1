@@ -95,7 +95,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes the source run root."

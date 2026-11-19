@@ -239,10 +239,10 @@ Use this procedure only for the `BLOCKED` message above. It is an operator recov
 
 Use this procedure only after a retry reports that an owned directory or its deterministic quarantine is `BLOCKED` or cannot be deleted.
 
-1. Stop every worker and finalizer for the repository. From the persisted cleanup tuple, identify the exact claim directory or run root and derive only its same-parent `<owned-directory>.codex-removal` name. Do not search for or guess random removal directories.
+1. Stop every worker and finalizer for the repository. For terminal cleanup, use the persisted cleanup tuple to identify the exact claim directory or run root. For an interrupted install, derive the exact install target only from the verified state's `worktreePath` plus canonical `modRelativePath`. Derive only the corresponding same-parent `<owned-directory>.codex-removal` name; do not search for or guess random removal directories.
 2. If the original and quarantine both exist, either name is a file, either path is a link or reparse point, or the persisted owner tuple does not bind the exact path, preserve both unchanged for forensic review. Do not mark `claimDirectoryRemoved` or `runRootRemoved`, and do not release the reservation.
 3. If the original is absent and the exact quarantine is an ordinary directory bound to the persisted owner, inspect and remove only that quarantined tree. If the original exists and the quarantine is absent, leave the original for the normal retry to quarantine. Never recursively delete the claim root, `In Progress`, or another run's sibling.
-4. Resume the same pinned finalizer. It must observe both the original and deterministic quarantine absent before persisting the cleanup step and may release the reservation only after every cleanup boundary is complete.
+4. Resume the same pinned command. An install retry must remove the exact target quarantine before copying the staged MOD tree. A finalizer retry must observe both the original and deterministic quarantine absent before persisting the cleanup step and may release the reservation only after every cleanup boundary is complete.
 
 ## MOD exceptions
 

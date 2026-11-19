@@ -567,7 +567,7 @@ function Assert-ContainedPath {
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
     $prefix = $rootFull + [IO.Path]::DirectorySeparatorChar
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $candidateFull.StartsWith($prefix, $comparison)) {
         throw "$Label escapes the allowed root."
     }
@@ -594,7 +594,12 @@ function Assert-NoReparsePath {
     $comparisonCommand = Get-Command -Name 'Get-PortablePathComparison' -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if ($null -ne $comparisonCommand) {
-        $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+        $comparison = if ($rootFull.Equals([IO.Path]::GetPathRoot($rootFull), [StringComparison]::OrdinalIgnoreCase)) {
+            Get-PortablePathComparison -Paths @($pathFull, $rootFull)
+        }
+        else {
+            Get-PortablePathComparison -Root $rootFull
+        }
     }
     $reparseCommand = Get-Command -Name 'Test-PortableReparseItem' -ErrorAction SilentlyContinue |
         Select-Object -First 1
@@ -3952,11 +3957,14 @@ function Invoke-Install {
     $modsRoot = Assert-NoReparsePath @modsRootParameters
     $target = Assert-ContainedPath -Candidate (Join-Path $modsRoot $State.repoModDirectory) -Root $modsRoot -Label 'MOD install path'
     $target = Assert-NoReparsePath -Path $target -Root ([string]$State.worktreePath) -Label 'MOD install path' -AllowMissing
-    if (Test-Path -LiteralPath $target) {
-        $resolvedTarget = [IO.Path]::GetFullPath($target)
-        $resolvedMods = [IO.Path]::GetFullPath($modsRoot) + [IO.Path]::DirectorySeparatorChar
-        if (-not $resolvedTarget.StartsWith($resolvedMods, (Get-PortablePathComparison -Paths @($resolvedMods, $resolvedTarget)))) { throw 'Refusing broad install deletion.' }
-        $null = Assert-NoReparseTree -Path $resolvedTarget -Root ([string]$State.worktreePath) -Label 'Existing MOD install tree before removal'
+    $resolvedTarget = [IO.Path]::GetFullPath($target)
+    $resolvedMods = [IO.Path]::GetFullPath($modsRoot) + [IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedTarget.StartsWith($resolvedMods, (Get-PortablePathComparison -Root $modsRoot))) { throw 'Refusing broad install deletion.' }
+    $targetQuarantine = $resolvedTarget + '.codex-removal'
+    if ((Test-Path -LiteralPath $resolvedTarget) -or (Test-Path -LiteralPath $targetQuarantine)) {
+        if (Test-Path -LiteralPath $resolvedTarget) {
+            $null = Assert-NoReparseTree -Path $resolvedTarget -Root ([string]$State.worktreePath) -Label 'Existing MOD install tree before removal'
+        }
         Remove-DirectoryTreeWithHeartbeat -Path $resolvedTarget -Root ([string]$State.worktreePath)
     }
     Copy-DirectoryBytes -Source $source -Destination $target

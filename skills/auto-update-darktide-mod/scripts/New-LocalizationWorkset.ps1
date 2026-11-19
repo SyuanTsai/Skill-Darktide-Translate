@@ -176,7 +176,7 @@ function Assert-ContainedPath {
     param([string] $Candidate, [string] $Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $candidateFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'NEW localization path escapes the staging MOD root.'
     }
@@ -188,7 +188,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $current = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $current)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $current.Equals($rootFull, $comparison) -and
         -not $current.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw 'Localization workset path escapes its verification root.'

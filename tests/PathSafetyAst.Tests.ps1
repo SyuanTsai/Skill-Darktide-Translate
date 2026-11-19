@@ -237,7 +237,7 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Extract|IO.File::O
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Extract|Move-Item|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Extract|New-Item|3
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Extract|Test-Path|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Install|Test-Path|2
+skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Install|Test-Path|4
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Localization|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Localization|New-Item|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Localization|Test-Path|2
@@ -392,11 +392,12 @@ skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Get-FileSha256|IO
 
 # Pure reads/non-filesystem provider operations retained under an already-held owner guard.
 $pureReadExclusions = @'
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.Directory::Exists|2
+skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Test-ModUpdateWorktreeRegistered|IO.Directory::Exists|1
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.Directory::Exists|4
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.Directory::GetFileSystemEntries|1
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.File::Delete|1
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.File::Exists|4
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.File::Exists|5
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.File::Open|1
-skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|type::IO.DirectoryInfo|1
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableTransactionResidue|IO.Directory::GetFileSystemEntries|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.Directory::Exists|4
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.File::Exists|4

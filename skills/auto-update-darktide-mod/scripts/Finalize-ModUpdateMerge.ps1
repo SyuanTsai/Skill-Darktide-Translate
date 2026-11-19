@@ -73,8 +73,8 @@ function Test-ModUpdateWorktreeRegistered {
         $comparison = [StringComparison]::Ordinal
         $comparisonCommand = Get-Command -Name 'Get-PortablePathComparison' -ErrorAction SilentlyContinue |
             Select-Object -First 1
-        if ($null -ne $comparisonCommand) {
-            $comparison = Get-PortablePathComparison -Paths @($candidate, $expected)
+        if ($null -ne $comparisonCommand -and [IO.Directory]::Exists($expected)) {
+            $comparison = Get-PortablePathComparison -Root $expected
         }
         if ($candidate.Equals($expected, $comparison)) { return $true }
     }
@@ -111,7 +111,7 @@ function Get-ModUpdateFinishedArchiveLocation {
         throw 'Finalization archive filename is not one safe file name.'
     }
     $finishedRoot = Join-Path ([string]$State.repositoryRoot) 'AI Auto Update/Finished'
-    $finishedPath = Assert-ContainedPath -Candidate (Join-Path $finishedRoot $filename) -Root $finishedRoot -Label 'Finished archive'
+    $finishedPath = Assert-ContainedPath -Candidate (Join-Path $finishedRoot $filename) -Root ([string]$State.repositoryRoot) -Label 'Finished archive'
     $finishedPath = Assert-NoReparsePath -Path $finishedPath -Root ([string]$State.repositoryRoot) -Label 'Finished archive' -AllowMissing
     [ordered]@{ filename = $filename; finishedRoot = $finishedRoot; finishedPath = $finishedPath }
 }
@@ -304,19 +304,6 @@ function Assert-ModUpdateFinalEvidence {
         $null = Assert-MergeFileTuple -Path $archivedPath -Size ([int64]$entry.size) -Sha256 ([string]$entry.sha256)
     }
     [ordered]@{ stateFinal = $stateFinal; manifest = $manifest }
-}
-
-function Remove-ModUpdateOwnedTree {
-    param(
-        [Parameter(Mandatory)][string] $Path,
-        [Parameter(Mandatory)][string] $Root,
-        [Parameter(Mandatory)][string] $Label
-    )
-    $fullPath = Assert-NoReparseTree -Path $Path -Root $Root -Label $Label
-    $rootFull = [IO.Path]::GetFullPath($Root)
-    $pathComparison = Get-PortablePathComparison -Paths @($rootFull, $fullPath)
-    if ($fullPath.Equals($rootFull, $pathComparison)) { throw "$Label cannot be the containment root." }
-    Remove-DirectoryTreeWithHeartbeat -Path $fullPath -Root $rootFull
 }
 
 function Assert-ModUpdateMergeFinalizationState {

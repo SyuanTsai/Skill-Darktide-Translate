@@ -1,5 +1,20 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
+$caseProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('.mod-update-case-probe-' + [guid]::NewGuid().ToString('N'))
+$caseProbePath = Join-Path $caseProbeRoot 'CaseProbe'
+$caseVariantProbePath = Join-Path $caseProbeRoot 'caseProbe'
+try {
+    [void][IO.Directory]::CreateDirectory($caseProbeRoot)
+    $caseProbeStream = [IO.File]::Open($caseProbePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+    try { $caseProbeStream.Flush($true) }
+    finally { $caseProbeStream.Dispose() }
+    $testVolumeIsCaseInsensitive = [IO.File]::Exists($caseVariantProbePath)
+}
+finally {
+    if ([IO.File]::Exists($caseProbePath)) { [IO.File]::Delete($caseProbePath) }
+    if ([IO.Directory]::Exists($caseProbeRoot)) { [IO.Directory]::Delete($caseProbeRoot) }
+}
+
 Describe 'Deterministic Darktide MOD update automation' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -150,30 +165,30 @@ Describe 'Deterministic Darktide MOD update automation' {
         $pathSafety | Should -Not -Match $deletedRuntimeTokens
     }
 
-    # Scenario: A Unix-like host compares managed paths that differ only by case on its current volume.
-    # Purpose: Keep containment and exclusion aligned with the filesystem instead of assuming Unix is case-sensitive.
-    if (-not $IsWindows) {
-        It 'UnitT108U_UsesStrictUnixContainmentAndNativeExclusionComparison' {
-            Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-            $root = Join-Path $TestDrive 'unix-case-policy'
-            [void][IO.Directory]::CreateDirectory((Join-Path $root 'Mods'))
-            $caseVariantDirectory = Join-Path $root 'mods'
-            $filesystemIsCaseInsensitive = [IO.Directory]::Exists($caseVariantDirectory)
-            $expectedComparison = if ($filesystemIsCaseInsensitive) {
-                [StringComparison]::OrdinalIgnoreCase
-            }
-            else {
-                [StringComparison]::Ordinal
-            }
-            $containment = Get-PortablePathComparison -Paths @($root)
-            $containment | Should -Be $expectedComparison
-            Get-PortablePathComparison -Paths @($root) -Purpose Containment | Should -Be $expectedComparison
-            Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be $expectedComparison
-            $prefix = (Join-Path $root 'Mods') + [IO.Path]::DirectorySeparatorChar
-            (Join-Path $root 'mods/Escape.lua').StartsWith($prefix, $containment) | Should -Be $filesystemIsCaseInsensitive
-            (Join-Path $root 'Mods/Inside.lua').StartsWith($prefix, $containment) | Should -BeTrue
+    # Scenario: A native host compares managed paths that differ only by case on its current volume.
+    # Purpose: Keep containment and exclusion aligned with the filesystem instead of inferring semantics from the OS.
+    It 'UnitT108U_UsesStrictUnixContainmentAndNativeExclusionComparison' {
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $root = Join-Path $TestDrive 'native-case-policy'
+        [void][IO.Directory]::CreateDirectory((Join-Path $root 'Mods'))
+        $caseVariantDirectory = Join-Path $root 'mods'
+        $filesystemIsCaseInsensitive = [IO.Directory]::Exists($caseVariantDirectory)
+        $expectedComparison = if ($filesystemIsCaseInsensitive) {
+            [StringComparison]::OrdinalIgnoreCase
         }
+        else {
+            [StringComparison]::Ordinal
+        }
+        $containment = Get-PortablePathComparison -Root $root
+        $containment | Should -Be $expectedComparison
+        Get-PortablePathComparison -Root $root -Purpose Containment | Should -Be $expectedComparison
+        Get-PortablePathComparison -Root $root -Purpose Exclusion | Should -Be $expectedComparison
+        $prefix = (Join-Path $root 'Mods') + [IO.Path]::DirectorySeparatorChar
+        (Join-Path $root 'mods/Escape.lua').StartsWith($prefix, $containment) | Should -Be $filesystemIsCaseInsensitive
+        (Join-Path $root 'Mods/Inside.lua').StartsWith($prefix, $containment) | Should -BeTrue
+    }
 
+    if (-not $testVolumeIsCaseInsensitive) {
         # Scenario: A case-sensitive volume contains two real sibling directories whose names differ only by case.
         # Purpose: Prove case detection uses a unique temporary file instead of mistaking the sibling for an alias.
         It 'InterT407_DoesNotConflateCaseSensitiveSiblingDirectoriesDuringCaseDetection' {
@@ -183,11 +198,7 @@ Describe 'Deterministic Darktide MOD update automation' {
             $lower = Join-Path $parent 'caseRoot'
             [void][IO.Directory]::CreateDirectory($upper)
             [void][IO.Directory]::CreateDirectory($lower)
-            if ([IO.Directory]::Exists((Join-Path $parent 'CASEROOT'))) {
-                throw 'This native-host case requires a case-sensitive filesystem.'
-            }
-
-            Get-PortablePathComparison -Paths @($upper) | Should -Be ([StringComparison]::Ordinal)
+            Get-PortablePathComparison -Root $upper | Should -Be ([StringComparison]::Ordinal)
             @(Get-ChildItem -LiteralPath $upper -Force -Filter '.casecheck-*').Count | Should -Be 0
             @(Get-ChildItem -LiteralPath $lower -Force -Filter '.casecheck-*').Count | Should -Be 0
         }
@@ -208,12 +219,27 @@ Describe 'Deterministic Darktide MOD update automation' {
         else {
             [StringComparison]::Ordinal
         }
-        Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be $expectedComparison
-        { Get-PortablePathComparison -Purpose Exclusion } | Should -Throw '*existing directory ancestor*'
-        { Get-PortablePathComparison } | Should -Throw '*existing directory ancestor*'
+        Get-PortablePathComparison -Root $root -Purpose Exclusion | Should -Be $expectedComparison
+        { Get-PortablePathComparison -Purpose Exclusion } | Should -Throw '*existing directory entry*'
+        { Get-PortablePathComparison } | Should -Throw '*existing directory entry*'
         $expander = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Expand-Schema14Reference.ps1') -Raw
         $expander | Should -Match 'Get-PortablePathComparison -Paths @\(\$resolvedSkillRoot, \$resolvedOutputRoot\) -Purpose Exclusion'
         $expander | Should -Not -Match 'exclusion always ignores case'
+    }
+
+    # Scenario: A filesystem-aware comparison is requested for the host filesystem root, which may be read-only.
+    # Purpose: Determine case semantics from existing entries without creating a probe in an unowned ancestor.
+    It 'UnitT408_DoesNotWriteACaseProbeIntoTheFilesystemRoot' {
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $filesystemRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($TestDrive))
+        { Get-PortablePathComparison -Paths @($filesystemRoot) } | Should -Not -Throw
+        $pathSafety = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Raw
+        $comparisonStart = $pathSafety.IndexOf('function Get-PortablePathComparison')
+        $comparisonEnd = $pathSafety.IndexOf('function Resolve-PortableContainedPath', $comparisonStart)
+        $comparisonSource = $pathSafety.Substring($comparisonStart, $comparisonEnd - $comparisonStart)
+        $comparisonSource | Should -Not -Match 'while \(-not \[IO\.Directory\]::Exists\(\$candidate\)\)'
+        $comparisonSource | Should -Match "ParameterSetName -ceq 'ExistingPaths'"
+        $comparisonSource | Should -Match 'IO\.Directory\]::GetFileSystemEntries'
     }
 
     # Scenario: the current volume exposes a Git worktree path through a differently-cased prefix.
@@ -230,8 +256,56 @@ Describe 'Deterministic Darktide MOD update automation' {
                 [IO.Path]::DirectorySeparatorChar
             ) + [IO.Path]::DirectorySeparatorChar)
         $caseAlias = [IO.Path]::GetFullPath((Join-Path $caseVariantWorktree 'review-artifacts/localization-workset.json'))
-        $comparison = Get-PortablePathComparison -Paths @($worktree, $caseAlias) -Purpose Exclusion
+        $comparison = Get-PortablePathComparison -Root $worktree -Purpose Exclusion
         $caseAlias.StartsWith($worktreePrefix, $comparison) | Should -Be $filesystemIsCaseInsensitive
+    }
+
+    # Scenario: The Candidate state is on a volume whose injected comparer ignores case while its worktree volume is case-sensitive.
+    # Purpose: Select the comparer from the verified worktree paths, not from the run-state volume, without requiring two CI volumes.
+    It 'UnitT394_UsesTheWorktreeVolumeComparerForInstallRootIdentity' {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($validatorPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0
+        $physicalInstallCommand = $ast.Find({
+            param($node)
+            if ($node -isnot [Management.Automation.Language.CommandAst] -or
+                $node.GetCommandName() -cne 'Add-ValidationCheck') { return $false }
+            @($node.CommandElements | Where-Object {
+                    $_ -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                    $_.Value -ceq 'physical-install-tree'
+                }).Count -eq 1
+        }, $true)
+        $physicalInstallCommand | Should -Not -BeNullOrEmpty
+        $actionAst = @($physicalInstallCommand.CommandElements | Where-Object {
+                $_ -is [Management.Automation.Language.ScriptBlockExpressionAst]
+            })[0]
+
+        $worktree = Join-Path $TestDrive 'CandidateWorktree'
+        [void][IO.Directory]::CreateDirectory($worktree)
+        $caseVariantWorktree = Join-Path $TestDrive 'candidateWorktree'
+        $installRoot = Join-Path $caseVariantWorktree 'mods/ExampleMod'
+        $module = New-Module -ArgumentList $actionAst.ScriptBlock.EndBlock.Extent.Text, $worktree, $installRoot -ScriptBlock {
+            param($actionSource, $candidateWorktree, $candidateInstallRoot)
+            $script:worktree = $candidateWorktree
+            $script:state = @{ modRelativePath = 'mods/ExampleMod'; installRoot = $candidateInstallRoot }
+            $script:statePathComparison = [StringComparison]::OrdinalIgnoreCase
+            $script:observedComparerRoot = $null
+            function Assert-NoReparsePath { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+            function Assert-NoReparseTree { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+            function Get-PortablePathComparison {
+                param([string] $Root, [string] $Purpose = 'Containment')
+                $script:observedComparerRoot = $Root
+                [StringComparison]::Ordinal
+            }
+            $script:action = [scriptblock]::Create($actionSource)
+        }
+        try {
+            { & $module { & $script:action } } | Should -Throw '*installRoot differs*'
+            $observed = & $module { $script:observedComparerRoot }
+            $observed | Should -BeExactly ([IO.Path]::GetFullPath($worktree))
+        }
+        finally { Remove-Module $module -Force }
     }
 
     # Scenario: The runner's ancestor walk is executed without the PathSafety module, as the legacy harness extracts it.
@@ -462,6 +536,147 @@ Remove-DirectoryTreeWithHeartbeat -Path $OwnedPath -Root $RootPath
         }
     }
 
+    # Scenario: Production install is terminated after renaming an existing MOD to its deterministic quarantine.
+    # Purpose: A retry of the same incomplete install stage must remove the quarantine before installing the staged tree.
+    It 'InterT409_ResumesInstallAfterTerminationAtTheQuarantineRename' -Tag 'MultiProcess' {
+        $runnerTokens = $null
+        $runnerErrors = $null
+        $runnerAst = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$runnerTokens, [ref]$runnerErrors)
+        @($runnerErrors).Count | Should -Be 0
+        $sources = @{}
+        foreach ($name in @('Remove-DirectoryTreeWithHeartbeat', 'Invoke-Install')) {
+            $functionAst = $runnerAst.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+            }, $true)
+            $functionAst | Should -Not -BeNullOrEmpty
+            $sources[$name] = $functionAst.Extent.Text
+        }
+
+        $runRoot = Join-Path $TestDrive 'install-retry-run'
+        $source = Join-Path $runRoot 'extracted/ExampleMod'
+        $worktree = Join-Path $TestDrive 'install-retry-worktree'
+        $target = Join-Path $worktree 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+        $quarantine = $target + '.codex-removal'
+        $artifacts = Join-Path $runRoot 'artifacts'
+        [void][IO.Directory]::CreateDirectory($source)
+        [void][IO.Directory]::CreateDirectory($target)
+        [void][IO.Directory]::CreateDirectory($artifacts)
+        [IO.File]::WriteAllText((Join-Path $source 'new.txt'), 'new payload')
+        [IO.File]::WriteAllText((Join-Path $target 'old.txt'), 'old payload')
+
+        $ready = Join-Path $TestDrive 'install-quarantined.ready'
+        $childPath = Join-Path $TestDrive 'install-retry-child.ps1'
+        [IO.File]::WriteAllText($childPath, @'
+param(
+    [string] $RemovalSourceBase64,
+    [string] $InstallSourceBase64,
+    [string] $RunRoot,
+    [string] $Worktree,
+    [string] $ArtifactsRoot,
+    [string] $ReadyPath
+)
+$ErrorActionPreference = 'Stop'
+function Update-ActiveReservationHeartbeat { param([switch] $Force) }
+function Update-ActiveSharedCoordinationHeartbeat { param([switch] $Force) }
+function Get-CompletedStageResult { param($State,$Name) $null }
+function Start-Stage { param($Name) @{ name = $Name } }
+function Assert-LockOwner { param($State) }
+function Assert-NoReparsePath { param($Path,$Root,$Label,[switch]$AllowMissing) [IO.Path]::GetFullPath($Path) }
+function Assert-NoReparseTree { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+function Assert-ContainedPath { param($Candidate,$Root,$Label) [IO.Path]::GetFullPath($Candidate) }
+function Get-PortablePathComparison { param($Root,$Purpose) [StringComparison]::OrdinalIgnoreCase }
+function Copy-DirectoryBytes { throw 'Install copy must not begin before the terminated cleanup resumes.' }
+function New-Manifest { throw 'Manifest creation must not begin before the terminated cleanup resumes.' }
+function New-GitNormalizationManifest { throw 'Normalization must not begin before the terminated cleanup resumes.' }
+function Complete-Stage { throw 'Completion must not begin before the terminated cleanup resumes.' }
+$removalSource = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RemovalSourceBase64))
+$move = '[IO.Directory]::Move($removalRoot, $quarantine)'
+$pause = $move + [Environment]::NewLine +
+    '[IO.File]::WriteAllText($ReadyPath, ''ready'')' + [Environment]::NewLine +
+    'while ($true) { [Threading.Thread]::Sleep(50) }'
+. ([scriptblock]::Create($removalSource.Replace($move, $pause)))
+. ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($InstallSourceBase64))))
+$state = [ordered]@{
+    extractionRoot = Join-Path $RunRoot 'extracted'
+    repoModDirectory = 'ExampleMod'
+    runRoot = $RunRoot
+    worktreePath = $Worktree
+    artifactsRoot = $ArtifactsRoot
+}
+Invoke-Install -State $state
+'@, [Text.UTF8Encoding]::new($false))
+        $removalBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($sources['Remove-DirectoryTreeWithHeartbeat']))
+        $installBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($sources['Invoke-Install']))
+        $start = [Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = (Get-Process -Id $PID).Path
+        $start.UseShellExecute = $false
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $childPath,
+                '-RemovalSourceBase64', $removalBase64, '-InstallSourceBase64', $installBase64,
+                '-RunRoot', $runRoot, '-Worktree', $worktree, '-ArtifactsRoot', $artifacts,
+                '-ReadyPath', $ready)) { [void]$start.ArgumentList.Add($argument) }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $start
+        try {
+            $process.Start() | Should -BeTrue
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            while (-not [IO.File]::Exists($ready)) {
+                if ($process.HasExited) { throw "Install child exited before quarantine: $($process.ExitCode)" }
+                if ($watch.ElapsedMilliseconds -ge 30000) { throw 'Install child did not reach quarantine within 30 seconds.' }
+                [Threading.Thread]::Sleep(20)
+            }
+            $process.Kill($true)
+            $process.WaitForExit()
+            [IO.Directory]::Exists($target) | Should -BeFalse
+            [IO.Directory]::Exists($quarantine) | Should -BeTrue
+
+            $module = New-Module -ArgumentList $sources['Remove-DirectoryTreeWithHeartbeat'], $sources['Invoke-Install'] -ScriptBlock {
+                param($removalSource, $installSource)
+                $script:completedStages = 0
+                function Update-ActiveReservationHeartbeat { param([switch] $Force) }
+                function Update-ActiveSharedCoordinationHeartbeat { param([switch] $Force) }
+                function Get-CompletedStageResult { param($State,$Name) $null }
+                function Start-Stage { param($Name) @{ name = $Name } }
+                function Assert-LockOwner { param($State) }
+                function Assert-NoReparsePath { param($Path,$Root,$Label,[switch]$AllowMissing) [IO.Path]::GetFullPath($Path) }
+                function Assert-NoReparseTree { param($Path,$Root,$Label) [IO.Path]::GetFullPath($Path) }
+                function Assert-ContainedPath { param($Candidate,$Root,$Label) [IO.Path]::GetFullPath($Candidate) }
+                function Get-PortablePathComparison { param($Root,$Purpose) [StringComparison]::OrdinalIgnoreCase }
+                function Copy-DirectoryBytes {
+                    param($Source,$Destination)
+                    [void][IO.Directory]::CreateDirectory($Destination)
+                    [IO.File]::WriteAllText((Join-Path $Destination 'new.txt'), [IO.File]::ReadAllText((Join-Path $Source 'new.txt')))
+                }
+                function New-Manifest { param($Root,$OutputPath,$Kind) @{ sha256 = ('a' * 64); kind = $Kind } }
+                function New-GitNormalizationManifest { param($State) @{ sha256 = ('b' * 64) } }
+                function Complete-Stage { param($State,$Context,$ArtifactSha256,$Data) $script:completedStages++ }
+                . ([scriptblock]::Create($removalSource))
+                . ([scriptblock]::Create($installSource))
+            }
+            try {
+                $state = [ordered]@{
+                    extractionRoot = Join-Path $runRoot 'extracted'
+                    repoModDirectory = 'ExampleMod'
+                    runRoot = $runRoot
+                    worktreePath = $worktree
+                    artifactsRoot = $artifacts
+                }
+                & $module { param($retryState) Invoke-Install -State $retryState } $state
+                (& $module { $script:completedStages }) | Should -Be 1
+            }
+            finally { Remove-Module $module -Force }
+
+            [IO.Directory]::Exists($quarantine) | Should -BeFalse
+            [IO.Directory]::Exists($target) | Should -BeTrue
+            [IO.File]::ReadAllText((Join-Path $target 'new.txt')) | Should -BeExactly 'new payload'
+            [IO.File]::Exists((Join-Path $target 'old.txt')) | Should -BeFalse
+        }
+        finally {
+            if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+            $process.Dispose()
+        }
+    }
+
     # Scenario: A live owner's process start time is read again later on each platform.
     # Purpose: Keep Windows creation-time identity exact while Linux/macOS wall-clock-derived drift never makes a live owner look inactive.
     It 'UnitT366_ToleratesUnixProcessStartDriftButKeepsWindowsExact' {
@@ -685,8 +900,10 @@ Remove-DirectoryTreeWithHeartbeat -Path $OwnedPath -Root $RootPath
             . ([scriptblock]::Create($functionSource))
         }
         try {
-            $nativePath = 'F:\Runs\Darktide Update'
-            $porcelain = "worktree F:/Runs/Darktide Update`nHEAD $('a' * 40)`nbranch refs/heads/Update/example"
+            $nativePath = Join-Path $TestDrive 'Darktide Update'
+            [void][IO.Directory]::CreateDirectory($nativePath)
+            $porcelainPath = $nativePath.Replace([char]92, [char]47)
+            $porcelain = "worktree $porcelainPath`nHEAD $('a' * 40)`nbranch refs/heads/Update/example"
             (& $module { param($text, $path) Test-ModUpdateWorktreeRegistered -Porcelain $text -ExpectedPath $path } $porcelain $nativePath) |
                 Should -BeTrue
             (& $module { param($text) Test-ModUpdateWorktreeRegistered -Porcelain $text -ExpectedPath 'F:\Runs\Other' } $porcelain) |
@@ -1202,7 +1419,7 @@ Remove-DirectoryTreeWithHeartbeat -Path $OwnedPath -Root $RootPath
 
     # Scenario: Terminal-owner recovery receives differently-cased aliases on a case-insensitive native filesystem.
     # Purpose: Accept aliases that the filesystem identifies as the same repository, state, run, and lock paths.
-    if ($IsWindows) {
+    if ($testVolumeIsCaseInsensitive) {
         It 'InterT129B_RecoversTerminalOwnerThroughCaseInsensitivePathAliases' {
             $parent = Join-Path $TestDrive 'terminal-owner-alias'
             $repository = Join-Path $parent 'CaseRepository'
@@ -1241,7 +1458,7 @@ Remove-DirectoryTreeWithHeartbeat -Path $OwnedPath -Root $RootPath
 
     # Scenario: Terminal-owner recovery sees case-only sibling repositories on a case-sensitive native filesystem.
     # Purpose: Keep distinct sibling state and run paths from resolving to the wrong terminal owner.
-    if (-not $IsWindows) {
+    if (-not $testVolumeIsCaseInsensitive) {
         It 'InterT129C_DoesNotRecoverTerminalOwnerFromACaseSensitiveSibling' {
             $parent = Join-Path $TestDrive 'terminal-owner-siblings'
             $repository = Join-Path $parent 'CaseRepository'
@@ -1272,6 +1489,7 @@ Remove-DirectoryTreeWithHeartbeat -Path $OwnedPath -Root $RootPath
 
     Context 'Released finalization through the formal command entry' {
         BeforeAll {
+            $originalReleasedPath = $env:PATH
             $releasedRepository = Join-Path $TestDrive 'released-finalization-entry'
             $releasedModRoot = Join-Path $releasedRepository 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
             $releasedQueueRoot = Join-Path $releasedRepository 'AI Auto Update'
@@ -1375,7 +1593,6 @@ printf '%s' "$S8_TEST_GH_JSON"
 '@, [Text.UTF8Encoding]::new($false))
                 & chmod 700 $fakeGhPath
             }
-            $originalReleasedPath = $env:PATH
             $env:PATH = $fakeBin + [IO.Path]::PathSeparator + $env:PATH
             $env:S8_TEST_GH_JSON = ([ordered]@{
                     number = 131; url = [string]$releasedState.prUrl; state = 'MERGED'; isDraft = $false

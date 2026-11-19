@@ -241,7 +241,12 @@ function Assert-NoReparsePath {
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
     $rootPrefix = if ($rootFull.EndsWith([IO.Path]::DirectorySeparatorChar) -or $rootFull.EndsWith([IO.Path]::AltDirectorySeparatorChar)) { $rootFull } else { $rootFull + [IO.Path]::DirectorySeparatorChar }
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    $comparison = if ($rootFull.Equals([IO.Path]::GetPathRoot($rootFull), [StringComparison]::OrdinalIgnoreCase)) {
+        Get-PortablePathComparison -Paths @($pathFull, $rootFull)
+    }
+    else {
+        Get-PortablePathComparison -Root $rootFull
+    }
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootPrefix, $comparison)) {
         throw "$Label escapes its physical verification root."
@@ -440,7 +445,7 @@ function Assert-SourceReceiptIntegrity {
     $receiptFull = Assert-NoReparsePath -Path ([string]$State.sourceReceipt.path) -Root ([string]$State.repositoryRoot) -Label 'Schema 15 source receipt'
     $requestFull = Assert-NoReparsePath -Path ([string]$State.sourceReceipt.sourceRequestPath) -Root ([string]$State.repositoryRoot) -Label 'Schema 15 source request'
     $recordFull = Assert-NoReparsePath -Path ([string]$State.sourceAcquisition.recordPath) -Root ([string]$State.repositoryRoot) -Label 'Schema 15 source acquisition record'
-    $sourcePathComparison = Get-PortablePathComparison -Paths @($sourceRunRoot, $receiptFull, $requestFull, $recordFull)
+    $sourcePathComparison = Get-PortablePathComparison -Root $sourceRunRoot
     if (-not $receiptFull.Equals(
             [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-receipt.json')), $sourcePathComparison) -or
         -not $requestFull.Equals(
@@ -1571,8 +1576,9 @@ Add-ValidationCheck -Name 'precommit-security-validation' -Action {
 Add-ValidationCheck -Name 'physical-install-tree' -Action {
     $verifiedWorktree = Assert-NoReparsePath -Path $worktree -Root ([IO.Path]::GetPathRoot($worktree)) -Label 'Candidate worktree'
     $expectedInstallRoot = [IO.Path]::GetFullPath((Join-Path $verifiedWorktree ([string]$state.modRelativePath)))
+    $worktreePathComparison = Get-PortablePathComparison -Root $verifiedWorktree
     if (-not ([IO.Path]::GetFullPath([string]$state.installRoot)).Equals(
-            $expectedInstallRoot, $statePathComparison)) {
+            $expectedInstallRoot, $worktreePathComparison)) {
         throw 'Candidate installRoot differs from the fixed MOD path in its worktree.'
     }
     $null = Assert-NoReparseTree -Path ([string]$state.installRoot) -Root $verifiedWorktree -Label 'Candidate installed MOD tree'

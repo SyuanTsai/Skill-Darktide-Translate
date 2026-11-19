@@ -158,7 +158,7 @@ function Assert-NoReparsePath {
     $rawRoot = [IO.Path]::GetFullPath($Root)
     $rootFull = if ($rawRoot -ceq [IO.Path]::GetPathRoot($rawRoot)) { $rawRoot } else { $rawRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) }
     $pathFull = [IO.Path]::GetFullPath($Path)
-    $comparison = Get-PortablePathComparison -Paths @($rootFull, $pathFull)
+    $comparison = Get-PortablePathComparison -Root $rootFull
     if (-not $pathFull.Equals($rootFull, $comparison) -and
         -not $pathFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, $comparison)) {
         throw "$Label escapes the source run root."
@@ -244,7 +244,7 @@ $null = Assert-NoReparsePath -Path $requestFull -Root $sourceRunRoot -Label 'Sou
 if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
     $expectedReceiptPath = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-receipt.json'))
     $expectedRequestPath = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'review-artifacts/source-request.json'))
-    $sourcePathComparison = Get-PortablePathComparison -Paths @($sourceRunRoot, $receiptFull, $requestFull)
+    $sourcePathComparison = Get-PortablePathComparison -Root $sourceRunRoot
     if (-not $receiptFull.Equals($expectedReceiptPath, $sourcePathComparison) -or
         -not $requestFull.Equals($expectedRequestPath, $sourcePathComparison)) {
         throw 'Source receipt verification requires the fixed run-local review artifact paths.'
@@ -346,7 +346,7 @@ if ($isRetainedNonDelivered) {
     if (-not (Test-Path -LiteralPath $retainedFull -PathType Leaf) -or
         (Split-Path -Leaf $retainedParent).StartsWith('.incoming-', [StringComparison]::Ordinal) -ne $true -or
         -not ([IO.Path]::GetFullPath((Split-Path -Parent $retainedParent))).Equals(
-            $sourceRunRoot, (Get-PortablePathComparison -Paths @($sourceRunRoot, $retainedParent)))) {
+            $sourceRunRoot, (Get-PortablePathComparison -Root $sourceRunRoot))) {
         throw 'Retained source is outside a fixed run-local incoming directory.'
     }
     $archiveEvidence = Get-ArchiveEvidence -Path $retainedFull
@@ -403,7 +403,7 @@ $deliveredPath = [IO.Path]::GetFullPath([string]$receipt.deliveredPath)
 $null = Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source'
 if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
     $verifiedRoot = [IO.Path]::GetFullPath((Join-Path $sourceRunRoot 'verified-source')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    if (-not $deliveredPath.StartsWith($verifiedRoot + [IO.Path]::DirectorySeparatorChar, (Get-PortablePathComparison -Paths @($verifiedRoot, $deliveredPath)))) {
+    if (-not $deliveredPath.StartsWith($verifiedRoot + [IO.Path]::DirectorySeparatorChar, (Get-PortablePathComparison -Root $verifiedRoot))) {
         throw 'Delivered source escapes the fixed run-local verified-source directory.'
     }
 }

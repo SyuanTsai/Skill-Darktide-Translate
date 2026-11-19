@@ -1146,7 +1146,7 @@ return localization
         [void][IO.Directory]::CreateDirectory($probeRoot)
         $caseVariant = Join-Path $probeParent 'caseRoot'
         $filesystemIsCaseInsensitive = [IO.Directory]::Exists($caseVariant)
-        $comparison = Get-PortablePathComparison -Paths @($probeRoot) -Purpose Containment
+        $comparison = Get-PortablePathComparison -Root $probeRoot -Purpose Containment
         $comparisonStart = $pathSafety.IndexOf('function Get-PortablePathComparison')
         $comparisonEnd = $pathSafety.IndexOf('function Resolve-PortableContainedPath', $comparisonStart)
         $comparisonStart | Should -BeGreaterOrEqual 0
@@ -1162,7 +1162,9 @@ return localization
             })
         $comparisonFunction | Should -Match '\.casecheck-'
         $comparisonFunction | Should -Match '\[IO\.File\]::Delete'
-        $comparisonFunction | Should -Not -Match 'GetFileSystemEntries'
+        $comparisonFunction | Should -Match "ParameterSetName -ceq 'ExistingPaths'"
+        $comparisonFunction | Should -Match 'GetFileSystemEntries'
+        $comparisonFunction | Should -Not -Match 'while \(-not \[IO\.Directory\]::Exists\(\$candidate\)\)'
         $comparisonFunction | Should -Not -Match 'Get-PortablePlatformName'
     }
 

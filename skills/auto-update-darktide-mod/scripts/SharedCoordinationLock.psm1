@@ -94,7 +94,7 @@ function Assert-CoordinationPath {
     )
     $fullPath = [IO.Path]::GetFullPath($Path)
     $prefix = $repository + [IO.Path]::DirectorySeparatorChar
-    $comparison = Get-PortablePathComparison -Paths @($repository, $fullPath)
+    $comparison = Get-PortablePathComparison -Root $repository
     if (-not $fullPath.Equals($repository, $comparison) -and
         -not $fullPath.StartsWith($prefix, $comparison)) {
         throw 'Shared coordination path escapes the repository root.'
