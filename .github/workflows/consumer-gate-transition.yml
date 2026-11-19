@@ -1,0 +1,186 @@
+name: Consumer gate transition
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+concurrency:
+  group: consumer-gate-transition-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, platform: windows }
+          - { os: ubuntu-latest, platform: linux }
+          - { os: macos-latest, platform: macos }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Configure Git checkout line endings
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: base
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: candidate
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Require unconverted base
+        shell: pwsh
+        run: |
+          if (Test-Path ./base/scripts/Invoke-PinnedAuthority.ps1) { throw '轉換已完成，請刪除此 workflow' }
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version: stable, check-latest: true }
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with: { python-version: '3.12', check-latest: false }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: '24.21.0' }
+      - name: Bind transition inputs
+        shell: pwsh
+        env:
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          @(
+            "CONSUMER_GATE_EVENT_REPOSITORY=$($env:REPOSITORY_URL)",
+            "STANDARD_GO_RUNTIME_VERSION=$(((& go version) -replace '^go version go([^ ]+).+$', '$1').Trim())"
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Prepare transition
+        shell: pwsh
+        env:
+          STANDARD_VALIDATION_GITHUB_API_TOKEN: ${{ github.token }}
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          CANDIDATE_REVISION: ${{ github.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+          GATE_PLATFORM: ${{ matrix.platform }}
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "consumer-gate-$($env:GATE_PLATFORM)"
+          & ./candidate/scripts/Invoke-PinnedAuthority.ps1 -Phase prepare -BaseRoot ./base -CandidateRoot ./candidate -WorkRoot $work `
+            -TransitionFromLegacy -TriggerEvent pull_request -BaseRevision $env:BASE_REVISION -CandidateRevision $env:CANDIDATE_REVISION `
+            -HeadRevision $env:HEAD_REVISION -WorkflowRunId $env:GATE_RUN_ID -WorkflowRunAttempt $env:GATE_RUN_ATTEMPT -Platform $env:GATE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate transition
+        shell: pwsh
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          CANDIDATE_REVISION: ${{ github.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+          GATE_PLATFORM: ${{ matrix.platform }}
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "consumer-gate-$($env:GATE_PLATFORM)"
+          & ./candidate/scripts/Invoke-PinnedAuthority.ps1 -Phase validate -BaseRoot ./base -CandidateRoot ./candidate -WorkRoot $work `
+            -TransitionFromLegacy -TriggerEvent pull_request -BaseRevision $env:BASE_REVISION -CandidateRevision $env:CANDIDATE_REVISION `
+            -HeadRevision $env:HEAD_REVISION -WorkflowRunId $env:GATE_RUN_ID -WorkflowRunAttempt $env:GATE_RUN_ATTEMPT -Platform $env:GATE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Finalize transition
+        shell: pwsh
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          CANDIDATE_REVISION: ${{ github.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+          GATE_PLATFORM: ${{ matrix.platform }}
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "consumer-gate-$($env:GATE_PLATFORM)"
+          & ./candidate/scripts/Invoke-PinnedAuthority.ps1 -Phase finalize -BaseRoot ./base -CandidateRoot ./candidate -WorkRoot $work `
+            -TransitionFromLegacy -TriggerEvent pull_request -BaseRevision $env:BASE_REVISION -CandidateRevision $env:CANDIDATE_REVISION `
+            -HeadRevision $env:HEAD_REVISION -WorkflowRunId $env:GATE_RUN_ID -WorkflowRunAttempt $env:GATE_RUN_ATTEMPT -Platform $env:GATE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload transition leg receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: consumer-gate-leg-${{ matrix.platform }}
+          path: ${{ runner.temp }}/consumer-gate-${{ matrix.platform }}/receipts/leg-${{ matrix.platform }}.json
+          if-no-files-found: error
+      - name: Upload transition validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: consumer-gate-evidence-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/consumer-gate-${{ matrix.platform }}/source-tools/diagnostics
+            ${{ runner.temp }}/consumer-gate-${{ matrix.platform }}/validation-artifacts
+          if-no-files-found: error
+
+  aggregate:
+    needs: gate
+    if: always()
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure Git checkout line endings
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { path: base, ref: '${{ github.event.pull_request.base.sha }}', fetch-depth: 2, persist-credentials: false }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { path: candidate, ref: '${{ github.sha }}', fetch-depth: 2, persist-credentials: false }
+      - name: Require unconverted base
+        shell: pwsh
+        run: |
+          if (Test-Path ./base/scripts/Invoke-PinnedAuthority.ps1) { throw '轉換已完成，請刪除此 workflow' }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { pattern: consumer-gate-leg-*, path: '${{ runner.temp }}/consumer-gate-aggregate/receipts', merge-multiple: true }
+      - name: Aggregate transition
+        shell: pwsh
+        env:
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          CANDIDATE_REVISION: ${{ github.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $env:CONSUMER_GATE_EVENT_REPOSITORY = $env:REPOSITORY_URL
+          & ./candidate/scripts/Invoke-PinnedAuthority.ps1 -Phase aggregate -BaseRoot ./base -CandidateRoot ./candidate `
+            -WorkRoot (Join-Path $env:RUNNER_TEMP 'consumer-gate-aggregate') -TransitionFromLegacy -TriggerEvent pull_request `
+            -BaseRevision $env:BASE_REVISION -CandidateRevision $env:CANDIDATE_REVISION -HeadRevision $env:HEAD_REVISION `
+            -WorkflowRunId $env:GATE_RUN_ID -WorkflowRunAttempt $env:GATE_RUN_ATTEMPT -Platform aggregate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  repository-contract:
+    needs: [gate, aggregate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        env: { GATE_RESULT: '${{ needs.gate.result }}', AGGREGATE_RESULT: '${{ needs.aggregate.result }}' }
+        run: '[[ "$GATE_RESULT" == success && "$AGGREGATE_RESULT" == success ]]'
+  skill-validator:
+    needs: [gate, aggregate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        env: { GATE_RESULT: '${{ needs.gate.result }}', AGGREGATE_RESULT: '${{ needs.aggregate.result }}' }
+        run: '[[ "$GATE_RESULT" == success && "$AGGREGATE_RESULT" == success ]]'
+  skill-tools:
+    needs: [gate, aggregate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        env: { GATE_RESULT: '${{ needs.gate.result }}', AGGREGATE_RESULT: '${{ needs.aggregate.result }}' }
+        run: '[[ "$GATE_RESULT" == success && "$AGGREGATE_RESULT" == success ]]'

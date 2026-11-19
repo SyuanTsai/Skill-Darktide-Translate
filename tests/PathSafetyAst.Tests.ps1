@@ -47,12 +47,13 @@ function ConvertTo-CountMap {
     return $map
 }
 
-$prProductionPowerShellFiles = @(
+$runtimePowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1',
     'skills/auto-update-darktide-mod/scripts/Expand-Schema14Reference.ps1',
-    'skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1',
     'skills/auto-update-darktide-mod/scripts/Finalize-LocalizationWorksetEvidence.ps1',
+    'skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1',
     'skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1',
+    'skills/auto-update-darktide-mod/scripts/LuaLocalizationScanner.psm1',
     'skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1',
     'skills/auto-update-darktide-mod/scripts/PathSafety.psm1',
     'skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1',
@@ -63,102 +64,11 @@ $prProductionPowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1',
     'skills/auto-update-darktide-mod/scripts/mod-update.ps1'
 )
-$protectedPrProductionPowerShellInventorySha256 = '71abeabf1c4115c711584514d6279531ff293576c3998bc18b2989a3f21ae927'
-$scopedFiles = @($prProductionPowerShellFiles)
+$protectedRuntimePowerShellInventorySha256 = '1bc621212ab14d834f869cecbdab41251d29980efb66f927e9262319601c1c9b'
+$scopedFiles = @($runtimePowerShellFiles)
 
-# Exact origin/main function-level inventory. Format: file|function|call|count.
-$originMainExclusions = @'
-scripts/Install-LatestPowerShell.ps1|<script>|Get-Item|1
-scripts/Install-LatestPowerShell.ps1|<script>|IO.File::Open|1
-scripts/Install-LatestPowerShell.ps1|<script>|New-Item|1
-scripts/Install-LatestPowerShell.ps1|<script>|Test-Path|3
-scripts/PowerShellRelease.psm1|Assert-VerifiedPowerShellArchive|Get-Item|1
-scripts/PowerShellRelease.psm1|Assert-VerifiedPowerShellArchive|Test-Path|1
-scripts/Test-Repository.ps1|<script>|Get-ChildItem|1
-scripts/Test-Repository.ps1|<script>|Get-Item|1
-scripts/Test-Repository.ps1|<script>|Test-Path|6
-scripts/Test-Repository.ps1|Add-PublisherSkillPath|Get-Item|1
-scripts/Test-Repository.ps1|Assert-BootstrapOpenAiMetadata|Get-Item|1
-scripts/Test-Repository.ps1|Assert-NoReparseAncestors|Get-Item|1
-scripts/Test-Repository.ps1|Get-ContentInventory|Get-ChildItem|1
-scripts/Test-Repository.ps1|Get-ContentInventory|Get-Item|1
-scripts/Test-Repository.ps1|Get-ManagedProjectionSnapshot|Get-ChildItem|1
-scripts/Test-Repository.ps1|Get-ManagedProjectionSnapshot|Get-Item|1
-scripts/Test-Repository.ps1|Get-PublisherSkillDiscoveryPaths|Get-ChildItem|9
-scripts/Test-Repository.ps1|Get-PublisherSkillDiscoveryPaths|Get-Item|2
-scripts/Test-Repository.ps1|Get-PublisherSkillDiscoveryPaths|Test-Path|2
-scripts/Test-Repository.ps1|Get-RawFileSha256|IO.File::Open|1
-scripts/Test-Repository.ps1|Invoke-BootstrapTransitionRepositoryValidation|Get-ChildItem|1
-scripts/Test-Repository.ps1|Invoke-BootstrapTransitionRepositoryValidation|Get-Item|1
-scripts/Test-Repository.ps1|Invoke-BootstrapTransitionRepositoryValidation|Test-Path|6
-scripts/Test-Repository.ps1|Read-OpenAiMetadata|Get-Item|1
-scripts/Test-Repository.ps1|Read-OpenAiMetadata|Test-Path|1
-scripts/Test-Repository.ps1|Read-StrictJson|Test-Path|1
-scripts/Test-Repository.ps1|Read-StrictUtf8File|IO.File::ReadAllBytes|1
-scripts/Test-Repository.ps1|Write-ExclusiveUtf8File|Get-Item|1
-scripts/Test-Repository.ps1|Write-ExclusiveUtf8File|IO.File::Open|1
-scripts/Test-Repository.ps1|Write-ExclusiveUtf8File|IO.File::ReadAllBytes|1
-scripts/Test-Repository.ps1|Write-ExclusiveUtf8File|New-Item|1
-scripts/Validate.ps1|<script>|Copy-Item|1
-scripts/Validate.ps1|<script>|Get-ChildItem|2
-scripts/Validate.ps1|<script>|Get-Item|11
-scripts/Validate.ps1|<script>|IO.File::AppendAllText|2
-scripts/Validate.ps1|<script>|IO.File::Open|1
-scripts/Validate.ps1|<script>|IO.File::ReadAllBytes|2
-scripts/Validate.ps1|<script>|IO.File::WriteAllBytes|1
-scripts/Validate.ps1|<script>|IO.File::WriteAllText|7
-scripts/Validate.ps1|<script>|New-Item|6
-scripts/Validate.ps1|<script>|Remove-Item|5
-scripts/Validate.ps1|<script>|Test-Path|12
-scripts/Validate.ps1|Assert-ExternalReceiptFile|Test-Path|1
-scripts/Validate.ps1|Assert-NoGitReplacementObjects|Get-ChildItem|1
-scripts/Validate.ps1|Assert-NoGitReplacementObjects|Get-Item|2
-scripts/Validate.ps1|Assert-NoGitReplacementObjects|Test-Path|2
-scripts/Validate.ps1|Assert-NoReparseAncestors|Get-Item|1
-scripts/Validate.ps1|Assert-NoReparseTree|Get-ChildItem|1
-scripts/Validate.ps1|Assert-NoReparseTree|Get-Item|1
-scripts/Validate.ps1|Assert-ReceiptFile|Test-Path|1
-scripts/Validate.ps1|Assert-RunnerCommandFilesUnchanged|Test-Path|1
-scripts/Validate.ps1|Assert-TrustedGitTreeFile|Get-Item|1
-scripts/Validate.ps1|Expand-TrustedGitArchive|New-Item|1
-scripts/Validate.ps1|Expand-TrustedGitArchive|Remove-Item|1
-scripts/Validate.ps1|Expand-TrustedGitArchive|Test-Path|2
-scripts/Validate.ps1|Get-FileByteSha256|IO.File::ReadAllBytes|1
-scripts/Validate.ps1|Get-InstalledDirectoryClosureSha256|Get-ChildItem|1
-scripts/Validate.ps1|Get-InstalledDirectoryClosureSha256|Test-Path|1
-scripts/Validate.ps1|Get-InstalledDirectoryClosureSha256|type::IO.FileInfo|1
-scripts/Validate.ps1|Get-RepositoryRawSnapshot|Get-ChildItem|2
-scripts/Validate.ps1|Get-RunnerCommandFileSnapshot|Test-Path|1
-scripts/Validate.ps1|Invoke-BootstrapTransitionValidation|Get-Item|2
-scripts/Validate.ps1|Invoke-BootstrapTransitionValidation|IO.File::AppendAllText|1
-scripts/Validate.ps1|Invoke-BootstrapTransitionValidation|New-Item|2
-scripts/Validate.ps1|Invoke-BootstrapTransitionValidation|Test-Path|6
-scripts/Validate.ps1|Invoke-NativeChecked|Get-Item|1
-scripts/Validate.ps1|Invoke-NativeChecked|IO.File::Open|1
-scripts/Validate.ps1|Invoke-NativeChecked|Remove-Item|1
-scripts/Validate.ps1|Invoke-NativeChecked|Test-Path|6
-scripts/Validate.ps1|Invoke-ProtectedPesterRunspace|Get-Item|2
-scripts/Validate.ps1|Invoke-ProtectedPesterRunspace|IO.File::ReadAllBytes|1
-scripts/Validate.ps1|Invoke-ProtectedPesterRunspace|Test-Path|3
-scripts/Validate.ps1|Invoke-ProtectedPesterServerProxy|Test-Path|5
-scripts/Validate.ps1|Invoke-ProtectedPesterSupervisor|Get-Item|2
-scripts/Validate.ps1|Invoke-ProtectedPesterSupervisor|Test-Path|1
-scripts/Validate.ps1|Invoke-TrustedPowerShellProcess|Test-Path|2
-scripts/Validate.ps1|New-ContainedProcessEnvironment|Get-Item|2
-scripts/Validate.ps1|New-ContainedProcessEnvironment|New-Item|2
-scripts/Validate.ps1|Protect-ProcessCredentialEnvironment|Get-ChildItem|1
-scripts/Validate.ps1|Read-JsonFile|Test-Path|1
-scripts/Validate.ps1|Read-SkillSpectorJsonReport|IO.File::ReadAllText|1
-scripts/Validate.ps1|Read-StrictUtf8File|IO.File::ReadAllBytes|1
-scripts/Validate.ps1|Resolve-GitCommonDirectoryFromMetadata|Get-Item|4
-scripts/Validate.ps1|Resolve-GitCommonDirectoryFromMetadata|Test-Path|4
-scripts/Validate.ps1|Set-WindowsLowIntegrityDirectory|Get-Item|1
-scripts/Validate.ps1|Set-WindowsLowIntegrityDirectory|Test-Path|1
-scripts/Validate.ps1|Write-ExclusiveUtf8File|Get-Item|2
-scripts/Validate.ps1|Write-ExclusiveUtf8File|IO.File::Open|1
-scripts/Validate.ps1|Write-ExclusiveUtf8File|IO.File::ReadAllBytes|1
-scripts/Validate.ps1|Write-ExclusiveUtf8File|New-Item|1
-scripts/Validate.ps1|Write-ExclusiveUtf8File|Test-Path|2
+# Exact reviewed runtime function-level inventory. Format: file|function|call|count.
+$reviewedPathnameCallAllowances = @'
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|<script>|Test-Path|2
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|Assert-NoReparsePath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|Assert-NoReparsePath|type::IO.DirectoryInfo|1
@@ -204,12 +114,7 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Complete-InterruptedSourc
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Copy-DirectoryBytes|Get-ChildItem|2
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Copy-DirectoryBytes|New-Item|3
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Copy-FileWithHeartbeat|IO.File::Open|2
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-ModReservation|Get-ChildItem|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-ModReservation|IO.Directory::Delete|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-ModReservation|IO.Directory::Move|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-ModReservation|IO.File::Delete|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-ModReservation|New-Item|3
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-ModReservation|Test-Path|3
+skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-ModReservation|New-Item|2
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-ModReservationWorker|New-Item|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-RunWriterLock|IO.File::Move|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Enter-RunWriterLock|IO.File::Open|1
@@ -253,15 +158,12 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Normalize-GitCaseVariantW
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Normalize-GitCaseVariantWorktreePaths|New-Item|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Normalize-GitCaseVariantWorktreePaths|Test-Path|4
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Read-FileBytesWithHeartbeat|IO.File::Open|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Read-ModReservationOwner|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Read-State|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.Directory::Delete|2
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.Directory::Move|2
+skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.Directory::Move|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.File::Delete|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.File::SetAttributes|3
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|Test-Path|2
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|type::IO.DirectoryInfo|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Test-SourceRequestPreflight|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-AtomicBytes|IO.File::Delete|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-AtomicBytes|IO.File::Move|1
@@ -276,8 +178,6 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-ByteFile|IO.File::M
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-ByteFile|New-Item|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-ByteFile|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-BytesWithHeartbeat|IO.File::Open|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-ModReservationOwner|IO.File::Open|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-ModReservationOwner|Test-Path|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|New-Item|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|Test-Path|5
@@ -338,11 +238,13 @@ skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUp
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|IO.File::Delete|1
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|IO.File::Move|1
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|New-Item|3
-skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|Test-Path|11
+skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Invoke-ModUpdateReviewedHeadFinalization|Test-Path|9
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Remove-ModUpdateOwnedDirectory|Test-Path|3
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Resolve-ModUpdateFinalizationStateFromOwner|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|<script>|Test-Path|3
 skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1|Read-QueueTextWithHeartbeat|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/LuaLocalizationScanner.psm1|Get-LuaLocalizationDocument|Test-Path|1
+skills/auto-update-darktide-mod/scripts/LuaLocalizationScanner.psm1|Read-LuaScannerFileBytes|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|Test-Path|1
 skills/auto-update-darktide-mod/scripts/SharedCoordinationLock.psm1|Assert-CoordinationPath|type::IO.DirectoryInfo|1
@@ -391,7 +293,7 @@ skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Get-FileSha256|IO
 '@ -split "`r?`n" | Where-Object { $_ }
 
 # Pure reads/non-filesystem provider operations retained under an already-held owner guard.
-$pureReadExclusions = @'
+$reviewedPureReadAllowances = @'
 skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1|Test-ModUpdateWorktreeRegistered|IO.Directory::Exists|1
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.Directory::Exists|4
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparison|IO.Directory::GetFileSystemEntries|1
@@ -401,85 +303,34 @@ skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortablePathComparis
 skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableTransactionResidue|IO.Directory::GetFileSystemEntries|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.Directory::Exists|4
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Remove-DirectoryTreeWithHeartbeat|IO.File::Exists|4
-scripts/StandardSourceDriver.psm1|Get-DarktideActiveSkillIds|Get-ChildItem|1
-scripts/StandardSourceDriver.psm1|Get-DarktideOwnedProcessEnvironment|Get-ChildItem|1
-scripts/StandardSourceDriver.psm1|Get-DarktideSourceResolverEnvironment|Remove-Item|1
-scripts/Invoke-SourceChild.ps1|Get-InventoryPaths|Get-ChildItem|1
-scripts/Invoke-SourceChild.ps1|Invoke-ChildOwnedCommand|Get-ChildItem|1
-scripts/Prepare-WorkflowPowerShell.ps1|<script>|IO.File::AppendAllText|3
-scripts/Invoke-CorePester.ps1|<script>|Get-ChildItem|1
-scripts/CorePesterIntegrity.psm1|Test-CorePesterClosure|Get-ChildItem|1
-scripts/CorePesterIntegrity.psm1|Get-CorePesterTreeSnapshot|Get-ChildItem|1
 '@ -split "`r?`n" | Where-Object { $_ }
 
-$corePesterBootstrapAllowances = [ordered]@{
-    'scripts/CorePesterIntegrity.psm1|Get-CorePesterAuthorityRuntimeBinding|IO.File::ReadAllBytes|1' =
-        'Authority runtime 載入前的 bootstrap 讀取，載入後以 lease 重讀並比對 bytes。'
-}
-
-# A1 capture cleanup is the sole reviewed pathname-deletion exception. Keep
-# every exact leaf explicit so the allowance cannot grow into a wildcard or a
-# recursive directory removal.
-$a1CaptureCleanupAllowances = @(
-    [pscustomobject]@{ File='scripts/Invoke-SourceChild.ps1'; Function='Invoke-ChildOwnedCommand'; Call='IO.File::Delete'; Leaf='stdout.txt'; Reason='authority Invoke-StandardValidation A1 exact-name cleanup' }
-    [pscustomobject]@{ File='scripts/Invoke-SourceChild.ps1'; Function='Invoke-ChildOwnedCommand'; Call='IO.File::Delete'; Leaf='stderr.txt'; Reason='authority Invoke-StandardValidation A1 exact-name cleanup' }
-    [pscustomobject]@{ File='scripts/Invoke-SourceChild.ps1'; Function='Invoke-ChildOwnedCommand'; Call='IO.Directory::Delete'; Leaf='<empty-capture-directory>'; Reason='authority Invoke-StandardValidation A1 nonrecursive empty-directory cleanup' }
-    [pscustomobject]@{ File='scripts/StandardSourceDriver.psm1'; Function='Invoke-DarktideOwnedProcess'; Call='IO.File::Delete'; Leaf='stdout.txt'; Reason='authority Invoke-StandardValidation A1 exact-name cleanup' }
-    [pscustomobject]@{ File='scripts/StandardSourceDriver.psm1'; Function='Invoke-DarktideOwnedProcess'; Call='IO.File::Delete'; Leaf='stderr.txt'; Reason='authority Invoke-StandardValidation A1 exact-name cleanup' }
-    [pscustomobject]@{ File='scripts/StandardSourceDriver.psm1'; Function='Invoke-DarktideOwnedProcess'; Call='IO.Directory::Delete'; Leaf='<empty-capture-directory>'; Reason='authority Invoke-StandardValidation A1 nonrecursive empty-directory cleanup' }
-)
 }
 
 Describe 'Epic pathname safety AST boundary' {
-    # Scenario: Core Pester runs either in the developer worktree or in a tracked-only snapshot with no .git entry.
-    # Purpose: Keep the complete reviewed PR production-file scope enforced in both environments without an implicit skip.
-    It 'matches every production PowerShell file changed from origin main or its protected snapshot inventory' {
+    # Scenario: The runtime is tested in a developer worktree or a tracked-only snapshot with no Git metadata.
+    # Purpose: Keep the complete reviewed Skill runtime scope deterministic in both environments.
+    It 'matches the complete protected Skill runtime PowerShell inventory' {
         $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-        [string[]]$actual = @($prProductionPowerShellFiles)
+        [string[]]$expected = @($runtimePowerShellFiles)
+        [Array]::Sort($expected, [StringComparer]::Ordinal)
+        $runtimeRoot = Join-Path $repositoryRoot 'skills/auto-update-darktide-mod/scripts'
+        [string[]]$actual = @(Get-ChildItem -LiteralPath $runtimeRoot -File -Force |
+            Where-Object { $_.Extension -in @('.ps1', '.psm1') } |
+            ForEach-Object { [IO.Path]::GetRelativePath($repositoryRoot, $_.FullName).Replace('\', '/') })
         [Array]::Sort($actual, [StringComparer]::Ordinal)
-        $inventoryBytes = [Text.UTF8Encoding]::new($false).GetBytes($actual -join "`n")
+        $inventoryBytes = [Text.UTF8Encoding]::new($false).GetBytes($expected -join "`n")
         [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($inventoryBytes)).ToLowerInvariant() |
-            Should -BeExactly $protectedPrProductionPowerShellInventorySha256
-        foreach ($relative in $actual) {
-            Test-Path -LiteralPath (Join-Path $repositoryRoot $relative) -PathType Leaf | Should -BeTrue -Because $relative
-        }
-
-        if (Test-Path -LiteralPath (Join-Path $repositoryRoot '.git')) {
-            $null = & git -C $repositoryRoot rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}'
-            $originMainResolveExitCode = $LASTEXITCODE
-        }
-        else {
-            $originMainResolveExitCode = 1
-        }
-
-        if ($originMainResolveExitCode -eq 0) {
-            $branchChanged = @(& git -C $repositoryRoot diff --name-only origin/main...HEAD -- '*.ps1' '*.psm1')
-            $LASTEXITCODE | Should -Be 0
-            $worktreeChanged = @(& git -C $repositoryRoot diff --name-only -- '*.ps1' '*.psm1')
-            $LASTEXITCODE | Should -Be 0
-            $changed = @($branchChanged + $worktreeChanged | Sort-Object -Unique)
-            [string[]]$expected = @($changed | Where-Object { $_ -like 'skills/*' })
-            [Array]::Sort($expected, [StringComparer]::Ordinal)
-        }
-        elseif ($originMainResolveExitCode -eq 1) {
-            [string[]]$expected = @($actual)
-        }
-        else {
-            $originMainResolveExitCode | Should -Be 0
-        }
+            Should -BeExactly $protectedRuntimePowerShellInventorySha256
         ($actual -join "`n") | Should -BeExactly ($expected -join "`n")
     }
 
     It 'contains no unreviewed pathname command, static IO method, or FileInfo/DirectoryInfo check' {
         $allowances = @{}
-        $reviewedRows = @($originMainExclusions) + @($pureReadExclusions) + @($corePesterBootstrapAllowances.Keys)
+        $reviewedRows = @($reviewedPathnameCallAllowances) + @($reviewedPureReadAllowances)
         foreach ($row in $reviewedRows) {
             $parts = $row -split '\|'
             $allowances["$($parts[0])|$($parts[1])|$($parts[2])"] = [int]$parts[3]
-        }
-        foreach ($entry in $a1CaptureCleanupAllowances) {
-            $key = "$($entry.File)|$($entry.Function)|$($entry.Call)"
-            $allowances[$key] = 1 + [int]$allowances[$key]
         }
         $violations = [Collections.Generic.List[string]]::new()
         foreach ($relative in $scopedFiles) {

@@ -49,16 +49,16 @@ skills/auto-update-darktide-mod/
   scripts/Test-ReferenceIntegrity.ps1
 catalog/source.json
 catalog/profiles.json
-config/standard-v1.json
-scripts/Validate.ps1
-scripts/Test-Repository.ps1
+config/authority-pin.json
+config/consumer-gate.json
+scripts/Invoke-PinnedAuthority.ps1
+scripts/Test-DarktideRepository.ps1
+scripts/Test-CleanRepositoryHead.ps1
 docs/RELEASE.md
 docs/ROLLBACK.md
-scripts/Get-SourcePin.ps1
-scripts/Invoke-PrePushValidation.ps1
-scripts/Test-CleanRepositoryHead.ps1
 tests/
-.github/workflows/
+.github/workflows/consumer-gate.yml
+.github/workflows/consumer-gate-transition.yml
 VERSION
 ```
 
@@ -66,20 +66,20 @@ VERSION
 
 Run from the repository root:
 
-Repository contract tests require Pester 5 or later.
-Commit the intended snapshot, ensure the working tree and index are clean, then run the one complete local Standard v1 gate used by GitHub before pushing:
+Repository contract tests require Pester 5 or later. Run the repository-owned checks directly when reproducing a consumer-gate result locally:
 
 ```powershell
-pwsh -NoLogo -NoProfile -File ./scripts/Invoke-PrePushValidation.ps1
+pwsh -NoLogo -NoProfile -File ./scripts/Test-DarktideRepository.ps1 -RepositoryRoot .
+Invoke-Pester -Path ./tests
 ```
 
-The wrapper binds the central Standard v1 authority, controlled tool acquisition, package integrity, SkillSpector, repository/domain tests, and the reproducible source pin to one unchanged HEAD by using an explicit base commit or the local clone's immutable merge-base with its remote default branch. `scripts/Validate.ps1` is the canonical validator invoked by the wrapper; `scripts/Test-Repository.ps1`, domain tests, and other component commands are diagnostic components, not alternate release gates. This repository validates only its own `skills/auto-update-darktide-mod/` package; external consumer projections and instruction manifests are outside this repository's inventory.
+Pull requests are validated by `.github/workflows/consumer-gate.yml` on Windows, Linux, and macOS. The `pull_request_target` workflow uses the immutable authority selected by `config/authority-pin.json`; the dedicated App publishes `repository-contract`, `skill-validator`, and `skill-tools` to the pull-request head. Repository-specific checks are `scripts/Test-DarktideRepository.ps1` and complete Pester discovery under `tests/`, as declared in `config/consumer-gate.json`. Routine authority upgrades change only the pin's `commit`.
 
-GitHub Actions runs one read-only Windows workflow for pull requests and pushes to `main`. It follows Microsoft's official stable PowerShell channel to its canonical release tag, retrieves metadata for that exact tag, verifies the x64 archive against its published SHA-256 digest, and invokes `scripts/Validate.ps1` through that exact executable. The report and release receipt stay in a unique `RUNNER_TEMP` directory while the exact event SHA is checked; the workflow removes that directory on every job outcome.
+The transition workflow is single-use conversion scaffolding and is removed in the follow-up cleanup pull request. Repository files describe the gate but do not by themselves prove that remote App, event-policy, environment, or ruleset enforcement is enabled.
 
 ## Versioning and rollback
 
-Release and immutable pin rules are in `docs/RELEASE.md`. Consumers start and roll back runs with the complete JSON emitted by `scripts/Get-SourcePin.ps1`, including the tag/ref, resolved commit, deterministic content hash, and installed Skill file manifest, as described in `docs/ROLLBACK.md`. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
+Release and immutable pin rules are in `docs/RELEASE.md`. Consumers start and roll back runs with the complete source-pin JSON retained for an approved immutable release, including the tag/ref, resolved commit, deterministic content hash, and installed Skill file manifest, as described in `docs/ROLLBACK.md`. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
 
 ### Historical trial evidence
 

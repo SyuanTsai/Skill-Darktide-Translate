@@ -1,0 +1,265 @@
+name: Consumer gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+concurrency:
+  group: consumer-gate-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Configure Git checkout line endings
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - name: Checkout protected base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: base
+          ref: ${{ github.event_name == 'push' && github.event.before || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: candidate
+          ref: ${{ github.event_name == 'push' && github.sha || format('refs/pull/{0}/merge', github.event.pull_request.number) }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect transition push
+        id: transition_push
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $base = Join-Path $env:GITHUB_WORKSPACE 'base/scripts/Invoke-PinnedAuthority.ps1'
+          $candidate = Join-Path $env:GITHUB_WORKSPACE 'candidate/scripts/Invoke-PinnedAuthority.ps1'
+          $skip = $env:EVENT_NAME -ceq 'push' -and -not (Test-Path -LiteralPath $base) -and (Test-Path -LiteralPath $candidate -PathType Leaf)
+          if ($skip) { 'transition push, gate skipped' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY }
+          elseif (-not (Test-Path -LiteralPath $base -PathType Leaf)) { throw 'Protected base bootstrap is missing.' }
+          "skip=$($skip.ToString().ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+      - name: Set up Go
+        if: steps.transition_push.outputs.skip != 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          check-latest: true
+      - name: Set up Python
+        if: steps.transition_push.outputs.skip != 'true'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          check-latest: false
+      - name: Set up Node
+        if: steps.transition_push.outputs.skip != 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.21.0'
+      - name: Bind gate inputs
+        if: steps.transition_push.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+          PR_BASE: ${{ github.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          $goVersion = ((& go version) -replace '^go version go([^ ]+).+$', '$1').Trim()
+          if ($env:EVENT_NAME -ceq 'push') { $base = $env:PUSH_BASE; $candidate = $env:PUSH_HEAD; $head = $env:PUSH_HEAD }
+          else { $base = $env:PR_BASE; $candidate = (& git -C candidate rev-parse HEAD).Trim(); $head = $env:PR_HEAD }
+          @(
+            "CONSUMER_GATE_EVENT_REPOSITORY=$($env:REPOSITORY_URL)",
+            "STANDARD_GO_RUNTIME_VERSION=$goVersion",
+            "GATE_BASE_REVISION=$base",
+            "GATE_CANDIDATE_REVISION=$candidate",
+            "GATE_HEAD_REVISION=$head"
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV
+      - name: Prepare consumer gate
+        if: steps.transition_push.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          STANDARD_VALIDATION_GITHUB_API_TOKEN: ${{ github.token }}
+          GATE_PLATFORM: ${{ matrix.platform }}
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GATE_TRIGGER: ${{ github.event_name }}
+        run: |
+          & ./base/scripts/Invoke-PinnedAuthority.ps1 -Phase prepare -BaseRoot ./base -CandidateRoot ./candidate `
+            -WorkRoot (Join-Path $env:RUNNER_TEMP "consumer-gate-$($env:GATE_PLATFORM)") -TriggerEvent $env:GATE_TRIGGER `
+            -BaseRevision $env:GATE_BASE_REVISION -CandidateRevision $env:GATE_CANDIDATE_REVISION -HeadRevision $env:GATE_HEAD_REVISION `
+            -WorkflowRunId $env:GATE_RUN_ID -WorkflowRunAttempt $env:GATE_RUN_ATTEMPT -Platform $env:GATE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate consumer gate
+        if: steps.transition_push.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GATE_PLATFORM: ${{ matrix.platform }}
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GATE_TRIGGER: ${{ github.event_name }}
+        run: |
+          & ./base/scripts/Invoke-PinnedAuthority.ps1 -Phase validate -BaseRoot ./base -CandidateRoot ./candidate `
+            -WorkRoot (Join-Path $env:RUNNER_TEMP "consumer-gate-$($env:GATE_PLATFORM)") -TriggerEvent $env:GATE_TRIGGER `
+            -BaseRevision $env:GATE_BASE_REVISION -CandidateRevision $env:GATE_CANDIDATE_REVISION -HeadRevision $env:GATE_HEAD_REVISION `
+            -WorkflowRunId $env:GATE_RUN_ID -WorkflowRunAttempt $env:GATE_RUN_ATTEMPT -Platform $env:GATE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Finalize consumer gate
+        if: steps.transition_push.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GATE_PLATFORM: ${{ matrix.platform }}
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GATE_TRIGGER: ${{ github.event_name }}
+        run: |
+          & ./base/scripts/Invoke-PinnedAuthority.ps1 -Phase finalize -BaseRoot ./base -CandidateRoot ./candidate `
+            -WorkRoot (Join-Path $env:RUNNER_TEMP "consumer-gate-$($env:GATE_PLATFORM)") -TriggerEvent $env:GATE_TRIGGER `
+            -BaseRevision $env:GATE_BASE_REVISION -CandidateRevision $env:GATE_CANDIDATE_REVISION -HeadRevision $env:GATE_HEAD_REVISION `
+            -WorkflowRunId $env:GATE_RUN_ID -WorkflowRunAttempt $env:GATE_RUN_ATTEMPT -Platform $env:GATE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload leg receipt
+        if: always() && steps.transition_push.outputs.skip != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: consumer-gate-leg-${{ matrix.platform }}
+          path: ${{ runner.temp }}/consumer-gate-${{ matrix.platform }}/receipts/leg-${{ matrix.platform }}.json
+          if-no-files-found: error
+      - name: Upload validation evidence
+        if: always() && steps.transition_push.outputs.skip != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: consumer-gate-evidence-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/consumer-gate-${{ matrix.platform }}/source-tools/diagnostics
+            ${{ runner.temp }}/consumer-gate-${{ matrix.platform }}/validation-artifacts
+          if-no-files-found: error
+
+  aggregate:
+    needs: gate
+    if: always()
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      authorityCommit: ${{ steps.aggregate.outputs.authorityCommit }}
+    steps:
+      - name: Configure Git checkout line endings
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - name: Checkout protected base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: base
+          ref: ${{ github.event_name == 'push' && github.event.before || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: candidate
+          ref: ${{ github.event_name == 'push' && github.sha || format('refs/pull/{0}/merge', github.event.pull_request.number) }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect transition push
+        id: transition_push
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $skip = $env:EVENT_NAME -ceq 'push' -and -not (Test-Path ./base/scripts/Invoke-PinnedAuthority.ps1) -and (Test-Path ./candidate/scripts/Invoke-PinnedAuthority.ps1)
+          if ($skip) { 'transition push, gate skipped' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY }
+          elseif (-not (Test-Path ./base/scripts/Invoke-PinnedAuthority.ps1)) { throw 'Protected base bootstrap is missing.' }
+          "skip=$($skip.ToString().ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+      - name: Download leg receipts
+        if: steps.transition_push.outputs.skip != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: consumer-gate-leg-*
+          path: ${{ runner.temp }}/consumer-gate-aggregate/receipts
+          merge-multiple: true
+      - name: Aggregate consumer gate
+        id: aggregate
+        if: steps.transition_push.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+          PR_BASE: ${{ github.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $env:CONSUMER_GATE_EVENT_REPOSITORY = $env:REPOSITORY_URL
+          if ($env:EVENT_NAME -ceq 'push') { $base = $env:PUSH_BASE; $candidate = $env:PUSH_HEAD; $head = $env:PUSH_HEAD }
+          else { $base = $env:PR_BASE; $candidate = (& git -C candidate rev-parse HEAD).Trim(); $head = $env:PR_HEAD }
+          & ./base/scripts/Invoke-PinnedAuthority.ps1 -Phase aggregate -BaseRoot ./base -CandidateRoot ./candidate `
+            -WorkRoot (Join-Path $env:RUNNER_TEMP 'consumer-gate-aggregate') -TriggerEvent $env:EVENT_NAME `
+            -BaseRevision $base -CandidateRevision $candidate -HeadRevision $head `
+            -WorkflowRunId $env:GATE_RUN_ID -WorkflowRunAttempt $env:GATE_RUN_ATTEMPT -Platform aggregate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  report:
+    needs: [gate, aggregate]
+    if: always() && github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    environment: consumer-gate
+    permissions: {}
+    steps:
+      - name: Create App token
+        id: app-token
+        uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2
+        with:
+          app-id: ${{ vars.CONSUMER_GATE_APP_ID }}
+          private-key: ${{ secrets.CONSUMER_GATE_APP_PRIVATE_KEY }}
+          permission-checks: write
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Publish required checks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          AGGREGATE_RESULT: ${{ needs.aggregate.result }}
+          AUTHORITY_COMMIT: ${{ needs.aggregate.outputs.authorityCommit }}
+        run: |
+          conclusion=failure
+          if [[ "$GATE_RESULT" == success && "$AGGREGATE_RESULT" == success ]]; then conclusion=success; fi
+          for name in repository-contract skill-validator skill-tools; do
+            gh api --method POST "/repos/$REPOSITORY/check-runs" \
+              -f name="$name" -f head_sha="$HEAD_SHA" -f status=completed -f conclusion="$conclusion" \
+              -f details_url="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID" -f external_id="$RUN_ID:$BASE_SHA" \
+              -f output[title]="$name" -f output[summary]="base=$BASE_SHA merge=$MERGE_SHA authority=$AUTHORITY_COMMIT"
+          done

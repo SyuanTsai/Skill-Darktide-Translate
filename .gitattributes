@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 * text=auto
+.gitattributes text eol=lf
 *.json text eol=lf
 *.lua text eol=lf
 *.md text eol=lf
 *.ps1 text eol=lf
 *.psm1 text eol=lf
+*.toml text eol=lf
 *.gz binary
 *.yaml text eol=lf
 *.yml text eol=lf
