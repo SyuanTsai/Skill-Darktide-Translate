@@ -562,12 +562,15 @@ function Assert-ContainedPath {
     param(
         [Parameter(Mandatory)][string] $Candidate,
         [Parameter(Mandatory)][string] $Root,
+        [string] $ComparisonRoot,
         [string] $Label = 'path'
     )
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
     $prefix = $rootFull + [IO.Path]::DirectorySeparatorChar
-    $comparison = Get-PortablePathComparison -Root $rootFull
+    $comparisonSource = if ([string]::IsNullOrWhiteSpace($ComparisonRoot)) { $rootFull }
+        else { [IO.Path]::GetFullPath($ComparisonRoot) }
+    $comparison = Get-PortablePathComparison -Root $comparisonSource
     if (-not $candidateFull.StartsWith($prefix, $comparison)) {
         throw "$Label escapes the allowed root."
     }
@@ -3315,7 +3318,7 @@ function Invoke-Claim {
     $short = [string]$plan.short
     $runRoot = [string]$plan.runRoot
     $actualStatePath = if ($StatePath) {
-        Assert-ContainedPath -Candidate $StatePath -Root $runRoot -Label 'State path'
+        Assert-ContainedPath -Candidate $StatePath -Root $runRoot -ComparisonRoot $repository -Label 'State path'
     }
     else { Join-Path $runRoot 'state.json' }
     $null = Assert-NoReparsePath -Path $runRoot -Root $repository -Label 'Claim run root' -AllowMissing
