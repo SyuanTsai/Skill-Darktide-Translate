@@ -606,11 +606,10 @@ function Assert-NoReparsePath {
             }
             return $false
         }
-        # Same rule as PathSafety: on Unix-like hosts the raw ancestor walk
-        # stops at the trusted root, so operating-system aliases above it
-        # (for example macOS /var -> /private/var) are not managed-path links.
-        $fallbackIsWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
-        $fallbackStopComparison = if ($fallbackIsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        # Same rule as PathSafety: the raw ancestor walk stops at the trusted
+        # root, so operating-system aliases above it (for example macOS
+        # /var -> /private/var) are not managed-path links.
+        $fallbackStopComparison = $comparison
         $probe = [IO.Path]::GetFullPath($CandidatePath)
         for ($probeDepth = 0; $probeDepth -lt 2048; $probeDepth++) {
             foreach ($info in @([IO.FileInfo]::new($probe), [IO.DirectoryInfo]::new($probe))) {
@@ -622,7 +621,7 @@ function Assert-NoReparsePath {
                     throw ('Unable to inspect {0} physical containment component: {1}' -f ([string]$Label), ([string]($_.Exception.Message)))
                 }
             }
-            if (-not $fallbackIsWindows -and $probe.Equals($rootFull, $fallbackStopComparison)) { break }
+            if ($probe.Equals($rootFull, $fallbackStopComparison)) { break }
             $parent = [IO.DirectoryInfo]::new($probe).Parent
             if ($null -eq $parent -or $parent.FullName.Equals($probe, $fallbackStopComparison)) { break }
             $probe = $parent.FullName

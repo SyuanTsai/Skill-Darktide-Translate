@@ -32,8 +32,8 @@ $resolvedOutputRoot = $outputRoot.TrimEnd(
 )
 $skillPrefix = $resolvedSkillRoot + [IO.Path]::DirectorySeparatorChar
 # This is an exclusion check (the output must be OUTSIDE the Skill source).
-# A case-sensitive comparer would let a case alias on a case-insensitive
-# volume (for example macOS APFS) escape it, so exclusion always ignores case.
+# Resolve comparison semantics from the Skill root's actual filesystem so a
+# case alias on a case-insensitive volume (for example macOS APFS) cannot escape.
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 $pathComparison = Get-PortablePathComparison -Paths @($resolvedSkillRoot, $resolvedOutputRoot) -Purpose Exclusion
 if (

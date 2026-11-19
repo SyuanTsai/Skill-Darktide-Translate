@@ -122,49 +122,70 @@ Describe 'Deterministic Darktide MOD update automation' {
         $pathSafety | Should -Not -Match $deletedRuntimeTokens
     }
 
-    # Scenario: A Unix-like host compares managed paths that differ only by case.
-    # Purpose: Keep both containment and exclusion comparisons aligned with native Unix path casing.
+    # Scenario: A Unix-like host compares managed paths that differ only by case on its current volume.
+    # Purpose: Keep containment and exclusion aligned with the filesystem instead of assuming Unix is case-sensitive.
     if (-not $IsWindows) {
         It 'UnitT108U_UsesStrictUnixContainmentAndNativeExclusionComparison' {
             Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
             $root = Join-Path $TestDrive 'unix-case-policy'
             [void][IO.Directory]::CreateDirectory((Join-Path $root 'Mods'))
+            $caseVariantDirectory = Join-Path $root 'mods'
+            $filesystemIsCaseInsensitive = [IO.Directory]::Exists($caseVariantDirectory)
+            $expectedComparison = if ($filesystemIsCaseInsensitive) {
+                [StringComparison]::OrdinalIgnoreCase
+            }
+            else {
+                [StringComparison]::Ordinal
+            }
             $containment = Get-PortablePathComparison -Paths @($root)
-            $containment | Should -Be ([StringComparison]::Ordinal)
-            Get-PortablePathComparison -Paths @($root) -Purpose Containment | Should -Be ([StringComparison]::Ordinal)
-            Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be ([StringComparison]::Ordinal)
+            $containment | Should -Be $expectedComparison
+            Get-PortablePathComparison -Paths @($root) -Purpose Containment | Should -Be $expectedComparison
+            Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be $expectedComparison
             $prefix = (Join-Path $root 'Mods') + [IO.Path]::DirectorySeparatorChar
-            (Join-Path $root 'mods/Escape.lua').StartsWith($prefix, $containment) | Should -BeFalse
+            (Join-Path $root 'mods/Escape.lua').StartsWith($prefix, $containment) | Should -Be $filesystemIsCaseInsensitive
             (Join-Path $root 'Mods/Inside.lua').StartsWith($prefix, $containment) | Should -BeTrue
         }
     }
 
-    # Scenario: Any host checks that a path is outside a protected root.
-    # Purpose: Use Windows-insensitive and Unix-sensitive comparisons consistently for local containment.
+    # Scenario: Any native host checks that a path is outside a protected root.
+    # Purpose: Use the protected root's actual filesystem comparison for local containment.
     It 'UnitT360_UsesTheNativePlatformComparisonForExclusionChecks' {
         Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
-        $root = Join-Path $TestDrive 'exclusion-policy'
+        $parent = Join-Path $TestDrive 'exclusion-policy'
+        $root = Join-Path $parent 'CaseRoot'
         [void][IO.Directory]::CreateDirectory($root)
-        $expectedComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        $caseVariantRoot = Join-Path $parent 'caseRoot'
+        $filesystemIsCaseInsensitive = [IO.Directory]::Exists($caseVariantRoot)
+        $expectedComparison = if ($filesystemIsCaseInsensitive) {
+            [StringComparison]::OrdinalIgnoreCase
+        }
+        else {
+            [StringComparison]::Ordinal
+        }
         Get-PortablePathComparison -Paths @($root) -Purpose Exclusion | Should -Be $expectedComparison
-        Get-PortablePathComparison -Purpose Exclusion | Should -Be $expectedComparison
-        Get-PortablePathComparison | Should -Be $expectedComparison
+        { Get-PortablePathComparison -Purpose Exclusion } | Should -Throw '*existing directory ancestor*'
+        { Get-PortablePathComparison } | Should -Throw '*existing directory ancestor*'
         $expander = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Expand-Schema14Reference.ps1') -Raw
         $expander | Should -Match 'Get-PortablePathComparison -Paths @\(\$resolvedSkillRoot, \$resolvedOutputRoot\) -Purpose Exclusion'
-        $expander | Should -Not -Match '\[StringComparison\]::Ordinal\s*\r?\n\s*\}'
+        $expander | Should -Not -Match 'exclusion always ignores case'
     }
 
-    # Scenario: a case-insensitive volume exposes the Git worktree through a differently-cased prefix.
-    # Purpose: The Candidate Gate must request the conservative exclusion comparer before rejecting the workset path.
+    # Scenario: the current volume exposes a Git worktree path through a differently-cased prefix.
+    # Purpose: The Candidate Gate must request the filesystem-aware exclusion comparer before evaluating the workset path.
     It 'UnitT393_UsesExclusionComparisonForLocalizationWorksetBoundary' {
         $candidate = Get-Content -LiteralPath $validatorPath -Raw
         $candidate | Should -Match 'Get-PortablePathComparison -Paths @\(\$worktreeFull, \$worksetFull\) -Purpose Exclusion'
-        $worktreePrefix = ([IO.Path]::GetFullPath((Join-Path $TestDrive 'WorkTree')).TrimEnd(
+        Import-Module (Join-Path $skillRoot 'scripts/PathSafety.psm1') -Force
+        $worktree = Join-Path $TestDrive 'WorkTree'
+        [void][IO.Directory]::CreateDirectory($worktree)
+        $caseVariantWorktree = Join-Path $TestDrive 'worktree'
+        $filesystemIsCaseInsensitive = [IO.Directory]::Exists($caseVariantWorktree)
+        $worktreePrefix = ([IO.Path]::GetFullPath($worktree).TrimEnd(
                 [IO.Path]::DirectorySeparatorChar
             ) + [IO.Path]::DirectorySeparatorChar)
-        $caseAlias = [IO.Path]::GetFullPath((Join-Path $TestDrive 'worktree/review-artifacts/localization-workset.json'))
-        $caseAlias.StartsWith($worktreePrefix, [StringComparison]::Ordinal) | Should -BeFalse
-        $caseAlias.StartsWith($worktreePrefix, [StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
+        $caseAlias = [IO.Path]::GetFullPath((Join-Path $caseVariantWorktree 'review-artifacts/localization-workset.json'))
+        $comparison = Get-PortablePathComparison -Paths @($worktree, $caseAlias) -Purpose Exclusion
+        $caseAlias.StartsWith($worktreePrefix, $comparison) | Should -Be $filesystemIsCaseInsensitive
     }
 
     # Scenario: The runner's ancestor walk is executed without the PathSafety module, as the legacy harness extracts it.

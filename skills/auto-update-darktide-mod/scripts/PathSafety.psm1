@@ -4,6 +4,9 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:PortablePathComparisonByRoot = [Collections.Generic.Dictionary[string, StringComparison]]::new(
+    [StringComparer]::Ordinal
+)
 
 function Get-PortablePlatformName {
     [OutputType([string])]
@@ -27,10 +30,100 @@ function Get-PortablePathComparison {
         [ValidateSet('Containment', 'Exclusion')][string] $Purpose = 'Containment'
     )
 
-    if ((Get-PortablePlatformName) -ceq 'windows') {
-        return [StringComparison]::OrdinalIgnoreCase
+    $probeRoot = $null
+    foreach ($pathValue in @($Paths)) {
+        if ([string]::IsNullOrWhiteSpace($pathValue)) { continue }
+        $candidate = [IO.Path]::GetFullPath($pathValue)
+        if ([IO.File]::Exists($candidate)) {
+            $candidate = [IO.Path]::GetDirectoryName($candidate)
+        }
+        while (-not [IO.Directory]::Exists($candidate)) {
+            $parent = [IO.DirectoryInfo]::new($candidate).Parent
+            if ($null -eq $parent -or $parent.FullName.Equals($candidate, [StringComparison]::Ordinal)) { break }
+            $candidate = $parent.FullName
+        }
+        if ([IO.Directory]::Exists($candidate)) {
+            $probeRoot = [IO.Path]::GetFullPath($candidate)
+            break
+        }
     }
-    [StringComparison]::Ordinal
+    if ([string]::IsNullOrWhiteSpace($probeRoot)) {
+        throw [IO.DirectoryNotFoundException]::new('A filesystem-aware path comparison requires a path with an existing directory ancestor.')
+    }
+
+    $cached = [StringComparison]::Ordinal
+    if ($script:PortablePathComparisonByRoot.TryGetValue($probeRoot, [ref]$cached)) { return $cached }
+
+    $flipCase = {
+        param([Parameter(Mandatory)][AllowEmptyString()][string] $Leaf)
+
+        for ($index = 0; $index -lt $Leaf.Length; $index++) {
+            $character = [char]$Leaf[$index]
+            $lower = [char]::ToLowerInvariant($character)
+            $upper = [char]::ToUpperInvariant($character)
+            if ($lower -ceq $upper) { continue }
+            $replacement = if ($character -ceq $lower) { $upper } else { $lower }
+            return $Leaf.Substring(0, $index) + $replacement + $Leaf.Substring($index + 1)
+        }
+        $null
+    }
+
+    $probePath = $probeRoot
+    $probeIsDirectory = $true
+    $trimmedRoot = [IO.Path]::TrimEndingDirectorySeparator($probeRoot)
+    $probeLeaf = [IO.Path]::GetFileName($trimmedRoot)
+    $variantLeaf = & $flipCase $probeLeaf
+    if ([string]::IsNullOrEmpty($variantLeaf)) {
+        foreach ($entry in [IO.Directory]::GetFileSystemEntries($probeRoot)) {
+            $entryLeaf = [IO.Path]::GetFileName([IO.Path]::TrimEndingDirectorySeparator($entry))
+            $entryVariant = & $flipCase $entryLeaf
+            if ([string]::IsNullOrEmpty($entryVariant)) { continue }
+            $probePath = $entry
+            $probeIsDirectory = [IO.Directory]::Exists($entry)
+            $probeLeaf = $entryLeaf
+            $variantLeaf = $entryVariant
+            break
+        }
+    }
+
+    $temporaryProbe = $null
+    if ([string]::IsNullOrEmpty($variantLeaf)) {
+        $probeLeaf = ".portable-case-probe-$([guid]::NewGuid().ToString('N')).tmp"
+        $probePath = Join-Path $probeRoot $probeLeaf
+        $temporaryProbe = [IO.FileStream]::new(
+            $probePath,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::ReadWrite,
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete),
+            1,
+            [IO.FileOptions]::DeleteOnClose)
+        $probeIsDirectory = $false
+        $variantLeaf = & $flipCase $probeLeaf
+    }
+
+    try {
+        $probeParent = [IO.Path]::GetDirectoryName($probePath)
+        if ([string]::IsNullOrEmpty($probeParent)) { $probeParent = $probeRoot }
+        $variantPath = Join-Path $probeParent $variantLeaf
+        $caseInsensitive = if ($probeIsDirectory) {
+            [IO.Directory]::Exists($variantPath)
+        }
+        else {
+            [IO.File]::Exists($variantPath)
+        }
+    }
+    finally {
+        if ($null -ne $temporaryProbe) { $temporaryProbe.Dispose() }
+    }
+
+    $comparison = if ($caseInsensitive) {
+        [StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [StringComparison]::Ordinal
+    }
+    $script:PortablePathComparisonByRoot[$probeRoot] = $comparison
+    $comparison
 }
 
 function Resolve-PortableContainedPath {
@@ -42,7 +135,7 @@ function Resolve-PortableContainedPath {
 
     $rootFull = [IO.Path]::GetFullPath($Root)
     $rootPath = [IO.Path]::GetPathRoot($rootFull)
-    if (-not $rootFull.Equals($rootPath, (Get-PortablePathComparison))) {
+    if (-not $rootFull.Equals($rootPath, (Get-PortablePathComparison -Paths @($rootFull)))) {
         $rootFull = $rootFull.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     }
     $candidateFull = if ([string]::IsNullOrEmpty($Path)) {

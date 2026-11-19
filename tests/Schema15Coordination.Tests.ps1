@@ -328,7 +328,7 @@ $lease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LeasePath -NoNewli
         $receiptRecord = Get-Content -LiteralPath ([string]$receipt.path) -Raw | ConvertFrom-TestJson -AsHashtable
         [string]$newLease.staleEvidencePath | Should -Not -BeNullOrEmpty
         [string]$receiptRecord.staleEvidencePath | Should -Be ([string]$newLease.staleEvidencePath)
-        [string]$newLease.staleEvidencePath | Should -Match '[\\/]\.git-coordination\.lock\.stale-[0-9a-f]{64}\.json$'
+        [string]$newLease.staleEvidencePath | Should -Match '[\\/]\.source-acquisition\.lock\.stale-[0-9a-f]{64}\.json$'
         Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Leaf | Should -BeTrue
         [Convert]::ToHexString([IO.File]::ReadAllBytes([string]$newLease.staleEvidencePath)) |
             Should -BeExactly ([Convert]::ToHexString($staleOwnerBytes))

@@ -153,12 +153,19 @@ Describe 'Schema 15 source acquisition contract' {
         $start | Should -BeGreaterOrEqual 0
         $end | Should -BeGreaterThan $start
         $reservation = $runner.Substring($start, $end - $start)
+        $writerStart = $runner.IndexOf('function Write-ModReservationOwner')
+        $writerEnd = $runner.IndexOf('function Invoke-ModReservationFaultInjection', $writerStart)
+        $writerStart | Should -BeGreaterOrEqual 0
+        $writerEnd | Should -BeGreaterThan $writerStart
+        $ownerWriter = $runner.Substring($writerStart, $writerEnd - $writerStart)
 
         $reservation | Should -Match 'Get-ModReservationSnapshot'
         $reservation | Should -Match 'Write-ModReservationOwner\s+-ModLockPath\s+\(\[string\]\$Plan\.modLockPath\)'
         $reservation | Should -Not -Match '\$preparedLockPath'
-        $runner | Should -Match 'Publish-PortableLeaseFile'
-        $runner | Should -Match '-NoReplace:\(-not \$ownerExists\)'
+        $ownerWriter | Should -Match '(?s)NoReplace\s*=\s*-not \$ownerExists.*?Publish-PortableLeaseFile\s+@publishParameters'
+        $pathSafety = Get-Content -LiteralPath (Join-Path $scriptRoot 'PathSafety.psm1') -Raw
+        $pathSafety | Should -Match '(?s)\[IO\.File\]::Move\(\$temporary, \$target, -not \$NoReplace\)'
+        $pathSafety | Should -Match '(?s)if \(\$NoReplace -and \[IO\.File\]::Exists\(\$target\)\).*?no-replace-target-exists'
         $reservation | Should -Not -Match '\[IO\.Directory\]::Move'
         $reservation | Should -Not -Match 'New-Item\s+-ItemType\s+Directory\s+-Path\s+\(\[string\]\$Plan\.modLockPath\)'
     }
