@@ -135,22 +135,27 @@ function Get-TestRepositoryLayout {
     $root = [IO.Path]::GetFullPath($RepositoryRoot)
     $legacyCatalogPath = Join-Path $root 'catalog/skills-catalog.json'
     $legacySkillRoot = Join-Path $root '.agents/skills/auto-update-darktide-mod'
-    $standardSourcePath = Join-Path $root 'catalog/source.json'
-    $standardAdapterPath = Join-Path $root 'config/standard-v1.json'
-    $standardSkillRoot = Join-Path $root 'skills/auto-update-darktide-mod'
+    $sourcePath = Join-Path $root 'catalog/source.json'
+    $profilePath = Join-Path $root 'catalog/profiles.json'
+    $skillRoot = Join-Path $root 'skills/auto-update-darktide-mod'
+    $authorityPinPath = Join-Path $root 'config/authority-pin.json'
+    $consumerGatePath = Join-Path $root 'config/consumer-gate.json'
 
     $hasLegacyCatalog = Test-Path -LiteralPath $legacyCatalogPath -PathType Leaf
     $hasLegacySkill = Test-Path -LiteralPath $legacySkillRoot -PathType Container
-    $hasStandardSource = Test-Path -LiteralPath $standardSourcePath -PathType Leaf
-    $hasStandardAdapter = Test-Path -LiteralPath $standardAdapterPath -PathType Leaf
-    $hasStandardSkill = Test-Path -LiteralPath $standardSkillRoot -PathType Container
+    $hasSource = Test-Path -LiteralPath $sourcePath -PathType Leaf
+    $hasProfile = Test-Path -LiteralPath $profilePath -PathType Leaf
+    $hasSkill = Test-Path -LiteralPath $skillRoot -PathType Container
+    $hasAuthorityPin = Test-Path -LiteralPath $authorityPinPath -PathType Leaf
+    $hasConsumerGate = Test-Path -LiteralPath $consumerGatePath -PathType Leaf
     $hasLegacyMarker = $hasLegacyCatalog -or $hasLegacySkill
-    $hasStandardMarker = $hasStandardSource -or $hasStandardAdapter -or $hasStandardSkill
+    $hasSourceOwnedMarker = $hasSource -or $hasProfile -or $hasSkill
+    $hasConsumerMarker = $hasAuthorityPin -or $hasConsumerGate
 
-    if ($hasLegacyMarker -and $hasStandardMarker) {
-        throw 'Repository layout is mixed; legacy and Standard v1 source-owned structures cannot coexist.'
+    if ($hasLegacyMarker -and ($hasSourceOwnedMarker -or $hasConsumerMarker)) {
+        throw 'Repository layout is mixed; legacy and source-owned structures cannot coexist.'
     }
-    if ($hasLegacyCatalog -and $hasLegacySkill -and -not $hasStandardMarker) {
+    if ($hasLegacyCatalog -and $hasLegacySkill -and -not $hasSourceOwnedMarker -and -not $hasConsumerMarker) {
         return [pscustomobject][ordered]@{
             Name = 'legacy'
             SkillsRootRelative = '.agents/skills'
@@ -162,28 +167,31 @@ function Get-TestRepositoryLayout {
             ProfilePath = 'catalog/skills-catalog.json'
             SourcePath = $null
             AdapterPath = $null
-            WorkflowPath = '.github/workflows/standard-v1-candidate-windows.yml'
+            AuthorityPinPath = $null
+            ConsumerGatePath = $null
             QualityWorkflowPath = $null
         }
     }
-    if ($hasStandardSource -and $hasStandardAdapter -and $hasStandardSkill -and -not $hasLegacyMarker) {
+    if ($hasSource -and $hasProfile -and $hasSkill -and -not $hasLegacyMarker -and
+        $hasAuthorityPin -eq $hasConsumerGate) {
+        $layoutName = if ($hasAuthorityPin) { 'consumer' } else { 'standard-v1' }
         return [pscustomobject][ordered]@{
-            Name = 'standard-v1'
+            Name = $layoutName
             SkillsRootRelative = 'skills'
             SkillPath = 'skills/auto-update-darktide-mod'
             SkillsRoot = Join-Path $root 'skills'
-            SkillRoot = $standardSkillRoot
-            ScriptRoot = Join-Path $standardSkillRoot 'scripts'
+            SkillRoot = $skillRoot
+            ScriptRoot = Join-Path $skillRoot 'scripts'
             CatalogPath = 'catalog/profiles.json'
             ProfilePath = 'catalog/profiles.json'
             SourcePath = 'catalog/source.json'
-            AdapterPath = 'config/standard-v1.json'
-            WorkflowPath = '.github/workflows/standard-v1-candidate-windows.yml'
+            AuthorityPinPath = if ($hasAuthorityPin) { 'config/authority-pin.json' } else { $null }
+            ConsumerGatePath = if ($hasConsumerGate) { 'config/consumer-gate.json' } else { $null }
             QualityWorkflowPath = $null
         }
     }
 
-    throw 'Repository layout is incomplete or unauthorized; only the complete legacy or Standard v1 structure is accepted.'
+    throw 'Repository layout is incomplete or unauthorized; only a complete legacy, pre-conversion, or consumer structure is accepted.'
 }
 
 

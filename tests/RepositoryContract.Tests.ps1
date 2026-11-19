@@ -158,13 +158,8 @@ Describe 'Darktide Translate repository contract' {
             "$skillPrefix/scripts/Finalize-ModUpdateMerge.ps1",
             'docs/RELEASE.md',
             'docs/ROLLBACK.md',
-            'scripts/Get-SourcePin.ps1',
             'scripts/Test-CleanRepositoryHead.ps1',
-            '.github/workflows/standard-v1-candidate-windows.yml',
-            'scripts/Install-LatestPowerShell.ps1',
-            'scripts/PowerShellRelease.psm1',
-            'scripts/Test-Repository.ps1',
-            'scripts/Validate.ps1',
+            'scripts/Test-DarktideRepository.ps1',
             'tests/Invoke-Tests.ps1',
             'VERSION'
         )
@@ -177,11 +172,7 @@ Describe 'Darktide Translate repository contract' {
             $expectedPaths += @(
                 'catalog/source.json',
                 'catalog/profiles.json',
-                'config/standard-v1.json',
-                'scripts/Invoke-PrePushValidation.ps1',
-                'tests/CanonicalValidation.Tests.ps1',
-                'tests/StandardV1Conformance.Tests.ps1',
-                'tests/Test-Repository.Tests.ps1'
+                'tests/Test-DarktideRepository.Tests.ps1'
             )
         }
 
@@ -294,160 +285,31 @@ Describe 'Darktide Translate repository contract' {
         $userAgentMatches[0].Groups['version'].Value | Should -Be $version
     }
 
-    # Scenario: A legacy bootstrap snapshot validates the migration against its pinned central authority.
-    # Purpose: Prevent a migration from retaining a stale authority pin that rejects the candidate before validation.
-    It 'UnitT44_BindsTheBootstrapSupervisorToTheCurrentAuthoritySnapshot' {
-        if ($layout.Name -ceq 'legacy') {
-            $validator = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts/Validate.ps1') -Raw
-
-            $validator | Should -Match ([regex]::Escape("`$approvedAuthorityCommit = 'ead467c3488c103546f316d137196b447a1ff58a'"))
-            $validator | Should -Match ([regex]::Escape("`$approvedAuthorityArchiveSha256 = 'ab304bc6caabe4bb9b605f403c852650e19e25f72999010db61bbad695e1c60b'"))
-            $validator | Should -Not -Match ([regex]::Escape('d38eba3faf967504751aba759f38102e7538a519'))
-        }
-    }
-
-
-
-
-
-
-
-
-
-
 }
 
-Describe 'Trusted filesystem contract' {
+Describe 'Portable repository link fixtures' {
     BeforeAll {
-        $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
-        function New-TestFilesystemModule {
-            param([Parameter(Mandatory)][string] $RelativePath)
-            $tokens = $null
-            $errors = $null
-            $ast = [Management.Automation.Language.Parser]::ParseFile(
-                (Join-Path $script:RepositoryRoot $RelativePath), [ref]$tokens, [ref]$errors)
-            if (@($errors).Count -ne 0) { throw 'The production filesystem source must parse.' }
-            $names = @(
-                'Assert-RegularFileForHash', 'Assert-NoReparseAncestors', 'Test-PathEqual',
-                'Assert-InstalledClosureSafeRelativePath', 'Get-InstalledClosureAsciiCaseFold', 'Add-InstalledClosureEntry',
-                'Sort-InstalledClosureEntriesByOrdinalPath', 'Get-InstalledDirectoryClosureSha256'
-            )
-            $functions = @($ast.FindAll({
-                param($node)
-                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -cin $names
-            }, $true))
-            $source = ($functions | ForEach-Object {
-                $_.Extent.Text
-            }) -join "`n"
-            $module = New-Module -ScriptBlock ([scriptblock]::Create($source))
-            return $module
-        }
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+    }
 
-        $script:FilesystemModules = @{}
-        foreach ($relativePath in @('scripts/Validate.ps1', 'scripts/Test-Repository.ps1')) {
-            $script:FilesystemModules[$relativePath] = New-TestFilesystemModule -RelativePath $relativePath
+    if ([OperatingSystem]::IsWindows()) {
+        It 'InterT80W_CreatesANativeWindowsDirectoryLink' {
+            $target = Join-Path $TestDrive 'windows-target'
+            $link = Join-Path $TestDrive 'windows-link'
+            [void](New-Item -ItemType Directory -Path $target)
+            $item = New-TestReparsePoint -Path $link -Target $target
+            $item.LinkType | Should -Be 'Junction'
+            (Test-Path -LiteralPath $link -PathType Container) | Should -BeTrue
         }
     }
-
-    # Scenario: A closure contains names whose culture sort differs from the authority's Ordinal order.
-    # Purpose: Bind canonical UTF-8 path/hash bytes to the same digest as the approved resolver contract.
-    It 'InterT50_MatchesOrdinalCanonicalClosureDigest' {
-        $root = Join-Path $TestDrive 'closure'
-        [void](New-Item -ItemType Directory -Path $root)
-        $names = [string[]]@('a.txt', 'Z.txt', 'é.txt', '中.txt')
-        foreach ($name in $names) {
-            [IO.File]::WriteAllText((Join-Path $root $name), "content:$name", [Text.UTF8Encoding]::new($false))
+    else {
+        It 'InterT80U_CreatesANativeUnixDirectoryLink' {
+            $target = Join-Path $TestDrive 'unix-target'
+            $link = Join-Path $TestDrive 'unix-link'
+            [void](New-Item -ItemType Directory -Path $target)
+            $item = New-TestReparsePoint -Path $link -Target $target
+            $item.LinkType | Should -Be 'SymbolicLink'
+            (Test-Path -LiteralPath $link -PathType Container) | Should -BeTrue
         }
-        [Array]::Sort($names, [StringComparer]::Ordinal)
-        $canonical = ($names | ForEach-Object {
-            $hash = (Get-FileHash -LiteralPath (Join-Path $root $_) -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$_`t$hash`n"
-        }) -join ''
-        $sha = [Security.Cryptography.SHA256]::Create()
-        try { $expected = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))) -replace '-', '').ToLowerInvariant() }
-        finally { $sha.Dispose() }
-        $actual = & $script:FilesystemModules['scripts/Validate.ps1'] {
-            param($path)
-            Get-InstalledDirectoryClosureSha256 -Path $path -Context 'Authority closure fixture'
-        } $root
-        $actual | Should -BeExactly $expected
-    }
-
-    # Scenario: A closure entry repeats a path or collides after authority normalization.
-    # Purpose: Preserve duplicate, Unicode NFC, ASCII case and unsafe-path rejection before sorting.
-    It 'UnitT60_RejectsInvalidClosureIdentity_<Case>' -ForEach @(
-        @{ Case = 'duplicate'; Paths = @('same', 'same'); Error = '*duplicate path*' }
-        @{ Case = 'unicode'; Paths = @('é', "e$([char]0x301)"); Error = '*Unicode-normalization-colliding*' }
-        @{ Case = 'ascii-case'; Paths = @('A.txt', 'a.txt'); Error = '*ASCII-case-colliding*' }
-        @{ Case = 'parent'; Paths = @('../outside'); Error = '*unsafe relative path*' }
-        @{ Case = 'separator'; Paths = @('folder\file'); Error = '*unsafe relative path*' }
-    ) {
-        { & $script:FilesystemModules['scripts/Validate.ps1'] {
-            param($paths)
-            $entries = [Collections.Generic.List[object]]::new()
-            $ordinal = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            $nfc = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
-            $ascii = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
-            foreach ($path in $paths) {
-                Add-InstalledClosureEntry -Entries $entries -OrdinalPaths $ordinal -NfcPaths $nfc -AsciiCasePaths $ascii `
-                    -Entry ([pscustomobject]@{ path = $path; sha256 = ('a' * 64) }) -Context 'Closure fixture'
-            }
-        } $Paths } | Should -Throw $Error
-    }
-
-    # Scenario: Installed file bytes change after a closure receipt is created.
-    # Purpose: Ensure content tampering changes the digest even when paths remain identical.
-    It 'InterT70_DetectsContentTampering' {
-        $root = Join-Path $TestDrive 'tamper-closure'
-        [void](New-Item -ItemType Directory -Path $root)
-        $path = Join-Path $root 'payload.txt'
-        [IO.File]::WriteAllText($path, 'before')
-        $before = & $script:FilesystemModules['scripts/Validate.ps1'] {
-            param($root)
-            Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Tamper fixture'
-        } $root
-        [IO.File]::WriteAllText($path, 'after')
-        $after = & $script:FilesystemModules['scripts/Validate.ps1'] {
-            param($root)
-            Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Tamper fixture'
-        } $root
-        $after | Should -Not -Be $before
-    }
-
-    # Scenario: A Windows installed closure contains a junction.
-    # Purpose: Reject reparse points before their contents can enter a trusted closure digest.
-    It 'InterT80_RejectsWindowsReparsePointsInInstalledClosures' {
-        $root = Join-Path $TestDrive 'linked-closure'
-        $target = Join-Path $root 'target'
-        [void](New-Item -ItemType Directory -Path $target -Force)
-        [IO.File]::WriteAllText((Join-Path $target 'payload'), 'fixture')
-        $link = Join-Path $root 'link'
-        [void](New-Item -ItemType Junction -Path $link -Target $target)
-        { & $script:FilesystemModules['scripts/Validate.ps1'] {
-            param($root)
-            Get-InstalledDirectoryClosureSha256 -Path $root -Context 'Windows reparse fixture'
-        } $root } | Should -Throw '*reparse*'
-    }
-
-    # Scenario: A large closure must be sorted while preserving its independently computed canonical bytes.
-    # Purpose: Prevent reintroducing quadratic insertion ordering or silently changing the Ordinal digest input.
-    It 'UnitT90_PreservesLargeClosureCanonicalBytesWithinABoundedSort' {
-        $entries = @(15278..0 | ForEach-Object {
-            [pscustomobject]@{ path = ('entry/{0:D5}' -f $_); sha256 = ('a' * 64) }
-        })
-        $timer = [Diagnostics.Stopwatch]::StartNew()
-        $actual = & $script:FilesystemModules['scripts/Validate.ps1'] {
-            param($entries)
-            (Sort-InstalledClosureEntriesByOrdinalPath -Entries $entries).ToArray()
-        } $entries
-        $timer.Stop()
-        $actual.Count | Should -Be 15279
-        $expectedPaths = [string[]]@($entries | ForEach-Object path)
-        [Array]::Sort($expectedPaths, [StringComparer]::Ordinal)
-        $actualCanonical = ($actual | ForEach-Object { "$($_.path)`t$($_.sha256)`n" }) -join ''
-        $expectedCanonical = ($expectedPaths | ForEach-Object { "$_`t$('a' * 64)`n" }) -join ''
-        $actualCanonical | Should -BeExactly $expectedCanonical
-        $timer.Elapsed.TotalSeconds | Should -BeLessThan 10
-        Write-Host "Ordinal ordering: 15279 entries in $($timer.Elapsed.TotalMilliseconds) ms; canonical bytes equal."
     }
 }

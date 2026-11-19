@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 SyuanTsai
+# SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 Describe 'Darktide Translate Standard v1 repository contract' {
     BeforeAll {
@@ -242,67 +242,6 @@ Describe 'Darktide Translate Standard v1 repository contract' {
         & $script:GitPath -C $script:FixtureRoot add -- skills/$($script:SkillId)/SKILL.md
         if ($LASTEXITCODE -ne 0) { throw 'Could not stage the optional allowed-tools fixture.' }
         { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw
-    }
-
-    It 'rejects profile membership drift in the product-local catalog' {
-        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
-        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-        $catalog.profiles[0].includes = @('unlisted-skill')
-        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
-        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*profile identity or membership*'
-    }
-
-    It 'rejects a non-Boolean product-local profile default' {
-        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
-        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-        $catalog.profiles[0].default = 0
-        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
-        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*profile identity or membership*'
-    }
-
-    It 'rejects a product-local profile source path that leaves the canonical source package' {
-        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
-        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-        $catalog.skills[0].source.path = 'skills/other-skill'
-        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
-        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*source binding*'
-    }
-
-    It 'rejects an inactive product-local Skill lifecycle' {
-        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
-        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-        $catalog.skills[0].lifecycle.status = 'retired'
-        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
-        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*lifecycle*'
-    }
-
-    It 'rejects a changed required capability in the product-local catalog' {
-        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
-        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-        $catalog.skills[0].compatibility.requiredCapabilities[0].state = 'missing'
-        $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $profilePath -Encoding utf8NoBOM -NoNewline
-        { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*required capability*'
-    }
-
-    # Scenario: Each alternative capability field changes only its case, or stays canonical.
-    # Purpose: Exercise the real repository validator so case-only contract drift cannot pass.
-    It 'InterT30_ProfileAlternativeCapabilityCase_<scenario>' -ForEach @(
-        @{ scenario = 'canonical'; alternativeIndex = 0; field = ''; value = '' },
-        @{ scenario = 'connector-kind'; alternativeIndex = 0; field = 'kind'; value = 'Connector' },
-        @{ scenario = 'connector-id'; alternativeIndex = 0; field = 'id'; value = 'GitHub' },
-        @{ scenario = 'connector-state'; alternativeIndex = 0; field = 'state'; value = 'Configured' },
-        @{ scenario = 'command-kind'; alternativeIndex = 1; field = 'kind'; value = 'Command' },
-        @{ scenario = 'command-id'; alternativeIndex = 1; field = 'id'; value = 'GH' },
-        @{ scenario = 'command-state'; alternativeIndex = 1; field = 'state'; value = 'Authenticated' }
-    ) {
-        $profilePath = Join-Path $script:FixtureRoot 'catalog/profiles.json'
-        $catalog = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-        if ($field) { $catalog.skills[0].compatibility.anyOfCapabilities[$alternativeIndex].$field = $value }
-        [IO.File]::WriteAllText($profilePath, ($catalog | ConvertTo-Json -Depth 30), [Text.UTF8Encoding]::new($false))
-        if ($field) {
-            { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Throw '*alternative capability contract*'
-        }
-        else { { & $script:ValidatorPath -RepositoryRoot $script:FixtureRoot } | Should -Not -Throw }
     }
 
     It 'rejects malformed optional OpenAI interface fields' {

@@ -3418,9 +3418,15 @@ finally {
                 else {
                     $stderrText.Substring(0, 4096) + '...[truncated]'
                 }
-                throw "$Context exited with code $exitCode. STDERR (bounded to 4096 characters):`n$boundedStandardError"
+                $failure = [InvalidOperationException]::new(
+                    "$Context exited with code $exitCode. STDERR (bounded to 4096 characters):`n$boundedStandardError")
+                $failure.Data['NativeExitCode'] = [int]$exitCode
+                throw $failure
             }
-            throw "$Context exited with code $exitCode.`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText"
+            $failure = [InvalidOperationException]::new(
+                "$Context exited with code $exitCode.`nSTDOUT:`n$stdoutText`nSTDERR:`n$stderrText")
+            $failure.Data['NativeExitCode'] = [int]$exitCode
+            throw $failure
         }
         return $stdoutText
     }
@@ -3463,22 +3469,210 @@ finally {
     }
 }
 
+function Get-SkillSpectorStreamFingerprint {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    return [pscustomobject][ordered]@{
+        byteCount = $bytes.Length
+        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    }
+}
+
+function New-SkillSpectorExecutionException {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('invalid-json-report', 'invalid-exit-one-report', 'nonzero-exit')]
+        [string] $ErrorType,
+        [Parameter(Mandatory = $true)][int] $ExitCode,
+        [Parameter(Mandatory = $true)][string] $ReportPath,
+        [Parameter(Mandatory = $true)][string] $StandardErrorPath
+    )
+    $standardOutput = Get-SkillSpectorStreamFingerprint -Path $ReportPath
+    $standardError = Get-SkillSpectorStreamFingerprint -Path $StandardErrorPath
+    $failure = [InvalidOperationException]::new(
+        "SkillSpector execution error: errorType=$ErrorType; exitCode=$ExitCode; " +
+        "stdoutBytes=$($standardOutput.byteCount); stdoutSha256=$($standardOutput.sha256); " +
+        "stderrBytes=$($standardError.byteCount); stderrSha256=$($standardError.sha256)")
+    $failure.Data['NativeExitCode'] = $ExitCode
+    $failure.Data['SkillSpectorErrorType'] = $ErrorType
+    return $failure
+}
+
 function Read-SkillSpectorJsonReport {
     param(
         [Parameter(Mandatory = $true)][string] $ReportPath,
         [Parameter(Mandatory = $true)][string] $StandardErrorPath,
-        [Parameter(Mandatory = $true)][string] $Context
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter(Mandatory = $true)][int] $ExitCode
     )
     try {
         return Read-JsonFile -Path $ReportPath -Context "$Context report"
     }
     catch {
-        $standardError = [IO.File]::ReadAllText($StandardErrorPath, [Text.UTF8Encoding]::new($false, $true))
-        if ($standardError.Length -gt 4096) {
-            $standardError = $standardError.Substring(0, 4096) + '...[truncated]'
-        }
-        throw "$($_.Exception.Message) STDERR (bounded to 4096 characters):`n$standardError"
+        throw (New-SkillSpectorExecutionException -ErrorType 'invalid-json-report' -ExitCode $ExitCode `
+            -ReportPath $ReportPath -StandardErrorPath $StandardErrorPath)
     }
+}
+
+function ConvertTo-BoundedSkillSpectorDiagnosticText {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $Value,
+        [Parameter()][ValidateRange(1, 512)][int] $MaximumLength = 256
+    )
+    $safe = [regex]::Replace($Value, '[\x00-\x1f\x7f]+', ' ')
+    $safe = [regex]::Replace($safe, '\s+', ' ').Trim()
+    if ($safe.Length -gt $MaximumLength) {
+        $safe = $safe.Substring(0, $MaximumLength) + '...[truncated]'
+    }
+    return $safe
+}
+
+function Get-SkillSpectorExitOneSummary {
+    param(
+        [Parameter(Mandatory = $true)] $Report,
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter(Mandatory = $true)][string[]] $ExpectedInventoryPaths
+    )
+    if ($Report -isnot [pscustomobject]) {
+        throw "$Context report root must be a JSON object."
+    }
+    $issues = Get-RequiredProperty -Object $Report -Name 'issues' -Context "$Context report"
+    $completeness = Get-RequiredProperty -Object $Report -Name 'analysis_completeness' -Context "$Context report"
+    $risk = Get-RequiredProperty -Object $Report -Name 'risk_assessment' -Context "$Context report"
+    if ($issues -isnot [array] -or $completeness -isnot [pscustomobject] -or $risk -isnot [pscustomobject]) {
+        throw "$Context report does not contain valid findings, completeness, and risk objects."
+    }
+
+    $numericTypes = @(
+        [byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64],
+        [single], [double], [decimal]
+    )
+    $coverage = Get-RequiredProperty -Object $completeness -Name 'coverage_percent' -Context "$Context completeness"
+    $riskScore = Get-RequiredProperty -Object $risk -Name 'score' -Context "$Context risk assessment"
+    $coverageIsNumeric = $false
+    $riskIsNumeric = $false
+    foreach ($type in $numericTypes) {
+        if ($coverage -is $type) { $coverageIsNumeric = $true }
+        if ($riskScore -is $type) { $riskIsNumeric = $true }
+    }
+    if (-not $coverageIsNumeric -or -not $riskIsNumeric) {
+        throw "$Context report contains a non-numeric completeness percentage or risk score."
+    }
+
+    $inventoryPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($inventoryPath in $ExpectedInventoryPaths) {
+        if ([string]::IsNullOrEmpty($inventoryPath) -or -not $inventoryPaths.Add($inventoryPath)) {
+            throw "$Context candidate Skill inventory is invalid."
+        }
+    }
+
+    $ledger = Get-RequiredProperty -Object $completeness -Name 'ledger_exceptions' -Context "$Context completeness"
+    if ($ledger -isnot [array]) { throw "$Context completeness ledger must be an array." }
+    $partialPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $partialCount = 0
+    foreach ($entry in @($ledger)) {
+        if ($entry -isnot [pscustomobject]) { throw "$Context completeness ledger contains an invalid entry." }
+        $outcome = Get-RequiredProperty -Object $entry -Name 'outcome' -Context "$Context completeness ledger entry"
+        $path = Get-RequiredProperty -Object $entry -Name 'path' -Context "$Context completeness ledger entry"
+        if ($outcome -isnot [string] -or $path -isnot [string]) {
+            throw "$Context completeness ledger contains an invalid outcome or path."
+        }
+        if ($outcome -ceq 'partial') {
+            $partialCount++
+            if ($inventoryPaths.Contains($path)) { [void]$partialPaths.Add($path) }
+        }
+    }
+
+    $safeContext = ConvertTo-BoundedSkillSpectorDiagnosticText -Value $Context -MaximumLength 128
+    $safeCoverage = [Convert]::ToString($coverage, [Globalization.CultureInfo]::InvariantCulture)
+    $safeRiskScore = [Convert]::ToString($riskScore, [Globalization.CultureInfo]::InvariantCulture)
+    # SkillSpector 2.13.4 deterministic rule identifiers. Semantic identifiers
+    # containing punctuation are intentionally not echoed into validation logs.
+    $knownRuleIds = @(
+        'AE1', 'AE2', 'AE3', 'AE4', 'AE5', 'AE6', 'AE7',
+        'AR1', 'AR2', 'AR3',
+        'AS1', 'AS2', 'AS3',
+        'AST1', 'AST2', 'AST3', 'AST4', 'AST5', 'AST6', 'AST7', 'AST8', 'AST9', 'AST10',
+        'BH1', 'BH2', 'BH3', 'BH4',
+        'DS1', 'DS2', 'DS3', 'DS4',
+        'E1', 'E2', 'E3', 'E4', 'E5',
+        'EA1', 'EA2', 'EA3', 'EA4', 'EA5',
+        'LP1', 'LP2', 'LP3', 'LP4',
+        'MP1', 'MP2', 'MP3',
+        'OH1', 'OH2', 'OH3',
+        'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9',
+        'PE1', 'PE2', 'PE3', 'PE4', 'PE5',
+        'RA1', 'RA2',
+        'RP1', 'RP2', 'RP3',
+        'SC1', 'SC2', 'SC3', 'SC4', 'SC5', 'SC6', 'SC7', 'SC8', 'SC9', 'SC10',
+        'SSRF1', 'SSRF2', 'SSRF3',
+        'TM1', 'TM2', 'TM3', 'TM4',
+        'TP1', 'TP2', 'TP3', 'TP4',
+        'TR1', 'TR2', 'TR3',
+        'TT1', 'TT2', 'TT3', 'TT4', 'TT5', 'TT6',
+        'YR1', 'YR2', 'YR3', 'YR4'
+    )
+    $knownSeverities = @('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')
+    $lines = [Collections.Generic.List[string]]::new()
+    [void]$lines.Add(
+        "SkillSpector exit 1 report summary for ${safeContext}: findings=$(@($issues).Count); " +
+        "completeness=$safeCoverage%; partialFiles=$partialCount; riskScore=$safeRiskScore")
+    $findingLimit = [Math]::Min(@($issues).Count, 16)
+    for ($index = 0; $index -lt $findingLimit; $index++) {
+        $issue = @($issues)[$index]
+        if ($issue -isnot [pscustomobject]) { throw "$Context report contains an invalid finding." }
+        $rule = Get-RequiredProperty -Object $issue -Name 'id' -Context "$Context finding"
+        $severity = Get-RequiredProperty -Object $issue -Name 'severity' -Context "$Context finding"
+        $location = Get-RequiredProperty -Object $issue -Name 'location' -Context "$Context finding"
+        $finding = Get-RequiredProperty -Object $issue -Name 'finding' -Context "$Context finding"
+        if ($rule -isnot [string] -or $severity -isnot [string] -or
+            $location -isnot [pscustomobject] -or $finding -isnot [string]) {
+            throw "$Context report contains an invalid finding summary."
+        }
+        $file = Get-RequiredProperty -Object $location -Name 'file' -Context "$Context finding location"
+        $line = Get-RequiredProperty -Object $location -Name 'start_line' -Context "$Context finding location"
+        $lineIsInteger = $line -is [byte] -or $line -is [sbyte] -or
+            $line -is [int16] -or $line -is [uint16] -or
+            $line -is [int32] -or $line -is [uint32] -or
+            $line -is [int64] -or $line -is [uint64]
+        if ($file -isnot [string] -or -not $lineIsInteger) {
+            throw "$Context report contains an invalid finding file or line."
+        }
+        $safeRule = if ($knownRuleIds -ccontains $rule) { $rule } else { '<unrecognized>' }
+        $safeSeverity = if ($knownSeverities -ccontains $severity) { $severity } else { '<unrecognized>' }
+        $safeFile = if ($inventoryPaths.Contains($file)) { $file } else { '<unknown-file>' }
+        $safeLine = [Convert]::ToString($line, [Globalization.CultureInfo]::InvariantCulture)
+        [void]$lines.Add("finding[$index]: rule=$safeRule; severity=$safeSeverity; file=${safeFile}:$safeLine")
+    }
+    if (@($issues).Count -gt $findingLimit) {
+        [void]$lines.Add("findingsTruncated=$(@($issues).Count - $findingLimit)")
+    }
+    $boundedPartialPaths = @($partialPaths | Sort-Object -CaseSensitive | Select-Object -First 16)
+    [void]$lines.Add("partialFileList=$($boundedPartialPaths -join ', ')")
+    if ($partialPaths.Count -gt $boundedPartialPaths.Count) {
+        [void]$lines.Add("partialFilesTruncated=$($partialPaths.Count - $boundedPartialPaths.Count)")
+    }
+    $summary = $lines -join [Environment]::NewLine
+    if ($summary.Length -gt 8192) {
+        $truncationMarker = '...[truncated]'
+        return $summary.Substring(0, 8192 - $truncationMarker.Length) + $truncationMarker
+    }
+    return $summary
+}
+
+function Assert-SkillSpectorScanExitCode {
+    param(
+        [Parameter(Mandatory = $true)][int] $ExitCode,
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter()][AllowEmptyString()][string] $ExitOneSummary = ''
+    )
+    if ($ExitCode -eq 0) { return }
+    if ($ExitCode -ne 1 -or [string]::IsNullOrWhiteSpace($ExitOneSummary)) {
+        throw "$Context returned an unsupported scanner outcome after report evaluation."
+    }
+    throw "$Context exited with code 1 after its report was evaluated by the existing completeness and security gates.`n$ExitOneSummary"
 }
 
 function Invoke-SkillSpectorScan {
@@ -3490,27 +3684,57 @@ function Invoke-SkillSpectorScan {
         [Parameter(Mandatory = $true)][string] $Context,
         [Parameter(Mandatory = $true)][string] $DiagnosticRoot,
         [Parameter(Mandatory = $true)][string] $ChildWritableRoot,
+        [Parameter(Mandatory = $true)][string[]] $ExpectedInventoryPaths,
         [Parameter()][AllowNull()][Collections.IDictionary] $AdditionalEnvironmentVariables,
-        [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline'
+        [Parameter()][ValidateSet('Offline', 'TrustedSemantic')][string] $NetworkProfile = 'Offline',
+        [Parameter()][AllowNull()][ref] $ExitCodeResult,
+        [Parameter()][AllowNull()][ref] $ExitOneSummaryResult
     )
     if ($Arguments -ccontains '--output') {
         throw "$Context must omit SkillSpector --output and capture stdout instead."
     }
-    [void](Invoke-NativeChecked `
-        -Command $Command `
-        -Arguments $Arguments `
-        -Context $Context `
-        -DiagnosticRoot $DiagnosticRoot `
-        -ChildWritableRoot $ChildWritableRoot `
-        -AdditionalEnvironmentVariables $AdditionalEnvironmentVariables `
-        -IsolateRunnerCommandFiles `
-        -TerminateProcessTree `
-        -ProtectRunnerCommandFiles `
-        -NetworkProfile $NetworkProfile `
-        -StandardOutputPath $ReportPath `
-        -StandardErrorPath $StandardErrorPath)
-    return Read-SkillSpectorJsonReport -ReportPath $ReportPath `
-        -StandardErrorPath $StandardErrorPath -Context $Context
+    $exitCode = 0
+    try {
+        [void](Invoke-NativeChecked `
+            -Command $Command `
+            -Arguments $Arguments `
+            -Context $Context `
+            -DiagnosticRoot $DiagnosticRoot `
+            -ChildWritableRoot $ChildWritableRoot `
+            -AdditionalEnvironmentVariables $AdditionalEnvironmentVariables `
+            -IsolateRunnerCommandFiles `
+            -TerminateProcessTree `
+            -ProtectRunnerCommandFiles `
+            -NetworkProfile $NetworkProfile `
+            -StandardOutputPath $ReportPath `
+            -StandardErrorPath $StandardErrorPath)
+    }
+    catch {
+        $nativeExitCode = $_.Exception.Data['NativeExitCode']
+        if ($nativeExitCode -isnot [int]) { throw }
+        $exitCode = [int]$nativeExitCode
+        if ($exitCode -ne 1) {
+            throw (New-SkillSpectorExecutionException -ErrorType 'nonzero-exit' -ExitCode $exitCode `
+                -ReportPath $ReportPath -StandardErrorPath $StandardErrorPath)
+        }
+    }
+    $report = Read-SkillSpectorJsonReport -ReportPath $ReportPath `
+        -StandardErrorPath $StandardErrorPath -Context $Context -ExitCode $exitCode
+    $summary = ''
+    if ($exitCode -eq 1) {
+        try {
+            $summary = Get-SkillSpectorExitOneSummary -Report $report -Context $Context `
+                -ExpectedInventoryPaths $ExpectedInventoryPaths
+        }
+        catch {
+            throw (New-SkillSpectorExecutionException -ErrorType 'invalid-exit-one-report' -ExitCode $exitCode `
+                -ReportPath $ReportPath -StandardErrorPath $StandardErrorPath)
+        }
+        Write-Host $summary
+    }
+    if ($null -ne $ExitCodeResult) { $ExitCodeResult.Value = $exitCode }
+    if ($null -ne $ExitOneSummaryResult) { $ExitOneSummaryResult.Value = $summary }
+    return $report
 }
 
 function Test-SecurityRelevantSkillChange {
@@ -4432,14 +4656,24 @@ foreach ($skillId in $skillIds) {
     $reportPath = Join-Path $childOutputRoot "skillspector-static-$skillId.json"
     $standardErrorPath = Join-Path $childOutputRoot "skillspector-static-$skillId.stderr.txt"
     $skillSpectorArguments = @('scan', $skillRoot, '--no-llm', '--format', 'json')
+    $skillSpectorExitCode = 0
+    $skillSpectorExitOneSummary = ''
     $report = Invoke-SkillSpectorScan -Command $skillSpectorPath -Arguments $skillSpectorArguments `
         -ReportPath $reportPath -StandardErrorPath $standardErrorPath `
         -Context "SkillSpector static scan for $skillId" -DiagnosticRoot $runRoot `
-        -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $skillSpectorRuntimeEnvironment
-    $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId `
-        -ExpectedInventoryPaths $expectedInventoryPaths -CandidateCommit $candidateCommit `
-        -ScannerVersion ([string]$receipts.skillspector.resolvedVersion) `
-        -InventorySha256 ([string]$skillIntegrity[0].contentSha256))
+        -ChildWritableRoot $childOutputRoot -ExpectedInventoryPaths $expectedInventoryPaths `
+        -AdditionalEnvironmentVariables $skillSpectorRuntimeEnvironment `
+        -ExitCodeResult ([ref]$skillSpectorExitCode) -ExitOneSummaryResult ([ref]$skillSpectorExitOneSummary)
+    try {
+        $issues = @(Assert-SkillSpectorReport -Report $report -SkillRoot $skillRoot -SkillId $skillId `
+            -ExpectedInventoryPaths $expectedInventoryPaths -CandidateCommit $candidateCommit `
+            -ScannerVersion ([string]$receipts.skillspector.resolvedVersion) `
+            -InventorySha256 ([string]$skillIntegrity[0].contentSha256))
+    }
+    catch {
+        if ($skillSpectorExitCode -eq 1) { throw "$skillSpectorExitOneSummary`n$($_.Exception.Message)" }
+        throw
+    }
     foreach ($issue in $issues) {
         $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector issue'
         if ($reportedSeverity -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedSeverity)) {
@@ -4461,6 +4695,8 @@ foreach ($skillId in $skillIds) {
         }
     }
     $staticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($reportPath); standardError = [IO.Path]::GetFileName($standardErrorPath); arguments = @($skillSpectorArguments); findings = $issues.Count; files = $expectedInventoryPaths.Count }
+    Assert-SkillSpectorScanExitCode -ExitCode $skillSpectorExitCode `
+        -Context "SkillSpector static scan for $skillId" -ExitOneSummary $skillSpectorExitOneSummary
 }
 
 $securityPreflightPath = Join-Path $runRoot 'security-preflight.json'
@@ -4618,16 +4854,21 @@ if ($semanticTriggered) {
             $semanticEnvironment[$name] = [string]$skillSpectorRuntimeEnvironment[$name]
         }
         $semanticArguments = @('scan', $skillRoot, '--format', 'json')
+        $semanticExitCode = 0
+        $semanticExitOneSummary = ''
         $semanticReport = Invoke-SkillSpectorScan -Command $skillSpectorPath -Arguments $semanticArguments `
             -ReportPath $semanticPath -StandardErrorPath $semanticStandardErrorPath `
             -Context "SkillSpector semantic scan for $skillId" -DiagnosticRoot $runRoot `
-            -ChildWritableRoot $childOutputRoot -AdditionalEnvironmentVariables $semanticEnvironment `
-            -NetworkProfile TrustedSemantic
+            -ChildWritableRoot $childOutputRoot -ExpectedInventoryPaths $expectedInventoryPaths `
+            -AdditionalEnvironmentVariables $semanticEnvironment `
+            -NetworkProfile TrustedSemantic -ExitCodeResult ([ref]$semanticExitCode) `
+            -ExitOneSummaryResult ([ref]$semanticExitOneSummary)
         try {
             $semanticIssues = @(Assert-SkillSpectorReport -Report $semanticReport -SkillRoot $skillRoot -SkillId $skillId -ExpectedInventoryPaths $expectedInventoryPaths)
         }
         catch {
-            throw "Triggered SkillSpector semantic scan did not complete for '$skillId': $($_.Exception.Message)"
+            $diagnostic = if ($semanticExitCode -eq 1) { "$semanticExitOneSummary`n" } else { '' }
+            throw "${diagnostic}Triggered SkillSpector semantic scan did not complete for '$skillId': $($_.Exception.Message)"
         }
         foreach ($issue in $semanticIssues) {
             $reportedSeverity = Get-RequiredProperty -Object $issue -Name 'severity' -Context 'SkillSpector semantic issue'
@@ -4643,6 +4884,8 @@ if ($semanticTriggered) {
                 default { throw "Central validation/security gate returned unsupported action '$($finding.action)'." }
             }
         }
+        Assert-SkillSpectorScanExitCode -ExitCode $semanticExitCode `
+            -Context "SkillSpector semantic scan for $skillId" -ExitOneSummary $semanticExitOneSummary
         $semanticReports += [pscustomobject][ordered]@{ skillId = $skillId; report = [IO.Path]::GetFileName($semanticPath); standardError = [IO.Path]::GetFileName($semanticStandardErrorPath); arguments = @($semanticArguments); findings = $semanticIssues.Count }
     }
 }
