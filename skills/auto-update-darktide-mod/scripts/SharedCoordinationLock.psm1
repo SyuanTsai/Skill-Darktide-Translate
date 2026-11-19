@@ -719,6 +719,13 @@ function Enter-SharedCoordinationLease {
         $guard = Enter-CoordinationOwnerGuard -LockRoot $lockRoot -ResourceKey $ResourceKey
         try {
             $snapshot = Get-CoordinationLeaseSnapshot -LockRoot $lockRoot -ResourceKey $ResourceKey
+            if (-not [bool]$snapshot.exists) {
+                $transactionResidue = Get-PortableTransactionResidue -LockRoot $lockRoot
+                if ([bool]$transactionResidue.hasResidue) {
+                    throw [IO.InvalidDataException]::new(
+                        "BLOCKED: incomplete owner publication residue exists under 'AI Auto Update/In Progress/.locks/.ai-instructions-txn' ($(@($transactionResidue.entries) -join ', ')). Follow 'Manual recovery for incomplete owner publication' in references/automation.md.")
+                }
+            }
             if ([bool]$snapshot.exists) {
                 $existing = $snapshot.value
                 Assert-CoordinationOwner -Owner $existing -ResourceKey $ResourceKey

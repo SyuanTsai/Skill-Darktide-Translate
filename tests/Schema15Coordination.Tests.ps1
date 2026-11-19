@@ -847,3 +847,161 @@ $null = Exit-SharedCoordinationLease -Lease $lease
         finally { $null = Exit-SharedCoordinationLease -Lease $second }
     }
 }
+
+Describe 'Incomplete owner publication transaction residue guard' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+        $layout = Get-TestRepositoryLayout -RepositoryRoot $repoRoot
+        $skillRoot = $layout.SkillRoot
+        $scriptRoot = Join-Path $skillRoot 'scripts'
+        $runnerPath = Join-Path $scriptRoot 'mod-update.ps1'
+        $coordinationModule = Join-Path $scriptRoot 'SharedCoordinationLock.psm1'
+        $pathSafetyModule = Join-Path $scriptRoot 'PathSafety.psm1'
+
+        function New-ModReservationGuardModuleForTest {
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+            if (@($parseErrors).Count -ne 0) { throw 'The MOD runner does not parse.' }
+            $names = @(
+                'Assert-NoReparsePath', 'Get-ModReservationOwnerPath', 'Get-ModReservationSnapshot',
+                'Read-ModReservationOwner', 'Write-ModReservationOwner', 'Assert-ReleasedModReservationOwnerReusable',
+                'Enter-ModReservation'
+            )
+            $functionSource = @($ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
+            }, $true)).Extent.Text -join "`n"
+            New-Module -ArgumentList $functionSource, $pathSafetyModule -ScriptBlock {
+                param($source, $pathSafetyPath)
+                Import-Module -Name $pathSafetyPath -Force
+                function Get-CurrentProcessIdentity {
+                    [ordered]@{ machineName = 'guard-test'; processId = 42; processStartTicks = 43 }
+                }
+                function Get-ModReservationActorToken { param($Value) 'a' * 32 }
+                function Test-ReservationLeaseMatchesOwner { param($Lease, $Owner) $false }
+                function Get-UtcTimestamp { [DateTimeOffset]::UtcNow.ToString('o') }
+                . ([scriptblock]::Create($source))
+            }
+        }
+    }
+
+    # Scenario: Shared-owner replacement crashed after displacing owner.lock but before publishing the stage file.
+    # Purpose: Block a new shared acquisition without publishing an owner or changing the transaction namespace.
+    It 'InterT399_BlocksSharedAcquireWhenPreviousOwnerResidueExistsWithoutOwner' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'shared-previous-residue'
+        [void][IO.Directory]::CreateDirectory($repository)
+        $first = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' -RunId 'guard-first'
+        $lockRoot = Split-Path -Parent ([string]$first.path)
+        $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('9' * 32)
+        [void][IO.Directory]::CreateDirectory($transactionDirectory)
+        $previousPath = Join-Path $transactionDirectory ('previous-' + ('8' * 32))
+        [byte[]]$ownerBytes = [IO.File]::ReadAllBytes([string]$first.path)
+        [IO.File]::Move([string]$first.path, $previousPath)
+        [string[]]$namespaceBefore = [IO.Directory]::GetFileSystemEntries((Join-Path $lockRoot '.ai-instructions-txn'), '*', [IO.SearchOption]::AllDirectories)
+
+        { Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'source-acquisition' `
+                -RunId 'guard-second' -TimeoutSeconds 2 } |
+            Should -Throw '*BLOCKED*AI Auto Update/In Progress/.locks*Manual recovery for incomplete owner publication*'
+
+        Test-Path -LiteralPath ([string]$first.path) | Should -BeFalse
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($previousPath)) |
+            Should -BeExactly ([Convert]::ToHexString($ownerBytes))
+        [string[]]$namespaceAfter = [IO.Directory]::GetFileSystemEntries((Join-Path $lockRoot '.ai-instructions-txn'), '*', [IO.SearchOption]::AllDirectories)
+        ($namespaceAfter -join "`n") | Should -BeExactly ($namespaceBefore -join "`n")
+    }
+
+    # Scenario: MOD-owner replacement crashed after displacing the reservation owner but before publishing its stage file.
+    # Purpose: Block canonical-MOD acquisition without recreating owner or mutating the transaction residue.
+    It 'InterT400_BlocksModAcquireWhenPreviousOwnerResidueExistsWithoutOwner' {
+        $module = New-ModReservationGuardModuleForTest
+        try {
+            $repository = Join-Path $TestDrive 'mod-previous-residue'
+            $lockKey = 'd' * 64
+            $lockRoot = Join-Path $repository 'AI Auto Update/In Progress/.locks/mod'
+            [void][IO.Directory]::CreateDirectory($lockRoot)
+            $lockPath = Join-Path $lockRoot "$lockKey.lock"
+            $plan = [ordered]@{
+                repositoryRoot = $repository
+                modLockPath = $lockPath
+                lockKey = $lockKey
+                modRelativePath = 'Warhammer 40,000 DARKTIDE/mods/GuardedMod'
+            }
+            & $module {
+                param($path, $root)
+                Write-ModReservationOwner -ModLockPath $path -Repository $root -Value ([ordered]@{ seed = 'owner' })
+            } $lockPath $repository
+            $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('7' * 32)
+            [void][IO.Directory]::CreateDirectory($transactionDirectory)
+            $previousPath = Join-Path $transactionDirectory ('previous-' + ('6' * 32))
+            [byte[]]$ownerBytes = [IO.File]::ReadAllBytes($lockPath)
+            [IO.File]::Move($lockPath, $previousPath)
+            [string[]]$namespaceBefore = [IO.Directory]::GetFileSystemEntries((Join-Path $lockRoot '.ai-instructions-txn'), '*', [IO.SearchOption]::AllDirectories)
+
+            { & $module {
+                    param($planValue, $statePath)
+                    Enter-ModReservation -Plan $planValue -ActualRunId 'guard-mod-second' -PlannedStatePath $statePath
+                } $plan (Join-Path $repository 'AI Auto Update/In Progress/guard-mod-second/state.json') } |
+                Should -Throw '*BLOCKED*AI Auto Update/In Progress/.locks/mod*Manual recovery for incomplete owner publication*'
+
+            Test-Path -LiteralPath $lockPath | Should -BeFalse
+            [Convert]::ToHexString([IO.File]::ReadAllBytes($previousPath)) |
+                Should -BeExactly ([Convert]::ToHexString($ownerBytes))
+            [string[]]$namespaceAfter = [IO.Directory]::GetFileSystemEntries((Join-Path $lockRoot '.ai-instructions-txn'), '*', [IO.SearchOption]::AllDirectories)
+            ($namespaceAfter -join "`n") | Should -BeExactly ($namespaceBefore -join "`n")
+        }
+        finally { Remove-Module $module -Force }
+    }
+
+    # Scenario: A previous-* leaf is a directory or a native reparse/symlink entry instead of one regular evidence file.
+    # Purpose: Treat every non-regular transaction entry as residue and fail closed on every native host.
+    It 'InterT401_TreatsNonRegularTransactionEntryAsResidue_<Case>' -ForEach @(
+        @{ Case = 'Directory' }
+        @{ Case = 'ReparseOrSymlink' }
+    ) {
+        Import-Module -Name $pathSafetyModule -Force
+        $lockRoot = Join-Path $TestDrive "non-regular-residue-$Case"
+        $transactionDirectory = Join-Path (Join-Path $lockRoot '.ai-instructions-txn') ('5' * 32)
+        [void][IO.Directory]::CreateDirectory($transactionDirectory)
+        $entry = Join-Path $transactionDirectory ('previous-' + ('4' * 32))
+        if ($Case -ceq 'Directory') {
+            [void][IO.Directory]::CreateDirectory($entry)
+        }
+        else {
+            $target = Join-Path $TestDrive "residue-link-target-$Case"
+            [void][IO.Directory]::CreateDirectory($target)
+            $null = New-TestReparsePoint -Path $entry -Target $target
+        }
+
+        $result = Get-PortableTransactionResidue -LockRoot $lockRoot
+
+        $result.hasResidue | Should -BeTrue
+        @($result.entries).Count | Should -BeGreaterOrEqual 1
+        (@($result.entries) -join "`n") | Should -Match ([regex]::Escape(".ai-instructions-txn/$('5' * 32)/previous-$('4' * 32)"))
+    }
+
+    # Scenario: A stale shared owner is successfully replaced and retained as previous-* evidence beside the new owner.
+    # Purpose: Preserve acquire, heartbeat, and release behavior when residue belongs to a completed stale takeover.
+    It 'InterT402_AllowsCompletedStaleTakeoverWithOwnerPresent' {
+        Import-Module -Name $coordinationModule -Force
+        $repository = Join-Path $TestDrive 'completed-stale-takeover'
+        [void][IO.Directory]::CreateDirectory($repository)
+        $oldLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'stale-old'
+        $owner = Get-Content -LiteralPath $oldLease.path -Raw | ConvertFrom-TestJson -AsHashtable
+        $owner.owner.processId = 2147483000
+        $owner.owner.processStartTicks = 1
+        $owner.owner.heartbeat = [DateTimeOffset]::UtcNow.AddMinutes(-4).ToString('o')
+        $owner.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
+        [IO.File]::WriteAllText([string]$oldLease.path, ($owner | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+
+        $newLease = Enter-SharedCoordinationLease -RepositoryRoot $repository -ResourceKey 'git-coordination' -RunId 'stale-new'
+        $newLease.staleEvidencePath | Should -Match '[\\/]\.ai-instructions-txn[\\/][0-9a-f]{32}[\\/]previous-[0-9a-f]{32}$'
+        Test-Path -LiteralPath ([string]$newLease.path) -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath ([string]$newLease.staleEvidencePath) -PathType Leaf | Should -BeTrue
+        { Update-SharedCoordinationLease -Lease $newLease -Force } | Should -Not -Throw
+        { $script:completedTakeoverReceipt = Exit-SharedCoordinationLease -Lease $newLease } | Should -Not -Throw
+        $script:completedTakeoverReceipt | Should -Not -BeNullOrEmpty
+    }
+}

@@ -825,6 +825,13 @@ function Write-ModReservationOwner {
         if (-not $guardStream) { throw 'Unable to acquire the short MOD owner update guard.' }
         $snapshot = Get-ModReservationSnapshot -ModLockPath $ModLockPath -Repository $Repository
         $ownerExists = [bool]$snapshot.exists
+        if (-not $ownerExists -and [string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
+            $transactionResidue = Get-PortableTransactionResidue -LockRoot $lockRoot
+            if ([bool]$transactionResidue.hasResidue) {
+                throw [IO.InvalidDataException]::new(
+                    "BLOCKED: incomplete owner publication residue exists under 'AI Auto Update/In Progress/.locks/mod/.ai-instructions-txn' ($(@($transactionResidue.entries) -join ', ')). Follow 'Manual recovery for incomplete owner publication' in references/automation.md.")
+            }
+        }
         if ($ownerExists) {
             if ([string]::IsNullOrWhiteSpace($ExpectedReservationToken)) {
                 throw 'Updating an existing MOD reservation requires its current reservation token.'

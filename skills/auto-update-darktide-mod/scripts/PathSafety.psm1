@@ -397,6 +397,107 @@ function Get-PortableLeaseFileState {
     }
 }
 
+function Get-PortableTransactionResidue {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $LockRoot)
+
+    $physicalLockRoot = Resolve-PortableTrustedRoot -Path $LockRoot
+    $transactionRootPath = [IO.Path]::GetFullPath((Join-Path $physicalLockRoot '.ai-instructions-txn'))
+    $transactionRootLease = $null
+    $residue = [Collections.Generic.List[string]]::new()
+    try {
+        try {
+            $transactionRootLease = Open-PlatformDirectory -Root $physicalLockRoot -RelativePath '.ai-instructions-txn'
+            $null = Assert-PlatformFileIdentity -Lease $transactionRootLease `
+                -Expected $transactionRootLease.Observation -VerifyPath
+        }
+        catch {
+            $candidate = $_.Exception
+            $missing = $false
+            for ($depth = 0; $depth -lt 32 -and $null -ne $candidate; $depth++) {
+                $errnoProperty = $candidate.PSObject.Properties['Errno']
+                $win32ErrorProperty = $candidate.PSObject.Properties['Win32Error']
+                $nativeErrorProperty = $candidate.PSObject.Properties['NativeErrorCode']
+                if ($candidate -is [IO.DirectoryNotFoundException] -or $candidate -is [IO.FileNotFoundException] -or
+                    ($null -ne $errnoProperty -and [int]$errnoProperty.Value -eq 2) -or
+                    ($null -ne $win32ErrorProperty -and [int]$win32ErrorProperty.Value -in @(2, 3)) -or
+                    ($null -ne $nativeErrorProperty -and [int]$nativeErrorProperty.Value -in @(2, 3))) {
+                    $missing = $true
+                    break
+                }
+                $candidate = $candidate.InnerException
+            }
+            if ($missing) {
+                return [ordered]@{ hasResidue = $false; entries = [string[]]@() }
+            }
+            $residue.Add('.ai-instructions-txn')
+            return [ordered]@{ hasResidue = $true; entries = [string[]]$residue.ToArray() }
+        }
+
+        foreach ($transactionEntry in @([IO.Directory]::GetFileSystemEntries($transactionRootPath))) {
+            $transactionLeaf = [IO.Path]::GetFileName([IO.Path]::TrimEndingDirectorySeparator($transactionEntry))
+            $transactionRelative = ".ai-instructions-txn/$transactionLeaf"
+            $expectedTransactionPath = [IO.Path]::GetFullPath((Join-Path $transactionRootPath $transactionLeaf))
+            if ([IO.Path]::GetFullPath($transactionEntry) -cne $expectedTransactionPath -or
+                $transactionLeaf -notmatch '^[0-9a-f]{32}$') {
+                $residue.Add($transactionRelative)
+                continue
+            }
+
+            $transactionLease = $null
+            try {
+                try {
+                    $transactionLease = Open-PlatformDirectory -Root $transactionRootPath -RelativePath $transactionLeaf
+                    $null = Assert-PlatformFileIdentity -Lease $transactionLease `
+                        -Expected $transactionLease.Observation -VerifyPath
+                }
+                catch {
+                    $residue.Add($transactionRelative)
+                    continue
+                }
+
+                foreach ($entryPath in @([IO.Directory]::GetFileSystemEntries($expectedTransactionPath))) {
+                    $entryLeaf = [IO.Path]::GetFileName([IO.Path]::TrimEndingDirectorySeparator($entryPath))
+                    $entryRelative = "$transactionRelative/$entryLeaf"
+                    $expectedEntryPath = [IO.Path]::GetFullPath((Join-Path $expectedTransactionPath $entryLeaf))
+                    if ([IO.Path]::GetFullPath($entryPath) -cne $expectedEntryPath) {
+                        $residue.Add($entryRelative)
+                        continue
+                    }
+                    try {
+                        $snapshot = Get-PortableLeaseFileState -ParentPath $expectedTransactionPath -Leaf $entryLeaf
+                        if (-not [bool]$snapshot.exists -or $entryLeaf -notmatch '^previous-[0-9a-f]{32}$') {
+                            $residue.Add($entryRelative)
+                            continue
+                        }
+                        $residue.Add($entryRelative)
+                    }
+                    catch {
+                        # Directories, reparse points, symlinks, hard links, and
+                        # entries that change while inspected are all residue.
+                        $residue.Add($entryRelative)
+                    }
+                }
+            }
+            catch {
+                $residue.Add($transactionRelative)
+            }
+            finally {
+                if ($null -ne $transactionLease) { $transactionLease.Dispose() }
+            }
+        }
+    }
+    catch {
+        $residue.Add('.ai-instructions-txn')
+    }
+    finally {
+        if ($null -ne $transactionRootLease) { $transactionRootLease.Dispose() }
+    }
+
+    [string[]]$entries = @($residue.ToArray() | Sort-Object -Unique)
+    [ordered]@{ hasResidue = $entries.Count -gt 0; entries = $entries }
+}
+
 function Remove-PortableTransactionFile {
     param(
         [Parameter(Mandatory)] $TransactionLease,
@@ -952,4 +1053,4 @@ function Enter-PortableFileLock {
 Export-ModuleMember -Function Get-PortablePathComparison, Test-PortableReparseItem, Test-PortablePhysicalIdentity,
     Resolve-PortableTrustedRoot, Enter-PortableFileLock, Get-PortableLockPrimitive, Get-PortablePlatformName,
     Assert-VendoredPlatformRuntime, Get-VendoredPlatformRuntimeBinding, Get-PortableLeaseFileState,
-    Publish-PortableLeaseFile
+    Get-PortableTransactionResidue, Publish-PortableLeaseFile

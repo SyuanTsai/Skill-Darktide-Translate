@@ -404,6 +404,7 @@ skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Get-FileSha256|IO
 
 # Pure reads/non-filesystem provider operations retained under an already-held lease.
 $pureReadExclusions = @'
+skills/auto-update-darktide-mod/scripts/PathSafety.psm1|Get-PortableTransactionResidue|IO.Directory::GetFileSystemEntries|2
 scripts/StandardSourceDriver.psm1|Get-DarktideActiveSkillIds|Get-ChildItem|1
 scripts/StandardSourceDriver.psm1|Get-DarktideOwnedProcessEnvironment|Get-ChildItem|1
 scripts/StandardSourceDriver.psm1|Get-DarktideSourceResolverEnvironment|Remove-Item|1
