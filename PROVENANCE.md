@@ -20,7 +20,7 @@ The SYP-158 migration separates the repository-owned source package into the can
 
 This migration is scoped to the Darktide Skill in this repository. No other `.agents/skills/*` projection or `.codex/ai-instructions.manifest.json` is present in the audited tree, so this record makes no preservation or validation claim about external consumer artifacts.
 
-`config/standard-v1.json` pins the reviewed `SyuanTsai-AI-Instructions` Standard v1 authority archive and normative files. `scripts/Validate.ps1` is the single local, pre-push, and CI validation entry point, while the existing Darktide domain regressions remain repository-test extensions within the canonical stage order.
+`config/authority-pin.json` selects the immutable `SyuanTsai-AI-Instructions` consumer-gate authority, and `config/consumer-gate.json` declares the retained Darktide repository check plus complete Pester discovery. Pull requests use the authority-published consumer workflow on Windows, Linux, and macOS; routine authority upgrades change only the pin's `commit`. The copied workflow and bootstrap are authority artifacts, while the Darktide Skill, repository checks, tests, metadata, and documentation remain repository-authored scope.
 
 ## Compressed reference audit
 
