@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "repositoryId": "skill-darktide-translate",
+  "sourceRepository": "https://github.com/SyuanTsai/Skill-Darktide-Translate.git",
+  "activeSkills": [
+    "auto-update-darktide-mod"
+  ],
+  "repositoryChecks": [
+    {
+      "id": "repository-darktide",
+      "kind": "general",
+      "path": "scripts/Test-DarktideRepository.ps1"
+    },
+    {
+      "id": "repository-pester",
+      "kind": "pester",
+      "path": "tests"
+    }
+  ]
+}

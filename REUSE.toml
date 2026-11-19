@@ -29,6 +29,24 @@ SPDX-FileCopyrightText = "2026 SyuanTsai"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
+path = "config/*.json"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 SyuanTsai"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ".github/workflows/consumer-gate*.yml"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 SyuanTsai"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "scripts/Invoke-PinnedAuthority.ps1"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 SyuanTsai"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
 path = "VERSION"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 SyuanTsai"
