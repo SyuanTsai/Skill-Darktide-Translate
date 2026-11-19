@@ -220,5 +220,13 @@ Describe 'Darktide consumer repository check' {
             $catalog | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $script:ProfilePath -Encoding utf8NoBOM -NoNewline
             { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } | Should -Throw $expected
         }
+
+        It 'UnitT46_RejectsMixedLegacyAndStandardCatalogs' {
+            $legacyCatalogPath = Join-Path $script:FixtureRoot 'catalog/skills-catalog.json'
+            [IO.File]::WriteAllText($legacyCatalogPath, '{}', [Text.UTF8Encoding]::new($false))
+
+            { & $script:RepositoryCheck -RepositoryRoot $script:FixtureRoot } |
+                Should -Throw '*Legacy source-owned cross-source catalog must not coexist with catalog/source.json*'
+        }
     }
 }

@@ -1070,6 +1070,8 @@ Describe 'SkillSpector exit-one report diagnostics' {
             'Assert-NoDuplicateJsonProperties',
             'Read-JsonFile',
             'Get-RequiredProperty',
+            'Get-SkillSpectorStreamFingerprint',
+            'New-SkillSpectorExecutionException',
             'Read-SkillSpectorJsonReport',
             'ConvertTo-BoundedSkillSpectorDiagnosticText',
             'Get-SkillSpectorExitOneSummary',
@@ -1192,14 +1194,26 @@ function Invoke-NativeChecked {
     }
 
     It 'UnitT39_TreatsExitOneWithInvalidJsonAsAnExecutionError' {
-        { & $script:SkillSpectorExitOneProbe {
-            param($root)
-            Set-SkillSpectorNativeFixture -ExitCode 1 -StandardOutput '{invalid-json'
-            Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
-                -ReportPath (Join-Path $root 'invalid.json') -StandardErrorPath (Join-Path $root 'invalid.stderr.txt') `
-                -Context 'fixture invalid scan' -DiagnosticRoot $root -ChildWritableRoot $root `
-                -ExpectedInventoryPaths @('SKILL.md')
-        } $TestDrive } | Should -Throw '*not valid unambiguous UTF-8 JSON*'
+        $failure = $null
+        $observedOutput = [Collections.Generic.List[string]]::new()
+        try {
+            & $script:SkillSpectorExitOneProbe {
+                param($root)
+                Set-SkillSpectorNativeFixture -ExitCode 1 -StandardOutput '{invalid-json' `
+                    -StandardError 'xoxb-0000-fake'
+                Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
+                    -ReportPath (Join-Path $root 'invalid.json') -StandardErrorPath (Join-Path $root 'invalid.stderr.txt') `
+                    -Context 'fixture invalid scan' -DiagnosticRoot $root -ChildWritableRoot $root `
+                    -ExpectedInventoryPaths @('SKILL.md')
+            } $TestDrive *>&1 | ForEach-Object { [void]$observedOutput.Add([string]$_) }
+        }
+        catch { $failure = $_.Exception }
+
+        $failure | Should -Not -BeNullOrEmpty
+        $failure.Message | Should -Match '^SkillSpector execution error: errorType=invalid-json-report; exitCode=1; '
+        $failure.Message | Should -Match 'stdoutBytes=13; stdoutSha256=[0-9a-f]{64}; stderrBytes=14; stderrSha256=[0-9a-f]{64}$'
+        $failure.Message | Should -Not -Match 'not valid|parser|xoxb-0000-fake'
+        (($observedOutput -join "`n") + "`n" + $failure.Message) | Should -Not -Match 'xoxb-0000-fake'
     }
 
     It 'UnitT41_PreservesExitZeroReportBehavior' {
@@ -1222,13 +1236,46 @@ function Invoke-NativeChecked {
     }
 
     It 'UnitT42_PreservesExitTwoAsAnExecutionError' {
-        { & $script:SkillSpectorExitOneProbe {
-            param($root, $json)
-            Set-SkillSpectorNativeFixture -ExitCode 2 -StandardOutput $json
-            Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
-                -ReportPath (Join-Path $root 'exit-two.json') -StandardErrorPath (Join-Path $root 'exit-two.stderr.txt') `
-                -Context 'fixture execution error' -DiagnosticRoot $root -ChildWritableRoot $root `
-                -ExpectedInventoryPaths @('SKILL.md')
-        } $TestDrive (New-SkillSpectorExitOneFixtureJson) } | Should -Throw '*exited with code 2*'
+        $failure = $null
+        $observedOutput = [Collections.Generic.List[string]]::new()
+        try {
+            & $script:SkillSpectorExitOneProbe {
+                param($root, $json)
+                Set-SkillSpectorNativeFixture -ExitCode 2 -StandardOutput $json `
+                    -StandardError 'xoxb-0000-fake'
+                Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
+                    -ReportPath (Join-Path $root 'exit-two.json') -StandardErrorPath (Join-Path $root 'exit-two.stderr.txt') `
+                    -Context 'fixture execution error' -DiagnosticRoot $root -ChildWritableRoot $root `
+                    -ExpectedInventoryPaths @('SKILL.md')
+            } $TestDrive (New-SkillSpectorExitOneFixtureJson) *>&1 |
+                ForEach-Object { [void]$observedOutput.Add([string]$_) }
+        }
+        catch { $failure = $_.Exception }
+
+        $failure | Should -Not -BeNullOrEmpty
+        $failure.Message | Should -Match '^SkillSpector execution error: errorType=nonzero-exit; exitCode=2; '
+        $failure.Message | Should -Match 'stdoutBytes=\d+; stdoutSha256=[0-9a-f]{64}; stderrBytes=14; stderrSha256=[0-9a-f]{64}$'
+        (($observedOutput -join "`n") + "`n" + $failure.Message) | Should -Not -Match 'xoxb-|scanner-controlled'
+    }
+
+    It 'UnitT43_SanitizesOtherNonzeroExitDiagnostics' {
+        $failure = $null
+        try {
+            & $script:SkillSpectorExitOneProbe {
+                param($root)
+                Set-SkillSpectorNativeFixture -ExitCode 7 -StandardOutput 'xoxb-stdout-fake' `
+                    -StandardError 'xoxb-stderr-fake'
+                Invoke-SkillSpectorScan -Command 'fixture-skillspector' -Arguments @('scan') `
+                    -ReportPath (Join-Path $root 'exit-seven.json') -StandardErrorPath (Join-Path $root 'exit-seven.stderr.txt') `
+                    -Context 'fixture other execution error' -DiagnosticRoot $root -ChildWritableRoot $root `
+                    -ExpectedInventoryPaths @('SKILL.md')
+            } $TestDrive
+        }
+        catch { $failure = $_.Exception }
+
+        $failure | Should -Not -BeNullOrEmpty
+        $failure.Message | Should -Match '^SkillSpector execution error: errorType=nonzero-exit; exitCode=7; '
+        $failure.Message | Should -Match 'stdoutBytes=16; stdoutSha256=[0-9a-f]{64}; stderrBytes=16; stderrSha256=[0-9a-f]{64}$'
+        $failure.Message | Should -Not -Match 'xoxb-stdout-fake|xoxb-stderr-fake'
     }
 }

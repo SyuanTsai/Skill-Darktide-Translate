@@ -3469,21 +3469,50 @@ finally {
     }
 }
 
+function Get-SkillSpectorStreamFingerprint {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    return [pscustomobject][ordered]@{
+        byteCount = $bytes.Length
+        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    }
+}
+
+function New-SkillSpectorExecutionException {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('invalid-json-report', 'invalid-exit-one-report', 'nonzero-exit')]
+        [string] $ErrorType,
+        [Parameter(Mandatory = $true)][int] $ExitCode,
+        [Parameter(Mandatory = $true)][string] $ReportPath,
+        [Parameter(Mandatory = $true)][string] $StandardErrorPath
+    )
+    $standardOutput = Get-SkillSpectorStreamFingerprint -Path $ReportPath
+    $standardError = Get-SkillSpectorStreamFingerprint -Path $StandardErrorPath
+    $failure = [InvalidOperationException]::new(
+        "SkillSpector execution error: errorType=$ErrorType; exitCode=$ExitCode; " +
+        "stdoutBytes=$($standardOutput.byteCount); stdoutSha256=$($standardOutput.sha256); " +
+        "stderrBytes=$($standardError.byteCount); stderrSha256=$($standardError.sha256)")
+    $failure.Data['NativeExitCode'] = $ExitCode
+    $failure.Data['SkillSpectorErrorType'] = $ErrorType
+    return $failure
+}
+
 function Read-SkillSpectorJsonReport {
     param(
         [Parameter(Mandatory = $true)][string] $ReportPath,
         [Parameter(Mandatory = $true)][string] $StandardErrorPath,
-        [Parameter(Mandatory = $true)][string] $Context
+        [Parameter(Mandatory = $true)][string] $Context,
+        [Parameter(Mandatory = $true)][int] $ExitCode
     )
     try {
         return Read-JsonFile -Path $ReportPath -Context "$Context report"
     }
     catch {
-        $standardError = [IO.File]::ReadAllText($StandardErrorPath, [Text.UTF8Encoding]::new($false, $true))
-        if ($standardError.Length -gt 4096) {
-            $standardError = $standardError.Substring(0, 4096) + '...[truncated]'
-        }
-        throw "$($_.Exception.Message) STDERR (bounded to 4096 characters):`n$standardError"
+        throw (New-SkillSpectorExecutionException -ErrorType 'invalid-json-report' -ExitCode $ExitCode `
+            -ReportPath $ReportPath -StandardErrorPath $StandardErrorPath)
     }
 }
 
@@ -3655,18 +3684,25 @@ function Invoke-SkillSpectorScan {
     }
     catch {
         $nativeExitCode = $_.Exception.Data['NativeExitCode']
-        if ($nativeExitCode -isnot [int] -or [int]$nativeExitCode -ne 1) { throw }
-        $exitCode = 1
+        if ($nativeExitCode -isnot [int]) { throw }
+        $exitCode = [int]$nativeExitCode
+        if ($exitCode -ne 1) {
+            throw (New-SkillSpectorExecutionException -ErrorType 'nonzero-exit' -ExitCode $exitCode `
+                -ReportPath $ReportPath -StandardErrorPath $StandardErrorPath)
+        }
     }
     $report = Read-SkillSpectorJsonReport -ReportPath $ReportPath `
-        -StandardErrorPath $StandardErrorPath -Context $Context
+        -StandardErrorPath $StandardErrorPath -Context $Context -ExitCode $exitCode
     $summary = ''
     if ($exitCode -eq 1) {
         try {
             $summary = Get-SkillSpectorExitOneSummary -Report $report -Context $Context `
                 -ExpectedInventoryPaths $ExpectedInventoryPaths
         }
-        catch { throw "$Context exited with code 1 and produced an invalid SkillSpector report: $($_.Exception.Message)" }
+        catch {
+            throw (New-SkillSpectorExecutionException -ErrorType 'invalid-exit-one-report' -ExitCode $exitCode `
+                -ReportPath $ReportPath -StandardErrorPath $StandardErrorPath)
+        }
         Write-Host $summary
     }
     if ($null -ne $ExitCodeResult) { $ExitCodeResult.Value = $exitCode }

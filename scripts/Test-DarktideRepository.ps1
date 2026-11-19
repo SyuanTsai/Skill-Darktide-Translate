@@ -443,6 +443,9 @@ if ($skillIds.Count -ne 1 -or $skillIds[0] -cne 'auto-update-darktide-mod') {
     throw 'Source inventory identity is invalid.'
 }
 Assert-DarktideProfileCatalog -Root $repoRoot -SourceInventory $source
+if (Test-Path -LiteralPath (Join-Path $repoRoot 'catalog/skills-catalog.json')) {
+    throw 'Legacy source-owned cross-source catalog must not coexist with catalog/source.json.'
+}
 $layout = Assert-DarktideConsumerConfiguration -Root $repoRoot
 
 $skillsRoot = Join-Path $repoRoot 'skills'
