@@ -6,6 +6,70 @@ Describe 'Darktide consumer repository check' {
         . (Join-Path $PSScriptRoot 'TestSupport.ps1')
         $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
         $script:RepositoryCheck = Join-Path $script:RepositoryRoot 'scripts/Test-DarktideRepository.ps1'
+
+        function Get-DarktideTestSnapshot {
+            param([Parameter(Mandatory)][string] $Root)
+
+            @(
+                Get-ChildItem -LiteralPath $Root -Recurse -Force |
+                    Where-Object {
+                        $relative = [IO.Path]::GetRelativePath($Root, $_.FullName).Replace('\', '/')
+                        $relative -cne '.git' -and -not $relative.StartsWith('.git/', [StringComparison]::Ordinal)
+                    } |
+                    ForEach-Object {
+                        [pscustomobject][ordered]@{
+                            path = [IO.Path]::GetRelativePath($Root, $_.FullName).Replace('\', '/')
+                            isContainer = [bool]$_.PSIsContainer
+                            length = if ($_.PSIsContainer) { 0 } else { [int64]$_.Length }
+                            sha256 = if ($_.PSIsContainer) { $null } else {
+                                (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                            }
+                        }
+                    } |
+                    Sort-Object -Property path -CaseSensitive
+            )
+        }
+
+        function New-DarktideGitlessSnapshot {
+            param(
+                [Parameter(Mandatory)][string] $Destination,
+                [switch] $ConsumerLayout
+            )
+
+            [void](New-Item -ItemType Directory -Path $Destination)
+            Copy-Item -LiteralPath (Join-Path $script:RepositoryRoot 'catalog') -Destination $Destination -Recurse
+            Copy-Item -LiteralPath (Join-Path $script:RepositoryRoot 'skills') -Destination $Destination -Recurse
+            if ($ConsumerLayout) {
+                $configRoot = Join-Path $Destination 'config'
+                [void](New-Item -ItemType Directory -Path $configRoot)
+                $authorityPin = [ordered]@{
+                    schemaVersion = 1
+                    repository = 'https://github.com/SyuanTsai/SyuanTsai-AI-Instructions.git'
+                    commit = 'a' * 40
+                }
+                $consumerGate = [ordered]@{
+                    schemaVersion = 1
+                    repositoryId = 'skill-darktide-translate'
+                    sourceRepository = 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
+                    activeSkills = @('auto-update-darktide-mod')
+                    repositoryChecks = @(
+                        [ordered]@{ id = 'repository-darktide'; kind = 'general'; path = 'scripts/Test-DarktideRepository.ps1' },
+                        [ordered]@{ id = 'repository-pester'; kind = 'pester'; path = 'tests' }
+                    )
+                }
+                [IO.File]::WriteAllText(
+                    (Join-Path $configRoot 'authority-pin.json'),
+                    ($authorityPin | ConvertTo-Json -Depth 10),
+                    [Text.UTF8Encoding]::new($false)
+                )
+                [IO.File]::WriteAllText(
+                    (Join-Path $configRoot 'consumer-gate.json'),
+                    ($consumerGate | ConvertTo-Json -Depth 10),
+                    [Text.UTF8Encoding]::new($false)
+                )
+            }
+            [IO.Path]::GetFullPath($Destination)
+        }
     }
 
     It 'UnitT10_DeclaresTheGeneralCheckInterfaceWithoutWindowsOnlyDependencies' {
@@ -16,7 +80,7 @@ Describe 'Darktide consumer repository check' {
     }
 
     It 'InterT20_ValidatesTheTrackedRepositoryAsAReadOnlySnapshot' {
-        $before = @(git -C $script:RepositoryRoot status --porcelain=v1 --untracked-files=all)
+        $before = @(Get-DarktideTestSnapshot -Root $script:RepositoryRoot)
         $powerShell = Get-TestPowerShellExecutablePath
         $output = @(& $powerShell -NoProfile -NonInteractive -File $script:RepositoryCheck `
                 -RepositoryRoot $script:RepositoryRoot -ReadOnlySnapshot)
@@ -25,16 +89,117 @@ Describe 'Darktide consumer repository check' {
         $evidence.schemaVersion | Should -Be 1
         $evidence.report | Should -Be 'darktide-repository-check-v1'
         $evidence.result | Should -Be 'passed'
+        $evidence.inventoryMode | Should -Be 'git'
         $evidence.activeSkillCount | Should -Be 1
         @($evidence.skills[0].files).Count | Should -BeGreaterThan 0
-        $after = @(git -C $script:RepositoryRoot status --porcelain=v1 --untracked-files=all)
-        ($after -join "`n") | Should -BeExactly ($before -join "`n")
+        $after = @(Get-DarktideTestSnapshot -Root $script:RepositoryRoot)
+        ($after | ConvertTo-Json -Depth 5 -Compress) |
+            Should -BeExactly ($before | ConvertTo-Json -Depth 5 -Compress)
     }
 
     It 'UnitT30_RejectsOutputMutationInReadOnlySnapshotMode' {
         { & $script:RepositoryCheck -RepositoryRoot $script:RepositoryRoot -ReadOnlySnapshot `
                 -OutputPath (Join-Path $TestDrive 'forbidden.json') } |
             Should -Throw '*does not permit an output file*'
+    }
+
+    Context 'git-less snapshot inventory' {
+        It 'InterT31_ValidatesPreConversionAndConsumerSnapshotsWithoutGitMetadata_<layout>' -ForEach @(
+            @{ layout = 'pre-conversion'; consumer = $false },
+            @{ layout = 'consumer'; consumer = $true }
+        ) {
+            $snapshot = New-DarktideGitlessSnapshot -Destination (Join-Path $TestDrive $layout) -ConsumerLayout:$consumer
+
+            $evidence = (& $script:RepositoryCheck -RepositoryRoot $snapshot -ReadOnlySnapshot | Out-String) |
+                ConvertFrom-TestJson
+
+            $evidence.result | Should -Be 'passed'
+            $evidence.layout | Should -Be $layout
+            $evidence.inventoryMode | Should -Be 'snapshot'
+            @($evidence.skills[0].files).Count | Should -BeGreaterThan 0
+        }
+
+        It 'UnitT32_RejectsCatalogIdentityDriftInASnapshot' {
+            $snapshot = New-DarktideGitlessSnapshot -Destination (Join-Path $TestDrive 'catalog-drift')
+            $sourcePath = Join-Path $snapshot 'catalog/source.json'
+            $source = Get-Content -LiteralPath $sourcePath -Raw | ConvertFrom-Json
+            $source.sourceId = 'other-source'
+            $source | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $sourcePath -Encoding utf8NoBOM -NoNewline
+
+            { & $script:RepositoryCheck -RepositoryRoot $snapshot -ReadOnlySnapshot } |
+                Should -Throw '*sourceId must be exact string*'
+        }
+
+        It 'UnitT33_RejectsInvalidUtf8SkillBytesInASnapshot' {
+            $snapshot = New-DarktideGitlessSnapshot -Destination (Join-Path $TestDrive 'invalid-utf8')
+            $invalidPath = Join-Path $snapshot 'skills/auto-update-darktide-mod/references/invalid.md'
+            [IO.File]::WriteAllBytes($invalidPath, [byte[]]@(0xC3, 0x28))
+
+            { & $script:RepositoryCheck -RepositoryRoot $snapshot -ReadOnlySnapshot } |
+                Should -Throw
+        }
+
+        It 'UnitT34_RejectsPresentButInvalidGitMetadata' {
+            $snapshot = New-DarktideGitlessSnapshot -Destination (Join-Path $TestDrive 'invalid-git')
+            [void](New-Item -ItemType Directory -Path (Join-Path $snapshot '.git'))
+
+            { & $script:RepositoryCheck -RepositoryRoot $snapshot -ReadOnlySnapshot } |
+                Should -Throw '*contains .git but is not a valid Git repository root*'
+        }
+
+        It 'InterT35_ValidatesASnapshotWithoutGitOnPath' {
+            $snapshot = New-DarktideGitlessSnapshot -Destination (Join-Path $TestDrive 'no-git-command')
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = Get-TestPowerShellExecutablePath
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            foreach ($argument in @(
+                    '-NoProfile', '-NonInteractive', '-File', $script:RepositoryCheck,
+                    '-RepositoryRoot', $snapshot, '-ReadOnlySnapshot'
+                )) {
+                [void]$start.ArgumentList.Add($argument)
+            }
+            $start.Environment['PATH'] = ''
+            $process = [Diagnostics.Process]::new()
+            try {
+                $process.StartInfo = $start
+                [void]$process.Start()
+                $stdout = $process.StandardOutput.ReadToEndAsync()
+                $stderr = $process.StandardError.ReadToEndAsync()
+                $process.WaitForExit()
+                $standardOutput = $stdout.GetAwaiter().GetResult()
+                $standardError = $stderr.GetAwaiter().GetResult()
+                $process.ExitCode | Should -Be 0 -Because $standardError
+                ($standardOutput | ConvertFrom-TestJson).inventoryMode | Should -Be 'snapshot'
+            }
+            finally {
+                $process.Dispose()
+            }
+        }
+
+        if ([OperatingSystem]::IsWindows()) {
+            It 'InterT36W_RejectsANativeWindowsReparseDirectoryInASnapshot' {
+                $snapshot = New-DarktideGitlessSnapshot -Destination (Join-Path $TestDrive 'windows-reparse')
+                $target = Join-Path $TestDrive 'windows-reparse-target'
+                [void](New-Item -ItemType Directory -Path $target)
+                [void](New-TestReparsePoint -Path (Join-Path $snapshot 'skills/auto-update-darktide-mod/reparse') -Target $target)
+
+                { & $script:RepositoryCheck -RepositoryRoot $snapshot -ReadOnlySnapshot } |
+                    Should -Throw '*contains a reparse point*'
+            }
+        }
+        else {
+            It 'InterT36U_RejectsANativeUnixSymlinkDirectoryInASnapshot' {
+                $snapshot = New-DarktideGitlessSnapshot -Destination (Join-Path $TestDrive 'unix-reparse')
+                $target = Join-Path $TestDrive 'unix-reparse-target'
+                [void](New-Item -ItemType Directory -Path $target)
+                [void](New-TestReparsePoint -Path (Join-Path $snapshot 'skills/auto-update-darktide-mod/reparse') -Target $target)
+
+                { & $script:RepositoryCheck -RepositoryRoot $snapshot -ReadOnlySnapshot } |
+                    Should -Throw '*contains a reparse point*'
+            }
+        }
     }
 
     Context 'product-local catalog domain contract' {

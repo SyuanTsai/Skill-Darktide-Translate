@@ -3781,6 +3781,7 @@ function Get-RequiredPesterTests {
         'Schema15SourceAcquisition.Tests.ps1'
         'SkillContract.Tests.ps1'
         'SkillSpectorOutput.Tests.ps1'
+        'SkillSourcePinGenerator.Tests.ps1'
         'SourcePin.Tests.ps1'
     )
     if ($IncludeTrustedPostPromotionTests) {

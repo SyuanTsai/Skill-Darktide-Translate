@@ -158,9 +158,11 @@ Describe 'Darktide Translate repository contract' {
             "$skillPrefix/scripts/Finalize-ModUpdateMerge.ps1",
             'docs/RELEASE.md',
             'docs/ROLLBACK.md',
+            'scripts/New-SkillSourcePin.ps1',
             'scripts/Test-CleanRepositoryHead.ps1',
             'scripts/Test-DarktideRepository.ps1',
             'tests/Invoke-Tests.ps1',
+            'tests/SkillSourcePinGenerator.Tests.ps1',
             'VERSION'
         )
         if ($layout.Name -ceq 'legacy') {

@@ -54,7 +54,7 @@ scripts/Validate.ps1
 scripts/Test-Repository.ps1
 docs/RELEASE.md
 docs/ROLLBACK.md
-scripts/Get-SourcePin.ps1
+scripts/New-SkillSourcePin.ps1
 scripts/Invoke-PrePushValidation.ps1
 scripts/Test-CleanRepositoryHead.ps1
 tests/
@@ -79,7 +79,13 @@ GitHub Actions runs one read-only Windows workflow for pull requests and pushes 
 
 ## Versioning and rollback
 
-Release and immutable pin rules are in `docs/RELEASE.md`. Consumers start and roll back runs with the complete JSON emitted by `scripts/Get-SourcePin.ps1`, including the tag/ref, resolved commit, deterministic content hash, and installed Skill file manifest, as described in `docs/ROLLBACK.md`. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
+Release and immutable pin rules are in `docs/RELEASE.md`. From a source checkout, generate the complete consumer pin without changing the repository:
+
+```powershell
+pwsh -NoLogo -NoProfile -File ./scripts/New-SkillSourcePin.ps1 -Ref HEAD -OutputPath ../darktide-source-pin.json
+```
+
+The JSON includes the requested ref, resolved commit, deterministic repository content hash, version, Skill path, and installed Skill per-file blob/SHA-256 manifest. Existing Schema 14 states remain immutable, and Schema 15 states never downgrade or migrate implicitly.
 
 ### Historical trial evidence
 

@@ -954,6 +954,7 @@ Describe 'Canonical Standard v1 validation adapter' {
             'Schema15SourceAcquisition.Tests.ps1'
             'SkillContract.Tests.ps1'
             'SkillSpectorOutput.Tests.ps1'
+            'SkillSourcePinGenerator.Tests.ps1'
             'SourcePin.Tests.ps1'
         )
         $observedCoreInventory = @(Get-RequiredPesterTests)

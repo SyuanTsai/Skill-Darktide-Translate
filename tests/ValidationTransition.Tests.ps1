@@ -251,6 +251,7 @@ Describe 'Standard v1 migration and canonical validation contracts' {
             'Schema15SourceAcquisition.Tests.ps1'
             'SkillContract.Tests.ps1'
             'SkillSpectorOutput.Tests.ps1'
+            'SkillSourcePinGenerator.Tests.ps1'
             'SourcePin.Tests.ps1'
         )
         @(Get-RequiredPesterTests) | Should -Be $expected
