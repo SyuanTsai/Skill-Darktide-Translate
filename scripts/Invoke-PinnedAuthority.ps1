@@ -19,6 +19,8 @@ $script:ExitCodes = @{ BLOCKED = 10
  INVALID = 30
  CANCELLED = 40 }
 $script:PinnedGitHooksPath = $null
+$script:PinnedGitExecutable = $null
+$script:PinnedGitRemainingMilliseconds = $null
 
 function Throw-ConsumerResult([string]$State, [string]$Message) { throw "$State|$Message" }
 function Get-Sha256([byte[]]$Bytes) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant() }
@@ -98,15 +100,47 @@ function New-PinnedGitHooksDirectory(
 function Initialize-PinnedGitHooks([string]$WorkRoot) {
     if ($null -ne $script:PinnedGitHooksPath) { Throw-ConsumerResult INVALID 'Git hooks isolation was initialized more than once.' }
     $script:PinnedGitHooksPath = New-PinnedGitHooksDirectory $WorkRoot
+    $script:PinnedGitExecutable = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 }
-function Invoke-PinnedGit([string]$RepositoryRoot, [string[]]$Arguments, [int[]]$AllowedExitCodes = @(0), [switch]$AllowFileProtocol) {
-    if ([string]::IsNullOrWhiteSpace($script:PinnedGitHooksPath)) { Throw-ConsumerResult INVALID 'Git hooks isolation is not initialized.' }
+function Initialize-PinnedGitDeadline([ValidateSet('prepare','validate','finalize','aggregate')][string]$CurrentPhase) {
+    $seconds = if ($CurrentPhase -in @('prepare','aggregate')) { 720 } else { 180 }
+    $script:PinnedGitRemainingMilliseconds = [long]$seconds * 1000
+}
+function Invoke-PinnedGit([string]$RepositoryRoot, [string[]]$Arguments, [int[]]$AllowedExitCodes = @(0), [switch]$AllowFileProtocol,
+    [int]$TimeoutSeconds = 0, [string]$GitExecutable = $script:PinnedGitExecutable, [string[]]$GitPrefixArguments = @()) {
+    if ([string]::IsNullOrWhiteSpace($script:PinnedGitHooksPath) -or [string]::IsNullOrWhiteSpace($GitExecutable) -or
+        $null -eq $script:PinnedGitRemainingMilliseconds) { Throw-ConsumerResult INVALID 'Git isolation and deadline are not initialized.' }
     $protocol = if ($AllowFileProtocol) { 'always' } else { 'never' }
-    $all = @('-c', "core.hooksPath=$script:PinnedGitHooksPath", '-c', "protocol.file.allow=$protocol", '-c', 'credential.helper=', '-C', $RepositoryRoot) + $Arguments
+    $all = @($GitPrefixArguments) + @('-c','maintenance.auto=false','-c','gc.autoDetach=false','-c',
+        "core.hooksPath=$script:PinnedGitHooksPath",'-c',"protocol.file.allow=$protocol",'-c','credential.helper=','-C',$RepositoryRoot) + $Arguments
     foreach($name in @('STANDARD_VALIDATION_GITHUB_API_TOKEN','GITHUB_TOKEN','GH_TOKEN')){[Environment]::SetEnvironmentVariable($name,$null,'Process');Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue}
-    $output=@(& git @all 2>&1);$exit=$LASTEXITCODE
-    if ($exit -notin $AllowedExitCodes) { Throw-ConsumerResult INVALID "git failed ($exit): $($output -join ' ')" }
-    [pscustomobject]@{ ExitCode = $exit; Output = $output }
+    $commandLimit = if ($TimeoutSeconds -gt 0) { $TimeoutSeconds } elseif ($Arguments -contains 'fetch') { 300 } else { 60 }
+    $limit = [Math]::Min([long]$commandLimit * 1000, [long]$script:PinnedGitRemainingMilliseconds)
+    if ($limit -lt 1) { Throw-ConsumerResult INVALID 'Bootstrap Git phase deadline was exhausted.' }
+    $start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$GitExecutable;$start.UseShellExecute=$false
+    $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+    foreach($argument in $all){[void]$start.ArgumentList.Add([string]$argument)}
+    $process=[Diagnostics.Process]::new();$watch=[Diagnostics.Stopwatch]::StartNew();$stdout=$null;$stderr=$null
+    try{
+        $process.StartInfo=$start;[void]$process.Start()
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+        if(-not$process.WaitForExit([int][Math]::Min($limit,[int]::MaxValue))){
+            try{$process.Kill($true)}catch{}
+            if(-not$process.WaitForExit(5000)){Throw-ConsumerResult INVALID 'Bootstrap Git timed out and process-tree cleanup was not confirmed.'}
+            [void][Threading.Tasks.Task]::WhenAll($stdout,$stderr).Wait(5000)
+            Throw-ConsumerResult INVALID "Bootstrap Git exceeded its bounded deadline of $([Math]::Ceiling($limit/1000)) seconds."
+        }
+        if(-not[Threading.Tasks.Task]::WhenAll($stdout,$stderr).Wait(5000)){Throw-ConsumerResult INVALID 'Bootstrap Git output draining exceeded its cleanup deadline.'}
+        $output=@();foreach($text in @($stdout.GetAwaiter().GetResult(),$stderr.GetAwaiter().GetResult())){
+            if(-not[string]::IsNullOrEmpty($text)){$output+=@($text.TrimEnd("`r","`n")-split"`r?`n")}
+        }
+        $exit=$process.ExitCode
+        if ($exit -notin $AllowedExitCodes) { Throw-ConsumerResult INVALID "git failed ($exit): $($output -join ' ')" }
+        [pscustomobject]@{ ExitCode = $exit; Output = $output }
+    }finally{
+        $watch.Stop();$script:PinnedGitRemainingMilliseconds=[Math]::Max(0,[long]$script:PinnedGitRemainingMilliseconds-[long]$watch.ElapsedMilliseconds)
+        $stdout=$null;$stderr=$null;$process.Dispose();Remove-Variable stdout,stderr,process -ErrorAction SilentlyContinue
+    }
 }
 function Get-ConsumerRunId([string]$Repository, [string]$RunId, [string]$Attempt) {
     if ($RunId -cnotmatch '^[0-9]+$' -or $Attempt -cnotmatch '^[1-9][0-9]*$') { Throw-ConsumerResult INVALID 'Workflow run identity is invalid.' }
@@ -222,84 +256,10 @@ function Write-CreateOnlyJson([string]$Path, $Value) {
     try { $stream.Write($bytes)
      $stream.Flush($true) } finally { $stream.Dispose() }
 }
-function Invoke-ConsumerGateProcess([string]$Executable, [string]$GatePath, [string]$InterfacePath, [string]$CurrentPhase, [string]$BindingPath, [string]$Token) {
-    $contract = (Read-StrictJson $InterfacePath 'consumer gate interface').Value
-    Assert-ConsumerInterface $contract
-    $allowed = @($contract.phaseEnvironment.$CurrentPhase)
-    $start = [Diagnostics.ProcessStartInfo]::new();$start.FileName = $Executable;$start.UseShellExecute = $false
-    $start.RedirectStandardOutput = $true;$start.RedirectStandardError = $true
-    foreach ($argument in @('-NoProfile','-NonInteractive','-File',$GatePath,'-Interface','consumer-gate-v1','-Phase',$CurrentPhase,`
-        '-AuthorityBindingPath',$BindingPath,'-BaseRoot',$BaseRoot,'-CandidateRoot',$CandidateRoot,'-WorkRoot',$WorkRoot,'-Platform',$Platform))`
-            { [void]$start.ArgumentList.Add($argument) }
-    if ($TransitionFromLegacy) { [void]$start.ArgumentList.Add('-TransitionFromLegacy') }
-    $preserved = @{};foreach ($name in $allowed) { $preserved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
-    if($allowed-ccontains'STANDARD_VALIDATION_GITHUB_API_TOKEN'){$preserved['STANDARD_VALIDATION_GITHUB_API_TOKEN']=$Token}
-    foreach ($name in @('PATH','Path','SystemRoot','WINDIR','TEMP','TMP','HOME','USERPROFILE','ComSpec','PATHEXT','PSModulePath')) {
-        $value = [Environment]::GetEnvironmentVariable($name, 'Process')
-         if (-not [string]::IsNullOrWhiteSpace($value)) { $preserved[$name] = $value }
-    }
-    $start.Environment.Clear()
-     foreach ($name in $preserved.Keys) { if ($null -ne $preserved[$name]) { $start.Environment[[string]$name] = [string]$preserved[$name] } }
-    $osNames = @('PATH','Path','PATHEXT','SystemRoot','WINDIR','OS','TEMP','TMP','TMPDIR','HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','APPDATA',`
-        'LOCALAPPDATA','PROGRAMDATA','PROGRAMFILES','PROGRAMFILES(X86)','PROGRAMW6432','COMMONPROGRAMFILES','COMMONPROGRAMFILES(X86)',`
-            'COMMONPROGRAMW6432','COMSPEC','NUMBER_OF_PROCESSORS','PROCESSOR_ARCHITECTURE','PROCESSOR_IDENTIFIER','LANG','LC_ALL','LC_CTYPE',`
-                'DOTNET_ROOT','DOTNET_ROOT_X64','XDG_RUNTIME_DIR','PSExecutionPolicyPreference')
-    $start.Environment.Clear()
-     foreach ($name in $osNames + $allowed) { $value = if ($preserved.ContainsKey($name)) { $preserved[$name] } else {`
-         [Environment]::GetEnvironmentVariable($name, 'Process') }
-     try { if ($null -ne $value) { $start.Environment[$name] = $value } }finally{$value=$null;Remove-Variable value -ErrorAction SilentlyContinue} }
-    $credentialNames = @($allowed | Where-Object { $_ -match '(?i)(TOKEN|SECRET|KEY|PASSWORD)' })
-    $process = [Diagnostics.Process]::new()
-    $resultCode = 30
-    try {
-        $process.StartInfo = $start
-        [void]$process.Start()
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $standardOutput = $stdout.GetAwaiter().GetResult()
-        $standardError = $stderr.GetAwaiter().GetResult()
-        $credentialLeak = $false
-        foreach ($name in $credentialNames) {
-            try {$sentinel = [string]$preserved[$name]
-                if (-not [string]::IsNullOrEmpty($sentinel) -and
-                    ($standardOutput.Contains($sentinel, [StringComparison]::Ordinal) -or
-                     $standardError.Contains($sentinel, [StringComparison]::Ordinal))) {
-                    $credentialLeak = $true
-                }}finally{$sentinel = $null
-            Remove-Variable sentinel -ErrorAction SilentlyContinue}
-        }
-
-        if ($credentialLeak) {
-            [Console]::Error.WriteLine('Gate output contained a credential sentinel and was suppressed.')
-            $resultCode = 20
-        }
-        else {
-            [Console]::Out.Write($standardOutput)
-            [Console]::Error.Write($standardError)
-            $resultCode = if ($process.ExitCode -in @(0,10,20,30,40)) { $process.ExitCode } else { 30 }
-        }
-    }
-    finally {
-        foreach ($name in $credentialNames) {
-            [void]$start.Environment.Remove([string]$name)
-            if ($preserved.ContainsKey($name)) {
-                $preserved[$name] = $null
-                [void]$preserved.Remove($name)
-            }
-        }
-        $standardOutput = $null
-        $standardError = $null
-        $stdout = $null
-        $stderr = $null
-        $credentialLeak = $null
-        $preserved.Clear()
-        $start.Environment.Clear()
-        $process.Dispose();$value = $null
-        $Token=$null
-        Remove-Variable standardOutput, standardError, stdout, stderr, credentialLeak, preserved, process, value, Token -ErrorAction SilentlyContinue
-    }
-    $resultCode
+function Import-ConsumerBootstrapSupervisor([string]$AuthorityRoot) {
+    $path=Join-Path $AuthorityRoot 'scripts/consumer/ConsumerBootstrapSupervisor.psm1'
+    [void](Assert-PlainPath $path 'consumer bootstrap supervisor' -Leaf)
+    Import-Module $path -Force -PassThru -ErrorAction Stop
 }
 if ($DefineFunctionsOnly) { return }
 $bootstrapToken=[string][Environment]::GetEnvironmentVariable('STANDARD_VALIDATION_GITHUB_API_TOKEN','Process')
@@ -317,11 +277,13 @@ try {
     if ((Test-PathInside $WorkRoot $BaseRoot) -or (Test-PathInside $WorkRoot $CandidateRoot)) { Throw-ConsumerResult INVALID `
         'WorkRoot is outside the permitted boundary.' }
     $tempRoot = if (-not [string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) { $env:RUNNER_TEMP } else { $env:CONSUMER_GATE_TEST_TEMP_ROOT }
-    if ([string]::IsNullOrWhiteSpace($tempRoot) -or -not (Test-PathInside $WorkRoot $tempRoot)) { Throw-ConsumerResult INVALID `
+    if ([string]::IsNullOrWhiteSpace($tempRoot) -or -not (Test-PathInside $WorkRoot $tempRoot) -or
+        (Test-PathInside $tempRoot $WorkRoot)) { Throw-ConsumerResult INVALID `
         'WorkRoot must be under RUNNER_TEMP or the local test temp root.' }
     if (-not (Test-Path $WorkRoot)) { [IO.Directory]::CreateDirectory($WorkRoot) | Out-Null }
      [void](Assert-PlainPath $WorkRoot 'WorkRoot')
     Initialize-PinnedGitHooks $WorkRoot
+    Initialize-PinnedGitDeadline $Phase
     Assert-Revisions $TriggerEvent $BaseRevision $CandidateRevision $HeadRevision $BaseRoot $CandidateRoot
     if ($TransitionFromLegacy -and ((Test-Path (Join-Path $BaseRoot 'scripts/Invoke-PinnedAuthority.ps1')) -or (Test-Path (Join-Path $BaseRoot `
         'config/authority-pin.json')))) { Throw-ConsumerResult FAILED 'Transition base already contains the bootstrap or pin.' }
@@ -370,6 +332,8 @@ try {
         if($boundTip-cne[string]$binding.aiiMainTip-or$boundTree-cne[string]$binding.treeSha){Throw-ConsumerResult FAILED `
             'Authority binding no longer matches the acquired repository.'}
         $interfacePath = Join-Path $authority.Root 'consumer/consumer-gate-interface.json'
+        $interface = (Read-StrictJson $interfacePath 'consumer gate interface').Value
+        Assert-ConsumerInterface $interface
     }
     $executable = (Get-Process -Id $PID).Path
     if ($Phase -in @('validate','finalize')) {
@@ -385,8 +349,11 @@ try {
                 'Verified PowerShell runtime changed.'}
         $executable = $runtimeExecutable
     }
-    $code = Invoke-ConsumerGateProcess $executable (Join-Path $authority.Root 'scripts/consumer/Invoke-ConsumerSourceGate.ps1') $interfacePath `
-        $Phase $bindingPath $bootstrapToken
+    $supervisor=Import-ConsumerBootstrapSupervisor $authority.Root
+    $code=& $supervisor.ExportedCommands['Invoke-ConsumerGateProcess'] -AuthorityRoot $authority.Root -Executable $executable `
+        -GatePath (Join-Path $authority.Root 'scripts/consumer/Invoke-ConsumerSourceGate.ps1') -InterfacePath $interfacePath `
+        -CurrentPhase $Phase -BindingPath $bindingPath -BaseRoot $BaseRoot -CandidateRoot $CandidateRoot -WorkRoot $WorkRoot `
+        -Platform $Platform -TransitionFromLegacy:$TransitionFromLegacy -Token $bootstrapToken
     exit $code
 } catch {
     $message = [string]$_.Exception.Message
