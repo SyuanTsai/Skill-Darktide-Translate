@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   gate:
+    timeout-minutes: 150
     permissions:
       contents: read
     strategy:
@@ -158,6 +159,7 @@ jobs:
           if-no-files-found: error
 
   aggregate:
+    timeout-minutes: 20
     needs: gate
     if: always()
     permissions:
@@ -226,6 +228,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   report:
+    timeout-minutes: 10
     needs: [gate, aggregate]
     if: always() && github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
