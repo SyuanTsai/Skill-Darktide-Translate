@@ -4,6 +4,52 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # Skill Darktide Translate
 
+## Overview
+
+**What it is:** An Agent Skill that safely updates Warhammer 40,000: Darktide MODs from Nexus Mods archives and keeps Taiwan Traditional Chinese (`zh-tw`) localization in sync. It supports maintenance of the [public Darktide MOD collection](https://github.com/SyuanTsai/Warhammer-40-000-DARKTIDE-Mods).
+
+**Problem it solves:** Manually replacing a MOD can silently drop or damage existing translations. The workflow preserves reliable translations when the source is unchanged, records Git evidence, and requires the Candidate Gate to pass before opening or updating a pull request (PR). A local review checks the published candidate.
+
+**Key Skills**
+
+| Skill | What it does |
+| --- | --- |
+| [`auto-update-darktide-mod`](skills/auto-update-darktide-mod/SKILL.md) | Updates MODs from verified Nexus Main files or supplied ZIPs, preserves active `zh-tw`, and records Schema 14 or 15 Git evidence. Supports acquiring sources, claiming or resuming updates, handling review feedback, and finalizing merges. |
+
+**Requirements:** Windows only. Requires PowerShell 7, Git, and either a configured GitHub connector or an authenticated `gh`. The `darktide-mod-maintenance` profile is opt-in.
+
+**Quick start:**
+
+1. In your [SyuanTsai-AI-Instructions](https://github.com/SyuanTsai/SyuanTsai-AI-Instructions) setup, install this repository as an independent Skill source and pin it using the [source pin procedure](#versioning-and-rollback).
+2. Enable the [`darktide-mod-maintenance` profile](catalog/profiles.json).
+3. Invoke [`auto-update-darktide-mod`](skills/auto-update-darktide-mod/SKILL.md) and follow its instructions for a Nexus Main file or a supplied ZIP.
+
+**License and attribution:** [Apache-2.0](LICENSE) covers repository-authored material. See [PROVENANCE.md](PROVENANCE.md) for excluded material and [NOTICE](NOTICE) for attribution.
+
+## 概覽
+
+**這是什麼：** 這個 Agent Skill 從 Nexus Mods 的壓縮檔安全更新《Warhammer 40,000: Darktide》的 MOD，並同步臺灣繁體中文（`zh-tw`）在地化內容。它可用於維護[公開的 Darktide MOD 合集](https://github.com/SyuanTsai/Warhammer-40-000-DARKTIDE-Mods)。
+
+**解決的問題：** 手動替換 MOD 時，既有翻譯可能在未察覺的情況下遺失或損毀。這套流程會在來源未變更時保留可靠的翻譯、記錄 Git 證據，並要求通過 Candidate Gate 後才能建立或更新 Pull Request（PR）。發布後會在本機審查候選版本。
+
+**主要 Skills**
+
+| Skill | 功能 |
+| --- | --- |
+| [`auto-update-darktide-mod`](skills/auto-update-darktide-mod/SKILL.md) | 使用經驗證的 Nexus Main 檔案或使用者提供的 ZIP 更新 MOD，保留使用中的 `zh-tw`，並記錄 Schema 14 或 15 的 Git 證據。支援取得來源、認領或繼續更新、處理審查回饋，以及完成合併後的收尾作業。 |
+
+**環境需求：** 僅支援 Windows。需要 PowerShell 7、Git，以及已設定的 GitHub connector 或已完成身分驗證的 `gh`。必須手動啟用 `darktide-mod-maintenance` 設定檔。
+
+**快速開始：**
+
+1. 在 [SyuanTsai-AI-Instructions](https://github.com/SyuanTsai/SyuanTsai-AI-Instructions) 的設定中，將此儲存庫安裝為獨立的 Skill 來源，並依照[來源版本固定程序](#versioning-and-rollback)固定版本。
+2. 啟用 [`darktide-mod-maintenance` 設定檔](catalog/profiles.json)。
+3. 呼叫 [`auto-update-darktide-mod`](skills/auto-update-darktide-mod/SKILL.md)，依指示使用 Nexus Main 檔案或使用者提供的 ZIP。
+
+**授權與署名：** [Apache-2.0](LICENSE) 適用於此儲存庫自行撰寫的內容。授權範圍以外的內容請見 [PROVENANCE.md](PROVENANCE.md)，署名資訊請見 [NOTICE](NOTICE)。
+
+---
+
 Independent, Windows-only Agent Skill source for safe Warhammer 40,000 DARKTIDE MOD archive updates and `zh-tw` source synchronization.
 
 Local development, installation, execution, testing, validation, and CI acceptance require a Windows host; Linux, macOS, and WSL are unsupported.
