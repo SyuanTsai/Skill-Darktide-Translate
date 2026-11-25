@@ -839,6 +839,7 @@ Describe 'Schema 15 source acquisition contract' {
         $oldLocalization = 'return { existing = { en = "Existing", ["zh-tw"] = "既有" } }'
         [IO.File]::WriteAllText((Join-Path $modRoot 'AutoMod_localization.lua'), $oldLocalization, [Text.UTF8Encoding]::new($false))
         & git -C $repository add .
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
 
         $runId = '36363636-4747-4888-8999-101010101010'
@@ -900,6 +901,7 @@ Describe 'Schema 15 source acquisition contract' {
         $localizationText = 'return { hello = { en = "Hello", ["zh-tw"] = "哈囉" } }'
         [IO.File]::WriteAllText((Join-Path $modRoot 'M_localization.lua'), $localizationText, [Text.UTF8Encoding]::new($false))
         & git -C $repository add .
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
 
         $runId = '34343434-4545-4666-8777-898989898989'

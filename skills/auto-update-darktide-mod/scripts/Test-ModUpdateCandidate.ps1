@@ -18,6 +18,7 @@ $ErrorActionPreference = 'Stop'
 $luaLocalizationScannerModulePath = Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1'
 Import-Module -Name $luaLocalizationScannerModulePath -Force -ErrorAction Stop
 Import-Module -Name (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'LocalizationWorksetContract.psm1') -Force -ErrorAction Stop
 
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
@@ -1183,30 +1184,6 @@ function Test-LocalizationWorksetCandidate {
     try { $null = Test-ApprovedSpanCandidate -Indexed $NewBytes -Merged $MergedBytes -ApprovedSpans $spans }
     catch { throw ("Candidate changed bytes outside approved localization workset edits. {0}" -f ([string]$_.Exception.Message)) }
     $true
-}
-
-function Get-ImmutableWorksetContractSha256 {
-    param($Workset)
-    $unitContracts = @($Workset.units | ForEach-Object {
-        [ordered]@{
-            unitId = $_.unitId; sourceId = $_.sourceId; containerPath = $_.containerPath
-            key = $_.key; occurrence = $_.occurrence; old = $_.old; new = $_.new
-            changeType = $_.changeType; action = $_.action; blockedReason = $_.blockedReason
-        }
-    })
-    $contract = [ordered]@{
-        schemaVersion = $Workset.schemaVersion
-        workflowSchemaVersion = $Workset.workflowSchemaVersion
-        generatorVersion = $Workset.generatorVersion
-        baseOid = $Workset.baseOid
-        sourceId = $Workset.sourceId
-        modRelativePath = $Workset.modRelativePath
-        old = $Workset.old
-        new = $Workset.new
-        counts = $Workset.counts
-        units = $unitContracts
-    }
-    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress)))
 }
 
 function Assert-PrBodyEvidenceSummary {

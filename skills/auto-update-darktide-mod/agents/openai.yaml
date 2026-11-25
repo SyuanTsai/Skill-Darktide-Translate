@@ -2,5 +2,5 @@
 # SPDX-License-Identifier: Apache-2.0
 interface:
   display_name: "Auto Update Darktide MOD"
-  short_description: "Windows-only DARKTIDE MOD updates and release evidence"
-  default_prompt: "Use $auto-update-darktide-mod on Windows to process, resume, review, or finalize a DARKTIDE MOD update with verified evidence and natural Taiwan Traditional Chinese."
+  short_description: "DARKTIDE MOD updates and verified release evidence"
+  default_prompt: "Use $auto-update-darktide-mod on Windows locally or on Linux in GitHub Actions to process, resume, review, or finalize a DARKTIDE MOD update with verified evidence and natural Taiwan Traditional Chinese."

@@ -25,6 +25,8 @@ Describe 'Auto Update Darktide MOD Skill contract' {
         $skill | Should -Match 'references/schema-15\.md'
         $skill | Should -Match 'scripts/Expand-Schema14Reference\.ps1'
         $skill | Should -Match 'scripts/Test-ReferenceIntegrity\.ps1'
+        $skill | Should -Match 'PowerShell 7 is supported on Windows for local use and on Linux in GitHub Actions \(`ubuntu-latest`\)'
+        $skill | Should -Match 'macOS and WSL are unsupported'
     }
 
     # Scenario: The Skill entrypoint is evaluated by the repository quality gate.

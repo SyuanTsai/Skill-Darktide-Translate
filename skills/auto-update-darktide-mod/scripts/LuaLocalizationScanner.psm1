@@ -789,4 +789,20 @@ function Get-LuaLocalizationDocument {
     }
 }
 
-Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment
+function Test-LuaNonStringTokenSequence {
+    param([string] $Source, [string] $Translation)
+
+    # Compare the full structure while allowing string literal text to change.
+    $sourceTokens = @(Get-LuaTokens -Text $Source)
+    $translationTokens = @(Get-LuaTokens -Text $Translation)
+    if ($sourceTokens.Count -ne $translationTokens.Count) { return $false }
+    for ($index = 0; $index -lt $sourceTokens.Count; $index++) {
+        $sourceToken = $sourceTokens[$index]
+        $translationToken = $translationTokens[$index]
+        if ($sourceToken.type -cne $translationToken.type) { return $false }
+        if ($sourceToken.type -cne 'string' -and $sourceToken.text -cne $translationToken.text) { return $false }
+    }
+    return $true
+}
+
+Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence

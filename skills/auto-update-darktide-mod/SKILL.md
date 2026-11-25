@@ -1,6 +1,6 @@
 ---
 name: auto-update-darktide-mod
-description: Update Warhammer 40,000 DARKTIDE MODs on Windows only from verified Nexus Main files or supplied ZIPs, preserve active zh-tw, and produce Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
+description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs, preserve active zh-tw, and produce Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
 allowed-tools: "git, pwsh, webfetch"
 ---
 <!--
@@ -14,7 +14,7 @@ SPDX-License-Identifier: Apache-2.0
 
 Use the packaged Schema 14 workflow as the normative base. For a new automatic-source run, also use the verified Schema 15 extension. The Skill routes each operation through the evidence needed for a trustworthy, recoverable result.
 
-Local installation, execution, and validation require Windows with PowerShell 7; Linux, macOS, and WSL are unsupported.
+PowerShell 7 is supported on Windows for local use and on Linux in GitHub Actions (`ubuntu-latest`). macOS and WSL are unsupported.
 The coordination helpers themselves use only local .NET locking, same-directory publication, lexical containment, and recognizable crash-residue names so their primitive contract can be verified on Windows, Linux, and macOS without a packaged runtime.
 
 ## Load the authoritative instructions
@@ -26,6 +26,8 @@ The coordination helpers themselves use only local .NET locking, same-directory 
 5. For a new Schema 15 run, read [references/schema-15.md](references/schema-15.md) completely after the expanded Schema 14 Workflow. Its acquisition, receipt, status, localization-workset, and lifecycle rules override only the corresponding Schema 14 manual-source and approved-span rules.
 6. Before local Review, external feedback classification, or Review completion, use the same script to materialize `assets/review-baseline.md` from the same pinned Skill source commit and read it completely, then apply the translation-quality outcome standard to its semantic fidelity checks.
 7. Before executing or recovering deterministic stages, read [references/automation.md](references/automation.md). Use [mod-update.ps1](scripts/mod-update.ps1) for fixed stage orchestration, [Finalize-ModUpdateMerge.ps1](scripts/Finalize-ModUpdateMerge.ps1) through its `finalize-merge` command for merge reconciliation or finalization, and the [Candidate Gate script](scripts/Test-ModUpdateCandidate.ps1) as the independent Final Candidate Gate. These reusable scripts derive MOD, run, PR, SHA, path, and reservation facts from the verified state instead of generated per-run helpers.
+
+8. Read [references/api-translation.md](references/api-translation.md) for the packaged API assets and PowerShell workset binding. Run the Python adapter separately from the repository source tree or GitHub Actions.
 
 Existing runs continue with the workflow tuple recorded in their own state. Runs pinned to version 0.3.12 or later expose `finalize-merge`; an older run follows the finalization or recovery procedure in its recorded package. A package upgrade starts a new run and leaves the old state unchanged.
 

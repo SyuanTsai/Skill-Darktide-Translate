@@ -2391,6 +2391,7 @@ function Suspend-Stage {
         $scanner = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/LuaLocalizationScanner.psm1') -Raw
         $generator = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/New-LocalizationWorkset.ps1') -Raw
         $worksetReceipt = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-LocalizationWorksetReceipt.ps1') -Raw
+        $worksetContract = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/LocalizationWorksetContract.psm1') -Raw
         $receipt = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-SourceReceipt.ps1') -Raw
         $reference = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/Test-ReferenceIntegrity.ps1') -Raw
         $runner | Should -Match 'while \(-not \$process\.WaitForExit\(1000\)\)'
@@ -2407,9 +2408,13 @@ function Suspend-Stage {
         $runner | Should -Not -Match '\[IO\.File\]::ReadAllBytes|\[IO\.File\]::Copy|Remove-Item[^\r\n]+-Recurse'
         $candidate | Should -Not -Match '\[IO\.File\]::ReadAllBytes'
         $candidate | Should -Not -Match '-HeartbeatAction \{ Invoke-Heartbeat \}'
-        foreach ($content in @($runner, $candidate, $generator, $worksetReceipt)) {
+        foreach ($content in @($runner, $candidate, $worksetContract)) {
             $content | Should -Match '\.CopyToAsync\(\$memory\)'
             $content | Should -Match 'ReadToEndAsync\(\)'
+            $content | Should -Not -Match '\.BaseStream\.CopyTo\('
+        }
+        foreach ($content in @($generator, $worksetReceipt)) {
+            $content | Should -Match 'Get-LocalizationGitBlobBytes[^\r\n]+-HeartbeatAction \$HeartbeatAction'
             $content | Should -Not -Match '\.BaseStream\.CopyTo\('
         }
         $scanner | Should -Match '\[scriptblock\] \$HeartbeatAction'
@@ -3223,6 +3228,16 @@ function Get-SourceTupleContractSha256 {
         $runner | Should -Match '(?s)pr'', ''edit''.*?--body'', \$updatedBody.*?Assert-PublishedPrAtF -State \$State'
         $validator | Should -Match 'function Assert-PrBodyEvidenceSummary'
         $validator | Should -Match "Add-ReviewCheck -Name 'pr-evidence-summary'"
+    }
+
+    It 'UnitT191A_AppendsApiTranslationSummaryOnlyWhenPresent' {
+        $module = New-RunnerFunctionModuleForTest -Names @('Get-PrBody', 'Assert-NoReparsePath')
+        $state = @{ schemaVersion = 14; runRoot = $TestDrive; localizationFiles = @(); securityOverrides = @() }
+        $summaryPath = Join-Path $TestDrive 'api-summary.md'
+        (& $module { param($s) Get-PrBody -State $s } $state) | Should -Not -Match '## API 翻譯'
+        @('## Claude API 臺灣繁中翻譯', '', 'Approved items: 2') | Set-Content -LiteralPath $summaryPath
+        (& $module { param($s) Get-PrBody -State $s } $state) |
+            Should -Match '(?m)^## API 翻譯\r?\n\r?\n### Claude API 臺灣繁中翻譯\r?\n\r?\nApproved items: 2$'
     }
 
     # Scenario: The evidence receipt claims that the coordinator checked every changed-path boundary.

@@ -31,6 +31,10 @@ param(
     [ValidateRange(0, 60000)]
     [int] $ObservationIntervalMilliseconds = 1000,
     [string] $LocalizationPlanPath,
+    # Match the API adapter's --mode when processing a ready Schema 15 workset.
+    [ValidateSet('update', 'improve')]
+    [string] $TranslationMode = 'update',
+    [ValidateNotNullOrEmpty()][string] $ModelId,
     [string] $SecurityOverridePath,
     [string] $LocalReviewPath,
     [string[]] $MetadataPath = @(),
@@ -4097,6 +4101,8 @@ function Invoke-LocalizationWorkset {
         HeartbeatAction = { Update-ActiveReservationHeartbeat }
         PassThru = $true
     }
+    if ($script:PSBoundParameters.ContainsKey('TranslationMode')) { $generationParameters.TranslationMode = $TranslationMode }
+    if ($script:PSBoundParameters.ContainsKey('ModelId')) { $generationParameters.ModelId = $ModelId }
     $generation = & $generator @generationParameters
     if ($generation.status -eq 'automation-excluded') {
         $State.status = 'automation-excluded'
@@ -5354,7 +5360,7 @@ function Get-PrBody {
             ForEach-Object { 'archiveSha256={0};relativePath={1};fileSha256={2}' -f ([string]$($_.archiveSha256)), ([string]$($_.relativePath)), ([string]$($_.fileSha256)) }
     ) -join ' | '
     if ([string]::IsNullOrWhiteSpace($securityOverrideSummary)) { $securityOverrideSummary = 'none' }
-    (
+    $body = (
     @(
         '## Darktide MOD update evidence'
         ''
@@ -5400,6 +5406,16 @@ function Get-PrBody {
         '{75}'
     ) -join [char]10
 ) -f ([string]$($State.runId)), ([string]$($State.mod)), ([string]$($State.schemaVersion)), ([string]$($State.evidenceChain.fOid)), ([string]$($State.evidenceChain.c0Oid)), ([string]$($State.evidenceChain.c1Oid)), ([string]$($State.evidenceChain.c2Oid)), ([string]$($State.evidenceChain.c2Status)), ([string]$($State.evidenceChain.c2Reason.code)), ([string]$($State.evidenceChain.c2Reason.disposition)), ([string]$($State.evidenceChain.c3Oid)), ([string]$($State.evidenceChain.c3Status)), ([string]$($State.evidenceChain.c3Reason.code)), ([string]$($State.evidenceChain.c3Reason.disposition)), ([string]$($State.evidenceChain.c0TreeOid)), ([string]$($State.evidenceChain.c1TreeOid)), ([string]$($State.evidenceChain.c2TreeOid)), ([string]$($State.evidenceChain.c3TreeOid)), ([string]$($State.evidenceChain.fTreeOid)), ([string]$($State.evidenceChain.c1ParentTreeOid)), ([string]$($State.evidenceChain.c2ParentTreeOid)), ([string]$($State.evidenceChain.c3ParentTreeOid)), ([string]$($State.evidenceDiffs.c0C1Diff.sha256)), ([string]$($State.evidenceDiffs.c0C1NameStatus.sha256)), ([string]$($State.evidenceDiffs.c1C2Diff.sha256)), ([string]$($State.evidenceDiffs.c1C2NameStatus.sha256)), ([string]$($State.evidenceDiffs.c2C3Diff.sha256)), ([string]$($State.evidenceDiffs.c2C3NameStatus.sha256)), ([string]$($State.evidenceDiffs.c0FDiff.sha256)), ([string]$($State.evidenceDiffs.c0FNameStatus.sha256)), ([string]$($State.evidenceDiffs.c3FDiff.sha256)), ([string]$($State.evidenceDiffs.c3FNameStatus.sha256)), ([string]$($State.evidenceTargetPathsSha256)), ([string]$(@($State.evidenceTargetPaths) -join ', ')), ([string]$($State.extractionManifest.sha256)), ([string]$($State.rawInstallManifest.sha256)), ([string]$($State.installManifest.sha256)), ([string]$($State.candidateTreeManifest.sha256)), ([string]$($State.gitIndexNormalization.sha256)), ([string]$($State.metadataPreview.sha256)), ([string]$($State.evidenceReceipt.sha256)), ([string]$($State.diffReadability.result)), ([string]$($State.diffReadability.sha256)), ([string]$($State.candidateGate.status)), ([string]$($State.candidateGate.validationReportSha256)), ([string]$($State.workflowCommitOid)), ([string]$($State.workflowSha256)), ([string]$($State.workflowSourceRepository)), ([string]$($State.workflowRef)), ([string]$($State.workflowSourceContentSha256)), ([string]$($State.workflowSourcePinSha256)), ([string]$($State.reviewBaselinePath)), ([string]$($State.reviewBaselineBlobOid)), ([string]$($State.reviewBaselineSha256)), ([string]$($State.translationQualityPath)), ([string]$($State.translationQualityBlobOid)), ([string]$($State.translationQualitySha256)), ([string]$($State.localizationMode)), ([string]$localizationIds), ([string]$localizationEvidence), ([string]$worksetSha), ([string]$worksetDeletionReceiptSha), ([string]$(@($State.evidenceTargetPaths).Count)), ([string]$approvedSpanCount), ([string]$unchangedTargetCount), ([string]$removedTargetCount), ([string]$localizationScope), ([string]$($State.archive.filename)), ([string]$($State.archive.sha256)), ([string]$($State.sourceTuple.contractSha256)), ([string]$(if ($State.Contains('sourceReceipt') -and $State.sourceReceipt) { $State.sourceReceipt.sha256 } else { 'not-applicable' })), ([string]$securityOverrideSummary), ([string]$(if ($State.Contains('securityOverrideReceipt') -and $State.securityOverrideReceipt) { $State.securityOverrideReceipt.sha256 } else { 'not-applicable' })), ([string]$($State.securityPrecommitValidation.sha256)), ([string]$($State.externalReview.status)), ([string]$localizationTable)
+    if ($State['runRoot']) {
+        $summaryPath = Join-Path ([string]$State.runRoot) 'api-summary.md'
+        $null = Assert-NoReparsePath -Path $summaryPath -Root ([string]$State.runRoot) -Label 'API translation summary' -AllowMissing
+        if (Test-Path -LiteralPath $summaryPath -PathType Leaf) {
+            $summary = [string](Get-Content -LiteralPath $summaryPath -Raw -Encoding utf8)
+            $summary = $summary.TrimEnd() -creplace '(?m)^(#{1,5})(?= )', '#$1'
+            $body += ([string][char]10 + [string][char]10 + '## API 翻譯' + [char]10 + [char]10 + $summary)
+        }
+    }
+    $body
 }
 
 function Assert-PublishedPrAtF {

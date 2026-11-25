@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "workflowSchemaVersion": 15,
+  "generatorVersion": 1,
+  "status": "ready",
+  "baseOid": "16129b1000000000000000000000000000000000",
+  "sourceId": "testmod",
+  "modRelativePath": "mods/TestMod",
+  "old": {"path": "mods/TestMod/test_localization.lua", "sha256": "old", "size": 20, "bom": false, "newline": "lf"},
+  "new": {"root": "synthetic-staging", "path": "synthetic-staging/test_localization.lua", "sha256": "new", "size": 20, "bom": false, "newline": "lf"},
+  "counts": {"source_changed_translation_unchanged": 1},
+  "units": [{
+    "unitId": "testmod :: $ :: demo :: 1",
+    "sourceId": "testmod",
+    "containerPath": "$",
+    "key": "demo",
+    "occurrence": 1,
+    "old": {
+      "sourceId": "testmod", "containerPath": "$", "key": "demo", "occurrence": 1,
+      "unitId": "testmod :: $ :: demo :: 1", "blockedReason": null,
+      "sourceExpression": {"raw": "\"Gain 10%\"", "canonical": "\"Gain 10%\"", "startByte": 10, "lengthByte": 10, "fieldStartByte": 5, "fieldLengthByte": 16, "separatorStartByte": 20, "separatorLengthByte": 1, "isDirectLocalizeCall": false, "isFullyLocaleResolvedExpression": false},
+      "zhTwExpression": {"raw": "\"增加10%\"", "canonical": "\"增加10%\"", "startByte": 34, "lengthByte": 11, "fieldStartByte": 22, "fieldLengthByte": 23, "separatorStartByte": null, "separatorLengthByte": 0, "isDirectLocalizeCall": false, "isFullyLocaleResolvedExpression": false},
+      "tableOpenByte": 4, "tableCloseByte": 45
+    },
+    "new": {
+      "sourceId": "testmod", "containerPath": "$", "key": "demo", "occurrence": 1,
+      "unitId": "testmod :: $ :: demo :: 1", "blockedReason": null,
+      "sourceExpression": {"raw": "\"Gain 15%\"", "canonical": "\"Gain 15%\"", "startByte": 10, "lengthByte": 10, "fieldStartByte": 5, "fieldLengthByte": 16, "separatorStartByte": 20, "separatorLengthByte": 1, "isDirectLocalizeCall": false, "isFullyLocaleResolvedExpression": false},
+      "zhTwExpression": {"raw": "\"增加10%\"", "canonical": "\"增加10%\"", "startByte": 34, "lengthByte": 11, "fieldStartByte": 22, "fieldLengthByte": 23, "separatorStartByte": null, "separatorLengthByte": 0, "isDirectLocalizeCall": false, "isFullyLocaleResolvedExpression": false},
+      "tableOpenByte": 4, "tableCloseByte": 45
+    },
+    "changeType": "source_changed_translation_unchanged",
+    "action": "AI_REQUIRED",
+    "blockedReason": null,
+    "reviewStatus": "pending",
+    "suggestedZhTwExpression": null
+  }],
+  "immutableContractSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

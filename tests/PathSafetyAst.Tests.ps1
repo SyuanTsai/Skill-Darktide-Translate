@@ -53,6 +53,7 @@ $runtimePowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/Finalize-LocalizationWorksetEvidence.ps1',
     'skills/auto-update-darktide-mod/scripts/Finalize-ModUpdateMerge.ps1',
     'skills/auto-update-darktide-mod/scripts/Invoke-ModUpdateQueue.ps1',
+    'skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1',
     'skills/auto-update-darktide-mod/scripts/LuaLocalizationScanner.psm1',
     'skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1',
     'skills/auto-update-darktide-mod/scripts/PathSafety.psm1',
@@ -64,11 +65,14 @@ $runtimePowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1',
     'skills/auto-update-darktide-mod/scripts/mod-update.ps1'
 )
-$protectedRuntimePowerShellInventorySha256 = '1bc621212ab14d834f869cecbdab41251d29980efb66f927e9262319601c1c9b'
+$protectedRuntimePowerShellInventorySha256 = '2d42925fba66c1c67ef8dec941d7f0769a2eed5088f703cc946b9396e0155497'
 $scopedFiles = @($runtimePowerShellFiles)
 
 # Exact reviewed runtime function-level inventory. Format: file|function|call|count.
 $reviewedPathnameCallAllowances = @'
+skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1|Read-LocalizationRuleFile|Get-Item|1
+skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1|Read-LocalizationRuleFile|IO.File::ReadAllBytes|1
+skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-PrBody|Test-Path|1
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|<script>|Test-Path|2
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|Assert-NoReparsePath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|Assert-NoReparsePath|type::IO.DirectoryInfo|1

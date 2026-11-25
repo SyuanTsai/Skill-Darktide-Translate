@@ -10,7 +10,7 @@
   "profiles": [
     {
       "id": "darktide-mod-maintenance",
-      "description": "Windows-only opt-in DARKTIDE MOD Nexus acquisition, archive update, natural zh-tw workset, evidence, PR, and state-driven merge finalization workflow.",
+      "description": "Opt-in DARKTIDE MOD Nexus acquisition, archive update, natural zh-tw workset, evidence, PR, and state-driven merge finalization workflow.",
       "default": false,
       "includes": [
         "auto-update-darktide-mod"
@@ -31,7 +31,8 @@
       ],
       "compatibility": {
         "platforms": [
-          "windows"
+          "windows",
+          "linux"
         ],
         "shells": [
           "pwsh>=7"
