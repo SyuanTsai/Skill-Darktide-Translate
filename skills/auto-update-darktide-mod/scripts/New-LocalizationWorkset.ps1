@@ -10,6 +10,9 @@ param(
     [Parameter(Mandatory)][string] $StagingModPath,
     [Parameter(Mandatory)][string] $OutputPath,
     [string] $SourceId,
+    [ValidateSet('update', 'improve')]
+    [string] $TranslationMode = 'update',
+    [ValidateNotNullOrEmpty()][string] $ModelId,
     [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
@@ -19,6 +22,7 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'LocalizationWorksetContract.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -86,31 +90,6 @@ function Get-FileSha256 {
     finally { $hasher.Dispose(); $stream.Dispose() }
 }
 
-function Get-ImmutableWorksetContractSha256 {
-    param($Workset)
-    $unitContracts = @($Workset.units | ForEach-Object {
-        [ordered]@{
-            unitId = $_.unitId; sourceId = $_.sourceId; containerPath = $_.containerPath
-            key = $_.key; occurrence = $_.occurrence; old = $_.old; new = $_.new
-            changeType = $_.changeType; action = $_.action; blockedReason = $_.blockedReason
-        }
-    })
-    $contract = [ordered]@{
-        schemaVersion = $Workset.schemaVersion
-        workflowSchemaVersion = $Workset.workflowSchemaVersion
-        generatorVersion = $Workset.generatorVersion
-        baseOid = $Workset.baseOid
-        sourceId = $Workset.sourceId
-        modRelativePath = $Workset.modRelativePath
-        old = $Workset.old
-        new = $Workset.new
-        counts = $Workset.counts
-        units = $unitContracts
-    }
-    $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress))
-    Get-Sha256Bytes -Bytes $bytes
-}
-
 function Get-ReviewWorksetContractSha256 {
     param($Workset)
     $reviewContract = @($Workset.units | ForEach-Object {
@@ -141,35 +120,6 @@ function Invoke-GitText {
     $result = [ordered]@{ exitCode = $process.ExitCode; output = $stdoutTask.Result.TrimEnd(); warning = $stderrTask.Result.TrimEnd() }
     if ($result.exitCode -ne 0 -and -not $AllowFailure) { throw ('Git localization query failed: {0} {1}' -f ([string]$result.warning), ([string]$result.output)) }
     $result
-}
-
-function Get-GitBlobBytes {
-    param([string] $WorkingDirectory, [string] $Object)
-    $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = 'git'
-    $start.UseShellExecute = $false
-    $start.RedirectStandardInput = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    foreach ($argument in @('-C', $WorkingDirectory, 'cat-file', 'blob', $Object)) { $start.ArgumentList.Add($argument) }
-    $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
-    if (-not $process.Start()) { throw 'Unable to start Git blob reader for localization workset generation.' }
-    $process.StandardInput.Close()
-    $memory = [IO.MemoryStream]::new()
-    try {
-        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
-        $errorTask = $process.StandardError.ReadToEndAsync()
-        while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
-            if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
-            else { [Threading.Tasks.Task]::Delay(50).Wait() }
-            Invoke-Heartbeat
-        }
-        $null = $copyTask.GetAwaiter().GetResult()
-        $errorText = $errorTask.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw "Unable to read immutable localization blob: $errorText" }
-        $memory.ToArray()
-    }
-    finally { $memory.Dispose(); $process.Dispose() }
 }
 
 function Assert-ContainedPath {
@@ -289,6 +239,19 @@ $existingWorkset = if (Test-Path -LiteralPath $outputFull -PathType Leaf) {
     Get-Content -LiteralPath $outputFull -Raw | ConvertFrom-Json -AsHashtable
 } else { $null }
 if ($existingWorkset) {
+    if ($existingWorkset.generatorVersion -eq 2) {
+        if ([string]::IsNullOrWhiteSpace([string]$existingWorkset.immutableContractSha256) -or
+            (Get-ImmutableWorksetContractSha256 -Workset $existingWorkset) -cne [string]$existingWorkset.immutableContractSha256) {
+            throw 'Existing localization workset immutable contract changed.'
+        }
+        $binding = $existingWorkset.translationBinding
+        if (($PSBoundParameters.ContainsKey('TranslationMode') -and $TranslationMode -ne $binding.mode) -or
+            ($PSBoundParameters.ContainsKey('ModelId') -and $ModelId -cne $binding.modelId)) {
+            throw 'Existing localization workset translation binding differs from the requested mode or model.'
+        }
+        $TranslationMode = $binding.mode
+        $ModelId = $binding.modelId
+    }
     foreach ($unit in @($existingWorkset.units)) {
         if ([string]$unit.action -cne 'AI_REQUIRED' -and
             ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
@@ -355,7 +318,7 @@ if ($newFiles.Count -ne 1) {
 $newPath = Assert-ContainedPath -Candidate $newFiles[0].FullName -Root $stagingRoot
 Assert-NoReparsePath -Path $newPath -Root $stagingRoot
 $oldPath = [string]$oldPaths[0]
-$oldBytes = Get-GitBlobBytes -WorkingDirectory $repository -Object ('{0}:{1}' -f ([string]$resolvedBaseOid), ([string]$oldPath))
+$oldBytes = Get-LocalizationGitBlobBytes -WorkingDirectory $repository -Object ('{0}:{1}' -f ([string]$resolvedBaseOid), ([string]$oldPath)) -HeartbeatAction $HeartbeatAction
 $newBytes = Read-FileBytesWithHeartbeat -Path $newPath
 $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath $oldPath -SourceId $sourceIdentity -HeartbeatAction $HeartbeatAction
 $newDocument = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newPath -SourceId $sourceIdentity -HeartbeatAction $HeartbeatAction
@@ -389,7 +352,7 @@ foreach ($name in @('unchanged', 'localized_source', 'missing_zh_tw', 'zh_tw_onl
 $workset = [ordered]@{
     schemaVersion = 1
     workflowSchemaVersion = 15
-    generatorVersion = 1
+    generatorVersion = if ($existingWorkset -and $existingWorkset.generatorVersion -eq 1) { 1 } else { 2 }
     status = if ($counts.blocked -gt 0) { 'blocked' } else { 'ready' }
     baseOid = $resolvedBaseOid
     sourceId = $sourceIdentity
@@ -398,6 +361,11 @@ $workset = [ordered]@{
     new = [ordered]@{ root = $stagingRoot; path = $newPath; sha256 = $newDocument.sha256; size = $newDocument.size; bom = $newDocument.bom; newline = $newDocument.newline }
     counts = $counts
     units = @($records)
+}
+if ($workset.generatorVersion -eq 2) {
+    $workset.translationBinding = Get-LocalizationTranslationBinding `
+        -ApiRoot (Join-Path $PSScriptRoot '../api') -RepositoryRoot $repository -BaseOid $resolvedBaseOid `
+        -Mode $TranslationMode -ModRelativePath $normalizedModPath -ModelId $ModelId -HeartbeatAction $HeartbeatAction
 }
 $workset.immutableContractSha256 = Get-ImmutableWorksetContractSha256 -Workset $workset
 

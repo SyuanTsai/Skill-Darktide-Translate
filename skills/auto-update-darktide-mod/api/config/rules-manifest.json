@@ -1,0 +1,102 @@
+{
+  "manifestVersion": 1,
+  "files": [
+    {
+      "repo": "skill",
+      "path": "skills/auto-update-darktide-mod/references/schema-15.md",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "skill",
+      "path": "skills/auto-update-darktide-mod/references/translation-quality.md",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "skill",
+      "path": "skills/auto-update-darktide-mod/api/prompts/translator.md",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "skill",
+      "path": "skills/auto-update-darktide-mod/api/prompts/reviewer.md",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "skill",
+      "path": "skills/auto-update-darktide-mod/api/schemas/translator-output.json",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "skill",
+      "path": "skills/auto-update-darktide-mod/api/schemas/reviewer-output.json",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "skill",
+      "path": "skills/auto-update-darktide-mod/api/config/api-translation.json",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "mods",
+      "path": "Darktide Translation Workspace/Rules/zh-tw_localization_base_rules.md",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "mods",
+      "path": "Darktide Translation Workspace/Rules/zh-tw_initial_translation_rules.md",
+      "modes": [
+        "update"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "mods",
+      "path": "Darktide Translation Workspace/Rules/zh-tw_revision_rules.md",
+      "modes": [
+        "improve"
+      ],
+      "modFilter": null
+    },
+    {
+      "repo": "mods",
+      "path": "Darktide Translation Workspace/Rules/enhanced_descriptions_zh-tw_special_rules.md",
+      "modes": [
+        "update",
+        "improve"
+      ],
+      "modFilter": "Enhanced_descriptions"
+    }
+  ]
+}

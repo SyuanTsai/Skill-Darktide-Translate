@@ -224,6 +224,25 @@ function Get-TestSkillRepositoryPath {
     return 'skills/auto-update-darktide-mod'
 }
 
+function Add-TestTranslationRules {
+    param([Parameter(Mandatory)][string] $RepositoryRoot)
+
+    $paths = @(
+        'Darktide Translation Workspace/Rules/zh-tw_localization_base_rules.md'
+        'Darktide Translation Workspace/Rules/zh-tw_initial_translation_rules.md'
+        'Darktide Translation Workspace/Rules/zh-tw_revision_rules.md'
+        'Darktide Translation Workspace/Rules/enhanced_descriptions_zh-tw_special_rules.md'
+        'Referneces/Translation.md'
+    )
+    foreach ($path in $paths) {
+        $file = Join-Path $RepositoryRoot $path
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $file) -Force
+        [IO.File]::WriteAllText($file, "$path`n")
+    }
+    & git -C $RepositoryRoot -c core.autocrlf=false add -- @paths
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to stage translation rules in the test fixture.' }
+}
+
 function New-TestSkillSourcePin {
     param(
         [Parameter(Mandatory)][string] $SkillRoot,

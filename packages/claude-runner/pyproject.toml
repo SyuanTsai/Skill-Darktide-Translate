@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-runner"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["anthropic==2.14.0", "jsonschema>=4.20"]
+
+[tool.setuptools.packages.find]
+include = ["claude_runner*"]

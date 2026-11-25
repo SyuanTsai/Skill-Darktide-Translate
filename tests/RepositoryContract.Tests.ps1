@@ -151,6 +151,7 @@ Describe 'Darktide Translate repository contract' {
             "$skillPrefix/scripts/Invoke-ModUpdateQueue.ps1",
             "$skillPrefix/scripts/SharedCoordinationLock.psm1",
             "$skillPrefix/scripts/LuaLocalizationScanner.psm1",
+            "$skillPrefix/scripts/LocalizationWorksetContract.psm1",
             "$skillPrefix/scripts/New-LocalizationWorkset.ps1",
             "$skillPrefix/scripts/Apply-LocalizationWorkset.ps1",
             "$skillPrefix/scripts/Test-LocalizationWorksetReceipt.ps1",
@@ -174,6 +175,7 @@ Describe 'Darktide Translate repository contract' {
             $expectedPaths += @(
                 'catalog/source.json',
                 'catalog/profiles.json',
+                '.github/workflows/python-api-tests.yml',
                 'tests/Test-DarktideRepository.Tests.ps1'
             )
         }

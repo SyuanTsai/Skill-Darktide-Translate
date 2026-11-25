@@ -23,6 +23,7 @@ Describe 'Schema 15 localization workset' {
                 modRelativePath = $Workset.modRelativePath; old = $Workset.old; new = $Workset.new
                 counts = $Workset.counts; units = $unitContracts
             }
+            if ($Workset.generatorVersion -eq 2) { $contract.translationBinding = $Workset.translationBinding }
             $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress))
             [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
         }
@@ -49,6 +50,74 @@ Describe 'Schema 15 localization workset' {
         Test-Path -LiteralPath (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') -PathType Leaf | Should -Be $true
         Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
         Get-Command Test-LuaTableFieldAssignment -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
+    }
+
+    It 'UnitT11_OnlyChangesLuaStringTokens: <label>' -ForEach @(
+        @{ label = 'added function call'; source = '"a"'; target = '"a" .. example.call("x") .. "b"'; expected = $false }
+        @{ label = 'added Localize call'; source = '"a"'; target = '"a" .. Localize("key")'; expected = $false }
+        @{ label = 'removed concatenation'; source = '"a" .. "b"'; target = '"c"'; expected = $false }
+        @{ label = 'renamed function'; source = 'string.format("%s old", x)'; target = 'string.gsub("%s new", x)'; expected = $false }
+        @{ label = 'added concatenation and string'; source = '"a" .. x'; target = '"甲" .. x .. "乙"'; expected = $false }
+        @{ label = 'added format argument'; source = 'string.format("%s", x)'; target = 'string.format("%s", x, "多")'; expected = $false }
+        @{ label = 'moved string'; source = '"a" .. x'; target = 'x .. "甲"'; expected = $false }
+        @{ label = 'added string with the same non-string sequence'; source = 'f("a")'; target = 'f("甲") "乙"'; expected = $false }
+        @{ label = 'moved string with the same non-string sequence'; source = 'f "a" .. x'; target = 'f .. x "甲"'; expected = $false }
+        @{ label = 'string replacement'; source = '"a" .. x'; target = '"甲" .. x'; expected = $true }
+        @{ label = 'plain long string replacement'; source = '[[English]]'; target = '"譯文"'; expected = $true }
+        @{ label = 'changed Localize key'; source = 'Localize("key")'; target = 'Localize("other")'; expected = $true }
+        @{ label = 'literal quoting'; source = '"English"'; target = '[=[譯文]=]'; expected = $true }
+        @{ label = 'format string'; source = 'string.format("%s old", x)'; target = "string.format('%s 新', x)"; expected = $true }
+    ) {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        Test-LuaNonStringTokenSequence -Source $source -Translation $target | Should -Be $expected
+    }
+
+    It 'UnitT12_HashesByteExactTranslationBindingVector' {
+        Import-Module (Join-Path $scriptRoot 'LocalizationWorksetContract.psm1') -Force
+        $apiRoot = Join-Path $TestDrive 'fixed-binding/api'
+        New-Item -Path (Join-Path $apiRoot 'config') -ItemType Directory -Force | Out-Null
+        '{"manifestVersion":1,"files":[{"repo":"mods","path":"Rules/a.md","modes":["update"],"modFilter":null},{"repo":"mods","path":"excluded","modes":["improve"],"modFilter":null}]}' |
+            Set-Content -LiteralPath (Join-Path $apiRoot 'config/rules-manifest.json')
+        '{"model":"fixed-model"}' | Set-Content -LiteralPath (Join-Path $apiRoot 'config/api-translation.json')
+        Mock Get-LocalizationGitBlobBytes -ModuleName LocalizationWorksetContract {
+            switch -CaseSensitive ($Object.Split(':', 2)[1]) {
+                'Rules/a.md' { return ,[Convert]::FromHexString('efbbbf610d0a') }
+                'Referneces/Translation.md' { return ,[Text.Encoding]::UTF8.GetBytes("test`n") }
+                default { throw "Unexpected blob: $Object" }
+            }
+        }
+        $binding = Get-LocalizationTranslationBinding -ApiRoot $apiRoot -RepositoryRoot $TestDrive `
+            -BaseOid ('1' * 40) -Mode update -ModRelativePath 'mods/Example'
+        $binding.modelId | Should -BeExactly 'fixed-model'
+        $binding.rulesManifest[0].sha256 | Should -BeExactly 'ea3948106c12d96eaf84d4bb8be214b194c3442acb99a3005251960b0ec2ba63'
+        $binding.rulesSha256 | Should -BeExactly 'c97468ce076ff86d35ca1841979eeb80a8927b2ee0682968e828cfe88c6581d2'
+        $binding.glossarySha256 | Should -BeExactly 'f2ca1bb6c7e907d06dafe4687e579fce76b37e4e93b7605022da52e6ccc26fd2'
+    }
+
+    # The consumer gate requires every discovered test to run.
+    if (-not [string]::IsNullOrWhiteSpace($env:SYP419_PYTHON)) {
+        It 'InterT13_MatchesPythonTranslationBinding' {
+            $repository = Join-Path $TestDrive 'binding-cross-check'
+            New-Item -Path $repository -ItemType Directory | Out-Null
+            & git -C $repository init --quiet
+            Add-TestTranslationRules -RepositoryRoot $repository
+            $baseTree = (& git -C $repository write-tree).Trim()
+            $LASTEXITCODE | Should -Be 0
+            'changed working tree glossary' | Set-Content -LiteralPath (Join-Path $repository 'Referneces/Translation.md')
+            Import-Module (Join-Path $scriptRoot 'LocalizationWorksetContract.psm1') -Force
+            $apiRoot = Join-Path (Split-Path -Parent $scriptRoot) 'api'
+            foreach ($mode in @('update', 'improve')) {
+                $modPath = 'mods/enhanced_DESCRIPTIONS'
+                $powershell = Get-LocalizationTranslationBinding -ApiRoot $apiRoot -RepositoryRoot $repository `
+                    -BaseOid $baseTree -Mode $mode -ModRelativePath $modPath
+                $lines = & $env:SYP419_PYTHON -B (Join-Path $apiRoot 'darktide_translate.py') binding `
+                    --mods-root $repository --mode $mode --mod-relative-path $modPath --base-oid $baseTree
+                $LASTEXITCODE | Should -Be 0
+                $python = ($lines -join "`n") | ConvertFrom-Json -AsHashtable
+                $powershell.rulesSha256 | Should -BeExactly $python.rulesSha256
+                $powershell.glossarySha256 | Should -BeExactly $python.glossarySha256
+            }
+        }
     }
 
     # Scenario: A localization file uses duplicate keys, bracketed language names, dynamic keys, comments, and multiline expressions.
@@ -222,6 +291,7 @@ local side_effect = os.time()
         $oldPath = Join-Path $oldModRoot 'Foo..Bar_localization.lua'
         [IO.File]::WriteAllText($oldPath, $localization, [Text.UTF8Encoding]::new($false))
         & git -C $repository add mods/Foo..Bar/Foo..Bar_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
@@ -262,6 +332,7 @@ return {
 }
 '@ | Set-Content -LiteralPath $oldPath -NoNewline
         & git -C $repository add mods/CaseMod/CaseMod_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
@@ -330,10 +401,14 @@ return {
 }
 '@ | Set-Content -LiteralPath $oldPath -NoNewline
         & git -C $repository add mods/ExampleMod/ExampleMod_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
         $runRoot = Join-Path $repository 'AI Auto Update/In Progress/example-test'
+        $glossaryPath = Join-Path $repository 'Referneces/Translation.md'
+        $committedGlossaryHash = (Get-FileHash -LiteralPath $glossaryPath).Hash.ToLowerInvariant()
+        'changed working tree glossary' | Set-Content -LiteralPath $glossaryPath
         $staging = Join-Path $runRoot 'staging/localization-workset-input/ExampleMod'
         New-Item -ItemType Directory -Path $staging -Force | Out-Null
         $newPath = Join-Path $staging 'ExampleMod_localization.lua'
@@ -370,6 +445,13 @@ return {
         $first.sha256 | Should -Be $second.sha256
         $workset = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
         $workset.workflowSchemaVersion | Should -Be 15
+        $workset.generatorVersion | Should -Be 2
+        $workset.translationBinding.mode | Should -BeExactly 'update'
+        $workset.translationBinding.glossarySha256 | Should -BeExactly $committedGlossaryHash
+        { & (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') `
+                -RepositoryRoot $repository -BaseOid $baseOid -ModRelativePath 'mods/ExampleMod' `
+                -StagingModPath $staging -OutputPath $outputPath -SourceId 'example' -TranslationMode improve } |
+            Should -Throw '*translation binding differs from the requested mode or model*'
         $workset.baseOid | Should -Be $baseOid
         @($workset.units).Count | Should -Be 7
         (@($workset.units | Where-Object key -eq 'unchanged')).changeType | Should -Be 'unchanged'
@@ -423,6 +505,12 @@ return {
         $newKey = @($workset.units | Where-Object key -eq 'new_key')[0]
         $newKey.reviewStatus = 'approved'
         $newKey.suggestedZhTwExpression = '"新增翻譯"'
+        $approvedExpression = $newKey.suggestedZhTwExpression
+        $newKey.suggestedZhTwExpression = '"新增" .. example.call("key")'
+        $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $outputPath -NoNewline
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru } |
+            Should -Throw '*token structure*'
+        $newKey.suggestedZhTwExpression = $approvedExpression
         $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $outputPath -NoNewline
 
         $rawNewPath = Join-Path $repository 'AI Auto Update/In Progress/example-test/review-artifacts/new.lua'
@@ -451,6 +539,45 @@ return {
             -WorksetPath $outputPath -NewPath $rawNewPath -MergedPath $newPath `
             -RepositoryRoot $repository -ExpectedBaseOid $baseOid -ExpectedModRelativePath 'mods/ExampleMod' -PassThru
         $receiptVerification.result | Should -Be 'passed'
+        $bindingTamperedPath = Join-Path $repository 'AI Auto Update/In Progress/binding-tampered/review-artifacts/localization-workset.json'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $bindingTamperedPath) -Force
+        $receiptScript = Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1'
+        $receiptInputs = @{
+            WorksetPath = $bindingTamperedPath; NewPath = $rawNewPath; MergedPath = $newPath
+            RepositoryRoot = $repository; ExpectedBaseOid = $baseOid; ExpectedModRelativePath = 'mods/ExampleMod'
+        }
+        foreach ($field in @('bindingVersion', 'mode', 'modelId', 'rulesSha256', 'glossarySha256', 'rulesManifest')) {
+            $tamperedBindingWorkset = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json -AsHashtable
+            $tamperedBindingWorkset.translationBinding[$field] = switch ($field) {
+                'bindingVersion' { 2 }
+                'mode' { 'improve' }
+                'modelId' { 'changed-model' }
+                'rulesManifest' { ,@() }
+                default { '0' * 64 }
+            }
+            $tamperedBindingWorkset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $bindingTamperedPath -NoNewline
+            { & $receiptScript @receiptInputs } | Should -Throw '*immutable contract*'
+            if ($field -in @('rulesSha256', 'glossarySha256', 'rulesManifest')) {
+                $tamperedBindingWorkset.immutableContractSha256 = Get-TestImmutableWorksetContractSha256 -Workset $tamperedBindingWorkset
+                $tamperedBindingWorkset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $bindingTamperedPath -NoNewline
+                { & $receiptScript @receiptInputs } | Should -Throw '*differs from the immutable rules or glossary*'
+            }
+        }
+        $missingBindingWorkset = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json -AsHashtable
+        $null = $missingBindingWorkset.Remove('translationBinding')
+        $missingBindingWorkset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $bindingTamperedPath -NoNewline
+        { & $receiptScript @receiptInputs } | Should -Throw '*requires a valid translation binding*'
+        $unsafeReview = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json -AsHashtable
+        (@($unsafeReview.units | Where-Object key -eq 'new_key'))[0].suggestedZhTwExpression = '"新增" .. example.call("key")'
+        $unsafeReview.apply.reviewContractSha256 = Get-TestReviewWorksetContractSha256 -Workset $unsafeReview
+        $unsafeReview | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $bindingTamperedPath -NoNewline
+        { & $receiptScript @receiptInputs } | Should -Throw '*token structure*'
+        $legacyWorkset = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json -AsHashtable
+        $legacyWorkset.generatorVersion = 1
+        $null = $legacyWorkset.Remove('translationBinding')
+        $legacyWorkset.immutableContractSha256 = Get-TestImmutableWorksetContractSha256 -Workset $legacyWorkset
+        $legacyWorkset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $bindingTamperedPath -NoNewline
+        (& $receiptScript @receiptInputs -PassThru).result | Should -Be 'passed'
         $inventoryTamperedPath = Join-Path $repository 'AI Auto Update/In Progress/inventory-tampered/review-artifacts/localization-workset.json'
         New-Item -ItemType Directory -Path (Split-Path -Parent $inventoryTamperedPath) -Force | Out-Null
         Copy-Item -LiteralPath $outputPath -Destination $inventoryTamperedPath
@@ -513,7 +640,8 @@ return {
         $receiptTampered.apply.edits[0].operation = 'UNAUTHORIZED'
         $receiptTampered | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $receiptTamperedPath -NoNewline
         { & (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') `
-                -WorksetPath $receiptTamperedPath -NewPath $rawNewPath -MergedPath $newPath -PassThru } |
+                -WorksetPath $receiptTamperedPath -NewPath $rawNewPath -MergedPath $newPath `
+                -RepositoryRoot $repository -ExpectedBaseOid $baseOid -ExpectedModRelativePath 'mods/ExampleMod' -PassThru } |
             Should -Throw '*deterministic edit plan*'
     }
 
@@ -538,6 +666,7 @@ return {
 '@
         [IO.File]::WriteAllText($oldPath, $lua, [Text.UTF8Encoding]::new($false))
         & git -C $repository add mods/ExampleMod/ExampleMod_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
@@ -594,6 +723,7 @@ return {
 '@) -replace "`r?`n", "`r`n"
         [IO.File]::WriteAllText($oldPath, $oldText, [Text.UTF8Encoding]::new($false))
         & git -C $repository -c core.autocrlf=false add mods/ExampleMod/ExampleMod_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
@@ -604,7 +734,8 @@ return {
         $newText = (@'
 return {
     restore = { en = "Stable", ["zh-tw"] = "upstream drift" },
-    ai = { en = "New", ["zh-tw"] = "原文" }
+    ai = { en = "New" ..
+        " text", ["zh-tw"] = "原文" }
 }
 '@) -replace "`r?`n", "`n"
         [IO.File]::WriteAllText($newPath, $newText, [Text.UTF8Encoding]::new($false))
@@ -643,6 +774,7 @@ return {
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
         'return { key = { en = "Stable", ["zh-tw"] = "舊翻譯" } }' | Set-Content -LiteralPath $oldPath -NoNewline
         & git -C $repository add mods/ExampleMod/ExampleMod_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
@@ -686,6 +818,7 @@ return {
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
         'return { key = { en = "Stable", ["zh-tw"] = "舊翻譯" } }' | Set-Content -LiteralPath $oldPath -NoNewline
         & git -C $repository add mods/ExampleMod/nested/ExampleMod_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
@@ -737,6 +870,7 @@ return {
 }
 '@ | Set-Content -LiteralPath $oldPath -NoNewline
         & git -C $repository add mods/ExampleMod/ExampleMod_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
@@ -811,6 +945,7 @@ return {
         $oldPath = Join-Path $oldModRoot 'ExampleMod_localization.lua'
         'return { key = { en = "Stable", ["zh-tw"] = "舊翻譯" } }' | Set-Content -LiteralPath $oldPath -NoNewline
         & git -C $repository add mods/ExampleMod/ExampleMod_localization.lua
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
         $baseOid = (& git -C $repository rev-parse HEAD).Trim()
 
@@ -942,6 +1077,7 @@ return localization
         'return { key = { en = "Stable", ["zh-tw"] = "穩定" } }' |
             Set-Content -LiteralPath (Join-Path $oldRoot 'RenameMod_localization.lua') -NoNewline
         & git -C $repository add .
+        Add-TestTranslationRules -RepositoryRoot $repository
         & git -C $repository commit --quiet -m 'base localization'
 
         $runId = '55555555-6666-4777-8888-999999999999'

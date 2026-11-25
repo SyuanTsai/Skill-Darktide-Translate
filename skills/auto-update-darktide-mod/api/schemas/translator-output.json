@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "unitId": {
+            "type": "string"
+          },
+          "segments": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "unknownTerms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "needsLookupDefinition": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "unitId",
+          "segments",
+          "unknownTerms",
+          "needsLookupDefinition"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "items"
+  ],
+  "additionalProperties": false
+}

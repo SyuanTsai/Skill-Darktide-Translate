@@ -1,0 +1,14 @@
+{
+  "configVersion": 1,
+  "model": "claude-sonnet-5-5",
+  "effort": {"translator": "medium", "reviewer": "medium"},
+  "batchSize": 50,
+  "maxItemsPerRun": 500,
+  "maxCorrectionsPerItem": 2,
+  "maxApiRetries": 3,
+  "retryBackoffSeconds": [5, 20, 60],
+  "requestTimeoutSeconds": 600,
+  "maxOutputTokens": 32000,
+  "pricingUsdPerMTok": {"input": 2.00, "output": 10.00, "cacheWrite": 2.50, "cacheRead": 0.10},
+  "pricingSource": "claude-api skill 2026-11-03 快取表，以 Console 帳單為準"
+}

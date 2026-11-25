@@ -588,8 +588,8 @@ function Assert-DarktideProfileCatalog {
     }
 
     Assert-DarktideExactPropertySet -Value $skill.compatibility -Expected @('platforms', 'shells', 'requiredCapabilities', 'anyOfCapabilities') -Context 'catalog/profiles.json Skill compatibility'
-    if ($skill.compatibility.platforms -isnot [array] -or @($skill.compatibility.platforms).Count -ne 1 -or
-        [string]@($skill.compatibility.platforms)[0] -cne 'windows' -or
+    if ($skill.compatibility.platforms -isnot [array] -or
+        ($skill.compatibility.platforms -join ',') -cne 'windows,linux' -or
         $skill.compatibility.shells -isnot [array] -or @($skill.compatibility.shells).Count -ne 1 -or
         [string]@($skill.compatibility.shells)[0] -cne 'pwsh>=7') {
         throw 'Profile catalog Skill platform compatibility is invalid.'

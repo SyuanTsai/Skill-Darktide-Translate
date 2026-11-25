@@ -8,7 +8,7 @@ Load this reference when executing, resuming, diagnosing, or extending the fixed
 
 ## Install
 
-Windows is the only supported local host; Linux, macOS, and WSL are unsupported. Install the complete `auto-update-darktide-mod` Skill directory from one immutable `darktide-translate` source pin. PowerShell 7, Git, and Pester 5 are required. Publication additionally requires authenticated `gh` access to the target MOD repository.
+Windows is supported for local use and Linux is supported in GitHub Actions (`ubuntu-latest`). macOS and WSL are unsupported. Install the complete `auto-update-darktide-mod` Skill directory from one immutable `darktide-translate` source pin. PowerShell 7, Git, and Pester 5 are required. Publication additionally requires authenticated `gh` access to the target MOD repository.
 
 Before a real run, follow the source-pin generation procedure in the selected immutable source checkout's README. Retain the generated pin outside the installed Skill and target repository, set `$skillSourcePinPath` to its absolute path, verify the complete installed package against it, then materialize the Workflow outside both repositories:
 

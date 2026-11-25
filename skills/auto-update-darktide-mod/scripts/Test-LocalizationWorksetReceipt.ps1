@@ -20,6 +20,7 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'LocalizationWorksetContract.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -124,30 +125,6 @@ function Assert-NoReparsePath {
     throw "Unable to prove $Label physical containment within 2048 path components."
 }
 
-function Get-ImmutableWorksetContractSha256 {
-    param($Workset)
-    $unitContracts = @($Workset.units | ForEach-Object {
-        [ordered]@{
-            unitId = $_.unitId; sourceId = $_.sourceId; containerPath = $_.containerPath
-            key = $_.key; occurrence = $_.occurrence; old = $_.old; new = $_.new
-            changeType = $_.changeType; action = $_.action; blockedReason = $_.blockedReason
-        }
-    })
-    $contract = [ordered]@{
-        schemaVersion = $Workset.schemaVersion
-        workflowSchemaVersion = $Workset.workflowSchemaVersion
-        generatorVersion = $Workset.generatorVersion
-        baseOid = $Workset.baseOid
-        sourceId = $Workset.sourceId
-        modRelativePath = $Workset.modRelativePath
-        old = $Workset.old
-        new = $Workset.new
-        counts = $Workset.counts
-        units = $unitContracts
-    }
-    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress)))
-}
-
 function Get-ReviewWorksetContractSha256 {
     param($Workset)
     $reviewContract = @($Workset.units | ForEach-Object {
@@ -158,35 +135,6 @@ function Get-ReviewWorksetContractSha256 {
         }
     })
     Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($reviewContract | ConvertTo-Json -Depth 10 -Compress)))
-}
-
-function Get-GitBlobBytes {
-    param([string] $WorkingDirectory, [string] $Object)
-    $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = 'git'
-    $start.UseShellExecute = $false
-    $start.RedirectStandardInput = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    foreach ($argument in @('-C', $WorkingDirectory, 'cat-file', 'blob', $Object)) { $start.ArgumentList.Add($argument) }
-    $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
-    if (-not $process.Start()) { throw 'Unable to start Git for independent OLD localization verification.' }
-    $process.StandardInput.Close()
-    $memory = [IO.MemoryStream]::new()
-    try {
-        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
-        $errorTask = $process.StandardError.ReadToEndAsync()
-        while (-not ($process.HasExited -and $copyTask.IsCompleted -and $errorTask.IsCompleted)) {
-            if (-not $process.HasExited) { $null = $process.WaitForExit(1000) }
-            else { [Threading.Tasks.Task]::Delay(50).Wait() }
-            Invoke-Heartbeat
-        }
-        $null = $copyTask.GetAwaiter().GetResult()
-        $errorText = $errorTask.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw "Unable to read immutable OLD localization blob: $errorText" }
-        $memory.ToArray()
-    }
-    finally { $memory.Dispose(); $process.Dispose() }
 }
 
 function Get-ExpressionSnapshot {
@@ -383,10 +331,25 @@ if ([string]::IsNullOrWhiteSpace([string]$workset.immutableContractSha256) -or
     (Get-ImmutableWorksetContractSha256 -Workset $workset) -cne [string]$workset.immutableContractSha256) {
     throw 'Localization workset immutable contract changed.'
 }
+if ($workset.generatorVersion -eq 2 -and $bindingValueCount -ne 3) {
+    throw 'Version 2 translation binding verification requires the immutable OLD verification inputs.'
+}
 if ($bindingValueCount -eq 3) {
     $normalizedExpectedModPath = $ExpectedModRelativePath.Replace('\', '/').Trim('/')
     if ([string]$workset.baseOid -cne $ExpectedBaseOid -or [string]$workset.modRelativePath -cne $normalizedExpectedModPath) {
         throw 'Localization workset base OID or MOD path differs from Candidate state.'
+    }
+    if ($workset.generatorVersion -eq 2) {
+        $binding = $workset.translationBinding
+        $expectedBinding = Get-LocalizationTranslationBinding `
+            -ApiRoot (Join-Path $PSScriptRoot '../api') -RepositoryRoot $repositoryFull -BaseOid $ExpectedBaseOid `
+            -Mode $binding.mode -ModRelativePath $normalizedExpectedModPath -ModelId $binding.modelId -HeartbeatAction $HeartbeatAction
+        if ($binding.rulesSha256 -cne $expectedBinding.rulesSha256 -or
+            $binding.glossarySha256 -cne $expectedBinding.glossarySha256 -or
+            (ConvertTo-Json -InputObject $binding.rulesManifest -Depth 10 -Compress) -cne
+            (ConvertTo-Json -InputObject $expectedBinding.rulesManifest -Depth 10 -Compress)) {
+            throw 'Localization workset translation binding differs from the immutable rules or glossary.'
+        }
     }
     if (-not ([string]$workset.old.path).StartsWith($normalizedExpectedModPath + '/', [StringComparison]::Ordinal)) {
         throw 'Localization workset OLD path escapes the expected MOD path.'
@@ -427,7 +390,7 @@ $oldDocument = $null
 $oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 if ($bindingValueCount -eq 3) {
     $oldObject = [string]::Concat($ExpectedBaseOid, [char]58, [string]$workset.old.path)
-    $oldBytes = Get-GitBlobBytes -WorkingDirectory $repositoryFull -Object $oldObject
+    $oldBytes = Get-LocalizationGitBlobBytes -WorkingDirectory $repositoryFull -Object $oldObject -HeartbeatAction $HeartbeatAction
     $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath ([string]$workset.old.path) -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
     if ((Get-Sha256Bytes -Bytes $oldBytes) -cne [string]$workset.old.sha256 -or
         $oldBytes.LongLength -ne [int64]$workset.old.size -or [bool]$oldDocument.bom -ne [bool]$workset.old.bom -or
@@ -513,6 +476,9 @@ foreach ($unit in @($workset.units)) {
         if ([string]$unit.reviewStatus -cne 'approved') { throw ('AI_REQUIRED localization unit is not approved: {0}' -f ([string]($unit.unitId))) }
         $normalized = ConvertTo-NewlineStyle -Text ([string]$unit.suggestedZhTwExpression) -NewlineStyle ([string]$workset.new.newline)
         $target = Test-SafeLuaExpression -Expression $normalized
+        if (-not (Test-LuaNonStringTokenSequence -Source ([string]$currentUnit.sourceExpression.raw) -Translation $target.raw)) {
+            throw ('AI_REQUIRED localization expression token structure differs from NEW English: {0}' -f ([string]$unit.unitId))
+        }
     }
     else { throw "Unsupported localization workset action: $action" }
 

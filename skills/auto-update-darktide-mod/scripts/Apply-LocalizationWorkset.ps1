@@ -14,6 +14,7 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'LocalizationWorksetContract.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -75,30 +76,6 @@ function Get-FileSha256 {
     param([string] $Path)
     $bytes = Read-FileBytesWithHeartbeat -Path $Path
     Get-Sha256Bytes -Bytes $bytes
-}
-
-function Get-ImmutableWorksetContractSha256 {
-    param($Workset)
-    $unitContracts = @($Workset.units | ForEach-Object {
-        [ordered]@{
-            unitId = $_.unitId; sourceId = $_.sourceId; containerPath = $_.containerPath
-            key = $_.key; occurrence = $_.occurrence; old = $_.old; new = $_.new
-            changeType = $_.changeType; action = $_.action; blockedReason = $_.blockedReason
-        }
-    })
-    $contract = [ordered]@{
-        schemaVersion = $Workset.schemaVersion
-        workflowSchemaVersion = $Workset.workflowSchemaVersion
-        generatorVersion = $Workset.generatorVersion
-        baseOid = $Workset.baseOid
-        sourceId = $Workset.sourceId
-        modRelativePath = $Workset.modRelativePath
-        old = $Workset.old
-        new = $Workset.new
-        counts = $Workset.counts
-        units = $unitContracts
-    }
-    Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress)))
 }
 
 function Get-ReviewWorksetContractSha256 {
@@ -393,6 +370,9 @@ foreach ($unit in @($workset.units)) {
         if ([string]$unit.reviewStatus -cne 'approved') { throw ('AI_REQUIRED localization unit is not approved: {0}' -f ([string]$unit.unitId)) }
         $normalizedExpression = ConvertTo-NewlineStyle -Text ([string]$unit.suggestedZhTwExpression) -NewlineStyle ([string]$workset.new.newline)
         $target = Test-SafeLuaExpression -Expression $normalizedExpression
+        if (-not (Test-LuaNonStringTokenSequence -Source ([string]$currentUnit.sourceExpression.raw) -Translation $target.raw)) {
+            throw ('AI_REQUIRED localization expression token structure differs from NEW English: {0}' -f ([string]$unit.unitId))
+        }
     }
     else { throw "Unsupported localization workset action: $action" }
 

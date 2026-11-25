@@ -55,6 +55,9 @@ Describe 'Skill source pin generator' {
         $pin.contentSha256 | Should -Match '^[0-9a-f]{64}$'
         $pin.skillPath | Should -Be 'skills/auto-update-darktide-mod'
         @($pin.skillFiles).Count | Should -BeGreaterThan 10
+        @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1'
+        @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/api/config/rules-manifest.json'
+        @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/api/darktide_translate.py'
         $result.result | Should -Be 'passed'
         $result.skillSourcePin.fileCount | Should -Be @($pin.skillFiles).Count
     }
