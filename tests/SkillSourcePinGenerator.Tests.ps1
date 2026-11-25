@@ -17,7 +17,7 @@ Describe 'Skill source pin generator' {
             [void](New-Item -ItemType Directory -Path $skillsRoot -Force)
             Copy-Item -LiteralPath $script:GeneratorPath -Destination (Join-Path $scriptsRoot 'New-SkillSourcePin.ps1')
             Copy-Item -LiteralPath $script:SourceSkillRoot -Destination $skillsRoot -Recurse
-            [IO.File]::WriteAllText((Join-Path $Root 'VERSION'), '0.4.1', [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText((Join-Path $Root 'VERSION'), '0.5.0', [Text.UTF8Encoding]::new($false))
 
             & git -C $Root init --quiet --initial-branch=main
             & git -C $Root config core.longpaths true
@@ -51,7 +51,7 @@ Describe 'Skill source pin generator' {
         $pin.repository | Should -Be 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
         $pin.requestedRef | Should -Be 'HEAD'
         $pin.resolvedCommit | Should -Match '^[0-9a-f]{40}$'
-        $pin.resolvedVersion | Should -Be '0.4.1'
+        $pin.resolvedVersion | Should -Be '0.5.0'
         $pin.contentSha256 | Should -Match '^[0-9a-f]{64}$'
         $pin.skillPath | Should -Be 'skills/auto-update-darktide-mod'
         @($pin.skillFiles).Count | Should -BeGreaterThan 10
