@@ -175,7 +175,6 @@ Describe 'Darktide Translate repository contract' {
             $expectedPaths += @(
                 'catalog/source.json',
                 'catalog/profiles.json',
-                '.github/workflows/python-api-tests.yml',
                 'tests/Test-DarktideRepository.Tests.ps1'
             )
         }

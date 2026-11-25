@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass
+from enum import Enum, auto
 from unicodedata import category
 
 
@@ -125,13 +126,22 @@ def quote(text):
     return '"' + escaped + '"'
 
 
+FORMAT_CALLS = frozenset(("string.format", "format"))
+
+
+class StringContext(Enum):
+    TRANSLATABLE = auto()
+    UNKNOWN_ARGUMENT = auto()
+    INDEX = auto()
+
+
 class Expression:
     """保守的單值文法。遇到無法辨識的動態結構時交由人工處理。"""
 
     def __init__(self, tokens):
         self.tokens = tokens
         self.position = 0
-        self.has_format = False
+        self.format_spans = []
 
     def peek(self):
         if self.position < len(self.tokens):
@@ -161,26 +171,28 @@ class Expression:
         if self.peek():
             raise ComplexExpression("需要單一 Lua expression")
 
-    def expression(self, minimum=1, enclosing_call=None):
+    def expression(self, minimum=1, context=StringContext.TRANSLATABLE):
         if self.peek() in ("not", "-", "#", "~"):
             self.position += 1
-            self.expression(11, enclosing_call)
+            self.expression(11, context)
         else:
-            self.atom(enclosing_call)
+            self.atom(context)
         while (priority := PRECEDENCE.get(self.peek(), 0)) >= minimum:
             operator = self.peek()
             self.position += 1
-            self.expression(priority + (operator not in ("^", "..")), enclosing_call)
+            self.expression(priority + (operator not in ("^", "..")), context)
 
-    def atom(self, enclosing_call):
+    def take_string(self, context):
+        if context is not StringContext.TRANSLATABLE:
+            raise ComplexExpression("字串位於索引或未知呼叫的參數位置")
+        self.position += 1
+
+    def atom(self, context):
         if self.position >= len(self.tokens):
             raise ComplexExpression("Lua expression 缺少值")
         token = self.tokens[self.position]
-        previous = self.tokens[self.position - 1].text if self.position else ""
         if token.kind == "string":
-            if previous in ("(", ",") and enclosing_call not in (None, "string.format", "format"):
-                raise ComplexExpression("字串位於未知呼叫的參數位置")
-            self.position += 1
+            self.take_string(context)
             return
         if token.kind == "number":
             self.number()
@@ -194,15 +206,17 @@ class Expression:
             self.number(prefix=".")
             return
         if self.accept("{"):
-            self.table(enclosing_call)
+            self.table(context)
             return
+        receiver_start = None
         if self.accept("("):
-            self.expression(enclosing_call=enclosing_call)
+            receiver_start = self.position
+            self.expression(context=context)
             self.require(")")
             name = "<expression>"
         else:
             name = self.take_name()
-        self.suffix(name, enclosing_call)
+        self.suffix(name, context, receiver_start)
 
     def number(self, prefix=""):
         token = self.tokens[self.position]
@@ -218,49 +232,58 @@ class Expression:
         if not NUMBER.fullmatch(value):
             raise ComplexExpression("Lua 數字格式無法辨識")
 
-    def suffix(self, name, enclosing_call):
+    def suffix(self, name, context, receiver_start):
         while self.peek():
             if self.accept("."):
                 name += "." + self.take_name()
             elif self.accept("["):
-                self.expression(enclosing_call=enclosing_call)
+                self.expression(context=StringContext.INDEX)
                 self.require("]")
                 name = "<expression>"
             else:
-                method = self.accept(":")
-                if method:
-                    name += ":" + self.take_name()
+                receiver_end = self.position - 1
+                method = self.take_name() if self.accept(":") else None
+                is_format = method is None and name in FORMAT_CALLS
+                argument_context = context
+                if not is_format and context is not StringContext.INDEX:
+                    argument_context = StringContext.UNKNOWN_ARGUMENT
                 if self.accept("("):
-                    self.has_format |= name in ("string.format", "format")
+                    start = end = self.position
                     if not self.accept(")"):
-                        self.expression(enclosing_call=name)
+                        self.expression(context=argument_context)
+                        end = self.position
                         while self.accept(","):
-                            self.expression(enclosing_call=name)
+                            self.expression(context=argument_context)
                         self.require(")")
-                elif self.accept("{"):
-                    self.table(name)
-                elif self.position < len(self.tokens) and self.tokens[self.position].kind == "string":
-                    if name not in ("string.format", "format"):
-                        raise ComplexExpression("字串是未知呼叫的參數")
-                    self.has_format = True
-                    self.position += 1
-                elif method:
-                    raise ComplexExpression("Lua 方法缺少參數")
                 else:
-                    return
+                    start = self.position
+                    if self.accept("{"):
+                        self.table(argument_context)
+                    elif self.position < len(self.tokens) and self.tokens[self.position].kind == "string":
+                        self.take_string(argument_context)
+                    elif method:
+                        raise ComplexExpression("Lua 方法缺少參數")
+                    else:
+                        return
+                    end = self.position
+                if is_format:
+                    self.format_spans.append((start, end))
+                elif method == "format" and receiver_start is not None:
+                    self.format_spans.append((receiver_start, receiver_end))
                 name = "<expression>"
+            receiver_start = None
 
-    def table(self, enclosing_call):
+    def table(self, context):
         while not self.accept("}"):
             if self.accept("["):
-                self.expression(enclosing_call=enclosing_call)
+                self.expression(context=StringContext.INDEX)
                 self.require("]")
                 self.require("=")
             elif (self.position + 1 < len(self.tokens)
                   and self.tokens[self.position + 1].text == "="):
                 self.take_name()
                 self.require("=")
-            self.expression(enclosing_call=enclosing_call)
+            self.expression(context=context)
             if not (self.accept(",") or self.accept(";")):
                 self.require("}")
                 return
@@ -276,7 +299,7 @@ class Template:
     tokens: list
     strings: list
     segments: dict
-    has_format: bool
+    format_groups: tuple[tuple[str, ...], ...]
 
     @classmethod
     def parse(cls, raw):
@@ -284,12 +307,18 @@ class Template:
             tokens = tokenize(raw)
             parser = Expression(tokens)
             parser.parse()
-            strings = [token for token in tokens if token.kind == "string"]
+            string_positions = [index for index, token in enumerate(tokens) if token.kind == "string"]
+            strings = [tokens[index] for index in string_positions]
             if not strings:
                 raise ComplexExpression("Lua expression 缺少可翻譯字串")
             segments = {f"s{index}": decode_string(token.text)
                         for index, token in enumerate(strings, 1)}
-            return cls(raw, tokens, strings, segments, parser.has_format)
+            keys_by_position = dict(zip(string_positions, segments))
+            groups = tuple(
+                tuple(keys_by_position[index] for index in range(start, end) if index in keys_by_position)
+                for start, end in sorted(parser.format_spans)
+            )
+            return cls(raw, tokens, strings, segments, groups)
         except (UnicodeError, RecursionError, OverflowError, ValueError) as error:
             raise ComplexExpression("無法安全建立 Lua 模板") from error
 
@@ -308,6 +337,7 @@ class Template:
             rendered = Template.parse(expression)
         except ComplexExpression:
             raise ValueError("lua_token_mismatch") from None
-        if token_shape(rendered.tokens) != token_shape(self.tokens) or rendered.segments != segments:
+        if (token_shape(rendered.tokens) != token_shape(self.tokens)
+                or rendered.segments != segments or rendered.format_groups != self.format_groups):
             raise ValueError("lua_token_mismatch")
         return expression

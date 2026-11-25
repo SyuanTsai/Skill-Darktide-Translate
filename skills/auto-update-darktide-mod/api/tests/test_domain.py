@@ -30,6 +30,75 @@ def test_4_5_complex_expressions(expression):
         Template.parse(expression)
 
 
+@pytest.mark.parametrize("expression", [
+    'lookup["weapon_name"] .. " damage"',
+    '{ ["key"] = "text" }',
+    'lookup[format("%s", name)] .. " text"',
+    'lookup[format("%s", k)] .. " x"',
+    '{ [format("%s", name)] = "text" }',
+    'Localize(prefix .. "weapon_name")',
+    'Localize(("k"))',
+    'Localize(format("%s", name)) .. " text"',
+    'Localize(string.format("%s_key", x))',
+    'string.format("%s", Localize("k"))',
+    'f(a, b .. "k")',
+    'f{ name = "k" }',
+])
+def test_lookup_keys_and_unknown_call_strings_are_complex(expression):
+    with pytest.raises(ComplexExpression):
+        Template.parse(expression)
+
+
+@pytest.mark.parametrize(("expression", "expected"), [
+    ('{ name = "text" }', {"s1": "text"}),
+    ('Localize(x) .. " text"', {"s1": " text"}),
+    ('string.format("%s", name) .. " text"', {"s1": "%s", "s2": " text"}),
+])
+def test_translatable_strings_follow_call_context(expression, expected):
+    assert Template.parse(expression).segments == expected
+
+
+@pytest.mark.parametrize(("expression", "groups"), [
+    ('string.format(("a %s" .. " b %d"), name, count) .. format "%i"',
+     (("s1", "s2"), ("s3",))),
+    ('("a %s" .. " b %d"):format(name, count) .. " text"', (("s1", "s2"),)),
+    ('format("%s", format("%d", count)) .. " text"', (("s1",), ("s2",))),
+])
+def test_format_groups_survive_render(expression, groups):
+    template = Template.parse(expression)
+    assert template.format_groups == groups
+    rendered = template.render({key: f"new {value}" for key, value in template.segments.items()})
+    assert Template.parse(rendered).format_groups == groups
+
+
+def test_format_placeholders_stay_in_their_call(terms):
+    template = Template.parse('string.format("%s", name) .. string.format("%d", count)')
+    _, issues = validate(template, {"s1": "%s %d", "s2": ""}, terms, Luac(None))
+    assert issues == ["format_order_mismatch"]
+    assert validate(template, {"s1": "Name %s", "s2": " Count %d"}, terms, Luac(None))[1] == []
+
+
+def test_format_placeholders_can_move_within_a_concatenated_argument(terms):
+    template = Template.parse('format(("a %s" .. " b %d"), name, count) .. format("%i", total)')
+    within = {"s1": "a", "s2": " %s %d", "s3": "%i"}
+    across = {"s1": "a", "s2": " %s", "s3": "%d %i"}
+    assert validate(template, within, terms, Luac(None))[1] == []
+    assert validate(template, across, terms, Luac(None))[1] == ["format_order_mismatch"]
+
+
+@pytest.mark.parametrize(("expression", "segments", "expected"), [
+    ('" text"', {"s1": " text %d"}, True),
+    ('" text %d"', {"s1": " text"}, True),
+    ('" text"', {"s1": " text %%"}, False),
+    ('format("%s", name) .. " text"', {"s1": "", "s2": "%s text"}, True),
+    ('format("%s", " text")', {"s1": "", "s2": "%s text"}, True),
+    ('("%s %d"):format(name, count)', {"s1": "%d %s"}, True),
+])
+def test_printf_changes_outside_format_and_in_method_receivers(expression, segments, expected, terms):
+    _, issues = validate(Template.parse(expression), segments, terms, Luac(None))
+    assert issues.count("format_order_mismatch") == int(expected)
+
+
 def test_4_5_long_strings_and_format():
     template = Template.parse("string.format([=[Hello %s]=], user) .. [[!]] .. 'ok'")
     assert template.segments == {"s1": "Hello %s", "s2": "!", "s3": "ok"}

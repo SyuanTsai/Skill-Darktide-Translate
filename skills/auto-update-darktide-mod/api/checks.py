@@ -60,6 +60,22 @@ def markup_shape(text):
     return [tag[0] for tag in tags], paired and complete
 
 
+def format_mismatch(template, segments):
+    format_keys = set()
+    for group in template.format_groups:
+        format_keys.update(group)
+        source = "".join(template.segments[key] for key in group)
+        target = "".join(segments[key] for key in group)
+        if FORMAT.findall(source) != FORMAT.findall(target):
+            return True
+
+    def printf_counts(text):
+        return Counter(spec for spec in FORMAT.findall(text) if spec != "%%")
+
+    return any(printf_counts(template.segments[key]) != printf_counts(segments[key])
+               for key in template.segments.keys() - format_keys)
+
+
 def validate(template, segments, glossary, luac):
     if not isinstance(segments, dict) or segments.keys() != template.segments.keys():
         return None, ["segment_mismatch"]
@@ -71,7 +87,7 @@ def validate(template, segments, glossary, luac):
     issues = []
     if Counter(PLACEHOLDER.findall(source)) != Counter(PLACEHOLDER.findall(target)):
         issues.append("placeholder_mismatch")
-    if template.has_format and FORMAT.findall(source) != FORMAT.findall(target):
+    if format_mismatch(template, segments):
         issues.append("format_order_mismatch")
     source_markup, source_paired = markup_shape(source)
     target_markup, target_paired = markup_shape(target)
