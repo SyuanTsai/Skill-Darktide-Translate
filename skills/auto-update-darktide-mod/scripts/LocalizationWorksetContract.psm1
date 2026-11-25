@@ -96,7 +96,7 @@ function Read-LocalizationRuleFile {
 
 function Get-LocalizationTranslationBinding {
     param(
-        [Parameter(Mandatory)][string] $ApiRoot,
+        [Parameter(Mandatory)][string] $SkillRoot,
         [Parameter(Mandatory)][string] $RepositoryRoot,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string] $BaseOid,
         [Parameter(Mandatory)][ValidateSet('update', 'improve')][string] $Mode,
@@ -105,13 +105,12 @@ function Get-LocalizationTranslationBinding {
         [scriptblock] $HeartbeatAction
     )
 
-    $skillRoot = Split-Path -Parent $ApiRoot
     $utf8 = [Text.UTF8Encoding]::new($false, $true)
-    $manifestBytes = Read-LocalizationRuleFile -SkillRoot $skillRoot -RelativePath 'api/config/rules-manifest.json'
+    $manifestBytes = Read-LocalizationRuleFile -SkillRoot $skillRoot -RelativePath 'assets/api-rules-manifest.json'
     $manifest = $utf8.GetString($manifestBytes).TrimStart([char]0xfeff) | ConvertFrom-Json -AsHashtable
     if ($manifest.manifestVersion -ne 1) { throw 'Translation rules manifest version is unsupported.' }
     if ([string]::IsNullOrEmpty($ModelId)) {
-        $configBytes = Read-LocalizationRuleFile -SkillRoot $skillRoot -RelativePath 'api/config/api-translation.json'
+        $configBytes = Read-LocalizationRuleFile -SkillRoot $skillRoot -RelativePath 'assets/api-translation.json'
         $config = $utf8.GetString($configBytes).TrimStart([char]0xfeff) | ConvertFrom-Json -AsHashtable
         $ModelId = $config.model
     }

@@ -364,7 +364,7 @@ $workset = [ordered]@{
 }
 if ($workset.generatorVersion -eq 2) {
     $workset.translationBinding = Get-LocalizationTranslationBinding `
-        -ApiRoot (Join-Path $PSScriptRoot '../api') -RepositoryRoot $repository -BaseOid $resolvedBaseOid `
+        -SkillRoot (Split-Path -Parent $PSScriptRoot) -RepositoryRoot $repository -BaseOid $resolvedBaseOid `
         -Mode $TranslationMode -ModRelativePath $normalizedModPath -ModelId $ModelId -HeartbeatAction $HeartbeatAction
 }
 $workset.immutableContractSha256 = Get-ImmutableWorksetContractSha256 -Workset $workset

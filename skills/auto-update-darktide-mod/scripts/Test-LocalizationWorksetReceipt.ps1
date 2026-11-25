@@ -342,7 +342,7 @@ if ($bindingValueCount -eq 3) {
     if ($workset.generatorVersion -eq 2) {
         $binding = $workset.translationBinding
         $expectedBinding = Get-LocalizationTranslationBinding `
-            -ApiRoot (Join-Path $PSScriptRoot '../api') -RepositoryRoot $repositoryFull -BaseOid $ExpectedBaseOid `
+            -SkillRoot (Split-Path -Parent $PSScriptRoot) -RepositoryRoot $repositoryFull -BaseOid $ExpectedBaseOid `
             -Mode $binding.mode -ModRelativePath $normalizedExpectedModPath -ModelId $binding.modelId -HeartbeatAction $HeartbeatAction
         if ($binding.rulesSha256 -cne $expectedBinding.rulesSha256 -or
             $binding.glossarySha256 -cne $expectedBinding.glossarySha256 -or

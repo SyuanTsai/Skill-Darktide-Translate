@@ -74,11 +74,11 @@ Describe 'Schema 15 localization workset' {
 
     It 'UnitT12_HashesByteExactTranslationBindingVector' {
         Import-Module (Join-Path $scriptRoot 'LocalizationWorksetContract.psm1') -Force
-        $apiRoot = Join-Path $TestDrive 'fixed-binding/api'
-        New-Item -Path (Join-Path $apiRoot 'config') -ItemType Directory -Force | Out-Null
+        $skillRoot = Join-Path $TestDrive 'fixed-binding'
+        New-Item -Path (Join-Path $skillRoot 'assets') -ItemType Directory -Force | Out-Null
         '{"manifestVersion":1,"files":[{"repo":"mods","path":"Rules/a.md","modes":["update"],"modFilter":null},{"repo":"mods","path":"excluded","modes":["improve"],"modFilter":null}]}' |
-            Set-Content -LiteralPath (Join-Path $apiRoot 'config/rules-manifest.json')
-        '{"model":"fixed-model"}' | Set-Content -LiteralPath (Join-Path $apiRoot 'config/api-translation.json')
+            Set-Content -LiteralPath (Join-Path $skillRoot 'assets/api-rules-manifest.json')
+        '{"model":"fixed-model"}' | Set-Content -LiteralPath (Join-Path $skillRoot 'assets/api-translation.json')
         Mock Get-LocalizationGitBlobBytes -ModuleName LocalizationWorksetContract {
             switch -CaseSensitive ($Object.Split(':', 2)[1]) {
                 'Rules/a.md' { return ,[Convert]::FromHexString('efbbbf610d0a') }
@@ -86,7 +86,7 @@ Describe 'Schema 15 localization workset' {
                 default { throw "Unexpected blob: $Object" }
             }
         }
-        $binding = Get-LocalizationTranslationBinding -ApiRoot $apiRoot -RepositoryRoot $TestDrive `
+        $binding = Get-LocalizationTranslationBinding -SkillRoot $skillRoot -RepositoryRoot $TestDrive `
             -BaseOid ('1' * 40) -Mode update -ModRelativePath 'mods/Example'
         $binding.modelId | Should -BeExactly 'fixed-model'
         $binding.rulesManifest[0].sha256 | Should -BeExactly 'ea3948106c12d96eaf84d4bb8be214b194c3442acb99a3005251960b0ec2ba63'
@@ -105,12 +105,12 @@ Describe 'Schema 15 localization workset' {
             $LASTEXITCODE | Should -Be 0
             'changed working tree glossary' | Set-Content -LiteralPath (Join-Path $repository 'Referneces/Translation.md')
             Import-Module (Join-Path $scriptRoot 'LocalizationWorksetContract.psm1') -Force
-            $apiRoot = Join-Path (Split-Path -Parent $scriptRoot) 'api'
+            $skillRoot = Split-Path -Parent $scriptRoot
             foreach ($mode in @('update', 'improve')) {
                 $modPath = 'mods/enhanced_DESCRIPTIONS'
-                $powershell = Get-LocalizationTranslationBinding -ApiRoot $apiRoot -RepositoryRoot $repository `
+                $powershell = Get-LocalizationTranslationBinding -SkillRoot $skillRoot -RepositoryRoot $repository `
                     -BaseOid $baseTree -Mode $mode -ModRelativePath $modPath
-                $lines = & $env:SYP419_PYTHON -B (Join-Path $apiRoot 'darktide_translate.py') binding `
+                $lines = & $env:SYP419_PYTHON -B (Join-Path $scriptRoot 'darktide_translate.py') binding `
                     --mods-root $repository --mode $mode --mod-relative-path $modPath --base-oid $baseTree
                 $LASTEXITCODE | Should -Be 0
                 $python = ($lines -join "`n") | ConvertFrom-Json -AsHashtable

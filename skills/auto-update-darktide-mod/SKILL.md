@@ -27,6 +27,8 @@ The coordination helpers themselves use only local .NET locking, same-directory 
 6. Before local Review, external feedback classification, or Review completion, use the same script to materialize `assets/review-baseline.md` from the same pinned Skill source commit and read it completely, then apply the translation-quality outcome standard to its semantic fidelity checks.
 7. Before executing or recovering deterministic stages, read [references/automation.md](references/automation.md). Use [mod-update.ps1](scripts/mod-update.ps1) for fixed stage orchestration, [Finalize-ModUpdateMerge.ps1](scripts/Finalize-ModUpdateMerge.ps1) through its `finalize-merge` command for merge reconciliation or finalization, and the [Candidate Gate script](scripts/Test-ModUpdateCandidate.ps1) as the independent Final Candidate Gate. These reusable scripts derive MOD, run, PR, SHA, path, and reservation facts from the verified state instead of generated per-run helpers.
 
+8. To translate pending Schema 15 workset units with the API adapter, follow [references/api-translation.md](references/api-translation.md).
+
 Existing runs continue with the workflow tuple recorded in their own state. Runs pinned to version 0.3.12 or later expose `finalize-merge`; an older run follows the finalization or recovery procedure in its recorded package. A package upgrade starts a new run and leaves the old state unchanged.
 
 ### Example

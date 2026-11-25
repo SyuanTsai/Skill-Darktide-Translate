@@ -2,12 +2,30 @@
 
 轉接器從 ready 的 Schema 1／15 工作集處理 `AI_REQUIRED` 且 `pending` 的項目。它先驗證工作集綁定，再檢查可接續的狀態與可沿用的快取。通過結構檢查與獨立語意審查的項目才會回填。
 
+## Skill 檔案
+
+下列路徑皆相對於 Skill 根目錄。
+
+- `scripts/darktide_translate.py`
+- `scripts/lua_template.py`
+- `scripts/checks.py`
+- `scripts/glossary.py`
+- `scripts/workset.py`
+- `scripts/rules.py`
+- `scripts/summary.py`
+- `assets/api-translator-prompt.md`
+- `assets/api-reviewer-prompt.md`
+- `assets/api-translator-output.schema.json`
+- `assets/api-reviewer-output.schema.json`
+- `assets/api-translation.json`
+- `assets/api-rules-manifest.json`
+
 ## 執行
 
 在 Skill repo 根目錄，以已備妥的 Python 3.11+ 環境執行。原始碼工作樹直接載入同 repo 的 `packages/claude-runner`。部署時使用相同版本的核心並保留 Skill repo 相對路徑佈局。
 
 ```text
-python skills/auto-update-darktide-mod/api/darktide_translate.py run
+python skills/auto-update-darktide-mod/scripts/darktide_translate.py run
   --workset <localization-workset.json> --mods-root <Mods repo>
   --state <api-state.json> --cache-dir <run cache>
   --summary-out <run>/api-summary.json [--mode update|improve]
@@ -35,14 +53,14 @@ PowerShell 套用工作集與驗證收據時，會比對完整的 Lua token 序�
 ## 工作集綁定契約
 
 ```text
-python skills/auto-update-darktide-mod/api/darktide_translate.py binding
+python skills/auto-update-darktide-mod/scripts/darktide_translate.py binding
   --mods-root <Mods repo> --mode <update|improve> --mod-relative-path <POSIX path>
   --base-oid <workset baseOid>
 ```
 
 新版工作集的 PowerShell 產生器、收據驗證器及 Python `run` 都從 `baseOid` 的 Git blob 讀取 Mods 規則和詞彙表。比對新版工作集時，`binding` 使用同一個 `--base-oid`。省略這個參數時，`binding` 會讀取 Mods 工作樹。
 
-工作集頂層 `translationBinding` 可由上述指令產生。PowerShell 與 Python 均讀 `config/rules-manifest.json`。採用下列位元組格式，以便跨語言交叉驗證。
+工作集頂層 `translationBinding` 可由上述指令產生。PowerShell 與 Python 均讀 `assets/api-rules-manifest.json`。採用下列位元組格式，以便跨語言交叉驗證。
 
 1. 使用 `modes` 與 `modFilter` 篩選 `files`。空值適用所有 MOD，有值時以 `modRelativePath` 的最後一個 POSIX 路徑元件做不區分大小寫的完整比對。
 2. `repo` 選定 Skill 或 Mods repo 根目錄。由根目錄以 POSIX 相對 `path` 取檔並讀取原始位元組，保留 BOM、CRLF 與 LF。對每檔取小寫十六進位 SHA-256。
@@ -56,7 +74,7 @@ python skills/auto-update-darktide-mod/api/darktide_translate.py binding
 ## 離線測試
 
 ```text
-python -m pytest packages/claude-runner/tests skills/auto-update-darktide-mod/api/tests -q
+python -m pytest packages/claude-runner/tests tests/python/darktide_api -q
 ```
 
 設定 `DARKTIDE_MODS_ROOT` 可額外驗證真實詞彙表。整合測試使用合成工作集與假 transport。

@@ -21,7 +21,7 @@
     },
     {
       "repo": "skill",
-      "path": "skills/auto-update-darktide-mod/api/prompts/translator.md",
+      "path": "skills/auto-update-darktide-mod/assets/api-translator-prompt.md",
       "modes": [
         "update",
         "improve"
@@ -30,7 +30,7 @@
     },
     {
       "repo": "skill",
-      "path": "skills/auto-update-darktide-mod/api/prompts/reviewer.md",
+      "path": "skills/auto-update-darktide-mod/assets/api-reviewer-prompt.md",
       "modes": [
         "update",
         "improve"
@@ -39,7 +39,7 @@
     },
     {
       "repo": "skill",
-      "path": "skills/auto-update-darktide-mod/api/schemas/translator-output.json",
+      "path": "skills/auto-update-darktide-mod/assets/api-translator-output.schema.json",
       "modes": [
         "update",
         "improve"
@@ -48,7 +48,7 @@
     },
     {
       "repo": "skill",
-      "path": "skills/auto-update-darktide-mod/api/schemas/reviewer-output.json",
+      "path": "skills/auto-update-darktide-mod/assets/api-reviewer-output.schema.json",
       "modes": [
         "update",
         "improve"
@@ -57,7 +57,7 @@
     },
     {
       "repo": "skill",
-      "path": "skills/auto-update-darktide-mod/api/config/api-translation.json",
+      "path": "skills/auto-update-darktide-mod/assets/api-translation.json",
       "modes": [
         "update",
         "improve"

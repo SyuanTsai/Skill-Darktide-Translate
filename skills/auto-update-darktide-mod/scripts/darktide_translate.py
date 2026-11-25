@@ -22,7 +22,7 @@ from claude_runner.state import State, StateMismatch
 from checks import Luac, validate
 from glossary import Glossary
 from lua_template import ComplexExpression, Template
-from rules import API_RELATIVE, MODES, load_config, load_rules
+from rules import ASSETS_RELATIVE, MODES, load_config, load_rules
 from summary import api_message, write_summary
 from workset import Workset, WorksetError, expression
 
@@ -72,7 +72,7 @@ class Requests:
         self.mode = rules.binding["mode"]
         self.system = {role: rules.system(role) for role in ("translator", "reviewer")}
         self.schemas = {
-            role: json.loads(rules.files["skill", f"{API_RELATIVE}/schemas/{role}-output.json"])
+            role: json.loads(rules.files["skill", f"{ASSETS_RELATIVE}/api-{role}-output.schema.json"])
             for role in self.system
         }
 

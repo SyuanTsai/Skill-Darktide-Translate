@@ -31,6 +31,7 @@ param(
     [ValidateRange(0, 60000)]
     [int] $ObservationIntervalMilliseconds = 1000,
     [string] $LocalizationPlanPath,
+    # Match --mode when running darktide_translate.py on a ready Schema 15 workset.
     [ValidateSet('update', 'improve')]
     [string] $TranslationMode = 'update',
     [ValidateNotNullOrEmpty()][string] $ModelId,

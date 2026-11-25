@@ -10,9 +10,10 @@ import subprocess
 from claude_runner.state import read_json
 
 
-API_ROOT = Path(__file__).resolve().parent
-SKILL_REPO = API_ROOT.parents[2]
-API_RELATIVE = API_ROOT.relative_to(SKILL_REPO).as_posix()
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+SKILL_REPO = SKILL_ROOT.parents[1]
+ASSETS_RELATIVE = (SKILL_ROOT / "assets").relative_to(SKILL_REPO).as_posix()
+PROMPT_PATHS = {role: f"{ASSETS_RELATIVE}/api-{role}-prompt.md" for role in ("translator", "reviewer")}
 GLOSSARY = "Referneces/Translation.md"
 MODES = ("update", "improve")
 
@@ -46,7 +47,7 @@ def read_repository_blob(root, base_oid, path):
 
 
 def load_config():
-    config = read_json(API_ROOT / "config/api-translation.json")
+    config = read_json(SKILL_ROOT / "assets/api-translation.json")
     positive = ("batchSize", "maxItemsPerRun", "requestTimeoutSeconds", "maxOutputTokens")
     nonnegative = ("maxCorrectionsPerItem", "maxApiRetries")
     effort_options = ("low", "medium", "high", "xhigh", "max")
@@ -75,10 +76,10 @@ class Rules:
     files: dict
 
     def system(self, role):
-        prompt_path = f"{API_RELATIVE}/prompts/{role}.md"
+        prompt_path = PROMPT_PATHS[role]
         sections = [self.files["skill", prompt_path].decode("utf-8-sig").strip()]
         for (repo, path), content in self.files.items():
-            if path.endswith(".md") and not path.startswith(f"{API_RELATIVE}/prompts/"):
+            if path.endswith(".md") and (repo != "skill" or path not in PROMPT_PATHS.values()):
                 sections.append(f"## {repo}/{path}\n\n{content.decode('utf-8-sig').strip()}")
         return "\n\n".join(sections)
 
@@ -92,7 +93,7 @@ def load_rules(mods_root, mode, mod_path, config=None, *, base_oid=None):
     if config is None:
         config = load_config()
 
-    manifest = read_json(API_ROOT / "config/rules-manifest.json")
+    manifest = read_json(SKILL_ROOT / "assets/api-rules-manifest.json")
     if manifest["manifestVersion"] != 1:
         raise ValueError("規則 manifest 版本無效。")
     roots = {"skill": SKILL_REPO, "mods": mods_root}

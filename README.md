@@ -153,4 +153,6 @@ The repository does not vendor third-party source code. CI and developer depende
 
 ## Scope
 
+For Schema 15 API translation, see the [adapter guide](skills/auto-update-darktide-mod/references/api-translation.md).
+
 This repository independently owns the packaged Skill, its Schema 14 Workflow and Review base, Schema 15 normative extension, source receipt boundary, deterministic localization worksets, stage runner, Candidate Gate, metadata, validation, and release contract. It is not added to the AI-Instructions Catalog, Lock, bootstrap, or fan-out; consumers install and pin it independently.

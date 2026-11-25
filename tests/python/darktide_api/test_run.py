@@ -9,7 +9,7 @@ import pytest
 from claude_runner.client import FakeTransport, FatalApiError, Response, RetryableApiError
 from checks import Luac
 from darktide_translate import main
-from rules import load_rules
+from rules import SKILL_ROOT, load_rules
 
 FIXTURES = Path(__file__).parent / "fixtures"
 WORDS = "sk-ant-TEST-DO-NOT-LOG-0000"
@@ -30,7 +30,7 @@ class Run:
         self.mods = path / "mods-root"
         self.doc = read(FIXTURES / "workset.json")
         self.base = copy.deepcopy(self.doc["units"][0])
-        for spec in read(Path(__file__).parents[1] / "config/rules-manifest.json")["files"]:
+        for spec in read(SKILL_ROOT / "assets/api-rules-manifest.json")["files"]:
             if spec["repo"] == "mods":
                 target = self.mods / spec["path"]
                 target.parent.mkdir(parents=True, exist_ok=True)
