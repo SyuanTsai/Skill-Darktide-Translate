@@ -10,8 +10,8 @@ import subprocess
 from claude_runner.state import read_json
 
 
-SKILL_ROOT = Path(__file__).resolve().parents[1]
-SKILL_REPO = SKILL_ROOT.parents[1]
+SKILL_REPO = Path(__file__).resolve().parents[2]
+SKILL_ROOT = SKILL_REPO / "skills/auto-update-darktide-mod"
 ASSETS_RELATIVE = (SKILL_ROOT / "assets").relative_to(SKILL_REPO).as_posix()
 PROMPT_PATHS = {role: f"{ASSETS_RELATIVE}/api-{role}-prompt.md" for role in ("translator", "reviewer")}
 GLOSSARY = "Referneces/Translation.md"

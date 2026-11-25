@@ -110,7 +110,7 @@ Describe 'Schema 15 localization workset' {
                 $modPath = 'mods/enhanced_DESCRIPTIONS'
                 $powershell = Get-LocalizationTranslationBinding -SkillRoot $skillRoot -RepositoryRoot $repository `
                     -BaseOid $baseTree -Mode $mode -ModRelativePath $modPath
-                $lines = & $env:SYP419_PYTHON -B (Join-Path $scriptRoot 'darktide_translate.py') binding `
+                $lines = & $env:SYP419_PYTHON -B (Join-Path $repoRoot 'packages/darktide-translate/darktide_translate.py') binding `
                     --mods-root $repository --mode $mode --mod-relative-path $modPath --base-oid $baseTree
                 $LASTEXITCODE | Should -Be 0
                 $python = ($lines -join "`n") | ConvertFrom-Json -AsHashtable

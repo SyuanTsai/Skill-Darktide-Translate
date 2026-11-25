@@ -57,7 +57,8 @@ Describe 'Skill source pin generator' {
         @($pin.skillFiles).Count | Should -BeGreaterThan 10
         @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1'
         @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/assets/api-rules-manifest.json'
-        @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/scripts/darktide_translate.py'
+        @($pin.skillFiles.repositoryPath) | Should -Not -Contain 'packages/darktide-translate/darktide_translate.py'
+        @($pin.skillFiles.repositoryPath | Where-Object { $_ -like '*.py' }) | Should -BeNullOrEmpty
         $result.result | Should -Be 'passed'
         $result.skillSourcePin.fileCount | Should -Be @($pin.skillFiles).Count
     }

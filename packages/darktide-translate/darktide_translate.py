@@ -9,7 +9,7 @@ import sys
 import time
 
 # 原始碼工作樹可直接執行。獨立 Skill 安裝則使用環境中的套件。
-source_package = Path(__file__).resolve().parents[3] / "packages/claude-runner"
+source_package = Path(__file__).resolve().parent.parent / "claude-runner"
 if (source_package / "claude_runner/__init__.py").is_file():
     sys.path.insert(0, str(source_package))
 

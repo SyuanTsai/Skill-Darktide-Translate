@@ -1,18 +1,11 @@
 # Darktide Schema 15 API 翻譯
 
-轉接器從 ready 的 Schema 1／15 工作集處理 `AI_REQUIRED` 且 `pending` 的項目。它先驗證工作集綁定，再檢查可接續的狀態與可沿用的快取。通過結構檢查與獨立語意審查的項目才會回填。
+Skill 提供 Schema 15 API 翻譯資產，以及產生、套用工作集和驗證收據的 PowerShell 腳本。PowerShell 從 Skill 資產與工作集基準版本的 Mods 規則和詞彙表計算並驗證 `translationBinding`。
 
 ## Skill 檔案
 
 下列路徑皆相對於 Skill 根目錄。
 
-- `scripts/darktide_translate.py`
-- `scripts/lua_template.py`
-- `scripts/checks.py`
-- `scripts/glossary.py`
-- `scripts/workset.py`
-- `scripts/rules.py`
-- `scripts/summary.py`
 - `assets/api-translator-prompt.md`
 - `assets/api-reviewer-prompt.md`
 - `assets/api-translator-output.schema.json`
@@ -22,10 +15,12 @@
 
 ## 執行
 
-在 Skill repo 根目錄，以已備妥的 Python 3.11+ 環境執行。原始碼工作樹直接載入同 repo 的 `packages/claude-runner`。部署時使用相同版本的核心並保留 Skill repo 相對路徑佈局。
+Python 轉接器的 repo 路徑是 `packages/darktide-translate/darktide_translate.py`。它不隨 Skill 安裝，只能從 repo 原始碼工作樹或 GitHub Actions 執行。在 repo 根目錄以已備妥的 Python 3.11+ 環境執行，轉接器會載入同 repo 的 `packages/claude-runner`。
+
+轉接器處理 ready 的 Schema 15 工作集中同時為 `AI_REQUIRED` 與 `pending` 的項目。它會先驗證工作集綁定，再讀取狀態及快取。通過結構檢查與獨立語意審查的項目才會回填。
 
 ```text
-python skills/auto-update-darktide-mod/scripts/darktide_translate.py run
+python packages/darktide-translate/darktide_translate.py run
   --workset <localization-workset.json> --mods-root <Mods repo>
   --state <api-state.json> --cache-dir <run cache>
   --summary-out <run>/api-summary.json [--mode update|improve]
@@ -53,14 +48,14 @@ PowerShell 套用工作集與驗證收據時，會比對完整的 Lua token 序�
 ## 工作集綁定契約
 
 ```text
-python skills/auto-update-darktide-mod/scripts/darktide_translate.py binding
+python packages/darktide-translate/darktide_translate.py binding
   --mods-root <Mods repo> --mode <update|improve> --mod-relative-path <POSIX path>
   --base-oid <workset baseOid>
 ```
 
 新版工作集的 PowerShell 產生器、收據驗證器及 Python `run` 都從 `baseOid` 的 Git blob 讀取 Mods 規則和詞彙表。比對新版工作集時，`binding` 使用同一個 `--base-oid`。省略這個參數時，`binding` 會讀取 Mods 工作樹。
 
-工作集頂層 `translationBinding` 可由上述指令產生。PowerShell 與 Python 均讀 `assets/api-rules-manifest.json`。採用下列位元組格式，以便跨語言交叉驗證。
+PowerShell 工作集產生器和收據驗證器從 Skill 資產讀取規則清單及模型設定。Python 使用相同資產，上述指令可輸出 `translationBinding` 供交叉驗證。兩端採用相同的位元組格式。
 
 1. 使用 `modes` 與 `modFilter` 篩選 `files`。空值適用所有 MOD，有值時以 `modRelativePath` 的最後一個 POSIX 路徑元件做不區分大小寫的完整比對。
 2. `repo` 選定 Skill 或 Mods repo 根目錄。由根目錄以 POSIX 相對 `path` 取檔並讀取原始位元組，保留 BOM、CRLF 與 LF。對每檔取小寫十六進位 SHA-256。
