@@ -257,13 +257,96 @@ def test_ac6_and_4_10_zero_api_cache_hit_and_model_guard(job, model):
     assert read(job.summary)["cacheHitCount"] == (1 if model == MODEL else 0)
 
 
+# Scenario: The translator flags terms in a translation that passes both checks.
+# Purpose: Keep the adopted text and terms available after API, resume, and cache paths.
+def test_InterT10_unknown_terms_follow_the_approved_translation(job):
+    unit = job.doc["units"][0]
+    unit["new"]["sourceExpression"]["raw"] = '"Shot Recovery"'
+    job.save()
+    flagged = ["Shot Recovery"]
+    expected = {"unitId": unit["unitId"], "key": unit["key"], "source": '"Shot Recovery"',
+                "terms": flagged, "translation": '"射擊恢復"'}
+
+    assert job.run(FakeTransport([scripted("射擊恢復", unknown=flagged), scripted()])) == 0
+    record = read(job.state)["units"][unit["unitId"]]
+    assert record["status"] == "approved"
+    assert record["unknownTerms"] == flagged
+    assert record["key"] == expected["key"] and record["source"] == expected["source"]
+    assert record["expression"] == expected["translation"]
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == expected["translation"]
+    assert read(job.summary)["unknownTerms"] == [expected]
+    assert read(job.summary)["blocked"] == []
+    markdown = job.summary.with_suffix(".md").read_text(encoding="utf-8")
+    assert "### 待確認術語\n\n- demo — Shot Recovery" in markdown
+    assert "### BLOCKED 項目" not in markdown
+
+    job.save()
+    assert job.run(FakeTransport([])) == 0
+    assert read(job.summary)["unknownTerms"] == [expected]
+
+    job.state.unlink()
+    unit.update(unitId="testmod :: $ :: cached :: 1", key="cached")
+    job.save()
+    assert job.run(FakeTransport([])) == 0
+    assert read(job.summary)["cacheHitCount"] == 1
+    assert read(job.summary)["unknownTerms"] == [{**expected, "unitId": unit["unitId"], "key": unit["key"]}]
+
+
+# Scenario: The model returns straight or curly double quotes around its text.
+# Purpose: Send corrected text to the reviewer and writeback while preserving source quotes.
+@pytest.mark.parametrize(("source", "translation", "adopted", "warned"), [
+    ('"Gain 15%"', '"增加15%"', "增加15%", True),
+    ('"Gain 15%"', '“增加15%”', "增加15%", True),
+    ('"Gain 15%"', ' ＂增加15%＂ ', " 增加15% ", True),
+    (r'"\"Gain 15%\""', '"增加15%"', '"增加15%"', False),
+    ('"“Gain 15%”"', '"增加15%"', '"增加15%"', False),
+    ('"Gain 15%"', '"增加" "15%"', '"增加" "15%"', False),
+])
+def test_InterT20_unexpected_outer_double_quotes_are_removed_before_review(job, source, translation, adopted, warned):
+    unit = job.doc["units"][0]
+    unit["new"]["sourceExpression"]["raw"] = source
+    job.save()
+    transport = FakeTransport([scripted(translation), scripted()])
+
+    assert job.run(transport) == 0
+    assert transport.requests[1].user["units"][0]["translation"] == {"s1": adopted}
+    record = read(job.state)["units"][unit["unitId"]]
+    output = read(job.workset)["units"][0]
+    assert output["reviewStatus"] == "approved"
+    assert output["suggestedZhTwExpression"] == json.dumps(adopted, ensure_ascii=False)
+    warning = "unexpected_outer_double_quotes"
+    assert record["warnings"] == ([warning] if warned else [])
+    report = read(job.summary)
+    assert report["warnings"] == ([{"unitId": unit["unitId"], "code": warning}] if warned else [])
+    assert report["blocked"] == []
+    assert (warning in job.summary.with_suffix(".md").read_text(encoding="utf-8")) == warned
+
+
+# Scenario: A flagged translation has extra quotes and changes an English placeholder.
+# Purpose: Required structural checks still block the item after exhausting corrections.
+def test_InterT30_placeholder_mismatch_still_blocks_a_flagged_translation(job):
+    unit = job.doc["units"][0]
+    unit["new"]["sourceExpression"]["raw"] = '"Gain {amount}"'
+    job.save()
+    bad_translation = scripted('"增加{other}"', unknown=["Gain"])
+
+    assert job.run(FakeTransport([bad_translation] * 3)) == 0
+    record = read(job.state)["units"][unit["unitId"]]
+    assert record["feedback"] == ["placeholder_mismatch"]
+    report = read(job.summary)
+    assert report["blocked"] == [{"unitId": unit["unitId"], "reason": "max_corrections_reached"}]
+    assert report["unknownTerms"] == []
+    assert read(job.workset)["units"][0]["reviewStatus"] == "pending"
+
+
+# Scenario: A unit hits a required lookup, structure, or Lua check.
+# Purpose: Preserve each existing blocking condition and leave the workset unit pending.
 @pytest.mark.parametrize(("reason", "replies"), [
-    ("needs_lookup_definition", [scripted(lookup=True)]),
-    ("unknown_term", [scripted(unknown=["unrecognized"])]),
+    ("needs_lookup_definition", [scripted(lookup=True, unknown=["unrecognized"])]),
     ("max_corrections_reached", [scripted("增加10%")] * 3),
     ("complex_expression", []),
 ])
-def test_4_7_blocked_remains_pending(job, reason, replies):
+def test_InterT40_blocked_remains_pending(job, reason, replies):
     if reason == "complex_expression":
         job.doc["units"][0]["new"]["sourceExpression"]["raw"] = 'Localize("key")'
     job.save()

@@ -15,6 +15,7 @@ PLACEHOLDER = re.compile(r"\{[A-Za-z_][\w.]*(?::[^{}\n]+)?\}|" + PRINTF)
 FORMAT = re.compile(PRINTF)
 MARKUP = re.compile(r"\{#([a-zA-Z_]\w*)\([^{}\n]*\)\}")
 NUMBER = re.compile(r"[+-]?\d+(?:\.\d+)?%?")
+DOUBLE_QUOTE_PAIRS = {'"': '"', '“': '”', '＂': '＂'}
 
 
 class Luac:
@@ -74,6 +75,33 @@ def format_mismatch(template, segments):
 
     return any(printf_counts(template.segments[key]) != printf_counts(segments[key])
                for key in template.segments.keys() - format_keys)
+
+
+def has_outer_double_quotes(text):
+    return len(text) >= 2 and DOUBLE_QUOTE_PAIRS.get(text[0]) == text[-1]
+
+
+def strip_unexpected_outer_quotes(template, segments):
+    if (not isinstance(segments, dict) or segments.keys() != template.segments.keys()
+            or any(not isinstance(text, str) for text in segments.values())):
+        return segments, []
+
+    source = "".join(template.segments.values()).strip()
+    target = "".join(segments[key] for key in template.segments).strip()
+    if has_outer_double_quotes(source) or not has_outer_double_quotes(target):
+        return segments, []
+    # 保留使用同一種引號標示的多個獨立片語。
+    if target[0] in target[1:-1] or target[-1] in target[1:-1]:
+        return segments, []
+
+    nonblank = [key for key in template.segments if segments[key].strip()]
+    first, last = nonblank[0], nonblank[-1]
+    normalized = segments.copy()
+    start = len(segments[first]) - len(segments[first].lstrip())
+    normalized[first] = segments[first][:start] + segments[first][start + 1:]
+    end = len(normalized[last].rstrip()) - 1
+    normalized[last] = normalized[last][:end] + normalized[last][end + 1:]
+    return normalized, ["unexpected_outer_double_quotes"]
 
 
 def validate(template, segments, glossary, luac):

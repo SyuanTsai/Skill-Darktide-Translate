@@ -23,11 +23,11 @@ API_MESSAGES = {
 
 BLOCK_LABELS = {
     "needs_lookup_definition": "需要 lookup 定義",
-    "unknown_term": "詞彙表缺少專有名詞",
     "max_corrections_reached": "已達修正上限",
     "complex_expression": "無法安全建立 Lua 模板",
     "api_failed": "API 失敗，可接續",
 }
+WARNING_LABELS = {"unexpected_outer_double_quotes": "已移除多餘的外層雙引號"}
 STATUS_LABELS = {
     "completed": "處理完成", "dry-run": "預演", "needs-confirmation": "需要人工確認",
     "missing-key": "缺少憑證", "api-failed": "API 中斷",
@@ -39,25 +39,33 @@ def api_message(code):
 
 
 def markdown_text(text):
-    # unitId 為外部資料，避免本機路徑、換行及 Markdown 控制字元進入 PR。
+    # 避免外部資料的本機路徑、換行及 Markdown 控制字元進入 PR。
     text = re.sub(r'(?i)(?:[a-z]:[\\/]|\\\\|(?<![\w/])/(?!/))[^ \t\r\n]*', "（路徑已省略）", text)
     return re.sub(r"([\\<>&*_\[\]\x60|])", r"\\\1", " ".join(text.split()))
 
 
 def write_summary(path, report, records, usage, prices):
     blocked = []
+    unknown_terms = []
+    warnings = []
     for unit_id, record in records.items():
         if reason := record.get("blockedReason"):
             item = {"unitId": unit_id, "reason": reason}
             if record.get("details"):
                 item["details"] = record["details"]
             blocked.append(item)
+        if terms := record.get("unknownTerms"):
+            unknown_terms.append({"unitId": unit_id, "key": record["key"], "source": record["source"],
+                                  "terms": terms, "translation": record["expression"]})
+        warnings.extend({"unitId": unit_id, "code": code} for code in record.get("warnings", []))
 
     report.update(
         processedCount=sum(record.get("status") in ("approved", "blocked") for record in records.values()),
         approvedCount=sum(record.get("status") == "approved" for record in records.values()),
         cacheHitCount=sum(record.get("origin") == "cache" for record in records.values()),
         blocked=blocked,
+        unknownTerms=unknown_terms,
+        warnings=warnings,
         corrections=dict(sorted(Counter(record.get("corrections", 0) for record in records.values()
                                         if record.get("status") in ("approved", "blocked")).items())),
         usage=usage.data,
@@ -101,6 +109,15 @@ def write_summary(path, report, records, usage, prices):
         lines += ["", "### BLOCKED 項目", ""]
         lines.extend(f"- {markdown_text(item['unitId'])} — {BLOCK_LABELS[item['reason']]}（{item['reason']}）"
                      for item in blocked)
+    if unknown_terms:
+        lines += ["", "### 待確認術語", ""]
+        for item in unknown_terms:
+            terms = "、".join(markdown_text(term) for term in item["terms"])
+            lines.append(f"- {markdown_text(item['key'])} — {terms}")
+    if warnings:
+        lines += ["", "### 警告", ""]
+        lines.extend(f"- {markdown_text(item['unitId'])} — {WARNING_LABELS[item['code']]}（{item['code']}）"
+                     for item in warnings)
     lines += ["", "<details>", "<summary>規則檔清單</summary>", ""]
     lines.extend(f"- {row['repo']}/{row['path']}　{row['sha256']}" for row in report["rulesManifest"])
     lines += ["", "</details>", ""]

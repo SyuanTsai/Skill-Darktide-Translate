@@ -39,6 +39,10 @@ python packages/darktide-translate/darktide_translate.py run
 
 狀態檔、快取與兩種摘要放於 run 目錄。每個工作集由同一個翻譯程序處理。狀態的 `worksetSha256` 採用工作集內的 `immutableContractSha256`，回填後可接續。API 中斷時已通過的項目會回填，當批的 `api_failed` 項可重試。其他 BLOCKED 項會保留原工作集狀態，並在摘要標示原因。
 
+有待確認術語的譯文照常進行結構檢查與獨立審查。JSON 摘要的頂層 `unknownTerms` 是已採用譯文的彙整陣列，無項目時為 `[]`。每筆包含字串欄位 `unitId`、`key`、`source`、`translation`，以及字串陣列 `terms`。`source` 是工作集的 NEW 英文 Lua 表達式，`translation` 是回填的臺灣繁中 Lua 表達式。Markdown 摘要在「待確認術語」列出 key 與詞清單。
+
+若英文原文沒有外層雙引號，轉接器會在審查前移除整段譯文多餘的外層雙引號。採用這筆譯文時，JSON 摘要的 `warnings` 陣列會記錄 `unitId` 和 `code: "unexpected_outer_double_quotes"`。
+
 快取鍵依序包含 NEW 英文 raw、OLD 繁中 raw 或 JSON null、規則 SHA、詞彙表 SHA、模式及請求模型 ID。已審查通過且翻譯及審查回應模型均相符的結果才會寫入。若 PATH 有 `luac`，轉接器以暫存檔執行 `luac -p`；缺少時在摘要記錄 `luacAvailable: false`。
 
 ## 安全檢查

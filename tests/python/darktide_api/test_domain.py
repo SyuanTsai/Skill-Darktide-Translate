@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from checks import Luac, validate
+from checks import Luac, strip_unexpected_outer_quotes, validate
 from glossary import Glossary
 from lua_template import ComplexExpression, Template, decode_string, tokenize
 
@@ -117,6 +117,20 @@ def test_4_5_scanner_number_tokens_and_original_trivia():
 @pytest.fixture
 def terms():
     return Glossary.parse((Path(__file__).parent / "fixtures/terms.md").read_text(encoding="utf-8"))
+
+
+# Scenario: One wrapper spans translated segments on both sides of a Lua variable.
+# Purpose: Remove just the extra quotes while preserving whitespace and token structure.
+def test_UnitT10_outer_quote_removal_preserves_lua_segments(terms):
+    template = Template.parse('" " .. "Gain " .. amount .. " now" .. " "')
+    segments = {"s4": " ", "s3": "現在” ", "s2": " “增加", "s1": " "}
+
+    normalized, warnings = strip_unexpected_outer_quotes(template, segments)
+
+    assert warnings == ["unexpected_outer_double_quotes"]
+    assert normalized == {"s1": " ", "s2": " 增加", "s3": "現在 ", "s4": " "}
+    assert segments["s2"] == " “增加" and segments["s3"] == "現在” "
+    assert validate(template, normalized, terms, Luac(None)) == ('" " .. " 增加" .. amount .. "現在 " .. " "', [])
 
 
 def test_ac3_exact_glossary_and_scoped_checks(terms):

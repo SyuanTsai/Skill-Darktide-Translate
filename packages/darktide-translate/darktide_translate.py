@@ -19,7 +19,7 @@ from claude_runner.cache import Cache
 from claude_runner.client import Client, FatalApiError
 from claude_runner.state import State, StateMismatch
 
-from checks import Luac, validate
+from checks import Luac, strip_unexpected_outer_quotes, validate
 from glossary import Glossary
 from lua_template import ComplexExpression, Template
 from rules import ASSETS_RELATIVE, MODES, load_config, load_rules
@@ -140,11 +140,10 @@ class Requests:
 def inspect_translation(template, item, glossary, luac):
     if item["needsLookupDefinition"]:
         return "needs_lookup_definition", [], None
-    if item["unknownTerms"]:
-        return "unknown_term", [], item["unknownTerms"]
-    segments = item["segments"]
+    segments, warnings = strip_unexpected_outer_quotes(template, item["segments"])
     rendered, issues = validate(template, segments, glossary, luac)
-    return None, issues, {"segments": segments, "expression": rendered}
+    return None, issues, {"segments": segments, "expression": rendered,
+                          "unknownTerms": item["unknownTerms"], "warnings": warnings}
 
 
 def valid_approval(record, template, glossary, luac):
@@ -183,6 +182,7 @@ def prepare(workset, state, cache, binding, glossary, luac):
             ready[unit_id] = ("cache", {
                 "segments": cached["segments"], "expression": cached["expression"],
                 "review": {**cached["review"], "unitId": unit_id},
+                "unknownTerms": cached.get("unknownTerms", []), "warnings": cached.get("warnings", []),
             })
         else:
             queue.append(unit_id)
@@ -236,9 +236,14 @@ def run(args, config, transport, sleeper, luac):
             "attempts": step.attempts, "corrections": step.corrections,
             "segments": value["segments"] if value else None,
             "expression": value["expression"] if value else None,
+            "unknownTerms": value["unknownTerms"] if value else [],
+            "warnings": value["warnings"] if value else [],
             "review": review, "blockedReason": reason,
             "feedback": step.feedback, "cacheable": step.cacheable, "origin": origin,
         }
+        if record["unknownTerms"]:
+            record["key"] = workset.pending[unit_id].get("key", unit_id)
+            record["source"] = templates[unit_id].raw
         if details:
             record["details"] = details
         if reason is None:
@@ -258,7 +263,8 @@ def run(args, config, transport, sleeper, luac):
 
     if exceeds_budget(len(queue), limit):
         for unit_id, (origin, value) in ready.items():
-            preview[unit_id] = {"origin": origin, "blockedReason": origin if value is None else None}
+            if origin != "resume":
+                preview[unit_id] = {"origin": origin, "blockedReason": origin if value is None else None}
         summarize("needs-confirmation", "待送項目超過單次上限。")
         return 2
 
