@@ -73,6 +73,12 @@ Describe 'Schema 15 localization workset' {
         @{ label = 'reordered format arguments'; source = '"Run: %s %d"'; target = '"執行：%d %s"'; expected = $false }
         @{ label = 'changed escaped format'; source = '"\x25s"'; target = '"%d"'; expected = $false }
         @{ label = 'same format arguments in a literal chain'; source = 'format(("a %s" .. " b %d"), name, count)'; target = 'format(("甲" .. " %s %d"), name, count)'; expected = $true }
+        @{ label = 'format arguments move into a parenthesized literal'; source = 'format("a %s" .. (" b %d"), name, count)'; target = 'format("甲" .. (" %s %d"), name, count)'; expected = $true }
+        @{ label = 'format arguments reorder in a parenthesized literal'; source = 'format("a %s" .. (" b %d"), name, count)'; target = 'format("甲" .. (" %d %s"), name, count)'; expected = $false }
+        @{ label = 'format arguments move to a value argument'; source = 'string.format("a %s" .. (" b %d"), "name", count)'; target = 'string.format("甲" .. (" %s"), "name %d", count)'; expected = $false }
+        @{ label = 'format arguments stay within a parenthesized receiver'; source = '(("a %s") .. " b %d"):format(name, count)'; target = '(("甲") .. " %s %d"):format(name, count)'; expected = $true }
+        @{ label = 'format arguments stay within a nested format call'; source = 'format(format("a %s", name) .. (" b %d"), count)'; target = 'format(format("甲", name) .. (" %s %d"), count)'; expected = $false }
+        @{ label = 'non-format call keeps format arguments in their literal'; source = 'other.format("a %s" .. " b %d", name, count)'; target = 'other.format("甲" .. " %s %d", name, count)'; expected = $false }
         @{ label = 'format moves arguments between calls'; source = 'format("%s", name) .. format("%d", count)'; target = 'format("%d", name) .. format("%s", count)'; expected = $false }
         @{ label = 'literal quoting'; source = '"English"'; target = '[=[譯文]=]'; expected = $true }
         @{ label = 'format string'; source = 'string.format("%s old", x)'; target = "string.format('%s 新', x)"; expected = $true }

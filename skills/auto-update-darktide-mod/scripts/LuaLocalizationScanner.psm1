@@ -812,28 +812,99 @@ function Get-LuaLocalizationDocument {
 
 $script:luaFormatSpecifier = '%(?:%|[-+ #0]*[0-9]*(?:\.[0-9]+)?[cdiouxXeEfgGqs])'
 
-function Get-LuaFormatSignature {
+function Test-LuaFormatFunctionToken {
+    param([object[]] $Tokens, [int] $Index)
+    if ($Index -lt 0 -or $Tokens[$Index].type -cne 'identifier' -or $Tokens[$Index].text -cne 'format') {
+        return $false
+    }
+    if ($Index -gt 0 -and $Tokens[$Index - 1].text -ceq '.') {
+        if ($Index -lt 2 -or $Tokens[$Index - 2].text -cne 'string') { return $false }
+        $Index -= 2
+    }
+    $Index -eq 0 -or $Tokens[$Index - 1].text -cnotin @('.', ':', 'function')
+}
+
+function Get-LuaFormatSpans {
     param([object[]] $Tokens)
-    $signature = [Text.StringBuilder]::new()
+    $delimiters = [Collections.Generic.Stack[object]]::new()
+    $openingByClosing = @{ ')' = '('; ']' = '['; '}' = '{' }
     for ($index = 0; $index -lt $Tokens.Count; $index++) {
         Invoke-LuaScannerProgressHeartbeat
-        if ($Tokens[$index].type -cne 'string') { continue }
-        $end = $index
-        # A chain of literals bounded by an argument or grouping delimiter has one format value.
-        if ($index -eq 0 -or $Tokens[$index - 1].text -cin @('(', ',')) {
-            while (($end + 2) -lt $Tokens.Count -and $Tokens[$end + 1].text -ceq '..' -and
-                $Tokens[$end + 2].type -ceq 'string') {
-                Invoke-LuaScannerProgressHeartbeat
-                $end += 2
+        $token = $Tokens[$index]
+        if ($token.type -ceq 'string') {
+            if (Test-LuaFormatFunctionToken -Tokens $Tokens -Index ($index - 1)) {
+                @{ start = $index; end = $index }
             }
-            if (($end + 1) -lt $Tokens.Count -and $Tokens[$end + 1].text -cnotin @(')', ',')) { $end = $index }
         }
-        $text = -join @(for ($literal = $index; $literal -le $end; $literal += 2) {
-            ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$literal].text)
-        })
+        elseif ($token.text -cin @('(', '[', '{')) {
+            $delimiters.Push(@{ start = $index; firstComma = -1 })
+        }
+        elseif ($token.text -ceq ',' -and $delimiters.Count -gt 0) {
+            $frame = $delimiters.Peek()
+            if ($frame.firstComma -lt 0) { $frame.firstComma = $index }
+        }
+        elseif ($openingByClosing.ContainsKey($token.text) -and $delimiters.Count -gt 0) {
+            $frame = $delimiters.Pop()
+            $open = $frame.start
+            if ($Tokens[$open].text -cne $openingByClosing[$token.text] -or $token.text -ceq ']') { continue }
+
+            if (Test-LuaFormatFunctionToken -Tokens $Tokens -Index ($open - 1)) {
+                if ($token.text -ceq '}') {
+                    @{ start = $open; end = $index }
+                }
+                else {
+                    # Only a comma at this call's nesting level ends the first argument.
+                    $end = if ($frame.firstComma -ge 0) { $frame.firstComma - 1 } else { $index - 1 }
+                    @{ start = $open + 1; end = $end }
+                }
+            }
+            if ($token.text -cne ')' -or ($index + 3) -ge $Tokens.Count -or
+                $Tokens[$index + 1].text -cne ':' -or $Tokens[$index + 2].text -cne 'format' -or
+                ($Tokens[$index + 3].type -cne 'string' -and $Tokens[$index + 3].text -cnotin @('(', '{'))) { continue }
+
+            # Match a parenthesized receiver, excluding the argument list of a preceding call.
+            if ($open -gt 0) {
+                $previous = $Tokens[$open - 1]
+                if ($previous.type -ceq 'string' -or $previous.text -cin @(')', ']', '}') -or
+                    ($previous.type -ceq 'identifier' -and $previous.text -cnotin @('and', 'or', 'not'))) { continue }
+            }
+            @{ start = $open + 1; end = $index - 1 }
+        }
+    }
+}
+
+function Get-LuaFormatSignature {
+    param([object[]] $Tokens, [object[]] $FormatSpans)
+    $literals = [Collections.Generic.SortedDictionary[int,string]]::new()
+    for ($index = 0; $index -lt $Tokens.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        if ($Tokens[$index].type -ceq 'string') {
+            $literals.Add($index, (ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$index].text)))
+        }
+    }
+
+    $grouped = [Collections.Generic.HashSet[int]]::new()
+    $values = [Collections.Generic.List[string]]::new()
+    foreach ($span in $FormatSpans) {
+        $text = [Text.StringBuilder]::new()
+        for ($index = $span.start; $index -le $span.end; $index++) {
+            Invoke-LuaScannerProgressHeartbeat
+            if ($literals.ContainsKey($index)) {
+                $null = $text.Append($literals[$index])
+                $null = $grouped.Add($index)
+            }
+        }
+        $values.Add($text.ToString())
+    }
+    foreach ($literal in $literals.GetEnumerator()) {
+        if (-not $grouped.Contains($literal.Key)) { $values.Add($literal.Value) }
+    }
+
+    $signature = [Text.StringBuilder]::new()
+    foreach ($text in $values) {
+        Invoke-LuaScannerProgressHeartbeat
         $formats = @([regex]::Matches($text, $script:luaFormatSpecifier) | ForEach-Object Value)
         $null = $signature.Append('|').Append(($formats -join ','))
-        $index = $end
     }
     $signature.ToString()
 }
@@ -870,8 +941,10 @@ function Test-LuaNonStringTokenSequence {
         if (($index -le $localizeEnd -or $sourceText -cmatch '^loc_[A-Za-z0-9_]+$') -and
             $sourceText -cne $translationText) { return $false }
     }
-    -not $changedLiteral -or (Get-LuaFormatSignature -Tokens $sourceTokens) -ceq
-        (Get-LuaFormatSignature -Tokens $translationTokens)
+    if (-not $changedLiteral) { return $true }
+    $formatSpans = @(Get-LuaFormatSpans -Tokens $sourceTokens)
+    (Get-LuaFormatSignature -Tokens $sourceTokens -FormatSpans $formatSpans) -ceq
+        (Get-LuaFormatSignature -Tokens $translationTokens -FormatSpans $formatSpans)
 }
 
 Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence
