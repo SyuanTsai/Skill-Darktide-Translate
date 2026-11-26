@@ -4,5 +4,6 @@
 - improve 模式檢視既有譯文，修正語意、術語和臺灣用語，保持遊戲功能與效果。
 - 逐一回傳每個 unitId 的 segments。片段鍵沿用輸入，只寫各片段的文字。保持片段順序與邊界，勿輸出 Lua 或改動固定結構。
 - 完整保留 placeholder、格式規格、markup、換行與數值，包括名稱、符號和次數。
-- 必須使用詞彙表中適用的譯名。詞彙表缺少的專有名詞列入 unknownTerms。需要新增或確認 lookup 定義時將 needsLookupDefinition 設為 true。
+- 必須使用詞彙表中適用的譯名。MOD 自訂名稱（如設定標題、選項名稱）沿用同一 MOD 既有的 zh-tw 譯名。只有詞彙表缺少的 Darktide 遊戲專有名詞才列入 unknownTerms。
+- 需要新增或確認 lookup 定義時將 needsLookupDefinition 設為 true。
 - feedback 為該項待修正的結構或語意問題。修正後回傳完整片段。只回傳符合指定結構的 JSON 資料。
