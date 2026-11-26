@@ -67,8 +67,8 @@ class Workset:
             _, end = decoder.raw_decode(self.text, position)
             if unit["unitId"] in approvals:
                 fields = dict(object_fields(self.text, position))
-                for name, value in (("reviewStatus", "approved"),
-                                    ("suggestedZhTwExpression", approvals[unit["unitId"]])):
+                status, expression = approvals[unit["unitId"]]
+                for name, value in (("reviewStatus", status), ("suggestedZhTwExpression", expression)):
                     start, finish = fields[name]
                     edits.append((start, finish, json.dumps(value, ensure_ascii=False)))
             position = WHITESPACE.match(self.text, end).end() + 1

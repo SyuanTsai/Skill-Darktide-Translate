@@ -339,16 +339,79 @@ def test_InterT30_placeholder_mismatch_still_blocks_a_flagged_translation(job):
     assert read(job.workset)["units"][0]["reviewStatus"] == "pending"
 
 
-# Scenario: A unit hits a required lookup, structure, or Lua check.
-# Purpose: Preserve each existing blocking condition and leave the workset unit pending.
+# Scenario: A lookup-marked reply passes review, has no usable text, or only fails term review.
+# Purpose: Report the lookup and adopt reviewed text, compatible zh-tw, or the exact English expression.
+@pytest.mark.parametrize(("candidate", "previous", "translation", "review_issue", "adopted", "adoption"), [
+    (None, None, "替代貼花%s\n{#color(1,2,3)}%d{#reset()}", None,
+     r'"替代貼花%s\n{#color(1,2,3)}%d{#reset()}"', "translation"),
+    (r"'現有貼花%s\n{#color(1,2,3)}%d{#reset()}'", None, "", None,
+     r"'現有貼花%s\n{#color(1,2,3)}%d{#reset()}'", "existing_zh_tw"),
+    ('""', r'"舊譯%d\n{#color(1,2,3)}%s{#reset()}"', "", None,
+     r'"Alt decal%s\n{#color(1,2,3)}%d{#reset()}"', "english_fallback"),
+    ('""', r'"舊版貼花%s\n{#color(1,2,3)}%d{#reset()}"', "", None,
+     r'"舊版貼花%s\n{#color(1,2,3)}%d{#reset()}"', "existing_zh_tw"),
+    (None, None, "替代貼花%s\n{#color(1,2,3)}%d{#reset()}", "term",
+     r'"Alt decal%s\n{#color(1,2,3)}%d{#reset()}"', "english_fallback"),
+])
+def test_InterT35_lookup_uses_safe_adoption(job, candidate, previous, translation, review_issue, adopted, adoption):
+    unit = job.doc["units"][0]
+    source = r'"Alt decal%s\n{#color(1,2,3)}%d{#reset()}"'
+    unit["new"]["sourceExpression"]["raw"] = source
+    for side, existing in (("new", candidate), ("old", previous)):
+        unit[side]["zhTwExpression"] = {"raw": existing} if existing is not None else None
+    job.save()
+    translate = scripted(translation, lookup=True, unknown=["Alt decal"])
+    review = scripted(issues=[{"category": review_issue, "detail": "Alt decal"}] if review_issue else [])
+    replies = [translate] if not translation else [translate, review] * (3 if review_issue else 1)
+    transport = FakeTransport(replies)
+
+    assert job.run(transport) == 0
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == adopted
+    report = read(job.summary)
+    assert report["blocked"] == []
+    assert report["termReviews"] == [{"unitId": unit["unitId"], "key": unit["key"], "source": source,
+                                      "terms": ["Alt decal"], "translation": adopted,
+                                      "reason": "needs_lookup_definition", "adoption": adoption}]
+    markdown = job.summary.with_suffix(".md").read_text(encoding="utf-8")
+    assert "needs_lookup_definition" in markdown and "Alt decal" in markdown
+    job.save()
+    assert job.run(FakeTransport([])) == 0
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == adopted
+
+
+# Scenario: An opaque call contains text that the adapter cannot safely rewrite.
+# Purpose: Record the untranslated fragment and leave the upstream field bytes alone.
+@pytest.mark.parametrize("existing", [None, '"上游譯文"'])
+def test_InterT36_opaque_lua_expression_is_preserved(job, existing):
+    unit = job.doc["units"][0]
+    source = 'Localize("loc_zone_expeditions") .. helper(" Expedition: %s")'
+    unit["new"]["sourceExpression"]["raw"] = source
+    unit["new"]["zhTwExpression"] = {"raw": existing} if existing else None
+    job.save()
+
+    assert job.run(FakeTransport([])) == 0
+    output = read(job.workset)["units"][0]
+    assert output["reviewStatus"] == "preserved"
+    assert output["suggestedZhTwExpression"] is None
+    report = read(job.summary)
+    assert report["blocked"] == []
+    assert report["termReviews"] == [{"unitId": unit["unitId"], "key": unit["key"], "source": source,
+                                      "terms": ["Expedition: %s"], "translation": existing or source,
+                                      "reason": "complex_expression", "adoption": "preserved_expression"}]
+
+
+# Scenario: Source Lua is invalid, or a candidate still violates a required structural/semantic check.
+# Purpose: Leave invalid items pending, including unsafe candidates that also carried a lookup flag.
 @pytest.mark.parametrize(("reason", "replies"), [
-    ("needs_lookup_definition", [scripted(lookup=True, unknown=["unrecognized"])]),
     ("max_corrections_reached", [scripted("增加10%")] * 3),
-    ("complex_expression", []),
+    ("max_corrections_reached", [scripted("增加10%", lookup=True)] * 3),
+    ("max_corrections_reached", [scripted(lookup=True),
+                                 scripted(issues=[{"category": "condition", "detail": "condition"}])] * 3),
+    ("invalid_lua_expression", []),
 ])
 def test_InterT40_blocked_remains_pending(job, reason, replies):
-    if reason == "complex_expression":
-        job.doc["units"][0]["new"]["sourceExpression"]["raw"] = 'Localize("key")'
+    if reason == "invalid_lua_expression":
+        job.doc["units"][0]["new"]["sourceExpression"]["raw"] = 'Localize("key") ..'
     job.save()
     assert job.run(FakeTransport(replies)) == 0
     assert read(job.summary)["blocked"][0]["reason"] == reason

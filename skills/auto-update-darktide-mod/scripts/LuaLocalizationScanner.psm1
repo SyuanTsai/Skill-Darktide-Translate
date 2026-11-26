@@ -384,12 +384,29 @@ function ConvertTo-Utf8ByteOffset {
 
 function Test-LuaIdentifierIsOnlyCalled {
     param([object[]] $Tokens, [string] $Name)
+    $seen = $false
     for ($index = 0; $index -lt $Tokens.Count; $index++) {
         Invoke-LuaScannerProgressHeartbeat
         if ($Tokens[$index].type -cne 'identifier' -or $Tokens[$index].text -cne $Name) { continue }
         $previous = if ($index -gt 0) { [string]$Tokens[$index - 1].text } else { $null }
         $next = if (($index + 1) -lt $Tokens.Count) { [string]$Tokens[$index + 1].text } else { $null }
+        if (-not $seen -and $previous -ceq 'local' -and $next -ceq '=' -and
+            ($index + 2) -lt $Tokens.Count -and $Tokens[$index + 2].type -ceq 'identifier' -and
+            $Tokens[$index + 2].text -ceq $Name) {
+            # A call, member, or operator following the RHS would change the alias value.
+            if (($index + 3) -lt $Tokens.Count) {
+                $afterAlias = $Tokens[$index + 3]
+                if ($afterAlias.text -cne ';' -and
+                    ($afterAlias.type -cne 'identifier' -or $afterAlias.text -cin @('and', 'or'))) {
+                    return $false
+                }
+            }
+            $seen = $true
+            $index += 2
+            continue
+        }
         if ($next -cne '(' -or $previous -in @('function', '.', ':')) { return $false }
+        $seen = $true
     }
     $true
 }
@@ -415,7 +432,7 @@ function Test-NeutralLuaStringLiteral {
     if ($StartIndex -ne $EndIndex -or $Tokens[$StartIndex].type -cne 'string') { return $false }
     try { $content = ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$StartIndex].text) }
     catch { return $false }
-    $content -notmatch '[\p{L}\p{N}]'
+    [regex]::Replace($content, $script:luaFormatSpecifier, '') -notmatch '[\p{L}\p{N}]'
 }
 
 function Get-FullyLocaleResolvedExpressionPart {
@@ -431,8 +448,12 @@ function Get-FullyLocaleResolvedExpressionPart {
         $EndIndex--
     }
 
-    if (Test-DirectLocalizeCallRange -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex) {
-        return [pscustomobject]@{ valid = $true; hasLocalize = $true }
+    if (($EndIndex - $StartIndex) -eq 3 -and $Tokens[$StartIndex + 2].type -ceq 'string' -and
+        (Test-DirectLocalizeCallRange -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex)) {
+        $key = ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$StartIndex + 2].text)
+        if ($key -cmatch '^loc_[A-Za-z0-9_]+$') {
+            return [pscustomobject]@{ valid = $true; hasLocalize = $true }
+        }
     }
     if (Test-NeutralLuaStringLiteral -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex) {
         return [pscustomobject]@{ valid = $true; hasLocalize = $false }
@@ -789,20 +810,68 @@ function Get-LuaLocalizationDocument {
     }
 }
 
+$script:luaFormatSpecifier = '%(?:%|[-+ #0]*[0-9]*(?:\.[0-9]+)?[cdiouxXeEfgGqs])'
+
+function Get-LuaFormatSignature {
+    param([object[]] $Tokens)
+    $signature = [Text.StringBuilder]::new()
+    for ($index = 0; $index -lt $Tokens.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        if ($Tokens[$index].type -cne 'string') { continue }
+        $end = $index
+        # A chain of literals bounded by an argument or grouping delimiter has one format value.
+        if ($index -eq 0 -or $Tokens[$index - 1].text -cin @('(', ',')) {
+            while (($end + 2) -lt $Tokens.Count -and $Tokens[$end + 1].text -ceq '..' -and
+                $Tokens[$end + 2].type -ceq 'string') {
+                Invoke-LuaScannerProgressHeartbeat
+                $end += 2
+            }
+            if (($end + 1) -lt $Tokens.Count -and $Tokens[$end + 1].text -cnotin @(')', ',')) { $end = $index }
+        }
+        $text = -join @(for ($literal = $index; $literal -le $end; $literal += 2) {
+            ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$literal].text)
+        })
+        $formats = @([regex]::Matches($text, $script:luaFormatSpecifier) | ForEach-Object Value)
+        $null = $signature.Append('|').Append(($formats -join ','))
+        $index = $end
+    }
+    $signature.ToString()
+}
+
 function Test-LuaNonStringTokenSequence {
     param([string] $Source, [string] $Translation)
 
-    # Compare the full structure while allowing string literal text to change.
+    # Compare the full structure while allowing ordinary string literal text to change.
     $sourceTokens = @(Get-LuaTokens -Text $Source)
     $translationTokens = @(Get-LuaTokens -Text $Translation)
     if ($sourceTokens.Count -ne $translationTokens.Count) { return $false }
+    $localizeEnd = -1
+    $changedLiteral = $false
     for ($index = 0; $index -lt $sourceTokens.Count; $index++) {
         $sourceToken = $sourceTokens[$index]
         $translationToken = $translationTokens[$index]
         if ($sourceToken.type -cne $translationToken.type) { return $false }
-        if ($sourceToken.type -cne 'string' -and $sourceToken.text -cne $translationToken.text) { return $false }
+        if ($sourceToken.type -cne 'string') {
+            if ($sourceToken.text -cne $translationToken.text) { return $false }
+            if ($index -gt $localizeEnd -and $sourceToken.type -ceq 'identifier' -and
+                $sourceToken.text -ceq 'Localize' -and ($index + 1) -lt $sourceTokens.Count) {
+                $nextToken = $sourceTokens[$index + 1]
+                if ($nextToken.text -ceq '(') {
+                    $localizeEnd = Get-MatchingTokenIndex -Tokens $sourceTokens -StartIndex ($index + 1) -Open '(' -Close ')'
+                }
+                elseif ($nextToken.type -ceq 'string') { $localizeEnd = $index + 1 }
+            }
+            continue
+        }
+        if ($sourceToken.text -ceq $translationToken.text) { continue }
+        $changedLiteral = $true
+        $sourceText = ConvertFrom-LuaKeyString -Literal ([string]$sourceToken.text)
+        $translationText = ConvertFrom-LuaKeyString -Literal ([string]$translationToken.text)
+        if (($index -le $localizeEnd -or $sourceText -cmatch '^loc_[A-Za-z0-9_]+$') -and
+            $sourceText -cne $translationText) { return $false }
     }
-    return $true
+    -not $changedLiteral -or (Get-LuaFormatSignature -Tokens $sourceTokens) -ceq
+        (Get-LuaFormatSignature -Tokens $translationTokens)
 }
 
 Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence

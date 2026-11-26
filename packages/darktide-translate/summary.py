@@ -25,7 +25,14 @@ BLOCK_LABELS = {
     "needs_lookup_definition": "需要 lookup 定義",
     "max_corrections_reached": "已達修正上限",
     "complex_expression": "無法安全建立 Lua 模板",
+    "invalid_lua_expression": "Lua 運算式無效或無法驗證",
     "api_failed": "API 失敗，可接續",
+}
+ADOPTION_LABELS = {
+    "translation": "採用通過審查的譯文",
+    "existing_zh_tw": "沿用現有繁中",
+    "english_fallback": "回退英文",
+    "preserved_expression": "原樣保留運算式",
 }
 WARNING_LABELS = {"unexpected_outer_double_quotes": "已移除多餘的外層雙引號"}
 STATUS_LABELS = {
@@ -47,6 +54,7 @@ def markdown_text(text):
 def write_summary(path, report, records, usage, prices):
     blocked = []
     unknown_terms = []
+    term_reviews = []
     warnings = []
     for unit_id, record in records.items():
         if reason := record.get("blockedReason"):
@@ -54,17 +62,23 @@ def write_summary(path, report, records, usage, prices):
             if record.get("details"):
                 item["details"] = record["details"]
             blocked.append(item)
-        if terms := record.get("unknownTerms"):
-            unknown_terms.append({"unitId": unit_id, "key": record["key"], "source": record["source"],
-                                  "terms": terms, "translation": record["expression"]})
+        if record.get("termReview") or record.get("unknownTerms"):
+            row = {"unitId": unit_id, "key": record["key"], "source": record["source"],
+                   "translation": record["expression"]}
+            if review := record.get("termReview"):
+                term_reviews.append({**row, **review})
+            else:
+                unknown_terms.append({**row, "terms": record["unknownTerms"]})
         warnings.extend({"unitId": unit_id, "code": code} for code in record.get("warnings", []))
 
     report.update(
-        processedCount=sum(record.get("status") in ("approved", "blocked") for record in records.values()),
+        processedCount=sum(record.get("status") in ("approved", "blocked", "preserved") for record in records.values()),
         approvedCount=sum(record.get("status") == "approved" for record in records.values()),
+        preservedCount=sum(record.get("status") == "preserved" for record in records.values()),
         cacheHitCount=sum(record.get("origin") == "cache" for record in records.values()),
         blocked=blocked,
         unknownTerms=unknown_terms,
+        termReviews=term_reviews,
         warnings=warnings,
         corrections=dict(sorted(Counter(record.get("corrections", 0) for record in records.values()
                                         if record.get("status") in ("approved", "blocked")).items())),
@@ -81,7 +95,8 @@ def write_summary(path, report, records, usage, prices):
         f"- 詞彙表 SHA-256：{report['glossarySha256']}",
         f"- 待送 API {report['apiItemCount']} 項，共 {report['batchCount']} 批，單次上限 {report['maxItems']} 項。",
         (f"- 已處理 {report['processedCount']} 項，通過 {report['approvedCount']} 項，"
-         f"沿用 {report['cacheHitCount']} 項，BLOCKED {len(blocked)} 項，非 AI {report['nonAiCount']} 項。"),
+         f"原樣保留 {report['preservedCount']} 項，沿用 {report['cacheHitCount']} 項，"
+         f"BLOCKED {len(blocked)} 項，非 AI {report['nonAiCount']} 項。"),
         f"- Lua 語法檢查器可用：{'是' if report['luacAvailable'] else '否'}。",
     ]
     if report["maxItemsOverride"] is not None:
@@ -109,11 +124,15 @@ def write_summary(path, report, records, usage, prices):
         lines += ["", "### BLOCKED 項目", ""]
         lines.extend(f"- {markdown_text(item['unitId'])} — {BLOCK_LABELS[item['reason']]}（{item['reason']}）"
                      for item in blocked)
-    if unknown_terms:
+    if unknown_terms or term_reviews:
         lines += ["", "### 待確認術語", ""]
         for item in unknown_terms:
             terms = "、".join(markdown_text(term) for term in item["terms"])
             lines.append(f"- {markdown_text(item['key'])} — {terms}")
+        for item in term_reviews:
+            terms = "、".join(markdown_text(term) for term in item["terms"]) or "—"
+            lines.append(f"- {markdown_text(item['key'])} — {item['reason']}，待確認詞 {terms}，"
+                         f"{ADOPTION_LABELS[item['adoption']]}：{markdown_text(item['translation'])}")
     if warnings:
         lines += ["", "### 警告", ""]
         lines.extend(f"- {markdown_text(item['unitId'])} — {WARNING_LABELS[item['code']]}（{item['code']}）"

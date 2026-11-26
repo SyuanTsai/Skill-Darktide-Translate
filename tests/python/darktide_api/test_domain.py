@@ -86,15 +86,18 @@ def test_format_placeholders_can_move_within_a_concatenated_argument(terms):
     assert validate(template, across, terms, Luac(None))[1] == ["format_order_mismatch"]
 
 
+# Scenario: A translation edits printf arguments in a literal or an explicit format call.
+# Purpose: Protect argument types and order, including strings formatted outside the expression.
 @pytest.mark.parametrize(("expression", "segments", "expected"), [
     ('" text"', {"s1": " text %d"}, True),
     ('" text %d"', {"s1": " text"}, True),
+    ('" text %s %d"', {"s1": " text %d %s"}, True),
     ('" text"', {"s1": " text %%"}, False),
     ('format("%s", name) .. " text"', {"s1": "", "s2": "%s text"}, True),
     ('format("%s", " text")', {"s1": "", "s2": "%s text"}, True),
     ('("%s %d"):format(name, count)', {"s1": "%d %s"}, True),
 ])
-def test_printf_changes_outside_format_and_in_method_receivers(expression, segments, expected, terms):
+def test_UnitT25_printf_changes_outside_format_and_in_method_receivers(expression, segments, expected, terms):
     _, issues = validate(Template.parse(expression), segments, terms, Luac(None))
     assert issues.count("format_order_mismatch") == int(expected)
 

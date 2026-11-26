@@ -19,13 +19,16 @@ DOUBLE_QUOTE_PAIRS = {'"': '"', '“': '”', '＂': '＂'}
 
 
 class Luac:
-    def __init__(self, executable, runner=subprocess.run):
+    def __init__(self, executable, runner=subprocess.run, *, lua_jit=False):
         self.executable = executable
         self.runner = runner
+        self.lua_jit = lua_jit
 
     @classmethod
     def discover(cls):
-        return cls(shutil.which("luac"))
+        if executable := shutil.which("luac"):
+            return cls(executable)
+        return cls(shutil.which("luajit"), lua_jit=True)
 
     @property
     def available(self):
@@ -34,6 +37,14 @@ class Luac:
     def accepts(self, expression):
         if not self.available:
             return True
+        if self.lua_jit:
+            try:
+                process = self.runner([str(self.executable), "-E", "-e", "assert(load(io.read('*a'), '=stdin', 't'))"],
+                                      input=f"return ({expression}\n)\n".encode("utf-8"),
+                                      capture_output=True, check=False, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            return process.returncode == 0
         with TemporaryDirectory() as directory:
             path = Path(directory) / "expression.lua"
             path.write_text(f"return {{ x = {expression} }}\n", encoding="utf-8", newline="\n")
@@ -70,10 +81,10 @@ def format_mismatch(template, segments):
         if FORMAT.findall(source) != FORMAT.findall(target):
             return True
 
-    def printf_counts(text):
-        return Counter(spec for spec in FORMAT.findall(text) if spec != "%%")
+    def printf_arguments(text):
+        return [spec for spec in FORMAT.findall(text) if spec != "%%"]
 
-    return any(printf_counts(template.segments[key]) != printf_counts(segments[key])
+    return any(printf_arguments(template.segments[key]) != printf_arguments(segments[key])
                for key in template.segments.keys() - format_keys)
 
 
@@ -104,7 +115,7 @@ def strip_unexpected_outer_quotes(template, segments):
     return normalized, ["unexpected_outer_double_quotes"]
 
 
-def validate(template, segments, glossary, luac):
+def validate(template, segments, glossary, luac, *, check_terms=True):
     if not isinstance(segments, dict) or segments.keys() != template.segments.keys():
         return None, ["segment_mismatch"]
     if any(not isinstance(text, str) or not safe_text(text) for text in segments.values()):
@@ -125,12 +136,13 @@ def validate(template, segments, glossary, luac):
         issues.append("newline_mismatch")
     if Counter(NUMBER.findall(source)) != Counter(NUMBER.findall(target)):
         issues.append("number_mismatch")
-    for group in glossary.groups(" ".join(template.segments.values())):
-        translations = {entry.translation for entry in group}
-        if len(translations) == 1 and not any(entry.contextual for entry in group):
-            if not any(term in target for term in translations):
-                issues.append("glossary_term_missing")
-                break
+    if check_terms:
+        for group in glossary.groups(" ".join(template.segments.values())):
+            translations = {entry.translation for entry in group}
+            if len(translations) == 1 and not any(entry.contextual for entry in group):
+                if not any(term in target for term in translations):
+                    issues.append("glossary_term_missing")
+                    break
 
     try:
         expression = template.render(segments)

@@ -473,6 +473,7 @@ foreach ($unit in @($workset.units)) {
         else { $null }
     }
     elseif ($action -ceq 'AI_REQUIRED') {
+        if ([string]$unit.reviewStatus -ceq 'preserved' -and $null -eq $unit.suggestedZhTwExpression) { continue }
         if ([string]$unit.reviewStatus -cne 'approved') { throw ('AI_REQUIRED localization unit is not approved: {0}' -f ([string]($unit.unitId))) }
         $normalized = ConvertTo-NewlineStyle -Text ([string]$unit.suggestedZhTwExpression) -NewlineStyle ([string]$workset.new.newline)
         $target = Test-SafeLuaExpression -Expression $normalized

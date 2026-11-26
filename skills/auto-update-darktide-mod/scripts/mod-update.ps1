@@ -4113,7 +4113,10 @@ function Invoke-LocalizationWorkset {
     if ($generation.status -eq 'blocked') { throw ('Localization workset generation is blocked: {0}' -f ([string]($generation.reason))) }
     $null = Assert-NoReparsePath -Path $worksetPath -Root ([string]$State.repositoryRoot) -Label 'Localization workset'
     $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
-    $pending = @($workset.units | Where-Object { $_.action -ceq 'AI_REQUIRED' -and $_.reviewStatus -cne 'approved' })
+    $pending = @($workset.units | Where-Object {
+        $_.action -ceq 'AI_REQUIRED' -and $_.reviewStatus -cne 'approved' -and
+        -not ($_.reviewStatus -ceq 'preserved' -and $null -eq $_.suggestedZhTwExpression)
+    })
     if ($pending.Count -gt 0) {
         $State.status = 'waiting-input'
         $State.localizationWorkset = [ordered]@{

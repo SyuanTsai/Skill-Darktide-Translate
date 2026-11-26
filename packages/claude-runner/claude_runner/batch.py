@@ -25,6 +25,7 @@ class BatchCallbacks:
     inspect: Callable
     review: Callable
     finish: Callable
+    fallback: Callable | None = None
 
 
 def process_batch(items, progress, model, max_corrections, callbacks):
@@ -41,10 +42,14 @@ def process_batch(items, progress, model, max_corrections, callbacks):
         retry = []
         reviewable = {}
 
-        def correct(unit_id, feedback):
+        def correct(unit_id, feedback, value):
             step = progress[unit_id]
             step.feedback = feedback
-            if step.corrections >= max_corrections:
+            exhausted = step.corrections >= max_corrections
+            fallback = callbacks.fallback(unit_id, value, feedback, exhausted) if callbacks.fallback else None
+            if fallback is not None:
+                callbacks.finish(unit_id, step, None, value=fallback)
+            elif exhausted:
                 callbacks.finish(unit_id, step, "max_corrections_reached")
             else:
                 step.corrections += 1
@@ -58,7 +63,7 @@ def process_batch(items, progress, model, max_corrections, callbacks):
             if reason:
                 callbacks.finish(unit_id, step, reason, details=value)
             elif issues:
-                correct(unit_id, issues)
+                correct(unit_id, issues, value)
             else:
                 reviewable[unit_id] = value
 
@@ -77,6 +82,6 @@ def process_batch(items, progress, model, max_corrections, callbacks):
                 if verdict["verdict"] == "pass":
                     callbacks.finish(unit_id, step, None, value=value, review=verdict)
                 else:
-                    correct(unit_id, verdict["issues"])
+                    correct(unit_id, verdict["issues"], value)
         pending = retry
     return None
