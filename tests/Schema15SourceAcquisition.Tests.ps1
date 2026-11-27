@@ -1201,14 +1201,16 @@ Describe 'Schema 15 source acquisition contract' {
         $verifier = Get-Content -LiteralPath (Join-Path $scriptRoot 'Test-SourceReceipt.ps1') -Raw
         $runner = Get-Content -LiteralPath (Join-Path $scriptRoot 'mod-update.ps1') -Raw
 
-        $receiver | Should -Match 'function Get-ArchiveEvidence'
-        $receiver | Should -Match '\[IO\.File\]::Open\(\$Path, \[IO\.FileMode\]::Open, \[IO\.FileAccess\]::Read, \[IO\.FileShare\]::Read\)'
-        $receiver | Should -Match '(?s)Assert-NoReparsePath -Path \$candidateFull.*\$archiveEvidence = Get-ArchiveEvidence -Path \$candidateFull'
+        $archive = Get-Content -LiteralPath (Join-Path $scriptRoot 'DesktopArchive.ps1') -Raw
+        ($archive -match 'function Get-DesktopArchiveEvidence') | Should -BeTrue
+        ($archive -match '\[IO\.File\]::Open\(\$Path,''Open'',''Read'',''Read''\)') | Should -BeTrue
+        ($archive -match '(?s)\$stream\.Position = 0.*\$hasher\.AppendData.*\$evidence\.stream = \$stream') | Should -BeTrue
+        $receiver | Should -Match '(?s)Assert-NoReparsePath -Path \$candidateFull.*\$archiveEvidence = Get-DesktopArchiveEvidence -Path \$candidateFull[^\r\n]*-KeepOpen'
         $receiver | Should -Match '(?s)\$archiveEvidence\.stream\.Position = 0.*Copy-StreamWithHeartbeat -Source \$archiveEvidence\.stream'
         $receiver | Should -Not -Match '\[IO\.File\]::Move\(\$candidateFull, \$deliveredPath\)'
         $receiver | Should -Not -Match '(?s)\$archiveFormat = Get-ArchiveFormat -Path \$candidateFull.*\$sha256 = Get-FileSha256 -Path \$candidateFull'
-        $verifier | Should -Match 'function Get-ArchiveEvidence'
-        $verifier | Should -Match '\[IO\.File\]::Open\(\$Path, \[IO\.FileMode\]::Open, \[IO\.FileAccess\]::Read, \[IO\.FileShare\]::Read\)'
+        $verifier | Should -Match 'Get-DesktopArchiveEvidence -Path \$deliveredPath'
+        $verifier | Should -Match 'DesktopArchive\.ps1'
         $verifier | Should -Not -Match '(?s)\$actualSha256 = Get-FileSha256 -Path \$deliveredPath.*Get-ArchiveFormat -Path \$deliveredPath'
         $runner | Should -Match '(?s)function Complete-InterruptedSourceDelivery.*\[IO\.File\]::Open\(\$candidate, \[IO\.FileMode\]::Open, \[IO\.FileAccess\]::Read, \[IO\.FileShare\]::Read\)'
     }
