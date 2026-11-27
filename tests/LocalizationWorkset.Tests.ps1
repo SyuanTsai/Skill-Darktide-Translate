@@ -917,7 +917,8 @@ return {
     DIRECT_ENTRIES
 }
 '@
-        $newLua.Replace('    DIRECT_ENTRIES', ($directEntries -join [Environment]::NewLine)) |
+        $newLua = $newLua.Replace("`r`n", "`n")
+        $newLua.Replace('    DIRECT_ENTRIES', ($directEntries -join "`n")) |
             Set-Content -LiteralPath $newPath -NoNewline
         $rawNewPath = Join-Path $runRoot 'review-artifacts/new.lua'
         New-Item -ItemType Directory -Path (Split-Path -Parent $rawNewPath) -Force | Out-Null
