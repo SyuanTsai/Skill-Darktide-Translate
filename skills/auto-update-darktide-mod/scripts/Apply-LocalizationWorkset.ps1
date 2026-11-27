@@ -279,6 +279,18 @@ function Invoke-ByteEdits {
     $result
 }
 
+function Assert-ApplySidecarAbsent {
+    param($Workset, $Document, [string] $StagingRoot, [string] $MainPath)
+
+    $relativeSidecar = Get-LocalizationWorksetSidecarRelativePath -Document $Document -ModRelativePath ([string]$Workset.modRelativePath) `
+        -MainRelativePath ([IO.Path]::GetRelativePath($StagingRoot, $MainPath).Replace('\', '/'))
+    $evidence = $Workset.new['zhTwSidecar']
+    if ($null -eq $evidence -or $evidence['absenceVerified'] -ne $true -or
+        -not (Test-LocalizationWorksetStagedSidecarAbsent $StagingRoot $relativeSidecar)) {
+        throw 'Localization sidecar evidence requires separate review before apply.'
+    }
+}
+
 $worksetFull = [IO.Path]::GetFullPath($WorksetPath)
 if ((Split-Path -Leaf $worksetFull) -cne 'localization-workset.json' -or (Split-Path -Leaf (Split-Path -Parent $worksetFull)) -cne 'review-artifacts') {
     throw 'WorksetPath must be review-artifacts/localization-workset.json.'
@@ -325,6 +337,10 @@ if ($workset.Contains('apply') -and $workset.apply) {
         if ($currentBytes.LongLength -ne [int64]$workset.apply.outputSize) {
             throw 'Workset applied output size differs from its pending receipt.'
         }
+        if ($workset.new.Contains('zhTwSidecar')) {
+            $appliedDocument = Get-LuaLocalizationDocument -Bytes $currentBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
+            Assert-ApplySidecarAbsent $workset $appliedDocument $recordedStagingRoot $newPath
+        }
         if ($applyStatus -ceq 'pending') {
             Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
             $workset.apply.status = 'applied'
@@ -345,14 +361,30 @@ if ($currentSha -cne [string]$workset.new.sha256) { throw 'Workset NEW localizat
 $originalBytes = $currentBytes
 $before = Get-LuaLocalizationDocument -Bytes $originalBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
 if ($workset.new.Contains('zhTwSidecar') -or $before.Contains('zhTwSidecarPath')) {
-    throw 'Localization sidecar evidence requires separate review before apply.'
+    Assert-ApplySidecarAbsent $workset $before $recordedStagingRoot $newPath
+    $before.units = @($before.units | Where-Object { -not $_['conditionalZhTwSidecar'] })
 }
+Assert-LocalizationWorksetPassthroughCoverage -Prefixes $before['gameLocalizedPassthroughPrefixes'] `
+    -Units (@($before.units) + @($workset.units | ForEach-Object { $_.old }))
 $beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
 $sharedOffsets = Get-LocalizationWorksetSharedTableOffsets -Units @($before.units)
 $edits = [Collections.Generic.List[object]]::new()
 $expectedZhTw = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+Assert-LocalizationWorksetSharedRestorationCoverage -ParsedUnits $before.units -ReviewedUnits $workset.units
+$restoredSharedOffsets = [Collections.Generic.HashSet[long]]::new()
+$positionalIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($insert in @(Get-LocalizationWorksetPositionalInsertions -ParsedUnits $before.units -ReviewedUnits $workset.units `
+        -ReviewSimplifiedChanges:($workset['positionalLabelReview'] -ceq 'zh-cn-changes'))) {
+    Invoke-Heartbeat
+    $edits.Add((New-Edit -Start $insert.startByte -Length 0 -Replacement ([Text.Encoding]::UTF8.GetBytes($insert.text)) -UnitId $insert.unitId -Operation 'INSERT'))
+    if ($null -ne $insert.literal) {
+        $null = $positionalIds.Add($insert.unitId)
+        $expectedZhTw[$insert.unitId] = $insert.literal
+    }
+}
 foreach ($unit in @($workset.units)) {
+    if ($positionalIds.Contains([string]$unit.unitId)) { continue }
     $action = [string]$unit.action
     if ($action -cne 'AI_REQUIRED' -and
         ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
@@ -397,7 +429,9 @@ foreach ($unit in @($workset.units)) {
     }
     elseif ($null -ne $target) {
         $insertionNewline = if ($workset.new.newline -ceq 'crlf') { [string][char]13 + [string][char]10 } else { [string][char]10 }
-        $edits.Add((Get-InsertionEdit -Unit $currentUnit -Expression ([string]$target.raw) -Bytes $originalBytes -Newline $insertionNewline))
+        if (-not $shared -or $restoredSharedOffsets.Add([long]$currentUnit.tableOpenByte)) {
+            $edits.Add((Get-InsertionEdit -Unit $currentUnit -Expression ([string]$target.raw) -Bytes $originalBytes -Newline $insertionNewline))
+        }
         $expectedZhTw[[string]$unit.unitId] = [string]$target.canonical
     }
 }

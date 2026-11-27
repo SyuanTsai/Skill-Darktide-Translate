@@ -1929,7 +1929,7 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
         if ((Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$workset.apply.outputSha256 -or (Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$record.mergedRawSha256) { throw 'Workset merged bytes differ from apply evidence.' }
         if ((Get-Sha256Bytes -Bytes $mergedIndexedBytes) -cne [string]$record.mergedSha256) { throw 'Workset merged indexed bytes changed.' }
         $receiptVerifier = Join-Path $PSScriptRoot 'Test-LocalizationWorksetReceipt.ps1'
-        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) -HeartbeatAction $HeartbeatAction -PassThru
+        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedUpstreamOid ([string]$chain.c2Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) -HeartbeatAction $HeartbeatAction -PassThru
         if ($receiptVerification.result -cne 'passed') { throw 'Independent localization apply receipt verification failed.' }
         $null = Test-LocalizationWorksetCandidate -NewBytes $newBytes -MergedBytes $mergedBytes -Edits @($workset.apply.edits)
         $targetPath = Join-Path $worktree ([string]$record.relativePath)

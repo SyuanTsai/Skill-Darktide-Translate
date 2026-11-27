@@ -552,6 +552,96 @@ return output
         ($mainDoc.units | Where-Object key -CEQ 'pre_direct-key').blockedReason | Should -BeExactly 'generated_positional_literal_value_unproven'
     }
 
+    # Scenario: Two literal groups share an upstream two-language list and receive approved Traditional Chinese.
+    # Purpose: Workset application must append the language and every row together, with independent receipt verification.
+    It 'InterT28_AppendsReviewedPositionalRowsAndVerifiesTheReceipt' {
+        $repository = Join-Path $TestDrive 'positional-writeback'
+        $oldMod = Join-Path $repository 'mods/PositionMod'
+        $run = Join-Path $repository 'runs/positional'
+        $staging = Join-Path $run 'staging/localization-workset-input/PositionMod'
+        $artifacts = Join-Path $run 'review-artifacts'
+        New-Item -ItemType Directory -Path $oldMod, $staging, $artifacts -Force | Out-Null
+        & git -C $repository init --quiet
+        & git -C $repository config user.name 'Workset Fixture'
+        & git -C $repository config user.email 'workset-fixture@example.invalid'
+        & git -C $repository config core.autocrlf false
+        $main = (Get-TestPositionalGeneratorLua).Replace('{"zh-cn", "en", "zh-tw"}', '{"en", "zh-cn"}').
+            Replace('{"简体", "English", "繁體"}', '{"English %s", "简体 %s",}').
+            Replace('short = {"短", "Short"}', 'short = {"Short", "短"}').
+            Replace('return output', ('local second = { next_row = {"Next", "下一个"} }' + [char]10 +
+                'generate_translation(second, "other_", nil, locale_order)' + [char]10 + 'return output'))
+        $loop = 'for i = 1,2 do output[string.format("slot_%s",i)] = {en = "Slot: "..tostring(i),["zh-cn"] = "槽位："..tostring(i),} end'
+        $main = $main.Replace('return output', $loop + [char]10 + 'return output')
+        $old = $main.Replace('{"en", "zh-cn"}', '{"en", "zh-cn", "zh-tw"}').
+            Replace('{"English %s", "简体 %s",}', '{"English %s", "旧简体 %s", "舊字 %s",}').
+            Replace('{"Short", "短"}', '{"Short", "短", ''短''}').
+            Replace('{"Next", "下一个"}', '{"Old Next", "下一个", "下一個"}').
+            Replace('["zh-cn"] = "槽位："..tostring(i),', '["zh-cn"] = "槽位："..tostring(i),["zh-tw"] = "欄位："..tostring(i),')
+        $oldFile = Join-Path $oldMod 'PositionMod_localization.lua'
+        $newFile = Join-Path $staging 'PositionMod_localization.lua'
+        $rawArtifact = Join-Path $artifacts 'new.lua'
+        $mergedArtifact = Join-Path $artifacts 'merged.lua'
+        $worksetPath = Join-Path $artifacts 'localization-workset.json'
+        [IO.File]::WriteAllText($oldFile, $old, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($newFile, $main, [Text.UTF8Encoding]::new($false))
+        Copy-Item -LiteralPath $newFile -Destination $rawArtifact
+        Add-TestTranslationRules -RepositoryRoot $repository
+        & git -C $repository add --all
+        & git -C $repository commit -m fixture --quiet
+        $LASTEXITCODE | Should -Be 0
+        $base = (& git -C $repository rev-parse HEAD).Trim()
+        $generator = Join-Path $scriptRoot 'New-LocalizationWorkset.ps1'
+        $defaultPath = Join-Path $repository 'runs/default/review-artifacts/localization-workset.json'
+        $null = & $generator -RepositoryRoot $repository -BaseOid $base -ModRelativePath 'mods/PositionMod' `
+            -StagingModPath $staging -OutputPath $defaultPath -PassThru
+        $default = Get-Content -LiteralPath $defaultPath -Raw | ConvertFrom-Json -AsHashtable
+        @($default.units | Where-Object key -CEQ 'pre_direct-key')[0].action | Should -BeExactly 'RESTORE_OLD_ZH_TW'
+        $result = & $generator -RepositoryRoot $repository -BaseOid $base `
+            -ModRelativePath 'mods/PositionMod' -StagingModPath $staging -OutputPath $worksetPath -ReviewPositionalLabelChanges -PassThru
+        $result.status | Should -BeExactly 'ready'
+        $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
+        $targets = [ordered]@{'pre_direct-key'='"新詞 %s"'; pre_short='''短'''; other_next_row='"下一個"'}
+        @($workset.units).Count | Should -Be 5
+        @($workset.units | Where-Object action -CEQ 'RESTORE_OLD_ZH_TW').Count | Should -Be 3
+        foreach ($unit in @($workset.units | Where-Object action -CEQ 'AI_REQUIRED')) {
+            $unit.action | Should -BeExactly 'AI_REQUIRED'
+            $unit.reviewStatus = 'approved'
+            $unit.suggestedZhTwExpression = $targets[$unit.key]
+        }
+        $partial = @($workset.units | Where-Object key -CEQ 'other_next_row')[0]
+        $partial.reviewStatus = 'preserved'
+        $partial.suggestedZhTwExpression = $null
+        $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $worksetPath
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $worksetPath -PassThru } |
+            Should -Throw '*every row*'
+        (Get-FileHash -LiteralPath $newFile).Hash | Should -BeExactly (Get-FileHash -LiteralPath $rawArtifact).Hash
+        $partial.reviewStatus = 'approved'
+        $partial.suggestedZhTwExpression = $targets[$partial.key]
+        $formatted = @($workset.units | Where-Object key -CEQ 'pre_direct-key')[0]
+        $formatted.suggestedZhTwExpression = '"新詞"'
+        $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $worksetPath
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $worksetPath -PassThru } |
+            Should -Throw '*token or format structure*'
+        (Get-FileHash -LiteralPath $newFile).Hash | Should -BeExactly (Get-FileHash -LiteralPath $rawArtifact).Hash
+        $formatted.suggestedZhTwExpression = $targets[$formatted.key]
+        $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $worksetPath
+        $applied = & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $worksetPath -PassThru
+        $applied.editCount | Should -Be 5
+        Copy-Item -LiteralPath $newFile -Destination $mergedArtifact
+        $receipt = & (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') -WorksetPath $worksetPath `
+            -NewPath $rawArtifact -MergedPath $mergedArtifact -RepositoryRoot $repository -ExpectedBaseOid $base `
+            -ExpectedModRelativePath 'mods/PositionMod' -PassThru
+        $receipt.result | Should -BeExactly 'passed'
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $doc = Get-LuaLocalizationDocument -Path $newFile -SourceId 'position'
+        foreach ($unit in $doc.units) {
+            $expected = if ($targets.Contains([string]$unit.key)) { $targets[$unit.key] } else { '"欄位："..tostring(i)' }
+            $unit.zhTwExpression.raw | Should -BeExactly $expected
+        }
+    }
+
+
+
     # Scenario: A canonical MOD directory contains an internal double dot that is part of its legal single-directory name.
     # Purpose: Reject traversal path components without excluding safe identities already accepted by acquisition and claim.
     It 'InterT29_AcceptsInternalDoubleDotsInASafeModDirectoryName' {

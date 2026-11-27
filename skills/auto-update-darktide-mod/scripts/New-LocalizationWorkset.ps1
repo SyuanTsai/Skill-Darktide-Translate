@@ -13,6 +13,7 @@ param(
     [ValidateSet('update', 'improve')]
     [string] $TranslationMode = 'update',
     [ValidateNotNullOrEmpty()][string] $ModelId,
+    [switch] $ReviewPositionalLabelChanges,
     [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
@@ -175,7 +176,7 @@ function Get-CanonicalExpression {
 }
 
 function New-UnitRecord {
-    param($OldUnit, $NewUnit, [switch] $SharedNewTable, $Sidecar)
+    param($OldUnit, $NewUnit, [switch] $SharedNewTable, $Sidecar, [switch] $ReviewSimplifiedChanges)
     $identity = if ($null -ne $NewUnit) { $NewUnit } else { $OldUnit }
     $blockedReason = if ($null -ne $NewUnit -and -not [string]::IsNullOrWhiteSpace([string]$NewUnit.blockedReason)) { [string]$NewUnit.blockedReason }
         elseif ($null -ne $OldUnit -and -not [string]::IsNullOrWhiteSpace([string]$OldUnit.blockedReason)) { [string]$OldUnit.blockedReason }
@@ -188,6 +189,10 @@ function New-UnitRecord {
     $changeType = $null; $action = $null
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { $changeType = 'blocked'; $action = 'BLOCKED' }
     elseif ($null -eq $NewUnit) { $changeType = 'deleted_key'; $action = 'ACCEPT_REMOVAL' }
+    elseif (Test-LocalizationWorksetPositionalAppend $NewUnit) {
+        $changeType = 'missing_zh_tw'
+        $action = Get-LocalizationWorksetPositionalAction -OldUnit $OldUnit -NewUnit $NewUnit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
+    }
     elseif ([bool]$NewUnit.sourceExpression.isFullyLocaleResolvedExpression -and $null -eq $oldZhTw -and $null -eq $newZhTw) { $changeType = 'localized_source'; $action = 'NONE' }
     elseif ($null -eq $OldUnit) { $changeType = 'new_key'; $action = 'AI_REQUIRED' }
     elseif ($null -eq $oldZhTw -and $null -eq $newZhTw) { $changeType = 'missing_zh_tw'; $action = 'AI_REQUIRED' }
@@ -381,6 +386,19 @@ if ($newDocument.Contains('zhTwSidecarPath')) {
     }
 }
 
+Assert-LocalizationWorksetPassthroughCoverage -Prefixes (@($oldDocument['gameLocalizedPassthroughPrefixes']) + @($newDocument['gameLocalizedPassthroughPrefixes'])) `
+    -Units (@($oldDocument.units) + @($newDocument.units))
+$oldSidecar = Get-LocalizationWorksetSidecarRelativePath -Document $oldDocument -ModRelativePath $normalizedModPath `
+    -MainRelativePath ($oldPath.Substring($normalizedModPath.Length + 1))
+$newSidecar = Get-LocalizationWorksetSidecarRelativePath -Document $newDocument -ModRelativePath $normalizedModPath `
+    -MainRelativePath ([IO.Path]::GetRelativePath($stagingRoot, $newPath).Replace('\', '/'))
+if ($oldSidecar -and $newSidecar -and (Test-LocalizationWorksetStagedSidecarAbsent $stagingRoot $newSidecar) -and
+    (Test-LocalizationWorksetTreeSidecarAbsent $repository $resolvedBaseOid $normalizedModPath $oldSidecar)) {
+    $sidecarEvidence.absenceVerified = $true
+    $sidecarEvidence.blockedReason = $null
+    $oldDocument.units = @($oldDocument.units | Where-Object { -not $_['conditionalZhTwSidecar'] })
+    $newDocument.units = @($newDocument.units | Where-Object { -not $_['conditionalZhTwSidecar'] })
+}
 $oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($oldDocument.units)) { $oldById[[string]$unit.unitId] = $unit }
 $newById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
@@ -393,11 +411,13 @@ foreach ($unit in @($newDocument.units)) {
 if ($null -ne $sidecar -and $null -ne $sidecar.values) {
     $sidecarEvidence.unpairedKeys = @($sidecar.values.Keys | Where-Object { -not $newOutputKeys.Contains($_) } | Sort-Object -CaseSensitive)
 }
+$reviewSimplified = if ($PSBoundParameters.ContainsKey('ReviewPositionalLabelChanges')) { [bool]$ReviewPositionalLabelChanges }
+    else { $null -ne $existingWorkset -and $existingWorkset['positionalLabelReview'] -ceq 'zh-cn-changes' }
 $records = [Collections.Generic.List[object]]::new()
 foreach ($newUnit in @($newDocument.units)) {
     $oldUnit = if ($oldById.ContainsKey([string]$newUnit.unitId)) { $oldById[[string]$newUnit.unitId] } else { $null }
     $shared = $null -ne $newUnit.tableOpenByte -and $sharedOffsets.Contains([long]$newUnit.tableOpenByte)
-    $records.Add((New-UnitRecord -OldUnit $oldUnit -NewUnit $newUnit -SharedNewTable:$shared -Sidecar $sidecar))
+    $records.Add((New-UnitRecord -OldUnit $oldUnit -NewUnit $newUnit -SharedNewTable:$shared -Sidecar $sidecar -ReviewSimplifiedChanges:$reviewSimplified))
 }
 foreach ($oldUnit in @($oldDocument.units)) {
     if (-not $newById.ContainsKey([string]$oldUnit.unitId)) { $records.Add((New-UnitRecord -OldUnit $oldUnit -NewUnit $null)) }
@@ -425,6 +445,7 @@ if ($workset.generatorVersion -eq 2) {
         -SkillRoot (Split-Path -Parent $PSScriptRoot) -RepositoryRoot $repository -BaseOid $resolvedBaseOid `
         -Mode $TranslationMode -ModRelativePath $normalizedModPath -ModelId $ModelId -HeartbeatAction $HeartbeatAction
 }
+if ($reviewSimplified) { $workset.positionalLabelReview = 'zh-cn-changes' }
 $workset.immutableContractSha256 = Get-ImmutableWorksetContractSha256 -Workset $workset
 
 if ($existingWorkset) {
