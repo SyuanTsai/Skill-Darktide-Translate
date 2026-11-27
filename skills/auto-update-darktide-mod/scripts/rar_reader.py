@@ -42,21 +42,43 @@ class Header(c.Structure):
     ]
 
 
+class Guid(c.Structure):
+    _fields_ = [
+        ("data1", c.c_uint32), ("data2", c.c_uint16), ("data3", c.c_uint16),
+        ("data4", c.c_ubyte * 8),
+    ]
+
+
+FOLDERID_PROGRAM_FILES = Guid(
+    0x905E63B6, 0xC1BF, 0x494E,
+    (c.c_ubyte * 8)(0xB2, 0x9C, 0x65, 0xB7, 0x32, 0xD3, 0xD2, 0x1A),
+)
+
+
+def windows_unrar_library():
+    path = c.c_wchar_p()
+    result = c.windll.shell32.SHGetKnownFolderPath(
+        c.byref(FOLDERID_PROGRAM_FILES), 0, None, c.byref(path)
+    )
+    if result:
+        raise OSError(result, "Could not resolve the Windows Program Files known folder")
+    try:
+        return str(Path(path.value) / "WinRAR" / "UnRAR.dll")
+    finally:
+        c.windll.ole32.CoTaskMemFree(path)
+
+
 def library():
-    location = os.environ.get("DARKTIDE_UNRAR_LIBRARY")
-    if location:
-        if not Path(location).is_absolute():
-            raise ValueError("DARKTIDE_UNRAR_LIBRARY requires an absolute installed library path")
-    elif os.name == "nt":
-        location = str(Path(os.environ["ProgramFiles"]) / "WinRAR" / "UnRAR.dll")
+    if os.name == "nt":
+        location = windows_unrar_library()
     else:
         location = ctypes.util.find_library("unrar")
     if not location:
-        raise RuntimeError("UnRAR shared library unavailable. Set DARKTIDE_UNRAR_LIBRARY.")
+        raise RuntimeError("UnRAR shared library unavailable from the trusted installation.")
     try:
         dll = (c.WinDLL if os.name == "nt" else c.CDLL)(location)
     except OSError as exc:
-        raise RuntimeError("Cannot load installed UnRAR. Set DARKTIDE_UNRAR_LIBRARY to its absolute path.") from exc
+        raise RuntimeError("Cannot load trusted UnRAR SDK.") from exc
     dll.RARGetDllVersion.restype, dll.RARGetDllVersion.argtypes = c.c_int, []
     dll.RAROpenArchiveEx.restype, dll.RAROpenArchiveEx.argtypes = P, [c.POINTER(OpenData)]
     dll.RARReadHeaderEx.restype, dll.RARReadHeaderEx.argtypes = c.c_int, [P, c.POINTER(Header)]
@@ -134,7 +156,7 @@ def process(dll, path):
     @Callback
     def callback(message, user, buffer, length):
         nonlocal remaining, error, crc
-        if message != 1:  # refuse new volumes, password prompts and other requests
+        if message != 1:  # refuse new volumes, password prompts and other decoder signals
             return -1
         try:
             if not 0 <= length <= remaining:

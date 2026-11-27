@@ -1204,9 +1204,10 @@ Describe 'Schema 15 source acquisition contract' {
         $archive = Get-Content -LiteralPath (Join-Path $scriptRoot 'DesktopArchive.ps1') -Raw
         ($archive -match 'function Get-DesktopArchiveEvidence') | Should -BeTrue
         ($archive -match '\[IO\.File\]::Open\(\$Path,''Open'',''Read'',''Read''\)') | Should -BeTrue
-        ($archive -match '(?s)\$stream\.Position = 0.*\$hasher\.AppendData.*\$evidence\.stream = \$stream') | Should -BeTrue
-        $receiver | Should -Match '(?s)Assert-NoReparsePath -Path \$candidateFull.*\$archiveEvidence = Get-DesktopArchiveEvidence -Path \$candidateFull[^\r\n]*-KeepOpen'
-        $receiver | Should -Match '(?s)\$archiveEvidence\.stream\.Position = 0.*Copy-StreamWithHeartbeat -Source \$archiveEvidence\.stream'
+        ($archive -match 'function Open-DesktopArchiveSource') | Should -BeTrue
+        ($archive -match '\[switch\] \$KeepOpen') | Should -BeFalse
+        $receiver | Should -Match '(?s)Assert-NoReparsePath -Path \$candidateFull.*\$archiveSource = Open-DesktopArchiveSource -Path \$candidateFull.*\$archiveEvidence = \$archiveSource\.evidence'
+        $receiver | Should -Match '(?s)\$archiveSource\.stream\.Position = 0.*Copy-StreamWithHeartbeat -Source \$archiveSource\.stream'
         $receiver | Should -Not -Match '\[IO\.File\]::Move\(\$candidateFull, \$deliveredPath\)'
         $receiver | Should -Not -Match '(?s)\$archiveFormat = Get-ArchiveFormat -Path \$candidateFull.*\$sha256 = Get-FileSha256 -Path \$candidateFull'
         $verifier | Should -Match 'Get-DesktopArchiveEvidence -Path \$deliveredPath'

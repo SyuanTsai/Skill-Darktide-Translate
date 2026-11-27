@@ -131,6 +131,7 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-CompletedStageResult|
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Resolve-InitialState|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-FileSha256|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Get-DesktopArchiveEvidence|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Open-DesktopArchiveSource|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Read-DesktopArchiveData|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Read-DesktopArchiveData|IO.Directory::CreateDirectory|2
 skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Assert-DesktopExtractionTree|Get-ChildItem|1

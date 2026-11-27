@@ -12,31 +12,49 @@ function Get-DesktopArchiveSignature {
     'unknown'
 }
 
-function Get-DesktopArchiveEvidence {
-    param([string] $Path, [scriptblock] $Heartbeat, [switch] $KeepOpen, [switch] $LegacyUnsupportedRar)
-    $stream = [IO.File]::Open($Path,'Open','Read','Read')
+function Get-DesktopArchiveEvidenceFromStream {
+    param([IO.Stream] $Stream, [scriptblock] $Heartbeat, [switch] $LegacyUnsupportedRar)
+    if (!$Stream.CanSeek) { throw 'Archive evidence requires a seekable source stream.' }
     $hasher = [Security.Cryptography.IncrementalHash]::CreateHash('SHA256')
     try {
         $buffer = [byte[]]::new(1MB)
-        $count = $stream.Read($buffer,0,8)
+        $Stream.Position = 0
+        $count = $Stream.Read($buffer,0,8)
         $format = Get-DesktopArchiveSignature $buffer $count -LegacyUnsupportedRar:$LegacyUnsupportedRar
-        $stream.Position = 0
-        while (($count = $stream.Read($buffer,0,$buffer.Length)) -gt 0) {
+        $Stream.Position = 0
+        while (($count = $Stream.Read($buffer,0,$buffer.Length)) -gt 0) {
             $hasher.AppendData($buffer,0,$count)
             if ($Heartbeat) { & $Heartbeat }
         }
-        $evidence = @{size=$stream.Length; archiveFormat=$format
+        $evidence = @{size=$Stream.Length; archiveFormat=$format
             sha256=[Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()}
-        if ($KeepOpen) {
-            $stream.Position = 0
-            $evidence.stream = $stream
-            $stream = $null
-        }
+        $Stream.Position = 0
         $evidence
+    } finally { $hasher.Dispose() }
+}
+
+function Get-DesktopArchiveEvidence {
+    param([string] $Path, [scriptblock] $Heartbeat, [switch] $LegacyUnsupportedRar)
+    $stream = [IO.File]::Open($Path,'Open','Read','Read')
+    try { Get-DesktopArchiveEvidenceFromStream -Stream $stream -Heartbeat $Heartbeat -LegacyUnsupportedRar:$LegacyUnsupportedRar }
+    finally { $stream.Dispose() }
+}
+
+function Open-DesktopArchiveSource {
+    param([string] $Path, [scriptblock] $Heartbeat, [switch] $LegacyUnsupportedRar)
+    $stream = [IO.File]::Open($Path,'Open','Read','Read')
+    try {
+        $source = @{evidence=(Get-DesktopArchiveEvidenceFromStream -Stream $stream -Heartbeat $Heartbeat -LegacyUnsupportedRar:$LegacyUnsupportedRar); stream=$stream}
+        $stream = $null
+        $source
     } finally {
-        $hasher.Dispose()
         if ($stream) { $stream.Dispose() }
     }
+}
+
+function Close-DesktopArchiveSource {
+    param($Source)
+    if ($Source -and $Source.stream) { $Source.stream.Dispose() }
 }
 
 function Assert-DesktopArchiveManifest {
@@ -150,7 +168,8 @@ function Close-DesktopArchive {
     } finally {
         if ($Reader.process) { $Reader.process.Dispose() }
         if ($Reader.archive) { $Reader.archive.Dispose() }
-        $Reader.stream.Dispose()
+        if ($Reader.source) { Close-DesktopArchiveSource $Reader.source }
+        elseif ($Reader.stream) { $Reader.stream.Dispose() }
     }
 }
 
@@ -166,8 +185,9 @@ function Wait-DesktopDecoderRead {
 
 function Open-DesktopArchive {
     param([string] $Path, [string] $ExpectedSha256, [string] $Format, [scriptblock] $Heartbeat)
-    $evidence = Get-DesktopArchiveEvidence $Path $Heartbeat -KeepOpen
-    $reader = @{archive=$null; process=$null; entries=@(); format=$Format; stream=$evidence.stream}
+    $source = Open-DesktopArchiveSource $Path $Heartbeat
+    $evidence = $source.evidence
+    $reader = @{archive=$null; process=$null; entries=@(); format=$Format; source=$source; stream=$source.stream}
     try {
         if ($evidence.archiveFormat -cne $Format -or $Format -cnotin @('zip','rar')) {
             throw 'Archive format differs from recorded evidence.'
@@ -232,7 +252,9 @@ function Read-DesktopArchiveData {
         $source = if ($rar) { $Reader.process.StandardOutput.BaseStream } else { $Reader.archive.Entries[$i].Open() }
         $digest = [Security.Cryptography.IncrementalHash]::CreateHash('SHA256')
         try {
-            $output = if ($destination -and !$entry.directory) { [IO.File]::Open($destination,'CreateNew','Write','None') } else { [IO.Stream]::Null }
+            $output = if ($destination -and !$entry.directory) {
+                [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            } else { [IO.Stream]::Null }
             try {
                 $crc = [uint32]::MaxValue
                 $remaining = [long]$entry.size

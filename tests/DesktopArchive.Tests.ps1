@@ -56,6 +56,33 @@ Describe 'Desktop archive reader' {
         Get-DesktopArchiveSignature $header 7 | Should -BeExactly unknown
     }
 
+    # Scenario: Evidence is a completed read, while a separate source owner retains
+    # the one verified descriptor used by a later ZIP read or verified delivery.
+    It 'UnitT28_SeparatesArchiveEvidenceFromVerifiedSourceOwnership' {
+        $file = Join-Path $TestDrive 'owned-source.zip'
+        [IO.File]::WriteAllBytes($file, [byte[]](80,75,5,6,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0))
+        $evidence = Get-DesktopArchiveEvidence -Path $file
+        $evidence.ContainsKey('stream') | Should -BeFalse
+        $source = Open-DesktopArchiveSource -Path $file
+        try {
+            $source.evidence.sha256 | Should -BeExactly $evidence.sha256
+            $source.stream.Position | Should -Be 0
+            $source.stream.ReadByte() | Should -Be 80
+        } finally { Close-DesktopArchiveSource $source }
+    }
+
+    # Scenario: Extraction creates only the already-contained destination and the
+    # native reader resolves its production DLL without process environment input.
+    It 'UnitT29_UsesExplicitFileEnumsAndAHostOwnedUnrarLocation' {
+        $archive = Get-Content -LiteralPath (Join-Path $source 'DesktopArchive.ps1') -Raw
+        $reader = Get-Content -LiteralPath (Join-Path $source 'rar_reader.py') -Raw
+        $archive | Should -Match '(?s)\[IO\.File\]::Open\(\$destination,\s*\[IO\.FileMode\]::CreateNew,\s*\[IO\.FileAccess\]::Write,\s*\[IO\.FileShare\]::None\)'
+        $archive | Should -Not -Match "Open\(\$destination,'CreateNew'"
+        $reader | Should -Not -Match 'os\.environ'
+        $reader | Should -Not -Match '\brequests\b'
+        $reader | Should -Match 'SHGetKnownFolderPath'
+    }
+
     # Scenario: An opaque RAR from the offline SDK fixture is acquired from the browser inbox.
     # Purpose: Bind replay, listing and extracted bytes to the original format, filename, size and SHA.
     It 'InterT30_RoundTripsRarIdentityAndStreamsItsPayload' {
@@ -102,11 +129,7 @@ Describe 'Desktop archive reader' {
         $file = Join-Path $TestDrive 'unavailable.rar'
         $sha = Write-RarFixture $file @(@{name='Mod/file'})
         { Open-DesktopArchive $file ('0' * 64) rar } | Should -Throw '*SHA-256*'
-        $previous = $env:DARKTIDE_UNRAR_LIBRARY
-        try {
-            $env:DARKTIDE_UNRAR_LIBRARY = Join-Path $TestDrive 'missing-unrar-library'
-            { Open-DesktopArchive $file $sha rar } | Should -Throw '*Cannot load installed UnRAR*'
-        } finally { $env:DARKTIDE_UNRAR_LIBRARY = $previous }
+        { Open-DesktopArchive $file $sha rar } | Should -Throw '*Cannot load trusted UnRAR SDK*'
     }
 
     # Scenario: A later RAR header is unsafe or reports a filesystem redirection.

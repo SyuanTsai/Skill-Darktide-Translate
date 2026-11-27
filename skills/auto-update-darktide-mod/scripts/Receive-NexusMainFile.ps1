@@ -464,7 +464,9 @@ if ($sampleTwo.size -le 0) { throw 'Downloaded file is empty.' }
 
 $verifyStart = [Diagnostics.Stopwatch]::StartNew()
 Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
-$archiveEvidence = Get-DesktopArchiveEvidence -Path $candidateFull -Heartbeat { Invoke-Heartbeat } -KeepOpen
+$archiveSource = $null
+$archiveSource = Open-DesktopArchiveSource -Path $candidateFull -Heartbeat { Invoke-Heartbeat }
+$archiveEvidence = $archiveSource.evidence
 $temporaryDelivery = $null
 $deleteCandidateAfterDelivery = $false
 try {
@@ -551,8 +553,8 @@ try {
     $temporaryDelivery = Assert-ContainedFilePath -Candidate (Join-Path $deliveryFull ('.delivery-' + [guid]::NewGuid().ToString('N') + '.tmp')) -Root $deliveryFull
     $destination = [IO.File]::Open($temporaryDelivery, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try {
-        $archiveEvidence.stream.Position = 0
-        Copy-StreamWithHeartbeat -Source $archiveEvidence.stream -Destination $destination
+        $archiveSource.stream.Position = 0
+        Copy-StreamWithHeartbeat -Source $archiveSource.stream -Destination $destination
         $destination.Flush($true)
     }
     finally { $destination.Dispose() }
@@ -577,7 +579,7 @@ try {
     })
 }
 finally {
-    if ($archiveEvidence.stream) { $archiveEvidence.stream.Dispose() }
+    if ($archiveSource) { Close-DesktopArchiveSource $archiveSource }
     if ($temporaryDelivery -and (Test-Path -LiteralPath $temporaryDelivery -PathType Leaf)) {
         [IO.File]::Delete($temporaryDelivery)
     }
