@@ -12,7 +12,10 @@ param(
     [string] $ExpectedBaseOid,
     [string] $ExpectedModRelativePath,
     [scriptblock] $HeartbeatAction,
-    [switch] $PassThru
+    [switch] $PassThru,
+    [string] $TerminologyRequestPath,
+    [long] $ExpectedNexusId,
+    [long] $ExpectedMainFileId
 )
 
 Set-StrictMode -Version Latest
@@ -135,32 +138,6 @@ function Get-ReviewWorksetContractSha256 {
         }
     })
     Get-Sha256Bytes -Bytes ([Text.UTF8Encoding]::new($false, $true).GetBytes(($reviewContract | ConvertTo-Json -Depth 10 -Compress)))
-}
-
-function Get-ExpressionSnapshot {
-    param($Expression)
-    if ($null -eq $Expression) { return $null }
-    [ordered]@{
-        raw = $Expression.raw; canonical = $Expression.canonical
-        isDirectLocalizeCall = $Expression.isDirectLocalizeCall
-        isFullyLocaleResolvedExpression = $Expression.isFullyLocaleResolvedExpression
-        startByte = $Expression.startByte; lengthByte = $Expression.lengthByte
-        fieldStartByte = $Expression.fieldStartByte; fieldLengthByte = $Expression.fieldLengthByte
-        separatorStartByte = $Expression.separatorStartByte; separatorLengthByte = $Expression.separatorLengthByte
-    }
-}
-
-function Get-UnitSnapshotJson {
-    param($Unit)
-    if ($null -eq $Unit) { return $null }
-    $snapshot = [ordered]@{
-        sourceId = $Unit.sourceId; containerPath = $Unit.containerPath; key = $Unit.key
-        occurrence = $Unit.occurrence; unitId = $Unit.unitId; blockedReason = $Unit.blockedReason
-        sourceExpression = Get-ExpressionSnapshot -Expression $Unit.sourceExpression
-        zhTwExpression = Get-ExpressionSnapshot -Expression $Unit.zhTwExpression
-        tableOpenByte = $Unit.tableOpenByte; tableCloseByte = $Unit.tableCloseByte
-    }
-    $snapshot | ConvertTo-Json -Depth 20 -Compress
 }
 
 function Get-CanonicalExpression {
@@ -324,6 +301,8 @@ if ($bindingValueCount -eq 3 -and (-not (Test-Path -LiteralPath $repositoryFull 
     throw 'Independent OLD verification repository or base OID is invalid.'
 }
 $workset = Get-Content -LiteralPath $worksetFull -Raw | ConvertFrom-Json -AsHashtable
+$terminologyRequested = @('TerminologyRequestPath', 'ExpectedNexusId', 'ExpectedMainFileId').Where({ $PSBoundParameters.ContainsKey($_) }).Count -gt 0
+$terminology = $null
 if ([int]$workset.schemaVersion -ne 1 -or [int]$workset.workflowSchemaVersion -ne 15 -or [string]$workset.status -cne 'applied') {
     throw 'Localization workset is not an applied Schema 15 artifact.'
 }
@@ -340,16 +319,8 @@ if ($bindingValueCount -eq 3) {
         throw 'Localization workset base OID or MOD path differs from Candidate state.'
     }
     if ($workset.generatorVersion -eq 2) {
-        $binding = $workset.translationBinding
-        $expectedBinding = Get-LocalizationTranslationBinding `
-            -SkillRoot (Split-Path -Parent $PSScriptRoot) -RepositoryRoot $repositoryFull -BaseOid $ExpectedBaseOid `
-            -Mode $binding.mode -ModRelativePath $normalizedExpectedModPath -ModelId $binding.modelId -HeartbeatAction $HeartbeatAction
-        if ($binding.rulesSha256 -cne $expectedBinding.rulesSha256 -or
-            $binding.glossarySha256 -cne $expectedBinding.glossarySha256 -or
-            (ConvertTo-Json -InputObject $binding.rulesManifest -Depth 10 -Compress) -cne
-            (ConvertTo-Json -InputObject $expectedBinding.rulesManifest -Depth 10 -Compress)) {
-            throw 'Localization workset translation binding differs from the immutable rules or glossary.'
-        }
+        Assert-LocalizationTranslationBinding -Binding $workset.translationBinding -RepositoryRoot $repositoryFull `
+            -BaseOid $ExpectedBaseOid -ModRelativePath $normalizedExpectedModPath -HeartbeatAction $HeartbeatAction
     }
     if (-not ([string]$workset.old.path).StartsWith($normalizedExpectedModPath + '/', [StringComparison]::Ordinal)) {
         throw 'Localization workset OLD path escapes the expected MOD path.'
@@ -371,8 +342,24 @@ if ($bindingValueCount -eq 3) {
 if (-not $workset.Contains('apply') -or -not $workset.apply -or [string]$workset.apply.status -cne 'applied') {
     throw 'Localization workset apply receipt is not finalized.'
 }
+$expectedApplyKeys = 'edits,inputSha256,outputSha256,outputSize,reviewContractSha256,status'
+if ($terminologyRequested) {
+    if ($bindingValueCount -ne 3 -or [string]::IsNullOrWhiteSpace($RunRoot) -or [string]::IsNullOrWhiteSpace($TerminologyRequestPath)) {
+        throw 'Reviewed terminology Receipt requires the request, run root, repository, base OID, and MOD path together.'
+    }
+    $null = Assert-NoReparsePath -Path $runRootFull -Root $repositoryFull -Label 'Reviewed terminology run root'
+    $requestFull = Assert-NoReparsePath -Path $TerminologyRequestPath -Root $runRootFull -Label 'Reviewed terminology request'
+    $terminology = Get-ReviewedTerminologyContext -Workset $workset -RequestPath $requestFull -RawNewPath $newFull `
+        -RunRoot $runRootFull -BaseOid $ExpectedBaseOid -ModRelativePath $ExpectedModRelativePath `
+        -NexusId $ExpectedNexusId -MainFileId $ExpectedMainFileId
+    $expectedMergedPath = Join-Path (Split-Path -Parent $newFull) 'merged.lua'
+    if (-not $mergedFull.Equals($expectedMergedPath, (Get-PortablePathComparison -Paths @($mergedFull, $expectedMergedPath)))) {
+        throw 'Reviewed terminology requires the fixed merged localization evidence path.'
+    }
+    $expectedApplyKeys += ',terminologyCorrection'
+}
 $applyKeys = @($workset.apply.Keys | Sort-Object)
-if (($applyKeys -join ',') -cne 'edits,inputSha256,outputSha256,outputSize,reviewContractSha256,status' -or
+if (($applyKeys -join ',') -cne $expectedApplyKeys -or
     [string]$workset.apply.reviewContractSha256 -cne (Get-ReviewWorksetContractSha256 -Workset $workset)) {
     throw 'Localization workset apply receipt fields are malformed.'
 }
@@ -383,26 +370,21 @@ if ((Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.new.sha256 -or
     (Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.apply.inputSha256) {
     throw 'Raw NEW localization evidence differs from the workset input.'
 }
-$before = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newFull -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
+$reviewedLocator = if ($terminologyRequested) { $terminology.terminologyCorrection }
+$before = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newFull -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction -ReviewedLocator $reviewedLocator
 $beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
 $oldDocument = $null
 $oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 if ($bindingValueCount -eq 3) {
-    $oldObject = [string]::Concat($ExpectedBaseOid, [char]58, [string]$workset.old.path)
+    $oldObject = if ($terminologyRequested) { "${ExpectedBaseOid}^{commit}:" + $workset.old.path }
+        else { [string]::Concat($ExpectedBaseOid, [char]58, [string]$workset.old.path) }
     $oldBytes = Get-LocalizationGitBlobBytes -WorkingDirectory $repositoryFull -Object $oldObject -HeartbeatAction $HeartbeatAction
-    $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath ([string]$workset.old.path) -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
-    if ((Get-Sha256Bytes -Bytes $oldBytes) -cne [string]$workset.old.sha256 -or
-        $oldBytes.LongLength -ne [int64]$workset.old.size -or [bool]$oldDocument.bom -ne [bool]$workset.old.bom -or
-        [string]$oldDocument.newline -cne [string]$workset.old.newline) {
-        throw 'Localization workset OLD metadata differs from the immutable base blob.'
-    }
+    $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath ([string]$workset.old.path) -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction -ReviewedLocator $reviewedLocator
+    Assert-LocalizationDocumentMetadata -Document $oldDocument -Expected $workset.old -Label 'OLD metadata differs from the immutable base blob'
     foreach ($unit in @($oldDocument.units)) { $oldById[[string]$unit.unitId] = $unit }
 }
-if ([int64]$before.size -ne [int64]$workset.new.size -or [bool]$before.bom -ne [bool]$workset.new.bom -or
-    [string]$before.newline -cne [string]$workset.new.newline) {
-    throw 'Localization workset NEW metadata differs from raw NEW evidence.'
-}
+Assert-LocalizationDocumentMetadata -Document $before -Expected $workset.new -Label 'NEW metadata differs from raw NEW evidence'
 $expectedIdentityIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($before.units)) { $null = $expectedIdentityIds.Add([string]$unit.unitId) }
 if ($bindingValueCount -eq 3) { foreach ($unit in @($oldDocument.units)) { $null = $expectedIdentityIds.Add([string]$unit.unitId) } }
@@ -495,6 +477,10 @@ foreach ($unit in @($workset.units)) {
     }
 }
 
+if ($terminologyRequested) {
+    $termEdit = Get-ReviewedTerminologyEdit -Request $terminology -Workset $workset -OldDocument $oldDocument -NewDocument $before -NewBytes $newBytes
+    $expectedEdits.Add((New-Edit -Start $termEdit.startByte -Length $termEdit.lengthByte -Replacement $termEdit.replacement -UnitId $termEdit.unitId -Operation $termEdit.operation))
+}
 $expectedReceiptEdits = @($expectedEdits | ForEach-Object {
     Invoke-Heartbeat
     $oldBytes = [byte[]]::new([int64]$_.lengthByte)
@@ -531,6 +517,14 @@ for ($index = 0; $index -lt $expectedReceiptEdits.Count; $index++) {
     }
 }
 
+$termEvidence = $null
+if ($terminologyRequested) {
+    $termEvidence = New-ReviewedTerminologyEvidence -Request $terminology -Workset $workset -Edit $expectedReceiptEdits[-1]
+    if (-not [string]::Equals((ConvertTo-Json -InputObject $workset.apply.terminologyCorrection -Depth 20 -Compress),
+            (ConvertTo-Json -InputObject $termEvidence -Depth 20 -Compress))) {
+        throw 'Reviewed terminology receipt evidence differs from the independently reconstructed request and edit.'
+    }
+}
 $expectedMergedBytes = Invoke-ByteEdits -Bytes $newBytes -Edits @($expectedEdits)
 $expectedMergedSha = Get-Sha256Bytes -Bytes $expectedMergedBytes
 if ($mergedBytes.LongLength -ne $expectedMergedBytes.LongLength -or
@@ -538,6 +532,10 @@ if ($mergedBytes.LongLength -ne $expectedMergedBytes.LongLength -or
     [string]$workset.apply.outputSha256 -cne $expectedMergedSha -or
     [int64]$workset.apply.outputSize -ne $expectedMergedBytes.LongLength) {
     throw 'Merged localization evidence differs from the deterministic edit plan.'
+}
+if ($terminologyRequested -and
+    (Get-Sha256Bytes -Bytes (Read-FileBytesWithHeartbeat -Path $stagedOutput)) -cne $expectedMergedSha) {
+    throw 'Reviewed terminology staged output differs from the deterministic edit plan.'
 }
 
 $result = [ordered]@{
@@ -547,4 +545,5 @@ $result = [ordered]@{
     outputSha256 = $expectedMergedSha
     editCount = $expectedReceiptEdits.Count
 }
+if ($terminologyRequested) { $result.terminologyCorrection = $termEvidence }
 if ($PassThru) { $result } else { $result | ConvertTo-Json -Depth 10 -Compress }

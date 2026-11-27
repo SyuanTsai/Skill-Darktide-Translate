@@ -287,8 +287,9 @@ local side_effect = os.time()
 
         $generator | Should -Match 'Get-LuaLocalizationDocument\s+-Bytes\s+\$newBytes\s+-DisplayPath\s+\$newPath'
         $generator | Should -Not -Match 'Get-LuaLocalizationDocument\s+-Path\s+\$newPath'
-        $applier | Should -Match '(?s)\$currentBytes = Read-FileBytesWithHeartbeat -Path \$newPath.*\$currentSha = Get-Sha256Bytes -Bytes \$currentBytes.*\$originalBytes = \$currentBytes'
-        $applier | Should -Not -Match '\$currentSha = Get-FileSha256 -Path \$newPath'
+        $applier | Should -Match '(?s)\$currentBytes = Read-FileBytesWithHeartbeat -Path \$stagedPath.*\$currentSha = Get-Sha256Bytes -Bytes \$currentBytes.*\$originalBytes = \$currentBytes'
+        $applier | Should -Match '(?s)\$originalBytes = Read-FileBytesWithHeartbeat -Path \$rawNewFull.*Get-Sha256Bytes -Bytes \$originalBytes.*Get-LuaLocalizationDocument -Bytes \$originalBytes'
+        $applier | Should -Not -Match 'Get-LuaLocalizationDocument\s+-Path\s+\$(stagedPath|rawNewFull)'
     }
 
     # Scenario: A canonical MOD directory contains an internal double dot that is part of its legal single-directory name.

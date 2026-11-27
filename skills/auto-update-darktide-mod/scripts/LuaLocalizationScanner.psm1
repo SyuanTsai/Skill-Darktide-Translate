@@ -224,7 +224,7 @@ function Test-IoDofileOnlyLoaderTokens {
 }
 
 function ConvertFrom-LuaKeyString {
-    param([string] $Literal)
+    param([string] $Literal, [switch] $RequireUtf8)
     if ($Literal.StartsWith('[', [StringComparison]::Ordinal)) {
         $longString = [regex]::Match($Literal, '^\[(=*)\[(.*)\]\1\]$', [Text.RegularExpressions.RegexOptions]::Singleline)
         if (-not $longString.Success) { throw 'Lua long-string key literal is malformed.' }
@@ -312,7 +312,10 @@ function ConvertFrom-LuaKeyString {
         }
     }
     try { $encoding.GetString($bytes.ToArray()) }
-    catch { '@bytes:' + [Convert]::ToHexString($bytes.ToArray()).ToLowerInvariant() }
+    catch {
+        if ($RequireUtf8) { throw 'Reviewed terminology requires a Lua literal that decodes as UTF-8.' }
+        '@bytes:' + [Convert]::ToHexString($bytes.ToArray()).ToLowerInvariant()
+    }
 }
 
 function Get-CanonicalTokenText {
@@ -599,6 +602,13 @@ function Test-LuaTableFieldStart {
     ($keyEnd + 1) -lt $CloseIndex -and $Tokens[$keyEnd + 1].text -ceq '='
 }
 
+function Test-LuaLocatorAncestor {
+    param([string] $Path, [string] $Locator)
+
+    [string]::Equals($Locator, $Path) -or $Locator.StartsWith($Path + '.', [StringComparison]::Ordinal) -or
+        $Locator.StartsWith($Path + '[', [StringComparison]::Ordinal)
+}
+
 function Read-LuaTable {
     param(
         [string] $Text,
@@ -608,10 +618,15 @@ function Read-LuaTable {
         [AllowNull()][string] $AssignedKey,
         [string] $SourceId,
         [Collections.Generic.List[object]] $Units,
-        [int] $BomLength
+        [int] $BomLength,
+        [string] $ReviewedPath
     )
     $closeIndex = Get-MatchingTokenIndex -Tokens $Tokens -StartIndex $OpenIndex -Open '{' -Close '}'
     $fields = [Collections.Generic.List[object]]::new()
+    $tablePath = if ([string]::IsNullOrWhiteSpace($AssignedKey)) { $ContainerPath } else { Join-LuaContainerPath -ContainerPath $ContainerPath -Key $AssignedKey }
+    $reviewedKeys = if ($ReviewedPath -and (Test-LuaLocatorAncestor -Path $tablePath -Locator $ReviewedPath)) {
+        ,([Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal))
+    }
     $position = $OpenIndex + 1
     while ($position -lt $closeIndex) {
         Invoke-LuaScannerProgressHeartbeat
@@ -635,8 +650,17 @@ function Read-LuaTable {
             $position++
             continue
         }
+        if ($null -ne $reviewedKeys -and $Tokens[$fieldStart].text -ceq '[' -and
+            ($keyEnd -ne ($fieldStart + 2) -or $Tokens[$fieldStart + 1].type -cnotin @('string', 'number'))) {
+            throw 'Reviewed terminology locator has an ambiguous computed Lua key.'
+        }
         $key = Get-LuaKey -Tokens $Tokens -StartIndex $fieldStart -EndIndex $keyEnd
         if ([string]::IsNullOrWhiteSpace($key)) { $position = [int]$equalsIndex + 1; continue }
+        if ($null -ne $reviewedKeys -and
+            (Test-LuaLocatorAncestor -Path (Join-LuaContainerPath -ContainerPath $tablePath -Key $key) -Locator $ReviewedPath) -and
+            -not $reviewedKeys.Add($key)) {
+            throw 'Reviewed terminology locator is ambiguous because a Lua key is assigned more than once.'
+        }
         $valueStart = [int]$equalsIndex + 1
         if ($valueStart -ge $closeIndex) { throw "Lua field $key has no value expression." }
         $braceDepth = 0; $parenDepth = 0; $bracketDepth = 0; $blockDepth = 0
@@ -682,8 +706,7 @@ function Read-LuaTable {
         $fields.Add($field)
 
         if ($Tokens[$valueStart].text -ceq '{') {
-            $tablePath = if ([string]::IsNullOrWhiteSpace($AssignedKey)) { $ContainerPath } else { Join-LuaContainerPath -ContainerPath $ContainerPath -Key $AssignedKey }
-            $null = Read-LuaTable -Text $Text -Tokens $Tokens -OpenIndex $valueStart -ContainerPath $tablePath -AssignedKey $key -SourceId $SourceId -Units $Units -BomLength $BomLength
+            $null = Read-LuaTable -Text $Text -Tokens $Tokens -OpenIndex $valueStart -ContainerPath $tablePath -AssignedKey $key -SourceId $SourceId -Units $Units -BomLength $BomLength -ReviewedPath $ReviewedPath
         }
         $position = if ($null -ne $separatorIndex) { [int]$separatorIndex + 1 } else { $valueEnd + 1 }
     }
@@ -721,7 +744,8 @@ function Get-LuaLocalizationDocument {
         [Parameter(Mandatory, ParameterSetName = 'Bytes')][byte[]] $Bytes,
         [Parameter(ParameterSetName = 'Bytes')][string] $DisplayPath = '<memory>',
         [Parameter(Mandatory)][string] $SourceId,
-        [scriptblock] $HeartbeatAction
+        [scriptblock] $HeartbeatAction,
+        [Collections.IDictionary] $ReviewedLocator
     )
     $previousHeartbeatAction = $script:luaScannerHeartbeatAction
     $previousHeartbeatProgress = $script:luaScannerHeartbeatProgress
@@ -742,11 +766,14 @@ function Get-LuaLocalizationDocument {
         Invoke-LuaScannerHeartbeat
         $tokens = @(Get-LuaTokens -Text $text)
         $units = [Collections.Generic.List[object]]::new()
+        $reviewedPath = if ($ReviewedLocator) {
+            Join-LuaContainerPath -ContainerPath $ReviewedLocator.containerPath -Key $ReviewedLocator.key
+        }
         $position = 0
         while ($position -lt $tokens.Count) {
             Invoke-LuaScannerProgressHeartbeat
             if ($tokens[$position].text -ceq '{') {
-                $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength
+                $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength -ReviewedPath $reviewedPath
             }
             $position++
         }
@@ -947,4 +974,15 @@ function Test-LuaNonStringTokenSequence {
         (Get-LuaFormatSignature -Tokens $translationTokens -FormatSpans $formatSpans)
 }
 
-Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence
+function ConvertFrom-LuaQuotedLiteral {
+    param([string] $Expression)
+
+    $tokens = @(Get-LuaTokens -Text $Expression)
+    if ($tokens.Count -ne 1 -or $tokens[0].type -cne 'string' -or -not [string]::Equals($tokens[0].text, $Expression) -or
+        $Expression[0] -cnotin @('"', "'") -or $Expression -cmatch '[\r\n]') {
+        throw 'Reviewed terminology requires a single-line quoted Lua literal.'
+    }
+    ConvertFrom-LuaKeyString -Literal $Expression -RequireUtf8
+}
+
+Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence, ConvertFrom-LuaQuotedLiteral

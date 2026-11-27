@@ -6,7 +6,14 @@
 param(
     [Parameter(Mandatory)][string] $WorksetPath,
     [scriptblock] $HeartbeatAction,
-    [switch] $PassThru
+    [switch] $PassThru,
+    [string] $TerminologyRequestPath,
+    [long] $ExpectedNexusId,
+    [long] $ExpectedMainFileId,
+    [string] $NewPath,
+    [string] $RepositoryRoot,
+    [string] $ExpectedBaseOid,
+    [string] $ExpectedModRelativePath
 )
 
 Set-StrictMode -Version Latest
@@ -101,7 +108,7 @@ function Write-AtomicJson {
 }
 
 function Write-AtomicBytes {
-    param([string] $Path, [byte[]] $Bytes)
+    param([string] $Path, [byte[]] $Bytes, [string] $ExpectedPriorSha256, [string] $RunRoot)
     Invoke-Heartbeat
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
     $temporary = Join-Path $parent ('.tmp-' + [guid]::NewGuid().ToString('N') + '.lua')
@@ -117,6 +124,12 @@ function Write-AtomicBytes {
         }
         finally { $stream.Dispose() }
         Invoke-Heartbeat
+        if ($ExpectedPriorSha256) {
+            Assert-NoReparsePath -Path $Path -Root $RunRoot
+            if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExpectedPriorSha256) {
+                throw 'Reviewed terminology staged NEW bytes changed before the write boundary.'
+            }
+        }
         [IO.File]::Move($temporary, [IO.Path]::GetFullPath($Path), $true)
     }
     finally {
@@ -306,44 +319,94 @@ if (-not $recordedStagingRoot.Equals(
         $expectedStagingRoot, (Get-PortablePathComparison -Paths @($expectedStagingRoot, $recordedStagingRoot)))) {
     throw 'Workset NEW root differs from its fixed run-local staging path.'
 }
-$newPath = Assert-ContainedPath -Candidate ([string]$workset.new.path) -Root ([string]$workset.new.root)
-if (-not (Test-Path -LiteralPath $newPath -PathType Leaf)) { throw 'Workset NEW localization file is missing.' }
-Assert-NoReparsePath -Path $newPath -Root ([string]$workset.new.root)
+$stagedPath = Assert-ContainedPath -Candidate ([string]$workset.new.path) -Root ([string]$workset.new.root)
+if (-not (Test-Path -LiteralPath $stagedPath -PathType Leaf)) { throw 'Workset NEW localization file is missing.' }
+Assert-NoReparsePath -Path $stagedPath -Root ([string]$workset.new.root)
 if ([string]$workset.new.newline -notin @('lf', 'crlf')) { throw 'Workset NEW localization newline style must be uniformly LF or CRLF.' }
-$currentBytes = Read-FileBytesWithHeartbeat -Path $newPath
+$currentBytes = Read-FileBytesWithHeartbeat -Path $stagedPath
 $currentSha = Get-Sha256Bytes -Bytes $currentBytes
-if ($workset.Contains('apply') -and $workset.apply) {
+$terminologyRequested = @('TerminologyRequestPath', 'ExpectedNexusId', 'ExpectedMainFileId', 'NewPath',
+    'RepositoryRoot', 'ExpectedBaseOid', 'ExpectedModRelativePath').Where({ $PSBoundParameters.ContainsKey($_) }).Count -gt 0
+$terminology = $null
+$originalBytes = $currentBytes
+if ($terminologyRequested) {
+    if (@($TerminologyRequestPath, $NewPath, $RepositoryRoot, $ExpectedBaseOid, $ExpectedModRelativePath).Where({
+            [string]::IsNullOrWhiteSpace($_)
+        }).Count -gt 0) {
+        throw 'Reviewed terminology Apply requires the request, raw NEW path, repository, base OID, and MOD path together.'
+    }
+    $repositoryFull = [IO.Path]::GetFullPath($RepositoryRoot)
+    $null = Assert-ContainedPath -Candidate $worksetRunRoot -Root $repositoryFull
+    Assert-NoReparsePath -Path $worksetRunRoot -Root $repositoryFull
+    Assert-NoReparsePath -Path $stagedPath -Root $worksetRunRoot
+    $requestFull = Assert-ContainedPath -Candidate $TerminologyRequestPath -Root $worksetRunRoot
+    $rawNewFull = Assert-ContainedPath -Candidate $NewPath -Root $worksetRunRoot
+    Assert-NoReparsePath -Path $requestFull -Root $worksetRunRoot
+    Assert-NoReparsePath -Path $rawNewFull -Root $worksetRunRoot
+    $terminology = Get-ReviewedTerminologyContext -Workset $workset -RequestPath $requestFull -RawNewPath $rawNewFull `
+        -RunRoot $worksetRunRoot -BaseOid $ExpectedBaseOid -ModRelativePath $ExpectedModRelativePath `
+        -NexusId $ExpectedNexusId -MainFileId $ExpectedMainFileId
+    Assert-LocalizationTranslationBinding -Binding $workset.translationBinding -RepositoryRoot $repositoryFull `
+        -BaseOid $ExpectedBaseOid -ModRelativePath $workset.modRelativePath -HeartbeatAction $HeartbeatAction
+    $originalBytes = Read-FileBytesWithHeartbeat -Path $rawNewFull
+    if ((Get-Sha256Bytes -Bytes $originalBytes) -cne $terminology.newSha256) {
+        throw 'Reviewed terminology raw NEW evidence SHA-256 differs from the approved input.'
+    }
+}
+$alreadyWritten = $false
+$hasApplyReceipt = $workset.Contains('apply') -and $workset.apply
+if (-not $hasApplyReceipt -and $workset.status -cin @('applying', 'applied')) {
+    throw 'Localization workset is missing its apply receipt.'
+}
+if ($hasApplyReceipt) {
+    $recordedTerminology = $workset.apply.Contains('terminologyCorrection')
+    if ($recordedTerminology -ne $terminologyRequested -or
+        (-not $terminologyRequested -and @($workset.apply.edits | Where-Object { $_.operation -ceq 'TERMINOLOGY_REPLACE' }).Count -gt 0)) {
+        throw 'Localization apply requires the same reviewed terminology request and evidence on retry.'
+    }
     $applyStatus = if ($workset.apply.Contains('status')) { [string]$workset.apply.status } else { $null }
-    if ($applyStatus -notin @('pending', 'applied') -or
+    if ($applyStatus -cnotin @('pending', 'applied') -or
         [string]$workset.apply.inputSha256 -cne [string]$workset.new.sha256 -or
         [string]$workset.apply.reviewContractSha256 -cne (Get-ReviewWorksetContractSha256 -Workset $workset) -or
-        [string]$workset.apply.outputSha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$workset.apply.outputSha256 -cnotmatch '\A[0-9a-f]{64}\z' -or
+        ($terminologyRequested -and $applyStatus -ceq 'pending' -and $workset.status -cne 'applying') -or
         [int64]$workset.apply.outputSize -lt 0) {
         throw 'Localization workset apply receipt is malformed.'
     }
-    if ($currentSha -ceq [string]$workset.apply.outputSha256) {
+    $alreadyWritten = $currentSha -ceq [string]$workset.apply.outputSha256
+    if ($alreadyWritten) {
         if ($currentBytes.LongLength -ne [int64]$workset.apply.outputSize) {
             throw 'Workset applied output size differs from its pending receipt.'
         }
-        if ($applyStatus -ceq 'pending') {
-            Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
-            $workset.apply.status = 'applied'
-            $workset.status = 'applied'
-            Write-AtomicJson -Path $worksetFull -Value $workset
-        }
-        elseif ([string]$workset.status -cne 'applied') {
+        if ($applyStatus -ceq 'applied' -and [string]$workset.status -cne 'applied') {
             throw 'Localization workset status differs from its applied receipt.'
         }
-        Write-Result -Value ([ordered]@{ result = 'passed'; status = 'applied'; idempotent = $true; path = $newPath; sha256 = $currentSha; editCount = @($workset.apply.edits).Count; worksetSha256 = Get-FileSha256 -Path $worksetFull })
-        return
+        if (-not $terminologyRequested) {
+            if ($applyStatus -ceq 'pending') {
+                Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
+                $workset.apply.status = 'applied'
+                $workset.status = 'applied'
+                Write-AtomicJson -Path $worksetFull -Value $workset
+            }
+            Write-Result -Value ([ordered]@{ result = 'passed'; status = 'applied'; idempotent = $true; path = $stagedPath; sha256 = $currentSha; editCount = @($workset.apply.edits).Count; worksetSha256 = Get-FileSha256 -Path $worksetFull })
+            return
+        }
     }
-    if ($applyStatus -cne 'pending' -or $currentSha -cne [string]$workset.apply.inputSha256) {
+    elseif ($applyStatus -cne 'pending' -or $currentSha -cne [string]$workset.apply.inputSha256) {
         throw 'Workset NEW localization SHA-256 differs from both sides of its pending apply receipt.'
     }
 }
-if ($currentSha -cne [string]$workset.new.sha256) { throw 'Workset NEW localization SHA-256 changed before apply.' }
-$originalBytes = $currentBytes
-$before = Get-LuaLocalizationDocument -Bytes $originalBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
+if (-not $alreadyWritten -and $currentSha -cne [string]$workset.new.sha256) { throw 'Workset NEW localization SHA-256 changed before apply.' }
+$reviewedLocator = if ($terminologyRequested) { $terminology.terminologyCorrection }
+$before = Get-LuaLocalizationDocument -Bytes $originalBytes -DisplayPath $stagedPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction -ReviewedLocator $reviewedLocator
+if ($terminologyRequested) {
+    $oldObject = "${ExpectedBaseOid}^{commit}:" + $workset.old.path
+    $oldBytes = Get-LocalizationGitBlobBytes -WorkingDirectory $repositoryFull -Object $oldObject -HeartbeatAction $HeartbeatAction
+    $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath $workset.old.path -SourceId $workset.sourceId -HeartbeatAction $HeartbeatAction -ReviewedLocator $reviewedLocator
+    Assert-LocalizationDocumentMetadata -Document $oldDocument -Expected $workset.old -Label 'OLD metadata differs from the immutable base blob'
+    Assert-LocalizationDocumentMetadata -Document $before -Expected $workset.new -Label 'NEW metadata differs from raw NEW evidence'
+    $termEdit = Get-ReviewedTerminologyEdit -Request $terminology -Workset $workset -OldDocument $oldDocument -NewDocument $before -NewBytes $originalBytes
+}
 $beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
 $edits = [Collections.Generic.List[object]]::new()
@@ -393,8 +456,13 @@ foreach ($unit in @($workset.units)) {
     }
 }
 
+if ($terminologyRequested) {
+    $edits.Add((New-Edit -Start $termEdit.startByte -Length $termEdit.lengthByte -Replacement $termEdit.replacement -UnitId $termEdit.unitId -Operation $termEdit.operation))
+    $expectedZhTw[$termEdit.unitId] = (Test-SafeLuaExpression -Expression ([Text.Encoding]::UTF8.GetString($termEdit.replacement))).canonical
+}
+
 $updatedBytes = Invoke-ByteEdits -Bytes $originalBytes -Edits @($edits)
-$after = Get-LuaLocalizationDocument -Bytes $updatedBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
+$after = Get-LuaLocalizationDocument -Bytes $updatedBytes -DisplayPath $stagedPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
 if ([bool]$after.bom -ne [bool]$workset.new.bom -or [string]$after.newline -cne [string]$workset.new.newline) {
     throw 'Localization apply changed the immutable NEW BOM or newline style.'
 }
@@ -438,10 +506,14 @@ $pendingApply = [ordered]@{
     outputSize = $updatedBytes.LongLength
     edits = $serializedEdits
 }
-$pendingApplyJson = $pendingApply | ConvertTo-Json -Depth 40 -Compress
-if ($workset.Contains('apply') -and $workset.apply) {
-    if (($workset.apply | ConvertTo-Json -Depth 40 -Compress) -cne $pendingApplyJson) {
-        throw 'Recovered localization apply plan differs from its pending receipt.'
+if ($terminologyRequested) {
+    $pendingApply.terminologyCorrection = New-ReviewedTerminologyEvidence -Request $terminology -Workset $workset -Edit $serializedEdits[-1]
+}
+if ($hasApplyReceipt) {
+    $pendingApply.status = $applyStatus
+    $pendingApplyJson = $pendingApply | ConvertTo-Json -Depth 40 -Compress
+    if (-not [string]::Equals(($workset.apply | ConvertTo-Json -Depth 40 -Compress), $pendingApplyJson)) {
+        throw 'Recovered localization apply plan differs from its recorded receipt.'
     }
 }
 else {
@@ -450,11 +522,18 @@ else {
     Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
     Write-AtomicJson -Path $worksetFull -Value $workset
 }
-Assert-NoReparsePath -Path $newPath -Root ([string]$workset.new.root)
-Write-AtomicBytes -Path $newPath -Bytes $updatedBytes
-if ((Get-FileSha256 -Path $newPath) -cne [string]$workset.apply.outputSha256) { throw 'Localization apply output changed at the write boundary.' }
-$workset.status = 'applied'
-$workset.apply.status = 'applied'
-Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
-Write-AtomicJson -Path $worksetFull -Value $workset
-Write-Result -Value ([ordered]@{ result = 'passed'; status = 'applied'; idempotent = $false; path = $newPath; sha256 = $workset.apply.outputSha256; editCount = $serializedEdits.Count; worksetSha256 = Get-FileSha256 -Path $worksetFull })
+if (-not $alreadyWritten) {
+    Assert-NoReparsePath -Path $stagedPath -Root ([string]$workset.new.root)
+    $expectedPriorSha = if ($terminologyRequested) { $currentSha }
+    Write-AtomicBytes -Path $stagedPath -Bytes $updatedBytes -ExpectedPriorSha256 $expectedPriorSha -RunRoot $worksetRunRoot
+}
+if ((Get-FileSha256 -Path $stagedPath) -cne [string]$workset.apply.outputSha256) { throw 'Localization apply output changed at the write boundary.' }
+if ($workset.apply.status -ceq 'pending') {
+    $workset.status = 'applied'
+    $workset.apply.status = 'applied'
+    Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
+    Write-AtomicJson -Path $worksetFull -Value $workset
+}
+$result = [ordered]@{ result = 'passed'; status = 'applied'; idempotent = $alreadyWritten; path = $stagedPath; sha256 = $workset.apply.outputSha256; editCount = $serializedEdits.Count; worksetSha256 = Get-FileSha256 -Path $worksetFull }
+if ($terminologyRequested) { $result.terminologyCorrection = $pendingApply.terminologyCorrection }
+Write-Result -Value $result
