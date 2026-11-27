@@ -61,7 +61,9 @@ def parser():
 def cache_identity(unit, binding):
     return [
         expression(unit, "new", "sourceExpression"),
+        expression(unit, "old", "sourceExpression"),
         expression(unit, "old", "zhTwExpression"),
+        expression(unit, "new", "zhTwExpression"),
         binding["rulesSha256"], binding["glossarySha256"], binding["mode"], binding["modelId"],
     ]
 
