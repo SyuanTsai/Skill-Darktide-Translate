@@ -1908,7 +1908,10 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
     }
     if ([string]$workset.old.path -cnotin @($state.evidenceTargetPaths)) { throw 'Workset OLD localization path is outside evidenceTargetPaths.' }
     if (@($workset.units | Where-Object { $_.action -ceq 'BLOCKED' }).Count -ne 0) { throw 'Localization workset contains BLOCKED units.' }
-    if (@($workset.units | Where-Object { $_.action -ceq 'AI_REQUIRED' -and $_.reviewStatus -cne 'approved' }).Count -ne 0) { throw 'Localization workset contains unapproved AI_REQUIRED units.' }
+    if (@($workset.units | Where-Object {
+        $_.action -ceq 'AI_REQUIRED' -and $_.reviewStatus -cne 'approved' -and
+        -not ($_.reviewStatus -ceq 'preserved' -and $null -eq $_.suggestedZhTwExpression)
+    }).Count -ne 0) { throw 'Localization workset contains unapproved AI_REQUIRED units.' }
         if (@($workset.units | Where-Object { $_.action -cne 'AI_REQUIRED' -and ($_.reviewStatus -cne 'not-required' -or $null -ne $_.suggestedZhTwExpression) }).Count -ne 0) { throw 'Localization review fields were edited outside AI_REQUIRED units.' }
     foreach ($record in @($state.localizationFiles)) {
         if ([string]$record.relativePath -cnotin @($state.evidenceTargetPaths)) { throw 'Workset NEW localization path is outside evidenceTargetPaths.' }

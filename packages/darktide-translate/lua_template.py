@@ -138,10 +138,11 @@ class StringContext(Enum):
 class Expression:
     """保守的單值文法。遇到無法辨識的動態結構時交由人工處理。"""
 
-    def __init__(self, tokens):
+    def __init__(self, tokens, *, allow_opaque_strings=False):
         self.tokens = tokens
         self.position = 0
         self.format_spans = []
+        self.allow_opaque_strings = allow_opaque_strings
 
     def peek(self):
         if self.position < len(self.tokens):
@@ -183,7 +184,7 @@ class Expression:
             self.expression(priority + (operator not in ("^", "..")), context)
 
     def take_string(self, context):
-        if context is not StringContext.TRANSLATABLE:
+        if context is not StringContext.TRANSLATABLE and not self.allow_opaque_strings:
             raise ComplexExpression("字串位於索引或未知呼叫的參數位置")
         self.position += 1
 

@@ -5,6 +5,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -19,15 +20,17 @@ from claude_runner.cache import Cache
 from claude_runner.client import Client, FatalApiError
 from claude_runner.state import State, StateMismatch
 
-from checks import Luac, strip_unexpected_outer_quotes, validate
+from checks import FORMAT, MARKUP, Luac, strip_unexpected_outer_quotes, validate
 from glossary import Glossary
-from lua_template import ComplexExpression, Template
+from lua_template import ComplexExpression, Expression, Template, decode_string, token_shape, tokenize
 from rules import ASSETS_RELATIVE, MODES, load_config, load_rules
 from summary import api_message, write_summary
 from workset import Workset, WorksetError, expression
 
 
 API_KEY_VARIABLE = "ANTHROPIC_API_KEY"
+LOOKUP = "needs_lookup_definition"
+COMPLEX = "complex_expression"
 
 
 def positive_int(text):
@@ -138,12 +141,70 @@ class Requests:
 
 
 def inspect_translation(template, item, glossary, luac):
-    if item["needsLookupDefinition"]:
-        return "needs_lookup_definition", [], None
     segments, warnings = strip_unexpected_outer_quotes(template, item["segments"])
+    lookup = item["needsLookupDefinition"]
+    value = {"segments": segments, "unknownTerms": item["unknownTerms"], "warnings": warnings}
+    if lookup:
+        value["termReview"] = {"reason": LOOKUP, "adoption": "translation",
+                               "terms": item["unknownTerms"] or text_fragments(template.segments.values())}
+        if (isinstance(segments, dict) and segments.keys() == template.segments.keys()
+                and all(isinstance(text, str) for text in segments.values())
+                and (segments == template.segments or not any(text.strip() for text in segments.values()))):
+            return None, ["lookup_text_missing"], value
     rendered, issues = validate(template, segments, glossary, luac)
-    return None, issues, {"segments": segments, "expression": rendered,
-                          "unknownTerms": item["unknownTerms"], "warnings": warnings}
+    return None, issues, {**value, "expression": rendered}
+
+
+def text_fragments(texts):
+    return list(dict.fromkeys(text.strip() for text in texts
+                              if not re.fullmatch(r"loc_[A-Za-z0-9_]+", text)
+                              and re.search(r"[^\W\d_]", FORMAT.sub("", MARKUP.sub("", text)))))
+
+
+def lookup_adoption(unit, template, glossary, luac):
+    for side in ("new", "old"):
+        raw = expression(unit, side, "zhTwExpression")
+        if not raw:
+            continue
+        try:
+            existing = Template.parse(raw)
+        except ComplexExpression:
+            continue
+        if (token_shape(existing.tokens) == token_shape(template.tokens)
+                and any(text.strip() for text in existing.segments.values())
+                and not validate(template, existing.segments, glossary, luac, check_terms=False)[1]
+                and luac.accepts(raw)):
+            return raw, "existing_zh_tw"
+    if luac.accepts(template.raw):
+        return template.raw, "english_fallback"
+    return None, None
+
+
+def preserve_expression(unit, raw, luac):
+    try:
+        tokens = tokenize(raw)
+        existing = expression(unit, "new", "zhTwExpression")
+        for value in (raw, existing):
+            if value is None:
+                continue
+            if not luac.accepts(value):
+                return None
+            if not luac.available:
+                Expression(tokenize(value), allow_opaque_strings=True).parse()
+                for token in tokenize(value):
+                    if token.kind == "string":
+                        decode_string(token.text)
+    except (ValueError, OverflowError, RecursionError):
+        return None
+    texts = []
+    for token in tokens:
+        if token.kind == "string":
+            try:
+                texts.append(decode_string(token.text))
+            except (ValueError, OverflowError):
+                texts.append(token.text)
+    return {"segments": None, "expression": existing or raw, "unknownTerms": [], "warnings": [],
+            "termReview": {"reason": COMPLEX, "adoption": "preserved_expression", "terms": text_fragments(texts)}}
 
 
 def valid_approval(record, template, glossary, luac):
@@ -163,17 +224,23 @@ def prepare(workset, state, cache, binding, glossary, luac):
         step = Progress(record.get("attempts", 0), record.get("corrections", 0),
                         record.get("feedback", []), record.get("cacheable", True))
         progress[unit_id] = step
-        if record.get("status") == "blocked" and record.get("blockedReason") != "api_failed":
+        if record.get("status") == "blocked" and record.get("blockedReason") not in ("api_failed", LOOKUP, COMPLEX):
             continue
         identity = cache_identity(unit, binding)
         try:
             template = Template.parse(identity[0] or "")
         except ComplexExpression:
-            ready[unit_id] = ("complex_expression", None)
+            preserved = preserve_expression(unit, identity[0] or "", luac)
+            ready[unit_id] = ("preserved", preserved) if preserved else ("invalid_lua_expression", None)
             continue
         templates[unit_id], identities[unit_id] = template, identity
         if record.get("status") == "approved":
-            if not valid_approval(record, template, glossary, luac):
+            adoption = (record.get("termReview") or {}).get("adoption")
+            if adoption in ("english_fallback", "existing_zh_tw"):
+                valid = lookup_adoption(unit, template, glossary, luac) == (record["expression"], adoption)
+            else:
+                valid = valid_approval(record, template, glossary, luac)
+            if not valid:
                 raise StateMismatch("狀態檔中的已核准結果無法重新驗證，請移除舊狀態檔或改用新的 --state 路徑。")
             ready[unit_id] = ("resume", record)
             continue
@@ -183,6 +250,7 @@ def prepare(workset, state, cache, binding, glossary, luac):
                 "segments": cached["segments"], "expression": cached["expression"],
                 "review": {**cached["review"], "unitId": unit_id},
                 "unknownTerms": cached.get("unknownTerms", []), "warnings": cached.get("warnings", []),
+                "termReview": cached.get("termReview"),
             })
         else:
             queue.append(unit_id)
@@ -231,8 +299,9 @@ def run(args, config, transport, sleeper, luac):
     preview = {}
 
     def finish(unit_id, step, reason, *, value=None, review=None, details=None, origin="api"):
+        status = "blocked" if reason else "preserved" if origin == "preserved" else "approved"
         record = {
-            "status": "blocked" if reason else "approved",
+            "status": status,
             "attempts": step.attempts, "corrections": step.corrections,
             "segments": value["segments"] if value else None,
             "expression": value["expression"] if value else None,
@@ -241,19 +310,36 @@ def run(args, config, transport, sleeper, luac):
             "review": review, "blockedReason": reason,
             "feedback": step.feedback, "cacheable": step.cacheable, "origin": origin,
         }
-        if record["unknownTerms"]:
-            record["key"] = workset.pending[unit_id].get("key", unit_id)
-            record["source"] = templates[unit_id].raw
+        unit = workset.pending[unit_id]
+        if value and value.get("termReview"):
+            record["termReview"] = value["termReview"]
+        if record["unknownTerms"] or record.get("termReview"):
+            record["key"] = unit.get("key", unit_id)
+            record["source"] = expression(unit, "new", "sourceExpression")
         if details:
             record["details"] = details
         if reason is None:
-            approvals[unit_id] = record["expression"]
+            approvals[unit_id] = (status, None if status == "preserved" else record["expression"])
         if args.dry_run:
             preview[unit_id] = record
             return
         state.set_unit(unit_id, record)
-        if reason is None and origin == "api" and step.cacheable:
+        if review is not None and origin == "api" and step.cacheable:
             cache.put(identities[unit_id], {**value, "review": review})
+
+    def fallback(unit_id, value, issues, exhausted):
+        if not value or not value.get("termReview"):
+            return None
+        term_only = issues == ["glossary_term_missing"] or (
+            issues and all(isinstance(issue, dict) and issue.get("category") == "term" for issue in issues))
+        if issues != ["lookup_text_missing"] and not (exhausted and term_only):
+            return None
+        unit, template = workset.pending[unit_id], templates[unit_id]
+        raw, adoption = lookup_adoption(unit, template, glossary, luac)
+        if raw is None:
+            return None
+        return {**value, "segments": None, "expression": raw, "warnings": [],
+                "termReview": {**value["termReview"], "adoption": adoption}}
 
     def summarize(status, message=None):
         report["status"] = status
@@ -269,7 +355,7 @@ def run(args, config, transport, sleeper, luac):
         return 2
 
     real_transport = None
-    if not args.dry_run and transport is None:
+    if queue and not args.dry_run and transport is None:
         try:
             api_key = os.environ[API_KEY_VARIABLE]
         except KeyError:
@@ -288,12 +374,12 @@ def run(args, config, transport, sleeper, luac):
 
     try:
         for unit_id, (origin, value) in ready.items():
-            if origin == "complex_expression":
+            if value is None:
                 finish(unit_id, progress[unit_id], origin)
             elif origin == "resume":
-                approvals[unit_id] = value["expression"]
+                approvals[unit_id] = ("approved", value["expression"])
             else:
-                finish(unit_id, progress[unit_id], None, value=value, review=value["review"], origin=origin)
+                finish(unit_id, progress[unit_id], None, value=value, review=value.get("review"), origin=origin)
         if args.dry_run:
             summarize("dry-run")
             return 0
@@ -305,6 +391,7 @@ def run(args, config, transport, sleeper, luac):
             inspect=lambda unit_id, item: inspect_translation(templates[unit_id], item, glossary, luac),
             review=lambda values: requests.review(client, values),
             finish=finish,
+            fallback=fallback,
         )
         error = None
         for unit_ids in batches(queue, batch_size):

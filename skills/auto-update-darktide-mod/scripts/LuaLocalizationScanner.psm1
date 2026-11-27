@@ -384,12 +384,29 @@ function ConvertTo-Utf8ByteOffset {
 
 function Test-LuaIdentifierIsOnlyCalled {
     param([object[]] $Tokens, [string] $Name)
+    $seen = $false
     for ($index = 0; $index -lt $Tokens.Count; $index++) {
         Invoke-LuaScannerProgressHeartbeat
         if ($Tokens[$index].type -cne 'identifier' -or $Tokens[$index].text -cne $Name) { continue }
         $previous = if ($index -gt 0) { [string]$Tokens[$index - 1].text } else { $null }
         $next = if (($index + 1) -lt $Tokens.Count) { [string]$Tokens[$index + 1].text } else { $null }
+        if (-not $seen -and $previous -ceq 'local' -and $next -ceq '=' -and
+            ($index + 2) -lt $Tokens.Count -and $Tokens[$index + 2].type -ceq 'identifier' -and
+            $Tokens[$index + 2].text -ceq $Name) {
+            # A call, member, or operator following the RHS would change the alias value.
+            if (($index + 3) -lt $Tokens.Count) {
+                $afterAlias = $Tokens[$index + 3]
+                if ($afterAlias.text -cne ';' -and
+                    ($afterAlias.type -cne 'identifier' -or $afterAlias.text -cin @('and', 'or'))) {
+                    return $false
+                }
+            }
+            $seen = $true
+            $index += 2
+            continue
+        }
         if ($next -cne '(' -or $previous -in @('function', '.', ':')) { return $false }
+        $seen = $true
     }
     $true
 }
@@ -415,7 +432,7 @@ function Test-NeutralLuaStringLiteral {
     if ($StartIndex -ne $EndIndex -or $Tokens[$StartIndex].type -cne 'string') { return $false }
     try { $content = ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$StartIndex].text) }
     catch { return $false }
-    $content -notmatch '[\p{L}\p{N}]'
+    [regex]::Replace($content, $script:luaFormatSpecifier, '') -notmatch '[\p{L}\p{N}]'
 }
 
 function Get-FullyLocaleResolvedExpressionPart {
@@ -431,8 +448,12 @@ function Get-FullyLocaleResolvedExpressionPart {
         $EndIndex--
     }
 
-    if (Test-DirectLocalizeCallRange -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex) {
-        return [pscustomobject]@{ valid = $true; hasLocalize = $true }
+    if (($EndIndex - $StartIndex) -eq 3 -and $Tokens[$StartIndex + 2].type -ceq 'string' -and
+        (Test-DirectLocalizeCallRange -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex)) {
+        $key = ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$StartIndex + 2].text)
+        if ($key -cmatch '^loc_[A-Za-z0-9_]+$') {
+            return [pscustomobject]@{ valid = $true; hasLocalize = $true }
+        }
     }
     if (Test-NeutralLuaStringLiteral -Tokens $Tokens -StartIndex $StartIndex -EndIndex $EndIndex) {
         return [pscustomobject]@{ valid = $true; hasLocalize = $false }
@@ -789,20 +810,141 @@ function Get-LuaLocalizationDocument {
     }
 }
 
+$script:luaFormatSpecifier = '%(?:%|[-+ #0]*[0-9]*(?:\.[0-9]+)?[cdiouxXeEfgGqs])'
+
+function Test-LuaFormatFunctionToken {
+    param([object[]] $Tokens, [int] $Index)
+    if ($Index -lt 0 -or $Tokens[$Index].type -cne 'identifier' -or $Tokens[$Index].text -cne 'format') {
+        return $false
+    }
+    if ($Index -gt 0 -and $Tokens[$Index - 1].text -ceq '.') {
+        if ($Index -lt 2 -or $Tokens[$Index - 2].text -cne 'string') { return $false }
+        $Index -= 2
+    }
+    $Index -eq 0 -or $Tokens[$Index - 1].text -cnotin @('.', ':', 'function')
+}
+
+function Get-LuaFormatSpans {
+    param([object[]] $Tokens)
+    $delimiters = [Collections.Generic.Stack[object]]::new()
+    $openingByClosing = @{ ')' = '('; ']' = '['; '}' = '{' }
+    for ($index = 0; $index -lt $Tokens.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        $token = $Tokens[$index]
+        if ($token.type -ceq 'string') {
+            if (Test-LuaFormatFunctionToken -Tokens $Tokens -Index ($index - 1)) {
+                @{ start = $index; end = $index }
+            }
+        }
+        elseif ($token.text -cin @('(', '[', '{')) {
+            $delimiters.Push(@{ start = $index; firstComma = -1 })
+        }
+        elseif ($token.text -ceq ',' -and $delimiters.Count -gt 0) {
+            $frame = $delimiters.Peek()
+            if ($frame.firstComma -lt 0) { $frame.firstComma = $index }
+        }
+        elseif ($openingByClosing.ContainsKey($token.text) -and $delimiters.Count -gt 0) {
+            $frame = $delimiters.Pop()
+            $open = $frame.start
+            if ($Tokens[$open].text -cne $openingByClosing[$token.text] -or $token.text -ceq ']') { continue }
+
+            if (Test-LuaFormatFunctionToken -Tokens $Tokens -Index ($open - 1)) {
+                if ($token.text -ceq '}') {
+                    @{ start = $open; end = $index }
+                }
+                else {
+                    # Only a comma at this call's nesting level ends the first argument.
+                    $end = if ($frame.firstComma -ge 0) { $frame.firstComma - 1 } else { $index - 1 }
+                    @{ start = $open + 1; end = $end }
+                }
+            }
+            if ($token.text -cne ')' -or ($index + 3) -ge $Tokens.Count -or
+                $Tokens[$index + 1].text -cne ':' -or $Tokens[$index + 2].text -cne 'format' -or
+                ($Tokens[$index + 3].type -cne 'string' -and $Tokens[$index + 3].text -cnotin @('(', '{'))) { continue }
+
+            # Match a parenthesized receiver, excluding the argument list of a preceding call.
+            if ($open -gt 0) {
+                $previous = $Tokens[$open - 1]
+                if ($previous.type -ceq 'string' -or $previous.text -cin @(')', ']', '}') -or
+                    ($previous.type -ceq 'identifier' -and $previous.text -cnotin @('and', 'or', 'not'))) { continue }
+            }
+            @{ start = $open + 1; end = $index - 1 }
+        }
+    }
+}
+
+function Get-LuaFormatSignature {
+    param([object[]] $Tokens, [object[]] $FormatSpans)
+    $literals = [Collections.Generic.SortedDictionary[int,string]]::new()
+    for ($index = 0; $index -lt $Tokens.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        if ($Tokens[$index].type -ceq 'string') {
+            $literals.Add($index, (ConvertFrom-LuaKeyString -Literal ([string]$Tokens[$index].text)))
+        }
+    }
+
+    $grouped = [Collections.Generic.HashSet[int]]::new()
+    $values = [Collections.Generic.List[string]]::new()
+    foreach ($span in $FormatSpans) {
+        $text = [Text.StringBuilder]::new()
+        for ($index = $span.start; $index -le $span.end; $index++) {
+            Invoke-LuaScannerProgressHeartbeat
+            if ($literals.ContainsKey($index)) {
+                $null = $text.Append($literals[$index])
+                $null = $grouped.Add($index)
+            }
+        }
+        $values.Add($text.ToString())
+    }
+    foreach ($literal in $literals.GetEnumerator()) {
+        if (-not $grouped.Contains($literal.Key)) { $values.Add($literal.Value) }
+    }
+
+    $signature = [Text.StringBuilder]::new()
+    foreach ($text in $values) {
+        Invoke-LuaScannerProgressHeartbeat
+        $formats = @([regex]::Matches($text, $script:luaFormatSpecifier) | ForEach-Object Value)
+        $null = $signature.Append('|').Append(($formats -join ','))
+    }
+    $signature.ToString()
+}
+
 function Test-LuaNonStringTokenSequence {
     param([string] $Source, [string] $Translation)
 
-    # Compare the full structure while allowing string literal text to change.
+    # Compare the full structure while allowing ordinary string literal text to change.
     $sourceTokens = @(Get-LuaTokens -Text $Source)
     $translationTokens = @(Get-LuaTokens -Text $Translation)
     if ($sourceTokens.Count -ne $translationTokens.Count) { return $false }
+    $localizeEnd = -1
+    $changedLiteral = $false
     for ($index = 0; $index -lt $sourceTokens.Count; $index++) {
         $sourceToken = $sourceTokens[$index]
         $translationToken = $translationTokens[$index]
         if ($sourceToken.type -cne $translationToken.type) { return $false }
-        if ($sourceToken.type -cne 'string' -and $sourceToken.text -cne $translationToken.text) { return $false }
+        if ($sourceToken.type -cne 'string') {
+            if ($sourceToken.text -cne $translationToken.text) { return $false }
+            if ($index -gt $localizeEnd -and $sourceToken.type -ceq 'identifier' -and
+                $sourceToken.text -ceq 'Localize' -and ($index + 1) -lt $sourceTokens.Count) {
+                $nextToken = $sourceTokens[$index + 1]
+                if ($nextToken.text -ceq '(') {
+                    $localizeEnd = Get-MatchingTokenIndex -Tokens $sourceTokens -StartIndex ($index + 1) -Open '(' -Close ')'
+                }
+                elseif ($nextToken.type -ceq 'string') { $localizeEnd = $index + 1 }
+            }
+            continue
+        }
+        if ($sourceToken.text -ceq $translationToken.text) { continue }
+        $changedLiteral = $true
+        $sourceText = ConvertFrom-LuaKeyString -Literal ([string]$sourceToken.text)
+        $translationText = ConvertFrom-LuaKeyString -Literal ([string]$translationToken.text)
+        if (($index -le $localizeEnd -or $sourceText -cmatch '^loc_[A-Za-z0-9_]+$') -and
+            $sourceText -cne $translationText) { return $false }
     }
-    return $true
+    if (-not $changedLiteral) { return $true }
+    $formatSpans = @(Get-LuaFormatSpans -Tokens $sourceTokens)
+    (Get-LuaFormatSignature -Tokens $sourceTokens -FormatSpans $formatSpans) -ceq
+        (Get-LuaFormatSignature -Tokens $translationTokens -FormatSpans $formatSpans)
 }
 
 Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence

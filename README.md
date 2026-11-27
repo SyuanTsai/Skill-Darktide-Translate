@@ -57,7 +57,7 @@ The Skill supports PowerShell 7 on Windows for local use and on Linux in GitHub 
 - Stable source ID: `darktide-translate`
 - Source inventory: `catalog/source.json`
 - Profile catalog extension: `catalog/profiles.json`
-- Current repository version: `0.6.0`
+- Current repository version: `0.7.0`
 - Delivery tracking is maintained outside this public source and does not change the repository licensing boundary.
 
 ## Skill
@@ -103,6 +103,7 @@ scripts/Test-CleanRepositoryHead.ps1
 scripts/New-SkillSourcePin.ps1
 docs/RELEASE.md
 docs/ROLLBACK.md
+CHANGELOG.md
 tests/
 .github/workflows/consumer-gate.yml
 .github/workflows/consumer-gate-transition.yml

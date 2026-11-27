@@ -52,7 +52,9 @@ Describe 'Schema 15 localization workset' {
         Get-Command Test-LuaTableFieldAssignment -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
     }
 
-    It 'UnitT11_OnlyChangesLuaStringTokens: <label>' -ForEach @(
+    # Scenario: An approved expression changes Lua tokens, game references, format arguments, or ordinary text.
+    # Purpose: Allow literal translation while protecting runtime references and format arguments.
+    It 'UnitT11_OnlyChangesUnprotectedLuaStringContent: <label>' -ForEach @(
         @{ label = 'added function call'; source = '"a"'; target = '"a" .. example.call("x") .. "b"'; expected = $false }
         @{ label = 'added Localize call'; source = '"a"'; target = '"a" .. Localize("key")'; expected = $false }
         @{ label = 'removed concatenation'; source = '"a" .. "b"'; target = '"c"'; expected = $false }
@@ -64,7 +66,20 @@ Describe 'Schema 15 localization workset' {
         @{ label = 'moved string with the same non-string sequence'; source = 'f "a" .. x'; target = 'f .. x "甲"'; expected = $false }
         @{ label = 'string replacement'; source = '"a" .. x'; target = '"甲" .. x'; expected = $true }
         @{ label = 'plain long string replacement'; source = '[[English]]'; target = '"譯文"'; expected = $true }
-        @{ label = 'changed Localize key'; source = 'Localize("key")'; target = 'Localize("other")'; expected = $true }
+        @{ label = 'changed Localize key'; source = 'Localize("key")'; target = 'Localize("other")'; expected = $false }
+        @{ label = 'same Localize key with different quotes'; source = 'Localize("loc_key")'; target = "Localize('loc_key')"; expected = $true }
+        @{ label = 'changed composed Localize key'; source = 'Localize("loc_key") .. ": %s"'; target = 'Localize("loc_other") .. ": %s"'; expected = $false }
+        @{ label = 'changed format type'; source = 'Localize("loc_key") .. ": %s"'; target = 'Localize("loc_key") .. ": %d"'; expected = $false }
+        @{ label = 'reordered format arguments'; source = '"Run: %s %d"'; target = '"執行：%d %s"'; expected = $false }
+        @{ label = 'changed escaped format'; source = '"\x25s"'; target = '"%d"'; expected = $false }
+        @{ label = 'same format arguments in a literal chain'; source = 'format(("a %s" .. " b %d"), name, count)'; target = 'format(("甲" .. " %s %d"), name, count)'; expected = $true }
+        @{ label = 'format arguments move into a parenthesized literal'; source = 'format("a %s" .. (" b %d"), name, count)'; target = 'format("甲" .. (" %s %d"), name, count)'; expected = $true }
+        @{ label = 'format arguments reorder in a parenthesized literal'; source = 'format("a %s" .. (" b %d"), name, count)'; target = 'format("甲" .. (" %d %s"), name, count)'; expected = $false }
+        @{ label = 'format arguments move to a value argument'; source = 'string.format("a %s" .. (" b %d"), "name", count)'; target = 'string.format("甲" .. (" %s"), "name %d", count)'; expected = $false }
+        @{ label = 'format arguments stay within a parenthesized receiver'; source = '(("a %s") .. " b %d"):format(name, count)'; target = '(("甲") .. " %s %d"):format(name, count)'; expected = $true }
+        @{ label = 'format arguments stay within a nested format call'; source = 'format(format("a %s", name) .. (" b %d"), count)'; target = 'format(format("甲", name) .. (" %s %d"), count)'; expected = $false }
+        @{ label = 'non-format call keeps format arguments in their literal'; source = 'other.format("a %s" .. " b %d", name, count)'; target = 'other.format("甲" .. " %s %d", name, count)'; expected = $false }
+        @{ label = 'format moves arguments between calls'; source = 'format("%s", name) .. format("%d", count)'; target = 'format("%d", name) .. format("%s", count)'; expected = $false }
         @{ label = 'literal quoting'; source = '"English"'; target = '[=[譯文]=]'; expected = $true }
         @{ label = 'format string'; source = 'string.format("%s old", x)'; target = "string.format('%s 新', x)"; expected = $true }
     ) {
@@ -850,9 +865,9 @@ return {
             Should -Throw '*reparse*'
     }
 
-    # Scenario: Entries use direct or composed game Localize calls, with either neutral separators or literal content.
-    # Purpose: Skip redundant zh-tw authoring when all visible text is locale-resolved, while translating compositions that add actual text.
-    It 'InterT35_SkipsContentlessLocalizeSourcesButStillTranslatesContentfulExpressions' {
+    # Scenario: Uptime's Localize alias precedes direct, punctuation and format calls, alongside SoloPlay's format and a preserved opaque expression.
+    # Purpose: Avoid redundant zh-tw fields and verify a byte-preserved expression through Apply and Receipt.
+    It 'InterT35_ClassifiesGameLocalizedFormatsAndPreservesOpaqueExpressions' {
         $repository = Join-Path $TestDrive 'direct-localize-repo'
         $oldModRoot = Join-Path $repository 'mods/ExampleMod'
         New-Item -ItemType Directory -Path $oldModRoot -Force | Out-Null
@@ -878,16 +893,33 @@ return {
         $staging = Join-Path $runRoot 'staging/localization-workset-input/ExampleMod'
         New-Item -ItemType Directory -Path $staging -Force | Out-Null
         $newPath = Join-Path $staging 'ExampleMod_localization.lua'
-        @'
+        $directKeys = @(1..28 | ForEach-Object { "uptime_direct_$_" })
+        $directEntries = $directKeys | ForEach-Object { '    {0} = {{ en = Localize("loc_confirm") }},' -f $_ }
+        $newLua = @'
+local mod = get_mod("uptime"); if not mod then return end
+local Localize = Localize
 return {
     existing_localized = { en = Localize("loc_social_menu_leave_party") },
     existing_translated = { en = Localize("loc_social_menu_leave_party") },
     new_localized = { en = Localize("loc_item_type_end_of_round") },
     contentless_composed = { en = Localize("loc_weapon_special_defensive_stance") .. " - " .. Localize("loc_weapon_family_ogryn_powermaul_slabshield_p1_m1") },
     parenthesized_contentless = { en = (Localize("loc_weapon_special_defensive_stance") .. " / " .. Localize("loc_weapon_family_ogryn_powermaul_slabshield_p1_m1")) },
-    contentful_composed = { en = Localize("loc_social_menu_leave_party") .. " now" }
+    loc_track_damage_view_and_tactical = { en = Localize("loc_achievement_mission_scripture_recovery_name") .. " + " .. Localize("loc_keyboard_input_tab") },
+    loc_track_damage_view_end = { en = Localize("loc_achievement_mission_scripture_recovery_name") .. " + " .. Localize("loc_hud_presence_end_of_round") },
+    loc_track_damage_view_tactical_end = { en = Localize("loc_achievement_mission_scripture_recovery_name") .. " + " .. Localize("loc_keyboard_input_tab") .. " + " .. Localize("loc_hud_presence_end_of_round") },
+    end_view_scoreboard_position = { en = Localize("loc_hud_presence_end_of_round") .. ": " .. Localize("loc_setting_com_wheel_tap_ping") },
+    mission_duration = { en = Localize("loc_interface_setting_chat_bubbles_lifetime_multiplier") ..
+        Localize("loc_hud_presence_mission") .. " %s - " .. Localize("loc_keybind_category_combat") .. " %s (%s)" },
+    loc_havoc_rank = { en = Localize("loc_havoc_name") .. " %d" },
+    format_expedition = { en = Localize("loc_zone_expeditions") .. ": %s" },
+    contentful_composed = { en = Localize("loc_social_menu_leave_party") .. " now" },
+    opaque = { en = Localize("loc_zone_expeditions") .. helper(" Expedition: %s"), ["zh-tw"] = helper("上游譯文") },
+    DIRECT_ENTRIES
 }
-'@ | Set-Content -LiteralPath $newPath -NoNewline
+'@
+        $newLua = $newLua.Replace("`r`n", "`n")
+        $newLua.Replace('    DIRECT_ENTRIES', ($directEntries -join "`n")) |
+            Set-Content -LiteralPath $newPath -NoNewline
         $rawNewPath = Join-Path $runRoot 'review-artifacts/new.lua'
         New-Item -ItemType Directory -Path (Split-Path -Parent $rawNewPath) -Force | Out-Null
         [IO.File]::WriteAllBytes($rawNewPath, [IO.File]::ReadAllBytes($newPath))
@@ -898,7 +930,11 @@ return {
                 -StagingModPath $staging -OutputPath $outputPath -SourceId 'example' -PassThru).result |
             Should -Be 'passed'
         $workset = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
-        foreach ($key in @('existing_localized', 'new_localized', 'contentless_composed', 'parenthesized_contentless')) {
+        $localizedKeys = $directKeys + @('existing_localized', 'new_localized', 'contentless_composed',
+            'parenthesized_contentless', 'loc_track_damage_view_and_tactical', 'loc_track_damage_view_end',
+            'loc_track_damage_view_tactical_end', 'end_view_scoreboard_position', 'mission_duration',
+            'loc_havoc_rank', 'format_expedition')
+        foreach ($key in $localizedKeys) {
             $unit = @($workset.units | Where-Object key -eq $key)[0]
             $unit.changeType | Should -Be 'localized_source'
             $unit.action | Should -Be 'NONE'
@@ -911,20 +947,33 @@ return {
         $composed = @($workset.units | Where-Object key -eq 'contentful_composed')[0]
         $composed.changeType | Should -Be 'missing_zh_tw'
         $composed.action | Should -Be 'AI_REQUIRED'
+        $opaque = @($workset.units | Where-Object key -eq 'opaque')[0]
+        $opaque.action | Should -Be 'AI_REQUIRED'
+        $opaque.reviewStatus = 'preserved'
         $composed.reviewStatus = 'approved'
+        $composed.suggestedZhTwExpression = 'Localize("loc_other") .. " 現在"'
+        $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $outputPath -NoNewline
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru } |
+            Should -Throw '*token structure differs*'
         $composed.suggestedZhTwExpression = 'Localize("loc_social_menu_leave_party") .. " 現在"'
+        $opaque.suggestedZhTwExpression = 'helper("不能在保留處置中改寫")'
+        $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $outputPath -NoNewline
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru } |
+            Should -Throw '*not approved*'
+        $opaque.suggestedZhTwExpression = $null
         $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $outputPath -NoNewline
 
         (& (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $outputPath -PassThru).result | Should -Be 'passed'
         Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
         $applied = Get-LuaLocalizationDocument -Path $newPath -SourceId 'example'
-        foreach ($key in @('existing_localized', 'new_localized', 'contentless_composed', 'parenthesized_contentless')) {
+        foreach ($key in $localizedKeys) {
             (@($applied.units | Where-Object key -eq $key)[0]).zhTwExpression | Should -BeNullOrEmpty
         }
         (@($applied.units | Where-Object key -eq 'existing_translated')[0]).zhTwExpression.raw |
             Should -Be '"保留既有翻譯"'
         (@($applied.units | Where-Object key -eq 'contentful_composed')[0]).zhTwExpression.raw |
             Should -Be 'Localize("loc_social_menu_leave_party") .. " 現在"'
+        (@($applied.units | Where-Object key -eq 'opaque')[0]).zhTwExpression.raw | Should -Be 'helper("上游譯文")'
         (& (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') `
                 -WorksetPath $outputPath -NewPath $rawNewPath -MergedPath $newPath `
                 -RepositoryRoot $repository -ExpectedBaseOid $baseOid -ExpectedModRelativePath 'mods/ExampleMod' -PassThru).result |
