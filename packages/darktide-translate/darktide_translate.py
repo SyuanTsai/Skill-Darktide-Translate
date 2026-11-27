@@ -20,7 +20,7 @@ from claude_runner.cache import Cache
 from claude_runner.client import Client, FatalApiError
 from claude_runner.state import State, StateMismatch
 
-from checks import FORMAT, MARKUP, Luac, strip_unexpected_outer_quotes, validate
+from checks import FORMAT, MARKUP, Luac, is_icon_only, strip_unexpected_outer_quotes, validate
 from glossary import Glossary
 from lua_template import ComplexExpression, Expression, Template, decode_string, token_shape, tokenize
 from rules import ASSETS_RELATIVE, MODES, load_config, load_rules
@@ -232,6 +232,13 @@ def prepare(workset, state, cache, binding, glossary, luac):
         except ComplexExpression:
             preserved = preserve_expression(unit, identity[0] or "", luac)
             ready[unit_id] = ("preserved", preserved) if preserved else ("invalid_lua_expression", None)
+            continue
+        if is_icon_only(template):
+            if luac.accepts(template.raw):
+                ready[unit_id] = ("icon_only", {"segments": template.segments, "expression": template.raw,
+                                               "unknownTerms": [], "warnings": []})
+            else:
+                ready[unit_id] = ("invalid_lua_expression", None)
             continue
         templates[unit_id], identities[unit_id] = template, identity
         if record.get("status") == "approved":

@@ -400,6 +400,65 @@ def test_InterT36_opaque_lua_expression_is_preserved(job, existing):
                                       "reason": "complex_expression", "adoption": "preserved_expression"}]
 
 
+# Scenario: Five synthetic icon-only values have empty zh-tw fields.
+# Purpose: Apply the exact source Lua without sending icon-only units to the translator.
+def test_InterT37_icon_only_values_are_applied_locally(job):
+    sources = ["' \ue000 '", '"\ue001\ue001"', '"\U000f0000"', '"\U0010fffd"',
+               r'(" " .. "\u{E002}") .. [[ ]]']
+    job.doc["units"].clear()
+    for index, source in enumerate(sources):
+        job.add(index, source)
+        job.doc["units"][-1]["new"]["zhTwExpression"] = {"raw": '""'}
+    job.save()
+    transport = FakeTransport([])
+
+    assert job.run(transport) == 0
+    assert transport.requests == []
+    assert read(job.summary)["apiItemCount"] == 0
+    assert read(job.summary)["approvedCount"] == 5
+    units = read(job.workset)["units"]
+    assert [unit["reviewStatus"] for unit in units] == ["approved"] * 5
+    assert [unit["suggestedZhTwExpression"] for unit in units] == sources
+
+    job.save()
+    assert job.run(FakeTransport([])) == 0
+    assert [unit["suggestedZhTwExpression"] for unit in read(job.workset)["units"]] == sources
+
+
+# Scenario: A translator omits 44 synthetic glyph occurrences from a mixed label.
+# Purpose: Give structural feedback before review and write back only the corrected label.
+def test_InterT38_mixed_label_is_corrected_before_review_and_writeback(job):
+    glyphs = "\ue000\ue001" * 22
+    unit = job.doc["units"][0]
+    unit["new"]["sourceExpression"]["raw"] = f'"Label {glyphs}"'
+    job.save()
+    corrected = f"標籤 {glyphs}"
+    transport = FakeTransport([scripted("標籤"), scripted(corrected), scripted()])
+
+    assert job.run(transport) == 0
+    assert [request.role for request in transport.requests] == ["translator", "translator", "reviewer"]
+    assert transport.requests[1].user["units"][0]["feedback"] == ["glyph_mismatch"]
+    assert transport.requests[2].user["units"][0]["translation"] == {"s1": corrected}
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == f'"{corrected}"'
+
+
+# Scenario: A lookup returns blank and the current zh-tw is missing the source glyph.
+# Purpose: Reject that fallback and retain the previous glyph-compatible zh-tw.
+def test_InterT39_lookup_fallback_requires_glyph_compatibility(job):
+    unit = job.doc["units"][0]
+    unit["new"]["sourceExpression"]["raw"] = '"Label \ue000"'
+    unit["new"]["zhTwExpression"] = {"raw": '"標籤"'}
+    previous = '"舊標籤 \ue000"'
+    unit["old"]["zhTwExpression"] = {"raw": previous}
+    job.save()
+
+    assert job.run(FakeTransport([scripted("", lookup=True, unknown=["Label"])])) == 0
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == previous
+    term_review, = read(job.summary)["termReviews"]
+    assert term_review["adoption"] == "existing_zh_tw"
+    assert term_review["translation"] == previous
+
+
 # Scenario: Source Lua is invalid, or a candidate still violates a required structural/semantic check.
 # Purpose: Leave invalid items pending, including unsafe candidates that also carried a lookup flag.
 @pytest.mark.parametrize(("reason", "replies"), [
