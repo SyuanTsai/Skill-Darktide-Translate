@@ -95,21 +95,57 @@ end
         @($document.units | Where-Object key -CEQ 'fire_red').Count | Should -Be 0
     }
 
-    # Scenario: The overlay references an unestablished key or would replace a preexisting literal translation.
-    # Purpose: Keep ambiguous overlays blocked without changing accepted earlier source expression records.
-    It 'UnitT40_RejectsConflictingCuratedOverlay: <Case>' -ForEach @(
-        @{ Case = 'unknown target'; Prefix = 'unknown'; Seed = $false }
-        @{ Case = 'already localized target'; Prefix = 'fire'; Seed = $true }
-    ) {
-        $source = Get-TestColorLoop
-        if ($Seed) { $source = $source.Replace('["zh-cn"] = "红"', '["zh-cn"] = "红", ["zh-tw"] = "舊"') }
-        $overlay = 'for _, prefix in ipairs({ "' + $Prefix + '" }) do output[prefix .. "_red"]["zh-tw"] = "新" end'
-        $source = @($source, $overlay, 'return output') -join [char]10
+    # Scenario: A literal zh-tw overlay targets a key absent from the returned accumulator.
+    # Purpose: Require an earlier proven source table for every overlay write.
+    It 'UnitT40_BlocksCuratedOverlayWithNoPriorTarget' {
+        $source = @'
+local output = {}
+for _, prefix in ipairs({ "fire" }) do
+    output[prefix .. "_red"] = { en = "Red" }
+end
+for _, prefix in ipairs({ "unknown" }) do
+    output[prefix .. "_red"]["zh-tw"] = "新"
+end
+return output
+'@
 
         $document = Read-TestLiteralLoop $source
 
-        @($document.units | Where-Object blockedReason -CEQ 'generated_literal_overlay_target_unproven').Count | Should -Be 1
-        if ($Seed) { ($document.units | Where-Object key -CEQ 'fire_red').zhTwExpression.raw | Should -BeExactly '"舊"' }
+        $blocked = @($document.units | Where-Object { $_.containerPath -ceq '$generated' -and $_.key -ceq 'unknown_red' })
+        $blocked.Count | Should -Be 1
+        $blocked[0].blockedReason | Should -BeExactly 'generated_literal_overlay_target_unproven'
+    }
+
+    # Scenario: A literal overlay would replace zh-tw supplied by an earlier source table.
+    # Purpose: Verify the original root row and the conflict record independently.
+    It 'UnitT41_KeepsTheLocalizedRowWhenAnOverlayConflicts' {
+        $base = @'
+local output = {}
+local prefixes = { "fire", "blight" }
+for _, prefix in ipairs(prefixes) do
+    output[prefix .. "_red"] = { en = "Red", ["zh-cn"] = "红", ["zh-tw"] = "舊" }
+    output[prefix .. "_alpha"] = { en = "Opacity", ["zh-cn"] = "透明度" }
+end
+'@
+        $overlay = @'
+for _, prefix in ipairs({ "fire" }) do
+    output[prefix .. "_red"]["zh-tw"] = "新"
+end
+'@
+        $baseline = Read-TestLiteralLoop (@($base, 'return output') -join [char]10)
+        $before = @($baseline.units | Where-Object { $_.containerPath -ceq '$' -and $_.key -ceq 'fire_red' })
+        $before.Count | Should -Be 1
+        $before[0].zhTwExpression.raw | Should -BeExactly '"舊"'
+
+        $document = Read-TestLiteralLoop (@($base, $overlay, 'return output') -join [char]10)
+
+        $rows = @($document.units | Where-Object { $_.containerPath -ceq '$' -and $_.key -ceq 'fire_red' })
+        $blocked = @($document.units | Where-Object { $_.containerPath -ceq '$generated' -and $_.key -ceq 'fire_red' })
+        $rows.Count | Should -Be 1
+        $rows[0].blockedReason | Should -BeNullOrEmpty
+        $rows[0].zhTwExpression.raw | Should -BeExactly $before[0].zhTwExpression.raw
+        $blocked.Count | Should -Be 1
+        $blocked[0].blockedReason | Should -BeExactly 'generated_literal_overlay_target_unproven'
     }
 
     # Scenario: A single overlay expression targets keys established by distinct source table spans.
