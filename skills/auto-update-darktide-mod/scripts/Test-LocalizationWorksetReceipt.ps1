@@ -160,6 +160,8 @@ function Get-UnitSnapshotJson {
         zhTwExpression = Get-ExpressionSnapshot -Expression $Unit.zhTwExpression
         tableOpenByte = $Unit.tableOpenByte; tableCloseByte = $Unit.tableCloseByte
     }
+    if ($Unit.Contains('positionalLocale')) { $snapshot.positionalLocale = $Unit.positionalLocale }
+    if ($Unit.Contains('generatedBinding')) { $snapshot.generatedBinding = $Unit.generatedBinding }
     $snapshot | ConvertTo-Json -Depth 20 -Compress
 }
 
@@ -384,8 +386,12 @@ if ((Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.new.sha256 -or
     throw 'Raw NEW localization evidence differs from the workset input.'
 }
 $before = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newFull -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
+if ($workset.new.Contains('zhTwSidecar') -or $before.Contains('zhTwSidecarPath')) {
+    throw 'Localization sidecar evidence requires separate review before receipt verification.'
+}
 $beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
+$sharedOffsets = Get-LocalizationWorksetSharedTableOffsets -Units @($before.units)
 $oldDocument = $null
 $oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 if ($bindingValueCount -eq 3) {
@@ -436,6 +442,11 @@ foreach ($unit in @($workset.units)) {
         throw "Localization workset unit identity differs from independently parsed bytes: $unitId"
     }
     $classification = Get-ExpectedClassification -OldUnit $parsedOld -NewUnit $parsedNew
+    $shared = $null -ne $parsedNew -and $null -ne $parsedNew.tableOpenByte -and $sharedOffsets.Contains([long]$parsedNew.tableOpenByte)
+    $writeBlockReason = Get-LocalizationWorksetWriteBlockReason -Action $classification.action -OldUnit $parsedOld -NewUnit $parsedNew -SharedNewTable:$shared
+    if ($writeBlockReason) {
+        throw "Localization receipt includes a generated unit requiring separate review: $unitId ($writeBlockReason)"
+    }
     if ([string]$unit.changeType -cne [string]$classification.changeType -or [string]$unit.action -cne [string]$classification.action -or
         [string]$unit.blockedReason -cne [string]$classification.blockedReason) {
         throw "Localization workset classification or action differs from OLD and NEW bytes: $unitId"

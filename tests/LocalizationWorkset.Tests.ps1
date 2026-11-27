@@ -8,6 +8,33 @@ Describe 'Schema 15 localization workset' {
         $scriptRoot = Join-Path $repoRoot $layout.SkillPath.Replace('/', [IO.Path]::DirectorySeparatorChar)
         $scriptRoot = Join-Path $scriptRoot 'scripts'
         $script:skillSourcePinPath = New-TestSkillSourcePin -SkillRoot (Split-Path -Parent $scriptRoot) -OutputPath (Join-Path $TestDrive 'skill-source-pin.json')
+        function Get-TestPositionalGeneratorLua {
+            @'
+local output = {}
+local locale_order = {"zh-cn", "en", "zh-tw"}
+local function generate_translation(t,prefix,suffix,lids)
+    if type(t) ~= "table" then return end
+    local prefix = prefix or ""
+    local suffix = suffix or ""
+    local full_id = ""
+    for id,text in pairs(t) do
+        full_id = prefix..id..suffix
+        output[full_id] = output[full_id] or {}
+        if type(text) == "table" and type(lids) == "table" and #lids == #text then
+            for i = 1,#lids do
+                output[full_id][lids[i]] = text[i]
+            end
+        elseif type(text) == "string" and type(lids) == "string" then
+            output[full_id][lids] = text
+        end
+    end
+end
+local unused = { fake = {"未使用", "Unused", "未使用"} }
+local items = { ["direct-key"] = {"简体", "English", "繁體"}, short = {"短", "Short"} }
+generate_translation(items, "pre_", nil, locale_order)
+return output
+'@
+        }
         function Get-TestImmutableWorksetContractSha256 {
             param($Workset)
             $unitContracts = @($Workset.units | ForEach-Object {
@@ -289,6 +316,240 @@ local side_effect = os.time()
         $generator | Should -Not -Match 'Get-LuaLocalizationDocument\s+-Path\s+\$newPath'
         $applier | Should -Match '(?s)\$currentBytes = Read-FileBytesWithHeartbeat -Path \$newPath.*\$currentSha = Get-Sha256Bytes -Bytes \$currentBytes.*\$originalBytes = \$currentBytes'
         $applier | Should -Not -Match '\$currentSha = Get-FileSha256 -Path \$newPath'
+    }
+
+    # Scenario: A literal locale list and an invoked translation generator populate a returned accumulator.
+    # Purpose: Pair a flattened output key with the original UTF-8 translations and exclude unrelated inputs.
+    It 'UnitT28_ResolvesPositionalGeneratorOutputKeysAndByteSpans' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = Get-TestPositionalGeneratorLua
+        $bytes = [Text.Encoding]::UTF8.GetBytes($lua)
+        $document = Get-LuaLocalizationDocument -Bytes $bytes -SourceId 'generated'
+
+        @($document.units).Count | Should -Be 2
+        $direct = $document.units | Where-Object key -CEQ 'pre_direct-key'
+        $direct.containerPath | Should -BeExactly '$'
+        $direct.sourceExpression.raw | Should -BeExactly '"English"'
+        $span = $direct.zhTwExpression
+        [Text.Encoding]::UTF8.GetString($bytes, $span.startByte, $span.lengthByte) | Should -BeExactly '"繁體"'
+        ($document.units | Where-Object key -CEQ 'pre_short').blockedReason | Should -BeExactly 'generated_locale_length_mismatch'
+    }
+
+    # Scenario: A local binding shadows one Lua primitive required by the positional helper.
+    # Purpose: Block a helper whose source body matches but whose runtime key generation cannot be proven.
+    It 'UnitT28_BlocksPositionalGeneratorWithShadowedPrimitive: <Primitive>' -ForEach @(
+        @{ Primitive = 'pairs'; Prelude = 'local pairs = function() return next, {} end' }
+        @{ Primitive = 'type'; Prelude = 'local type = function() return "string" end' }
+    ) {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = $Prelude + [Environment]::NewLine + (Get-TestPositionalGeneratorLua)
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+
+        @($document.units | Where-Object { -not $_.blockedReason }).Count | Should -Be 0
+        @($document.units | Where-Object blockedReason -CEQ 'generated_helper_binding_unproven').Count | Should -BeGreaterThan 0
+    }
+
+    # Scenario: A finite numeric loop writes a shared localization table with a literal format.
+    # Purpose: Give every real output key a stable identity while retaining the shared physical byte range.
+    It 'UnitT28_ExpandsFiniteFormattedAccumulatorKeys' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = @'
+local output = {}
+local unrelated = {}
+for i = 1,4 do
+    unrelated[string.format("ignore_%s",i)] = { en = "Ignored" }
+end
+for i = 1,4 do
+    output[string.format("slot_%s",i)] = {
+        en = "Slot: "..tostring(i),
+        ["zh-tw"] = "欄位："..tostring(i),
+    }
+end
+return output
+'@
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+
+        ($document.units.key -join ',') | Should -BeExactly 'slot_1,slot_2,slot_3,slot_4'
+        @($document.units.tableCloseByte | Sort-Object -Unique).Count | Should -Be 1
+        @($document.units | Where-Object blockedReason).Count | Should -Be 0
+    }
+
+    # Scenario: Direct assignments and finite literal helper calls extend a returned localization table.
+    # Purpose: Protect their real output keys and surface a runtime-only generator as blocked evidence.
+    It 'UnitT28_ResolvesLiteralAssignmentsAndFunctionTemplates' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = @'
+local output = { original = { en = "Original" } }
+local function label(target, suffix)
+    target["font_"..suffix] = { en = "Font", ["zh-tw"] = "字體" }
+end
+label(output, "light")
+label(output, "regular")
+output.warning = { en = "Warning", ["zh-tw"] = "警告" }
+output["more-warning"] = { en = "More", ["zh-tw"] = "更多" }
+for _, color in ipairs(Color.list) do
+    output[color] = { en = color }
+end
+return output
+'@
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+
+        $keys = @($document.units | Where-Object { -not $_.blockedReason } | ForEach-Object { $_.key })
+        $keys -join ',' | Should -BeExactly 'original,font_light,font_regular,warning,more-warning'
+        @($document.units | Where-Object blockedReason).Count | Should -Be 1
+        ($document.units | Where-Object blockedReason).blockedReason | Should -BeExactly 'unsupported_generated_localization_key'
+    }
+
+
+    # Scenario: Several emitted keys share the same physical Lua table or use positional languages.
+    # Purpose: Admit a byte-identical preserved expression and prevent unsafe edits through the current applier.
+    It 'UnitT28_BlocksEditsToSharedOrPositionalLanguageFields' {
+        Import-Module (Join-Path $scriptRoot 'LocalizationWorksetContract.psm1') -Force
+        $ordinary = [ordered]@{ key = 'slot_1' }
+        $positional = [ordered]@{ key = 'position'; positionalLocale = $true }
+        Get-LocalizationWorksetWriteBlockReason -Action 'NONE' -NewUnit $ordinary -SharedNewTable | Should -BeNullOrEmpty
+        Get-LocalizationWorksetWriteBlockReason -Action 'AI_REQUIRED' -NewUnit $ordinary -SharedNewTable |
+            Should -BeExactly 'generated_shared_translation_span_requires_review'
+        Get-LocalizationWorksetWriteBlockReason -Action 'RESTORE_OLD_ZH_TW' -NewUnit $positional |
+            Should -BeExactly 'generated_positional_locale_requires_review'
+
+        $oldShared = [ordered]@{ sourceExpression = @{raw = '"Slot" .. text and label'}; zhTwExpression = @{raw = '"欄位" .. text and label'} }
+        $newShared = [ordered]@{ sourceExpression = @{raw = '"Slot" .. textandlabel'}; zhTwExpression = @{raw = '"欄位" .. textandlabel'} }
+        Get-LocalizationWorksetWriteBlockReason -Action 'NONE' -OldUnit $oldShared -NewUnit $newShared -SharedNewTable |
+            Should -BeExactly 'generated_shared_translation_span_requires_review'
+    }
+
+    # Scenario: A zh-tw sidecar returns literal values in groups passed to the proven generator.
+    # Purpose: Resolve the sidecar's keys using the loader prefixes and reject ambiguous or dynamic values.
+    It 'UnitT28_ReadsOnlyLiteralZhTwSidecarValues' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $valid = 'return { talents = { ["some-talent"] = "原文" }, notable = { example = "重點" } }'
+        $ambiguous = 'return { talents = { duplicate = "舊", duplicate = get_value() } }'
+
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($valid)) -SourceId 'sidecar' -ZhTwSidecar
+        $document.blockedReason | Should -BeNullOrEmpty
+        $document.values['def_some-talent'] | Should -BeExactly '原文'
+        $document.values['highlight_example'] | Should -BeExactly '重點'
+        $unproven = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($ambiguous)) -SourceId 'sidecar' -ZhTwSidecar
+        $unproven.blockedReason | Should -BeExactly 'generated_sidecar_structure_unproven'
+    }
+
+    # Scenario: A literal assignment overrides an existing key with a table without any recognized language field.
+    # Purpose: Keep the old translation visible as blocked evidence when a later write could remove it.
+    It 'UnitT28_BlocksKnownKeysWithUnprovenReplacementTables' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = 'local output = { key = { en = "Old", ["zh-tw"] = "舊" } } output["key"] = { unknown = "Unknown" } return output'
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+
+        @($document.units | Where-Object blockedReason).Count | Should -Be 2
+        $document.units[0].blockedReason | Should -BeExactly 'duplicate_generated_localization_key'
+        $document.units[1].blockedReason | Should -BeExactly 'generated_output_language_fields_unproven'
+    }
+
+    # Scenario: A bracket assignment rebinds the string formatter before the numeric generator runs.
+    # Purpose: Require proof of the formatter before expanding any generated key.
+    It 'UnitT28_BlocksFormattedKeysWhenTheFormatterMayBeRebound' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = @'
+local output = {}
+string["format"] = replacement
+for i = 1,4 do
+    output[string.format("slot_%s",i)] = { en = "Slot", ["zh-tw"] = "欄位" }
+end
+return output
+'@
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+
+        @($document.units).Count | Should -Be 1
+        $document.units[0].blockedReason | Should -BeExactly 'unsupported_generated_localization_key'
+    }
+
+    # Scenario: A helper and its call change together to keep the same key while changing the bound translation value.
+    # Purpose: Require evidence of the effective binding before preserving a generated expression.
+    It 'UnitT28_BlocksChangedBindingsForTheSameGeneratedKey' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        Import-Module (Join-Path $scriptRoot 'LocalizationWorksetContract.psm1') -Force
+        $lua = @'
+local output = {}
+local function label(target, part)
+    target["slot_"..part] = { en = "Slot: "..part, ["zh-tw"] = "欄位："..part }
+end
+label(output, "2")
+return output
+'@
+        $old = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+        $newLua = $lua.Replace('"slot_"', '"slot_2"').Replace('label(output, "2")', 'label(output, "")')
+        $new = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($newLua)) -SourceId 'generated'
+
+        $old.units[0].key | Should -BeExactly 'slot_2'
+        $new.units[0].key | Should -BeExactly 'slot_2'
+        $old.units[0].zhTwExpression.raw | Should -BeExactly $new.units[0].zhTwExpression.raw
+        Get-LocalizationWorksetWriteBlockReason -Action 'NONE' -OldUnit $old.units[0] -NewUnit $new.units[0] |
+            Should -BeExactly 'generated_binding_changed_requires_review'
+    }
+
+    # Scenario: A chunk can return before later assignments populate the named localization accumulator.
+    # Purpose: Keep assignments with unproven execution from being represented as actual emitted localization keys.
+    It 'UnitT28_BlocksGeneratedOutputAfterAnEarlyReturn' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = 'local output = {} if true then return output end output.slot = { en = "Never", ["zh-tw"] = "不會出現" } return output'
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+
+        @($document.units | Where-Object key -CEQ 'slot').Count | Should -Be 0
+        $document.units[0].blockedReason | Should -BeExactly 'generated_control_flow_unproven'
+    }
+
+    # Scenario: Other tables look like localization data or contain members named after the returned accumulator.
+    # Purpose: Restrict output records to the actual returned table and accept its explicit deferred initialization.
+    It 'UnitT28_ReadsOnlyTheReturnedNamedAccumulator: <Scenario>' -ForEach @(
+        @{ Scenario = 'unused localization-shaped table'; Lua = 'local output={}; local debug={unused={en="Debug"}}; output.live={en="Live"}; return output'; Key = 'live' }
+        @{ Scenario = 'unrelated field with the same name'; Lua = 'local unrelated={output={}}; local output={actual={en="A"}}; unrelated.output.helper={en="irrelevant"}; return output'; Key = 'actual' }
+        @{ Scenario = 'deferred initialization'; Lua = 'local output; output={}; output.actual={en="A"}; return output'; Key = 'actual' }
+    ) {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($Lua)) -SourceId 'generated'
+
+        @($document.units).Count | Should -Be 1
+        $document.units[0].key | Should -BeExactly $Key
+        $document.units[0].blockedReason | Should -BeNullOrEmpty
+    }
+
+    # Scenario: The returned accumulator is named like a local variable of the recognized positional helper.
+    # Purpose: Refuse a token-matching helper that writes through a shadowed binding.
+    It 'UnitT28_BlocksPositionalHelperWithAShadowedAccumulator' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = (Get-TestPositionalGeneratorLua).Replace('output', 'prefix')
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+
+        @($document.units | Where-Object { -not $_.blockedReason }).Count | Should -Be 0
+        @($document.units | Where-Object blockedReason -CEQ 'generated_helper_binding_unproven').Count | Should -BeGreaterThan 0
+    }
+
+    # Scenario: A goto can bypass an assignment before the named accumulator is returned.
+    # Purpose: Block named generators in chunks with control transfers the scanner cannot prove.
+    It 'UnitT28_BlocksGeneratedOutputWhenGotoCanSkipIt' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $lua = 'local output={}; goto finish; output.foo={en="English",["zh-tw"]="繁體"}; ::finish:: return output'
+        $document = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($lua)) -SourceId 'generated'
+
+        @($document.units | Where-Object key -CEQ 'foo').Count | Should -Be 0
+        $document.units[0].blockedReason | Should -BeExactly 'generated_control_flow_unproven'
+    }
+
+    # Scenario: An escaped binary value and a UTF-8 string collide under the scanner's legacy key display.
+    # Purpose: Preserve type-safe sidecar evidence without changing existing binary key identities.
+    It 'UnitT28_DoesNotTreatBinaryValuesAsSidecarText' {
+        Import-Module (Join-Path $scriptRoot 'LuaLocalizationScanner.psm1') -Force
+        $binary = 'return { talents = { sample = "\xff" } }'
+        $text = 'return { talents = { sample = "@bytes:ff" } }'
+        $binaryDoc = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($binary)) -SourceId 'sidecar' -ZhTwSidecar
+        $textDoc = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($text)) -SourceId 'sidecar' -ZhTwSidecar
+
+        $binaryDoc.blockedReason | Should -BeExactly 'generated_sidecar_literal_value_unproven'
+        $textDoc.values['def_sample'] | Should -BeExactly '@bytes:ff'
+        $main = (Get-TestPositionalGeneratorLua).Replace('"繁體"', '"\xff"')
+        $mainDoc = Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($main)) -SourceId 'generated'
+        ($mainDoc.units | Where-Object key -CEQ 'pre_direct-key').blockedReason | Should -BeExactly 'generated_positional_literal_value_unproven'
     }
 
     # Scenario: A canonical MOD directory contains an internal double dot that is part of its legal single-directory name.

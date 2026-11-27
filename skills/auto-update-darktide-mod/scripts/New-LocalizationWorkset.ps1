@@ -175,7 +175,7 @@ function Get-CanonicalExpression {
 }
 
 function New-UnitRecord {
-    param($OldUnit, $NewUnit)
+    param($OldUnit, $NewUnit, [switch] $SharedNewTable, $Sidecar)
     $identity = if ($null -ne $NewUnit) { $NewUnit } else { $OldUnit }
     $blockedReason = if ($null -ne $NewUnit -and -not [string]::IsNullOrWhiteSpace([string]$NewUnit.blockedReason)) { [string]$NewUnit.blockedReason }
         elseif ($null -ne $OldUnit -and -not [string]::IsNullOrWhiteSpace([string]$OldUnit.blockedReason)) { [string]$OldUnit.blockedReason }
@@ -195,6 +195,25 @@ function New-UnitRecord {
     elseif ($oldSource -ceq $newSource) { $changeType = 'zh_tw_only_changed'; $action = 'RESTORE_OLD_ZH_TW' }
     elseif ($oldZhTw -ceq $newZhTw) { $changeType = 'source_changed_translation_unchanged'; $action = 'AI_REQUIRED' }
     else { $changeType = 'source_and_translation_changed'; $action = 'AI_REQUIRED' }
+
+    $writeBlockReason = Get-LocalizationWorksetWriteBlockReason -Action $action -OldUnit $OldUnit -NewUnit $NewUnit -SharedNewTable:$SharedNewTable
+    if ($writeBlockReason) {
+        $blockedReason = $writeBlockReason
+        if ($null -ne $NewUnit -and $NewUnit['positionalLocale'] -and $null -eq $newZhTw) {
+            $sidecarValue = $null
+            if ($null -ne $Sidecar -and $null -ne $Sidecar.values -and $Sidecar.values.TryGetValue([string]$NewUnit.key, [ref]$sidecarValue)) {
+                if ($null -ne $OldUnit -and $OldUnit.Contains('positionalZhTwValue')) {
+                    if ($OldUnit.positionalZhTwValue -cne $sidecarValue) { $blockedReason = 'generated_sidecar_zh_tw_differs_from_old' }
+                    elseif ($oldSource -cne $newSource) { $blockedReason = 'generated_sidecar_preserves_old_zh_tw_with_changed_source' }
+                    else { $blockedReason = 'generated_zh_tw_preserved_in_sidecar' }
+                }
+                else { $blockedReason = 'generated_sidecar_zh_tw_without_old_positional_value' }
+            }
+            elseif ($null -ne $oldZhTw) { $blockedReason = 'generated_positional_zh_tw_missing' }
+        }
+        $changeType = 'blocked'
+        $action = 'BLOCKED'
+    }
 
     [ordered]@{
         unitId = $identity.unitId
@@ -333,14 +352,52 @@ if (@($oldDocument.units).Count -eq 0 -or @($newDocument.units).Count -eq 0) {
     return
 }
 
+# Keep sidecar evidence bound to the staging snapshot. The existing applier and
+# independent receipt verifier only support edits within the main file.
+$sidecar = $null
+$sidecarEvidence = $null
+if ($newDocument.Contains('zhTwSidecarPath')) {
+    $loaderPath = [string]$newDocument.zhTwSidecarPath
+    $mainPathWithinMod = [IO.Path]::GetRelativePath($stagingRoot, $newPath).Replace('\', '/')
+    $sidecarPathWithinMod = $mainPathWithinMod -creplace '_localization\.lua$', '_localization_zh-tw.lua'
+    $expectedLoaderPath = $modPathSegments[-1] + '/' + $sidecarPathWithinMod
+    $sidecarReason = if (-not $newDocument.zhTwSidecarLocaleBindingProven) { 'generated_sidecar_locale_binding_unproven' }
+        else { 'generated_sidecar_path_unproven' }
+    $sidecarEvidence = [ordered]@{ loaderPath = $loaderPath; blockedReason = $sidecarReason }
+    if ($newDocument.zhTwSidecarLocaleBindingProven -and $loaderPath -ceq $expectedLoaderPath) {
+        $sidecarPath = Assert-ContainedPath -Candidate (Join-Path $stagingRoot $sidecarPathWithinMod) -Root $stagingRoot
+        $sidecarEvidence = [ordered]@{ loaderPath = $loaderPath; path = $sidecarPath; blockedReason = 'generated_sidecar_missing' }
+        if (Test-Path -LiteralPath $sidecarPath -PathType Leaf) {
+            Assert-NoReparsePath -Path $sidecarPath -Root $stagingRoot
+            $sidecarBytes = Read-FileBytesWithHeartbeat -Path $sidecarPath
+            $sidecar = Get-LuaLocalizationDocument -Bytes $sidecarBytes -DisplayPath $sidecarPath -SourceId $sourceIdentity -ZhTwSidecar -HeartbeatAction $HeartbeatAction
+            $sidecarEvidence = [ordered]@{
+                loaderPath = $loaderPath; path = $sidecarPath; sha256 = $sidecar.sha256
+                size = $sidecar.size; blockedReason = $sidecar.blockedReason
+                keyCount = if ($null -ne $sidecar.values) { $sidecar.values.Count } else { 0 }
+                unpairedKeys = @()
+            }
+        }
+    }
+}
+
 $oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($oldDocument.units)) { $oldById[[string]$unit.unitId] = $unit }
 $newById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-foreach ($unit in @($newDocument.units)) { $newById[[string]$unit.unitId] = $unit }
+$newOutputKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$sharedOffsets = Get-LocalizationWorksetSharedTableOffsets -Units $newDocument.units
+foreach ($unit in @($newDocument.units)) {
+    $newById[[string]$unit.unitId] = $unit
+    if ($unit.containerPath -ceq '$') { $null = $newOutputKeys.Add([string]$unit.key) }
+}
+if ($null -ne $sidecar -and $null -ne $sidecar.values) {
+    $sidecarEvidence.unpairedKeys = @($sidecar.values.Keys | Where-Object { -not $newOutputKeys.Contains($_) } | Sort-Object -CaseSensitive)
+}
 $records = [Collections.Generic.List[object]]::new()
 foreach ($newUnit in @($newDocument.units)) {
     $oldUnit = if ($oldById.ContainsKey([string]$newUnit.unitId)) { $oldById[[string]$newUnit.unitId] } else { $null }
-    $records.Add((New-UnitRecord -OldUnit $oldUnit -NewUnit $newUnit))
+    $shared = $null -ne $newUnit.tableOpenByte -and $sharedOffsets.Contains([long]$newUnit.tableOpenByte)
+    $records.Add((New-UnitRecord -OldUnit $oldUnit -NewUnit $newUnit -SharedNewTable:$shared -Sidecar $sidecar))
 }
 foreach ($oldUnit in @($oldDocument.units)) {
     if (-not $newById.ContainsKey([string]$oldUnit.unitId)) { $records.Add((New-UnitRecord -OldUnit $oldUnit -NewUnit $null)) }
@@ -362,6 +419,7 @@ $workset = [ordered]@{
     counts = $counts
     units = @($records)
 }
+if ($null -ne $sidecarEvidence) { $workset.new.zhTwSidecar = $sidecarEvidence }
 if ($workset.generatorVersion -eq 2) {
     $workset.translationBinding = Get-LocalizationTranslationBinding `
         -SkillRoot (Split-Path -Parent $PSScriptRoot) -RepositoryRoot $repository -BaseOid $resolvedBaseOid `

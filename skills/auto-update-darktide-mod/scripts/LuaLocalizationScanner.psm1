@@ -224,7 +224,7 @@ function Test-IoDofileOnlyLoaderTokens {
 }
 
 function ConvertFrom-LuaKeyString {
-    param([string] $Literal)
+    param([string] $Literal, [switch] $RequireUtf8)
     if ($Literal.StartsWith('[', [StringComparison]::Ordinal)) {
         $longString = [regex]::Match($Literal, '^\[(=*)\[(.*)\]\1\]$', [Text.RegularExpressions.RegexOptions]::Singleline)
         if (-not $longString.Success) { throw 'Lua long-string key literal is malformed.' }
@@ -312,7 +312,10 @@ function ConvertFrom-LuaKeyString {
         }
     }
     try { $encoding.GetString($bytes.ToArray()) }
-    catch { '@bytes:' + [Convert]::ToHexString($bytes.ToArray()).ToLowerInvariant() }
+    catch {
+        if ($RequireUtf8) { throw }
+        '@bytes:' + [Convert]::ToHexString($bytes.ToArray()).ToLowerInvariant()
+    }
 }
 
 function Get-CanonicalTokenText {
@@ -553,7 +556,8 @@ function New-ExpressionRecord {
         [string] $Text,
         [object[]] $Tokens,
         [Collections.IDictionary] $Field,
-        [int] $BomLength
+        [int] $BomLength,
+        [switch] $KnownStringLiteral
     )
     $valueStart = [int]$Tokens[$Field.valueStartIndex].start
     $lastToken = $Tokens[$Field.valueEndIndex]
@@ -571,8 +575,8 @@ function New-ExpressionRecord {
     [ordered]@{
         raw = $Text.Substring($valueStart, $valueEnd - $valueStart)
         canonical = Get-CanonicalTokenText -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
-        isDirectLocalizeCall = Test-DirectLocalizeCall -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
-        isFullyLocaleResolvedExpression = Test-FullyLocaleResolvedExpression -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex
+        isDirectLocalizeCall = -not $KnownStringLiteral -and (Test-DirectLocalizeCall -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex)
+        isFullyLocaleResolvedExpression = -not $KnownStringLiteral -and (Test-FullyLocaleResolvedExpression -Tokens $Tokens -StartIndex $Field.valueStartIndex -EndIndex $Field.valueEndIndex)
         startByte = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex $valueStart -BomLength $BomLength
         lengthByte = Get-LuaUtf8ByteCount -Text $Text -StartIndex $valueStart -CharacterCount ($valueEnd - $valueStart)
         fieldStartByte = ConvertTo-Utf8ByteOffset -Text $Text -CharacterIndex $fieldStart -BomLength $BomLength
@@ -694,7 +698,7 @@ function Read-LuaTable {
         if ($sourceFields.Count -gt 1 -or $zhTwFields.Count -gt 1) {
             $Units.Add([pscustomobject]@{
                 sourceId = $SourceId; containerPath = $ContainerPath; key = $AssignedKey; blockedReason = 'duplicate_language_field'
-                sourceExpression = $null; zhTwExpression = $null
+                sourceExpression = $null; zhTwExpression = $null; tableOpenByte = $null; tableCloseByte = $null
             })
         }
         elseif ($sourceFields.Count -eq 1 -or $zhTwFields.Count -eq 1) {
@@ -714,6 +718,761 @@ function Read-LuaTable {
     $closeIndex
 }
 
+# Track statement blocks outside table constructors, indices, and argument lists.
+# The supported generators each have an explicit token shape checked against these boundaries.
+function Get-LuaStatementLayout {
+    param([object[]] $Tokens)
+    $depths = [Collections.Generic.Dictionary[int, int]]::new()
+    $closes = [Collections.Generic.Dictionary[int, int]]::new()
+    $blocks = [Collections.Generic.Stack[int]]::new()
+    $outerReturns = [Collections.Generic.List[int]]::new()
+    $functionDepth = 0
+    $outerGotoOrLabel = $false
+    for ($index = 0; $index -lt $Tokens.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        $depths[$index] = $blocks.Count
+        switch -CaseSensitive ($Tokens[$index].text) {
+            '(' { $index = Get-MatchingTokenIndex $Tokens $index '(' ')' }
+            '[' { $index = Get-MatchingTokenIndex $Tokens $index '[' ']' }
+            '{' { $index = Get-MatchingTokenIndex $Tokens $index '{' '}' }
+            'function' { $blocks.Push($index); $functionDepth++ }
+            { $_ -cin @('if', 'do', 'repeat') } { $blocks.Push($index) }
+            'return' { if ($functionDepth -eq 0) { $outerReturns.Add($index) } }
+            { $_ -cin @('goto', '::') } { if ($functionDepth -eq 0) { $outerGotoOrLabel = $true } }
+            { $_ -cin @('end', 'until') } {
+                if ($blocks.Count -gt 0) {
+                    $start = $blocks.Pop()
+                    $closes[$start] = $index
+                    if ($Tokens[$start].text -ceq 'function') { $functionDepth-- }
+                }
+            }
+        }
+    }
+    [pscustomobject]@{ depths = $depths; closes = $closes; outerReturns = $outerReturns; outerGotoOrLabel = $outerGotoOrLabel }
+}
+
+function Add-LuaGeneratedBlock {
+    param($Context, [string] $Key, [string] $Reason, [string] $ContainerPath = '$generated')
+    $Context.units.Add([pscustomobject]@{
+        sourceId = $Context.sourceId; containerPath = $ContainerPath; key = $Key; blockedReason = $Reason
+        sourceExpression = $null; zhTwExpression = $null; tableOpenByte = $null; tableCloseByte = $null
+        generated = $true; positionalLocale = $false
+    })
+}
+
+function Add-LuaGeneratedTable {
+    param($Context, [int] $TableIndex, [string] $Key, $Binding)
+    $templateKey = '__template__'
+    $templatePath = '$.' + $templateKey
+    if (-not $Context.tableCache.ContainsKey($TableIndex)) {
+        $tableUnits = [Collections.Generic.List[object]]::new()
+        $null = Read-LuaTable -Text $Context.text -Tokens $Context.tokens -OpenIndex $TableIndex -ContainerPath '$' -AssignedKey $templateKey -SourceId $Context.sourceId -Units $tableUnits -BomLength $Context.bomLength
+        $Context.tableCache.Add($TableIndex, $tableUnits)
+    }
+    $destination = Join-LuaContainerPath '$' $Key
+    $hasRoot = $false
+    foreach ($unit in $Context.tableCache[$TableIndex]) {
+        $root = $unit.containerPath -ceq '$'
+        $hasRoot = $hasRoot -or $root
+        $Context.units.Add([pscustomobject]@{
+            sourceId = $unit.sourceId
+            containerPath = if ($root) { '$' } else { $destination + $unit.containerPath.Substring($templatePath.Length) }
+            key = if ($root) { $Key } else { $unit.key }
+            blockedReason = $unit.blockedReason
+            sourceExpression = $unit.sourceExpression
+            zhTwExpression = $unit.zhTwExpression
+            tableOpenByte = $unit.tableOpenByte
+            tableCloseByte = $unit.tableCloseByte
+            generated = $true
+            generatedBinding = $Binding
+        })
+    }
+    if (-not $hasRoot) { Add-LuaGeneratedBlock $Context $Key 'generated_output_language_fields_unproven' '$' }
+}
+
+function Get-LuaAccumulatorAssignment {
+    param([object[]] $Tokens, [int] $Index)
+    if (($Index + 3) -ge $Tokens.Count) { return }
+    $keyStart = $Index + 2
+    if ($Tokens[$Index + 1].text -ceq '.' -and $Tokens[$keyStart].type -ceq 'identifier') {
+        $keyEnd = $keyStart
+        $equalsIndex = $keyEnd + 1
+    }
+    elseif ($Tokens[$Index + 1].text -ceq '[') {
+        $equalsIndex = (Get-MatchingTokenIndex $Tokens ($Index + 1) '[' ']') + 1
+        $keyEnd = $equalsIndex - 2
+    }
+    else { return }
+    if (($equalsIndex + 1) -ge $Tokens.Count -or $Tokens[$equalsIndex].text -cne '=') { return }
+    $valueIndex = $equalsIndex + 1
+    $tableEnd = if ($Tokens[$valueIndex].text -ceq '{') { Get-MatchingTokenIndex $Tokens $valueIndex '{' '}' } else { -1 }
+    [pscustomobject]@{ keyStart = $keyStart; keyEnd = $keyEnd; valueIndex = $valueIndex; tableEnd = $tableEnd }
+}
+
+function Test-LuaTableStatementBoundary {
+    param([object[]] $Tokens, [int] $End)
+    if ($End -lt 0) { return $false }
+    if (($End + 1) -eq $Tokens.Count) { return $true }
+    $next = $Tokens[$End + 1]
+    $next.text -ceq ';' -or ($next.type -ceq 'identifier' -and $next.text -cnotin @('and', 'or'))
+}
+
+function Get-LuaLiteralAccumulatorKey {
+    param([object[]] $Tokens, [int] $AssignmentIndex, $Assignment)
+    if ($Assignment.keyStart -ne $Assignment.keyEnd) { return }
+    $key = $Tokens[$Assignment.keyStart]
+    if ($Tokens[$AssignmentIndex + 1].text -ceq '.') { return [string]$key.text }
+    if ($key.type -ceq 'string') { ConvertFrom-LuaKeyString -Literal $key.text }
+}
+
+function Test-LuaUnshadowedPrimitive {
+    param($Context, [string] $Name, [switch] $MemberCalls)
+    $tokens = $Context.tokens
+    foreach ($environment in @('_G', '_ENV', 'setfenv', 'getfenv')) {
+        if ($Context.references.ContainsKey($environment)) { return $false }
+    }
+    foreach ($index in $Context.references[$Name]) {
+        if ($index -gt 0 -and $tokens[$index - 1].text -cin @('.', ':')) { continue }
+        if ($index -gt 0 -and -not $Context.layout.depths.ContainsKey($index) -and
+            $tokens[$index - 1].text -cin @('{', ',', ';') -and $tokens[$index + 1].text -ceq '=') { continue }
+        if ($index -gt 0 -and $tokens[$index - 1].text -cin @('local', 'function')) { return $false }
+        if ($MemberCalls) {
+            if (($index + 3) -ge $tokens.Count -or $tokens[$index + 1].text -cne '.' -or
+                $tokens[$index + 2].type -cne 'identifier' -or $tokens[$index + 3].text -cne '(') { return $false }
+        }
+        elseif (($index + 1) -ge $tokens.Count -or $tokens[$index + 1].text -cne '(') { return $false }
+    }
+    $true
+}
+
+function Get-LuaLimitedFormatOutputs {
+    param($Context, [int] $AssignmentIndex, $Assignment)
+    # The complete loop body must consist of this one assignment.
+    $tokens = $Context.tokens
+    $loop = $AssignmentIndex - 7
+    $keyStart = $Assignment.keyStart
+    if ($loop -lt 0 -or $Assignment.tableEnd -lt 0 -or $Context.layout.depths[$loop] -ne 0 -or
+        $tokens[$loop].text -cne 'for' -or $tokens[$loop + 1].type -cne 'identifier' -or
+        $tokens[$loop + 2].text -cne '=' -or $tokens[$loop + 4].text -cne ',' -or
+        $tokens[$loop + 6].text -cne 'do' -or $Context.layout.closes[$loop + 6] -ne ($Assignment.tableEnd + 1) -or
+        $Assignment.keyEnd -ne ($keyStart + 7)) { return }
+    $variable = $tokens[$loop + 1].text
+    if ($tokens[$keyStart].text -cne 'string' -or $tokens[$keyStart + 1].text -cne '.' -or
+        $tokens[$keyStart + 2].text -cne 'format' -or $tokens[$keyStart + 3].text -cne '(' -or
+        $tokens[$keyStart + 4].type -cne 'string' -or $tokens[$keyStart + 5].text -cne ',' -or
+        $tokens[$keyStart + 6].text -cne $variable -or $tokens[$keyStart + 7].text -cne ')') { return }
+    if (-not (Test-LuaUnshadowedPrimitive $Context 'string' -MemberCalls)) { return }
+    $usesToString = @($Context.references['tostring'] | Where-Object { $_ -ge $Assignment.valueIndex -and $_ -lt $Assignment.tableEnd }).Count -gt 0
+    if ($usesToString -and -not (Test-LuaUnshadowedPrimitive $Context 'tostring')) { return }
+    $first = 0; $last = 0
+    if ($tokens[$loop + 3].text -cnotmatch '^[0-9]+$' -or $tokens[$loop + 5].text -cnotmatch '^[0-9]+$' -or
+        -not [int]::TryParse($tokens[$loop + 3].text, [ref]$first) -or
+        -not [int]::TryParse($tokens[$loop + 5].text, [ref]$last) -or
+        $last -lt $first -or ($last - [long]$first) -ge 128) { return }
+    $format = ConvertFrom-LuaKeyString -Literal $tokens[$keyStart + 4].text
+    if ($format -cnotmatch '^[^%]*%s[^%]*$') { return }
+    for ($value = [long]$first; $value -le $last; $value++) {
+        $literal = $value.ToString([Globalization.CultureInfo]::InvariantCulture)
+        [pscustomobject]@{
+            key = $format.Replace('%s', $literal)
+            binding = [ordered]@{ kind = 'numeric-loop'; parameter = $variable; value = $literal; format = $format }
+        }
+    }
+}
+
+function Test-LuaExactTokens {
+    param([object[]] $Tokens, [int] $Start, [int] $End, [string] $Expected)
+    $pattern = @(Get-LuaTokens -Text $Expected)
+    if ($End - $Start + 1 -ne $pattern.Count) { return $false }
+    for ($offset = 0; $offset -lt $pattern.Count; $offset++) {
+        if ($Tokens[$Start + $offset].text -cne $pattern[$offset].text) { return $false }
+    }
+    $true
+}
+
+function Get-LuaLiteralList {
+    param([object[]] $Tokens, [int] $Open, [int] $Close)
+    $fields = [Collections.Generic.List[object]]::new()
+    for ($index = $Open + 1; $index -lt $Close; $index += 2) {
+        if ($Tokens[$index].type -cne 'string' -or
+            (($index + 1) -lt $Close -and $Tokens[$index + 1].text -cnotin @(',', ';'))) { return }
+        $fields.Add([ordered]@{
+            fieldStartIndex = $index; valueStartIndex = $index; valueEndIndex = $index
+            separatorIndex = if (($index + 1) -lt $Close) { $index + 1 } else { $null }
+        })
+    }
+    [pscustomobject]@{ fields = @($fields) }
+}
+
+function Get-LuaCallArguments {
+    param([object[]] $Tokens, [int] $Open, [int] $Close)
+    # Each supported call takes single-token arguments.
+    $indices = [Collections.Generic.List[int]]::new()
+    for ($index = $Open + 1; $index -lt $Close; $index += 2) {
+        if (($index + 1) -lt $Close -and $Tokens[$index + 1].text -cne ',') { return }
+        $indices.Add($index)
+    }
+    if (($Close - $Open) % 2 -ne 0 -and $Close -ne ($Open + 1)) { return }
+    [pscustomobject]@{ indices = @($indices) }
+}
+
+function Get-LuaLiteralLocalTable {
+    param($Context, [int] $ArgumentIndex, [Collections.Generic.HashSet[int]] $AllowedReferences)
+    $tokens = $Context.tokens
+    $token = $tokens[$ArgumentIndex]
+    if ($token.type -cne 'identifier' -or -not $Context.references.ContainsKey($token.text)) { return }
+    $references = $Context.references[$token.text]
+    $declaration = -1
+    foreach ($index in $references) {
+        if ($AllowedReferences.Contains($index) -and $index -ne $ArgumentIndex) { continue }
+        if ($index -eq $ArgumentIndex) { continue }
+        # A member selector with the same spelling does not reference the local.
+        if ($index -gt 0 -and $tokens[$index - 1].text -cin @('.', ':')) { continue }
+        if ($index -gt 0 -and -not $Context.layout.depths.ContainsKey($index) -and
+            $tokens[$index - 1].text -cin @('{', ',', ';') -and $tokens[$index + 1].text -ceq '=') { continue }
+        if ($index -le 0 -or $index -ge $ArgumentIndex -or $declaration -ge 0 -or
+            $Context.layout.depths[$index] -ne 0 -or $tokens[$index - 1].text -cne 'local' -or
+            $tokens[$index + 1].text -cne '=' -or $tokens[$index + 2].text -cne '{') { return }
+        $declaration = $index
+    }
+    if ($declaration -lt 0) { return }
+    $open = $declaration + 2
+    $close = Get-MatchingTokenIndex $tokens $open '{' '}'
+    if (Test-LuaTableStatementBoundary $tokens $close) { [pscustomobject]@{ open = $open; close = $close } }
+}
+
+function Add-LuaPositionalRows {
+    param($Context, [int[]] $Arguments, [Collections.Generic.HashSet[int]] $AllowedReferences)
+    $tokens = $Context.tokens
+    $input = Get-LuaLiteralLocalTable $Context $Arguments[0] $AllowedReferences
+    $localeOrder = Get-LuaLiteralLocalTable $Context $Arguments[3] $AllowedReferences
+    if ($null -eq $input -or $null -eq $localeOrder) {
+        Add-LuaGeneratedBlock $Context $tokens[$Arguments[0]].text 'generated_local_table_unproven'
+        return
+    }
+    $affixes = @(
+        for ($index = 1; $index -le 2; $index++) {
+            $token = $tokens[$Arguments[$index]]
+            if ($token.type -ceq 'string') { ConvertFrom-LuaKeyString -Literal $token.text }
+            elseif ($token.text -ceq 'nil') { '' }
+        }
+    )
+    if ($affixes.Count -ne 2) {
+        Add-LuaGeneratedBlock $Context $tokens[$Arguments[0]].text 'generated_key_affix_not_literal'
+        return
+    }
+    $localeFields = Get-LuaLiteralList $tokens $localeOrder.open $localeOrder.close
+    $localeIndices = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
+    $localeReason = 'generated_locale_order_unproven'
+    if ($null -ne $localeFields) {
+        $localeReason = $null
+        foreach ($field in $localeFields.fields) {
+            $name = ConvertFrom-LuaKeyString -Literal $tokens[$field.valueStartIndex].text
+            if (-not $localeIndices.TryAdd($name, $localeIndices.Count)) { $localeReason = 'duplicate_generated_locale' }
+        }
+        if (-not $localeIndices.ContainsKey('en') -and -not $localeReason) { $localeReason = 'missing_en_source_expression' }
+    }
+
+    $rowIndex = $input.open + 1
+    while ($rowIndex -lt $input.close) {
+        Invoke-LuaScannerProgressHeartbeat
+        $keyEnd = if ($tokens[$rowIndex].text -ceq '[') { Get-MatchingTokenIndex $tokens $rowIndex '[' ']' } else { $rowIndex }
+        $key = if ($keyEnd -eq $rowIndex -or ($keyEnd -eq ($rowIndex + 2) -and $tokens[$rowIndex + 1].type -ceq 'string')) {
+            Get-LuaKey -Tokens $tokens -StartIndex $rowIndex -EndIndex $keyEnd
+        }
+        if ([string]::IsNullOrEmpty($key) -or $tokens[$keyEnd + 1].text -cne '=') {
+            Add-LuaGeneratedBlock $Context $tokens[$Arguments[0]].text 'generated_input_row_key_unproven'
+            return
+        }
+        $key = $affixes[0] + $key + $affixes[1]
+        $rowOpen = $keyEnd + 2
+        if ($tokens[$rowOpen].text -cne '{') {
+            Add-LuaGeneratedBlock $Context $key 'generated_row_not_literal' '$'
+            Add-LuaGeneratedBlock $Context $tokens[$Arguments[0]].text 'generated_input_rows_unproven'
+            return
+        }
+        $rowClose = Get-MatchingTokenIndex $tokens $rowOpen '{' '}'
+        $rowFields = Get-LuaLiteralList $tokens $rowOpen $rowClose
+        $reason = if ($localeReason) { $localeReason }
+            elseif ($null -eq $rowFields) { 'generated_row_not_literal' }
+            elseif ($rowFields.fields.Count -ne $localeFields.fields.Count) { 'generated_locale_length_mismatch' }
+            else { $null }
+        $zhTwValue = $null
+        if (-not $reason -and $localeIndices.ContainsKey('zh-tw')) {
+            $literal = $tokens[$rowFields.fields[$localeIndices['zh-tw']].valueStartIndex].text
+            try { $zhTwValue = ConvertFrom-LuaKeyString -Literal $literal -RequireUtf8 }
+            catch { $reason = 'generated_positional_literal_value_unproven' }
+        }
+        if ($reason) { Add-LuaGeneratedBlock $Context $key $reason '$' }
+        else {
+            $Context.units.Add([pscustomobject]@{
+                sourceId = $Context.sourceId; containerPath = '$'; key = $key; blockedReason = $null
+                sourceExpression = New-ExpressionRecord -Text $Context.text -Tokens $tokens -Field $rowFields.fields[$localeIndices['en']] -BomLength $Context.bomLength -KnownStringLiteral
+                zhTwExpression = if ($localeIndices.ContainsKey('zh-tw')) {
+                    New-ExpressionRecord -Text $Context.text -Tokens $tokens -Field $rowFields.fields[$localeIndices['zh-tw']] -BomLength $Context.bomLength -KnownStringLiteral
+                } else { $null }
+                tableOpenByte = ConvertTo-Utf8ByteOffset $Context.text $tokens[$rowOpen].start $Context.bomLength
+                tableCloseByte = ConvertTo-Utf8ByteOffset $Context.text $tokens[$rowClose].start $Context.bomLength
+                generated = $true; positionalLocale = $true; positionalZhTwValue = $zhTwValue
+            })
+        }
+        $rowIndex = $rowClose + 1
+        if ($rowIndex -lt $input.close) {
+            if ($tokens[$rowIndex].text -cnotin @(',', ';')) {
+                Add-LuaGeneratedBlock $Context $tokens[$Arguments[0]].text 'generated_input_rows_unproven'
+                return
+            }
+            $rowIndex++
+        }
+    }
+}
+
+function Get-LuaPositionalGeneratorCall {
+    param($Context, [int] $Index, [int] $Definition)
+    $tokens = $Context.tokens
+    if ($Index -le $Definition -or $Context.layout.depths[$Index] -ne 0 -or
+        $tokens[$Index + 1].text -cne '(' -or $tokens[$Index - 1].text -cin @('.', ':', '=', 'return', ',')) { return }
+    $close = Get-MatchingTokenIndex $tokens ($Index + 1) '(' ')'
+    $arguments = Get-LuaCallArguments $tokens ($Index + 1) $close
+    if ($null -ne $arguments -and $arguments.indices.Count -eq 4 -and (Test-LuaTableStatementBoundary $tokens $close)) {
+        $arguments
+    }
+}
+
+function Get-LuaPositionalGenerator {
+    param($Context, [string] $Accumulator)
+    $tokens = $Context.tokens
+    $name = 'generate_translation'
+    if (-not $Context.references.ContainsKey($name)) { return }
+    $references = $Context.references[$name]
+    $definitions = @($references | Where-Object {
+        $_ -ge 2 -and $Context.layout.depths[$_ - 1] -eq 0 -and $tokens[$_ - 2].text -ceq 'local' -and $tokens[$_ - 1].text -ceq 'function'
+    })
+    if ($definitions.Count -ne 1) { return }
+    $definition = $definitions[0]
+    $end = $Context.layout.closes[$definition - 1]
+    $body = @'
+generate_translation(t,prefix,suffix,lids)
+    if type(t) ~= "table" then return end
+    local prefix = prefix or ""
+    local suffix = suffix or ""
+    local full_id = ""
+    for id,text in pairs(t) do
+        full_id = prefix..id..suffix
+        ACCUMULATOR[full_id] = ACCUMULATOR[full_id] or {}
+        if type(text) == "table" and type(lids) == "table" and #lids == #text then
+            for i = 1,#lids do
+                ACCUMULATOR[full_id][lids[i]] = text[i]
+            end
+        elseif type(text) == "string" and type(lids) == "string" then
+            ACCUMULATOR[full_id][lids] = text
+        end
+    end
+end
+'@
+    if (-not $end -or -not (Test-LuaExactTokens $tokens $definition $end ($body.Replace('ACCUMULATOR', $Accumulator)))) { return }
+    # Calls at conditional depth are retained as unresolved evidence, but any other
+    # use of the helper name can rebind or escape it and invalidates static calls.
+    $calls = [Collections.Generic.Dictionary[int, object]]::new()
+    $allowedReferences = [Collections.Generic.HashSet[int]]::new()
+    $unresolved = [Collections.Generic.List[int]]::new()
+    $reason = if ($Accumulator -cin @('t', 'prefix', 'suffix', 'lids', 'full_id', 'id', 'text', 'i') -or
+        -not (Test-LuaUnshadowedPrimitive $Context 'pairs') -or -not (Test-LuaUnshadowedPrimitive $Context 'type')) {
+        'generated_helper_binding_unproven'
+    } else { $null }
+    foreach ($index in $references) {
+        if ($index -eq $definition) { continue }
+        $call = Get-LuaPositionalGeneratorCall $Context $index $definition
+        if ($null -ne $call) {
+            $calls.Add($index, $call.indices)
+            $null = $allowedReferences.Add($call.indices[0])
+            $null = $allowedReferences.Add($call.indices[3])
+        }
+        else {
+            $unresolved.Add($index)
+            if ($index -lt $definition -or $tokens[$index + 1].text -cne '(' -or
+                $tokens[$index - 1].text -cin @('local', 'function', '.', ':', '=', 'return', ',')) {
+                $reason = 'generated_helper_binding_unproven'
+            }
+        }
+    }
+    [pscustomobject]@{
+        start = $definition; end = $end; calls = $calls; allowedReferences = $allowedReferences
+        unresolved = $unresolved; reason = $reason
+    }
+}
+
+function Get-LuaTemplateGenerator {
+    param($Context, [string] $Name, [int] $CallIndex)
+    $tokens = $Context.tokens
+    $definitions = @($Context.references[$Name] | Where-Object {
+        $_ -ge 2 -and $_ -lt $CallIndex -and $Context.layout.depths[$_ - 1] -eq 0 -and
+        $tokens[$_ - 2].text -ceq 'local' -and $tokens[$_ - 1].text -ceq 'function'
+    })
+    if ($definitions.Count -ne 1) { return }
+    $definition = $definitions[0]
+    $end = $Context.layout.closes[$definition - 1]
+    if (($definition + 5) -ge $end -or $tokens[$definition + 1].text -cne '(' -or
+        $tokens[$definition + 2].type -cne 'identifier' -or $tokens[$definition + 3].text -cne ',' -or
+        $tokens[$definition + 4].type -cne 'identifier' -or $tokens[$definition + 5].text -cne ')') { return }
+    foreach ($reference in $Context.references[$Name]) {
+        if ($reference -eq $definition) { continue }
+        if ($reference -lt $definition -or $tokens[$reference + 1].text -cne '(' -or
+            $tokens[$reference - 1].text -cin @('local', 'function', '.', ':', '=', 'return', ',')) { return }
+    }
+    $target = $tokens[$definition + 2].text
+    $value = $tokens[$definition + 4].text
+    if ($target -ceq $value) { return }
+    $position = $definition + 6
+    # Spidey Sense registers a separate options entry before assigning localization tables.
+    if ($tokens[$position].text -ceq 'if') {
+        $guardEnd = $Context.layout.closes[$position]
+        $registration = 'if TEMPLATE ~= "melee_backstab" and TEMPLATE ~= "ranged_backstab" then table.insert(mod.typeList, {text = TEMPLATE .. "_name", value = TEMPLATE}) end'
+        if (-not $guardEnd -or -not (Test-LuaUnshadowedPrimitive $Context 'table' -MemberCalls) -or
+            -not (Test-LuaExactTokens $tokens $position $guardEnd ($registration.Replace('TEMPLATE', $value)))) { return }
+        $position = $guardEnd + 1
+    }
+    $templates = [Collections.Generic.List[object]]::new()
+    while ($position -lt $end) {
+        Invoke-LuaScannerProgressHeartbeat
+        if ($tokens[$position].text -cne $target -or $tokens[$position + 1].text -cne '[') { return }
+        $assignment = Get-LuaAccumulatorAssignment $tokens $position
+        if ($null -eq $assignment -or $assignment.keyEnd -ne ($assignment.keyStart + 2) -or
+            $assignment.tableEnd -lt 0 -or $tokens[$assignment.keyStart + 1].text -cne '..' -or
+            -not (Test-LuaTableStatementBoundary $tokens $assignment.tableEnd)) { return }
+        $left = $tokens[$assignment.keyStart]
+        $right = $tokens[$assignment.keyEnd]
+        $prefix = ''; $suffix = ''
+        if ($left.type -ceq 'string' -and $right.text -ceq $value) { $prefix = ConvertFrom-LuaKeyString -Literal $left.text }
+        elseif ($left.text -ceq $value -and $right.type -ceq 'string') { $suffix = ConvertFrom-LuaKeyString -Literal $right.text }
+        else { return }
+        $templates.Add([pscustomobject]@{ prefix = $prefix; suffix = $suffix; tableIndex = $assignment.valueIndex })
+        $position = $assignment.tableEnd + 1
+        if ($tokens[$position].text -ceq ';') { $position++ }
+    }
+    if ($templates.Count -gt 0) { [pscustomobject]@{ templates = @($templates); parameter = $value; targetParameter = $target } }
+}
+
+function Test-LuaReferenceIsField {
+    param($Context, [int] $Index)
+    if ($Index -eq 0) { return $false }
+    $tokens = $Context.tokens
+    if ($tokens[$Index - 1].text -cin @('.', ':')) { return $true }
+    -not $Context.layout.depths.ContainsKey($Index) -and ($Index + 1) -lt $tokens.Count -and
+        $tokens[$Index - 1].text -cin @('{', ',', ';') -and $tokens[$Index + 1].text -ceq '='
+}
+
+function Add-LuaAccumulatorRootTable {
+    param($Context, [int] $Open)
+    $null = Read-LuaTable -Text $Context.text -Tokens $Context.tokens -OpenIndex $Open -ContainerPath '$' -AssignedKey $null -SourceId $Context.sourceId -Units $Context.units -BomLength $Context.bomLength
+}
+
+function Add-LuaAccumulatorUnits {
+    param($Context)
+    $tokens = $Context.tokens
+    $last = $tokens.Count - 1
+    while ($last -ge 0 -and $tokens[$last].text -ceq ';') { $last-- }
+    if ($last -lt 2 -or $tokens[$last].type -cne 'identifier' -or $tokens[$last - 1].text -cne 'return') { return }
+    $accumulator = $tokens[$last].text
+    if ($accumulator -cin @('nil', 'true', 'false')) { return }
+    $Context.layout = Get-LuaStatementLayout $tokens
+    if ($Context.layout.depths[$last - 1] -ne 0) { return }
+    $references = [Collections.Generic.Dictionary[string, Collections.Generic.List[int]]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        if ($tokens[$index].type -cne 'identifier') { continue }
+        $name = $tokens[$index].text
+        if (-not $references.ContainsKey($name)) { $references.Add($name, [Collections.Generic.List[int]]::new()) }
+        $references[$name].Add($index)
+    }
+    $Context.references = $references
+    $accumulatorReferences = @($references[$accumulator] | Where-Object { -not (Test-LuaReferenceIsField $Context $_) })
+    $declarations = @($accumulatorReferences | Where-Object {
+        $_ -gt 0 -and $_ -lt ($last - 1) -and $Context.layout.depths.ContainsKey($_) -and
+        $Context.layout.depths[$_] -eq 0 -and $tokens[$_ - 1].text -ceq 'local'
+    })
+    if ($declarations.Count -eq 0) { return }
+    $declaration = $declarations[0]
+    $initial = $declaration
+    if ($tokens[$declaration + 1].text -ceq ';' -or $tokens[$declaration + 1].type -ceq 'identifier') {
+        $deferred = @($accumulatorReferences | Where-Object { $_ -gt $declaration })
+        if ($deferred.Count -gt 0) { $initial = $deferred[0] }
+    }
+    if (($initial + 2) -ge $tokens.Count -or $tokens[$initial + 1].text -cne '=' -or $tokens[$initial + 2].text -cne '{') {
+        $writes = @($accumulatorReferences | Where-Object { $null -ne (Get-LuaAccumulatorAssignment $tokens $_) })
+        if ($writes.Count -gt 0) { Add-LuaGeneratedBlock $Context $accumulator 'localization_accumulator_unproven' }
+        return
+    }
+    $Context.namedAccumulator = $true
+    if ($declarations.Count -gt 1) {
+        Add-LuaGeneratedBlock $Context $accumulator 'localization_accumulator_reassigned'
+        return
+    }
+    if ($Context.layout.outerReturns.Count -ne 1 -or $Context.layout.outerGotoOrLabel) {
+        Add-LuaGeneratedBlock $Context $accumulator 'generated_control_flow_unproven'
+        return
+    }
+    $initialClose = Get-MatchingTokenIndex $tokens ($initial + 2) '{' '}'
+    if (-not $Context.layout.depths.ContainsKey($initial) -or $Context.layout.depths[$initial] -ne 0 -or
+        -not (Test-LuaTableStatementBoundary $tokens $initialClose)) {
+        Add-LuaGeneratedBlock $Context $accumulator 'localization_accumulator_unproven'
+        return
+    }
+    Add-LuaAccumulatorRootTable $Context ($initial + 2)
+
+    $generator = Get-LuaPositionalGenerator $Context $accumulator
+    $Context.sidecarPath = Get-LuaGeneratedSidecarPath $Context $generator
+    $events = [Collections.Generic.SortedDictionary[int, object]]::new()
+    if ($null -ne $generator) {
+        foreach ($entry in $generator.calls.GetEnumerator()) {
+            $events.Add($entry.Key, [pscustomobject]@{ type = 'positional'; arguments = $entry.Value })
+        }
+        foreach ($index in $generator.unresolved) {
+            $events.Add($index, [pscustomobject]@{ type = 'unresolvedPositional' })
+        }
+    }
+
+    foreach ($index in $accumulatorReferences) {
+        if ($index -in @($declaration, $initial, $last)) { continue }
+        if ($null -ne $generator -and $index -gt $generator.start -and $index -lt $generator.end -and $initial -lt $generator.start) { continue }
+        $assignment = Get-LuaAccumulatorAssignment $tokens $index
+        if ($null -ne $assignment) {
+            $events.Add($index, [pscustomobject]@{ type = 'assignment'; assignment = $assignment })
+            continue
+        }
+        if ($tokens[$index + 1].text -ceq '=') {
+            $events.Add($index, [pscustomobject]@{ type = 'reassignment' })
+            continue
+        }
+        $events.Add($index, [pscustomobject]@{ type = 'reference' })
+    }
+
+    $hasWritten = $false
+    $templateGenerators = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $events.GetEnumerator()) {
+        Invoke-LuaScannerProgressHeartbeat
+        $index = $entry.Key
+        switch ($entry.Value.type) {
+            'reassignment' {
+                if (-not $hasWritten -and $index -gt $initialClose -and $initialClose -eq ($initial + 3) -and
+                    $Context.layout.depths[$index] -eq 0 -and $tokens[$index - 1].text -cnotin @('local', '.', ':', ',') -and
+                    $tokens[$index + 2].text -ceq '{') {
+                    $close = Get-MatchingTokenIndex $tokens ($index + 2) '{' '}'
+                    if (Test-LuaTableStatementBoundary $tokens $close) {
+                        Add-LuaAccumulatorRootTable $Context ($index + 2)
+                        $hasWritten = $true
+                        continue
+                    }
+                }
+                Add-LuaGeneratedBlock $Context $accumulator 'localization_accumulator_reassigned'
+            }
+            'positional' {
+                if ($generator.reason) { Add-LuaGeneratedBlock $Context $accumulator $generator.reason }
+                elseif ($initial -gt $generator.start) { Add-LuaGeneratedBlock $Context $accumulator 'localization_accumulator_unproven' }
+                else { Add-LuaPositionalRows $Context $entry.Value.arguments $generator.allowedReferences }
+            }
+            'unresolvedPositional' {
+                $key = if ($tokens[$index + 1].text -ceq '(') {
+                    $close = Get-MatchingTokenIndex $tokens ($index + 1) '(' ')'
+                    Get-CanonicalTokenText $tokens $index $close
+                } else { $tokens[$index].text }
+                Add-LuaGeneratedBlock $Context $key 'unsupported_generated_localization_call'
+            }
+            'assignment' {
+                $assignment = $entry.Value.assignment
+                $outputs = @(
+                    if ($Context.layout.depths[$index] -eq 0 -and $tokens[$index - 1].text -cnotin @('local', '.', ':', ',', '=') -and
+                        (Test-LuaTableStatementBoundary $tokens $assignment.tableEnd)) {
+                        $key = Get-LuaLiteralAccumulatorKey $tokens $index $assignment
+                        if ($key) { [pscustomobject]@{ key = $key; binding = $null } }
+                    }
+                    elseif ($assignment.tableEnd -ge 0) { Get-LuaLimitedFormatOutputs $Context $index $assignment }
+                )
+                if ($index -gt $initialClose -and $outputs.Count -gt 0) {
+                    foreach ($item in $outputs) { Add-LuaGeneratedTable $Context $assignment.valueIndex $item.key $item.binding }
+                }
+                else {
+                    $key = Get-LuaLiteralAccumulatorKey $tokens $index $assignment
+                    if ($key) { Add-LuaGeneratedBlock $Context $key 'unsupported_generated_localization_assignment' '$' }
+                    else {
+                        $shape = Get-CanonicalTokenText $tokens $assignment.keyStart $assignment.keyEnd
+                        Add-LuaGeneratedBlock $Context $shape 'unsupported_generated_localization_key'
+                    }
+                }
+            }
+            'reference' {
+                if ($index -gt ($initialClose + 1) -and $index -lt ($last - 3) -and
+                    $tokens[$index - 1].text -ceq '(' -and $tokens[$index - 2].type -ceq 'identifier' -and
+                    $Context.layout.depths[$index - 2] -eq 0 -and $tokens[$index - 3].text -cnotin @('.', ':', '=', 'return', ',') -and
+                    $tokens[$index + 1].text -ceq ',' -and $tokens[$index + 2].type -ceq 'string' -and
+                    $tokens[$index + 3].text -ceq ')' -and (Test-LuaTableStatementBoundary $tokens ($index + 3))) {
+                    $helperName = $tokens[$index - 2].text
+                    if (-not $templateGenerators.ContainsKey($helperName)) {
+                        $templateGenerators[$helperName] = Get-LuaTemplateGenerator $Context $helperName ($index - 2)
+                    }
+                    $helper = $templateGenerators[$helperName]
+                    if ($null -ne $helper) {
+                        $value = ConvertFrom-LuaKeyString -Literal $tokens[$index + 2].text
+                        foreach ($template in $helper.templates) {
+                            $binding = [ordered]@{
+                                kind = 'literal-helper'; parameter = $helper.parameter; targetParameter = $helper.targetParameter
+                                value = $value; prefix = $template.prefix; suffix = $template.suffix
+                            }
+                            Add-LuaGeneratedTable $Context $template.tableIndex ($template.prefix + $value + $template.suffix) $binding
+                        }
+                        $hasWritten = $true
+                        continue
+                    }
+                }
+                $shape = Get-CanonicalTokenText $tokens ([Math]::Max(0, $index - 2)) ([Math]::Min($last, $index + 3))
+                Add-LuaGeneratedBlock $Context $shape 'localization_accumulator_reference_unproven'
+            }
+        }
+        $hasWritten = $true
+    }
+}
+
+function Test-LuaActiveLocaleBinding {
+    param($Context, [int] $LoaderStart)
+    $tokens = $Context.tokens
+    $declarations = [Collections.Generic.List[int]]::new()
+    $memberWrites = [Collections.Generic.List[int]]::new()
+    foreach ($index in $Context.references['lid']) {
+        if (($index + 1) -ge $tokens.Count) { return $false }
+        if ($index -ge 2 -and $tokens[$index - 1].text -ceq '.' -and $tokens[$index - 2].text -ceq 'mod') {
+            if ($tokens[$index + 1].text -ceq '=') { $memberWrites.Add($index) }
+            continue
+        }
+        if (Test-LuaReferenceIsField $Context $index) { continue }
+        if ($index -gt 0 -and $tokens[$index - 1].text -ceq 'local') { $declarations.Add($index); continue }
+        if ($tokens[$index + 1].text -ceq '=') { return $false }
+    }
+    if ($declarations.Count -ne 1) { return $false }
+    $declaration = $declarations[0]
+    if ($declaration -ge $LoaderStart -or $Context.layout.depths[$declaration] -ne 0) { return $false }
+
+    $oldBinding = 'local lid = Managers and Managers.localization and Managers.localization:language() or mod:get("user_lid") or "en"'
+    $oldEnd = $declaration + @(Get-LuaTokens -Text $oldBinding).Count - 2
+    if ($oldEnd -lt $tokens.Count -and $memberWrites.Count -eq 0 -and
+        (Test-LuaExactTokens $tokens ($declaration - 1) $oldEnd $oldBinding) -and
+        (Test-LuaTableStatementBoundary $tokens $oldEnd)) { return $true }
+
+    if ($memberWrites.Count -ne 1 -or $memberWrites[0] -ge $declaration -or
+        $Context.layout.depths[$memberWrites[0]] -ne 0 -or
+        -not (Test-LuaExactTokens $tokens ($declaration - 1) ($declaration + 4) 'local lid = mod.lid') -or
+        -not (Test-LuaTableStatementBoundary $tokens ($declaration + 4))) { return $false }
+    $start = $memberWrites[0] - 2
+    $newBinding = 'mod.lid = Managers and Managers.localization and Managers.localization:language() or Application.user_setting("language_id") or "en"'
+    $newEnd = $start + @(Get-LuaTokens -Text $newBinding).Count - 1
+    $newEnd -lt $declaration -and (Test-LuaExactTokens $tokens $start $newEnd $newBinding) -and
+        (Test-LuaTableStatementBoundary $tokens $newEnd)
+}
+
+function Get-LuaGeneratedSidecarPath {
+    param($Context, $Generator)
+    $tokens = $Context.tokens
+    if ($null -eq $Generator -or $Generator.reason -or $Generator.unresolved.Count -ne 3) { return }
+    $tail = @'
+if lid and type(lid) == "string" then
+    local _mod_directory = "./../mods/"
+    local my_lid = SIDECAR_PATH .. lid
+    local file = _io.open(_mod_directory .. my_lid .. ".lua","r")
+    if file ~= nil then
+        file:close()
+        my_lid = mod:io_dofile(my_lid)
+        if my_lid.common then
+            local myl_nt = my_lid.common.player_notable_talents or my_lid.common.setting_player_notable_talents
+            if my_nt then
+                my_lid.common.mod_description = generate_notable_talents_description(myl_nt)
+            end
+            generate_translation(my_lid.common,nil,nil,lid)
+        end
+        if my_lid.talents then generate_translation(my_lid.talents,"def_",nil,lid) end
+        if my_lid.notable then generate_translation(my_lid.notable,"highlight_",nil,lid) end
+    end
+end
+'@
+    foreach ($index in $Context.references['my_lid']) {
+        if ($index -lt 2 -or $tokens[$index - 1].text -cne 'local' -or
+            $tokens[$index + 1].text -cne '=' -or $tokens[$index + 2].type -cne 'string') { continue }
+        $pathToken = $tokens[$index + 2].text
+        $path = ConvertFrom-LuaKeyString -Literal $pathToken
+        if ($path -cnotmatch '^[A-Za-z0-9_-]+/scripts/mods/[A-Za-z0-9_-]+/(?<stem>[A-Za-z0-9_-]+)_localization_$') { continue }
+        $start = $index - 15
+        if ($start -lt 0 -or $tokens[$start].text -cne 'if' -or $Context.layout.depths[$start] -ne 0) { continue }
+        $end = $Context.layout.closes[$start]
+        if ($end -and (Test-LuaExactTokens $tokens $start $end ($tail.Replace('SIDECAR_PATH', $pathToken)))) {
+            return [pscustomobject]@{
+                path = $path + 'zh-tw.lua'
+                localeBindingProven = Test-LuaActiveLocaleBinding $Context $start
+            }
+        }
+    }
+}
+
+function Read-LuaGeneratedSidecarValues {
+    param([object[]] $Tokens)
+    $values = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $groups = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $prefixes = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $prefixes.Add('common', '')
+    $prefixes.Add('talents', 'def_')
+    $prefixes.Add('notable', 'highlight_')
+    if ($Tokens.Count -lt 3 -or $Tokens[0].text -cne 'return' -or $Tokens[1].text -cne '{') { return }
+    $last = Get-MatchingTokenIndex $Tokens 1 '{' '}'
+    if ($last -ne ($Tokens.Count - 1)) { return }
+    $groupStart = 2
+    while ($groupStart -lt $last) {
+        Invoke-LuaScannerProgressHeartbeat
+        $group = $Tokens[$groupStart].text
+        if (-not $prefixes.ContainsKey($group) -or -not $groups.Add($group) -or
+            $Tokens[$groupStart + 1].text -cne '=' -or $Tokens[$groupStart + 2].text -cne '{') { return }
+        $groupEnd = Get-MatchingTokenIndex $Tokens ($groupStart + 2) '{' '}'
+        $position = $groupStart + 3
+        while ($position -lt $groupEnd) {
+            Invoke-LuaScannerProgressHeartbeat
+            $keyEnd = if ($Tokens[$position].text -ceq '[') { Get-MatchingTokenIndex $Tokens $position '[' ']' } else { $position }
+            $key = if ($keyEnd -eq $position -or ($keyEnd -eq ($position + 2) -and $Tokens[$position + 1].type -ceq 'string')) {
+                Get-LuaKey $Tokens $position $keyEnd
+            }
+            if (-not $key -or $Tokens[$keyEnd + 1].text -cne '=' -or $Tokens[$keyEnd + 2].type -cne 'string') { return }
+            try { $value = ConvertFrom-LuaKeyString -Literal $Tokens[$keyEnd + 2].text -RequireUtf8 }
+            catch {
+                return [pscustomobject]@{ values = $null; blockedReason = 'generated_sidecar_literal_value_unproven' }
+            }
+            if (-not $values.TryAdd($prefixes[$group] + $key, $value)) { return }
+            $position = $keyEnd + 3
+            if ($position -lt $groupEnd) {
+                if ($Tokens[$position].text -cnotin @(',', ';')) { return }
+                $position++
+            }
+        }
+        $groupStart = $groupEnd + 1
+        if ($groupStart -lt $last) {
+            if ($Tokens[$groupStart].text -cnotin @(',', ';')) { return }
+            $groupStart++
+        }
+    }
+    [pscustomobject]@{ values = $values; blockedReason = $null }
+}
+
+function Set-LuaGeneratedDuplicateReasons {
+    param([Collections.Generic.List[object]] $Units)
+    $identities = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($unit in $Units) {
+        Invoke-LuaScannerProgressHeartbeat
+        if ($unit.containerPath -cne '$') { continue }
+        if (-not $identities.ContainsKey($unit.key)) { $identities[$unit.key] = [Collections.Generic.List[object]]::new() }
+        $identities[$unit.key].Add($unit)
+    }
+    foreach ($group in $identities.Values) {
+        if ($group.Count -le 1 -or @($group | Where-Object { $_.PSObject.Properties['generated'] }).Count -eq 0) { continue }
+        foreach ($unit in $group) {
+            if (-not $unit.blockedReason) { $unit.blockedReason = 'duplicate_generated_localization_key' }
+        }
+    }
+}
+
 function Get-LuaLocalizationDocument {
     [CmdletBinding(DefaultParameterSetName = 'Path')]
     param(
@@ -721,6 +1480,7 @@ function Get-LuaLocalizationDocument {
         [Parameter(Mandatory, ParameterSetName = 'Bytes')][byte[]] $Bytes,
         [Parameter(ParameterSetName = 'Bytes')][string] $DisplayPath = '<memory>',
         [Parameter(Mandatory)][string] $SourceId,
+        [switch] $ZhTwSidecar,
         [scriptblock] $HeartbeatAction
     )
     $previousHeartbeatAction = $script:luaScannerHeartbeatAction
@@ -741,15 +1501,33 @@ function Get-LuaLocalizationDocument {
         catch { throw 'Lua localization source must be valid UTF-8.' }
         Invoke-LuaScannerHeartbeat
         $tokens = @(Get-LuaTokens -Text $text)
-        $units = [Collections.Generic.List[object]]::new()
-        $position = 0
-        while ($position -lt $tokens.Count) {
-            Invoke-LuaScannerProgressHeartbeat
-            if ($tokens[$position].text -ceq '{') {
-                $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength
+        if ($ZhTwSidecar) {
+            $sidecar = Read-LuaGeneratedSidecarValues $tokens
+            return [ordered]@{
+                sourceId = $SourceId; path = $fullPath; size = $bytes.LongLength
+                sha256 = Get-LuaScannerSha256 -Bytes $bytes
+                values = if ($null -ne $sidecar) { $sidecar.values } else { $null }
+                blockedReason = if ($null -eq $sidecar) { 'generated_sidecar_structure_unproven' } else { $sidecar.blockedReason }
             }
-            $position++
         }
+        $units = [Collections.Generic.List[object]]::new()
+        $context = [pscustomobject]@{
+            tokens = $tokens; text = $text; units = $units; sourceId = $SourceId; bomLength = $bomLength
+            layout = $null; references = $null; sidecarPath = $null; namedAccumulator = $false
+            tableCache = [Collections.Generic.Dictionary[int, object]]::new()
+        }
+        Add-LuaAccumulatorUnits $context
+        if (-not $context.namedAccumulator) {
+            $position = 0
+            while ($position -lt $tokens.Count) {
+                Invoke-LuaScannerProgressHeartbeat
+                if ($tokens[$position].text -ceq '{') {
+                    $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength
+                }
+                $position++
+            }
+        }
+        Set-LuaGeneratedDuplicateReasons $units
 
         $occurrences = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
         $unitIndex = 0
@@ -759,7 +1537,7 @@ function Get-LuaLocalizationDocument {
             $identityBase = ('{0} :: {1} :: {2}' -f $unit.sourceId, $unit.containerPath, $unit.key)
             if (-not $occurrences.ContainsKey($identityBase)) { $occurrences[$identityBase] = 0 }
             $occurrences[$identityBase]++
-            [ordered]@{
+            $numberedUnit = [ordered]@{
                 sourceId = $unit.sourceId
                 containerPath = $unit.containerPath
                 key = $unit.key
@@ -771,6 +1549,14 @@ function Get-LuaLocalizationDocument {
                 tableOpenByte = $unit.tableOpenByte
                 tableCloseByte = $unit.tableCloseByte
             }
+            if ($unit.PSObject.Properties['positionalLocale'] -and $unit.positionalLocale) {
+                $numberedUnit.positionalLocale = $true
+                if ($null -ne $unit.zhTwExpression) {
+                    $numberedUnit.positionalZhTwValue = $unit.positionalZhTwValue
+                }
+            }
+            if ($unit.PSObject.Properties['generatedBinding'] -and $null -ne $unit.generatedBinding) { $numberedUnit.generatedBinding = $unit.generatedBinding }
+            $numberedUnit
         }
         $hasCrlf = $false
         $hasLf = $false
@@ -791,7 +1577,7 @@ function Get-LuaLocalizationDocument {
             elseif ($hasBareCr) { 'mixed' }
             else { 'lf' }
         Invoke-LuaScannerHeartbeat
-        [ordered]@{
+        $document = [ordered]@{
             schemaVersion = 1
             sourceId = $SourceId
             path = $fullPath
@@ -803,6 +1589,11 @@ function Get-LuaLocalizationDocument {
             isIoDofileOnlyLoader = Test-IoDofileOnlyLoaderTokens -Tokens $tokens
             units = @($numbered)
         }
+        if ($context.sidecarPath) {
+            $document.zhTwSidecarPath = $context.sidecarPath.path
+            $document.zhTwSidecarLocaleBindingProven = $context.sidecarPath.localeBindingProven
+        }
+        $document
     }
     finally {
         $script:luaScannerHeartbeatAction = $previousHeartbeatAction

@@ -4,6 +4,57 @@
 
 Set-StrictMode -Version Latest
 
+function Get-LocalizationWorksetSharedTableOffsets {
+    param([object[]] $Units)
+    $tableOffsets = [Collections.Generic.HashSet[long]]::new()
+    $sharedOffsets = [Collections.Generic.HashSet[long]]::new()
+    foreach ($unit in $Units) {
+        if ($null -ne $unit.tableOpenByte -and -not $tableOffsets.Add([long]$unit.tableOpenByte)) {
+            $null = $sharedOffsets.Add([long]$unit.tableOpenByte)
+        }
+    }
+    ,$sharedOffsets
+}
+
+function Get-LocalizationWorksetWriteBlockReason {
+    param(
+        [string] $Action,
+        [Collections.IDictionary] $OldUnit,
+        [Collections.IDictionary] $NewUnit,
+        [switch] $SharedNewTable
+    )
+    $sharedReason = 'generated_shared_translation_span_requires_review'
+    if ($Action -ceq 'BLOCKED') { return }
+    if ($null -ne $OldUnit -and $null -ne $NewUnit) {
+        $oldBinding = $OldUnit['generatedBinding']
+        $newBinding = $NewUnit['generatedBinding']
+        if (($null -ne $oldBinding -or $null -ne $newBinding) -and
+            (ConvertTo-Json -InputObject $oldBinding -Compress) -cne (ConvertTo-Json -InputObject $newBinding -Compress)) {
+            return 'generated_binding_changed_requires_review'
+        }
+    }
+    if ($Action -ceq 'NONE') {
+        if ($SharedNewTable -and $null -ne $OldUnit -and $null -ne $NewUnit) {
+            foreach ($field in @('sourceExpression', 'zhTwExpression')) {
+                $oldExpression = $OldUnit[$field]
+                $newExpression = $NewUnit[$field]
+                $oldRaw = if ($null -ne $oldExpression) { $oldExpression['raw'] } else { $null }
+                $newRaw = if ($null -ne $newExpression) { $newExpression['raw'] } else { $null }
+                if ($oldRaw -cne $newRaw) { return $sharedReason }
+            }
+        }
+        return
+    }
+    if ($Action -ceq 'ACCEPT_REMOVAL') {
+        if ($null -ne $OldUnit -and $OldUnit['positionalLocale'] -and $null -ne $OldUnit['zhTwExpression']) {
+            return 'generated_positional_zh_tw_output_removed'
+        }
+        return
+    }
+    if ($null -ne $NewUnit -and $NewUnit['positionalLocale']) { return 'generated_positional_locale_requires_review' }
+    if ($SharedNewTable) { return $sharedReason }
+}
+
 function Get-ImmutableWorksetContractSha256 {
     param([Collections.IDictionary] $Workset)
 
@@ -158,4 +209,4 @@ function Get-LocalizationTranslationBinding {
     }
 }
 
-Export-ModuleMember -Function Get-ImmutableWorksetContractSha256, Get-LocalizationTranslationBinding, Get-LocalizationGitBlobBytes
+Export-ModuleMember -Function Get-ImmutableWorksetContractSha256, Get-LocalizationTranslationBinding, Get-LocalizationGitBlobBytes, Get-LocalizationWorksetWriteBlockReason, Get-LocalizationWorksetSharedTableOffsets
