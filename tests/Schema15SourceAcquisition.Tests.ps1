@@ -18,10 +18,10 @@ Describe 'Schema 15 source acquisition contract' {
         Test-Path -LiteralPath (Join-Path $scriptRoot 'Invoke-ModUpdateQueue.ps1') -PathType Leaf | Should -Be $true
     }
 
-    # Scenario: Nexus metadata identifies the requested Main file as a RAR before any provider is invoked.
+    # Scenario: Nexus metadata identifies the requested Main file as 7z before any provider is invoked.
     # Purpose: Prevent unsupported archives from being downloaded or claimed while preserving a structured user-facing reason.
     It 'UnitT20_RejectsKnownUnsupportedArchivesBeforeDownload' {
-        $runRoot = Join-Path $TestDrive 'known-rar'
+        $runRoot = Join-Path $TestDrive 'known-7z'
         New-Item -ItemType Directory -Path $runRoot | Out-Null
         $requestPath = Join-Path $runRoot 'source-request.json'
         [ordered]@{
@@ -30,7 +30,7 @@ Describe 'Schema 15 source acquisition contract' {
             modId = 123
             mainFileId = 456
             version = '2.0.0'
-            fileName = 'ExampleMod-2.0.0.rar'
+            fileName = 'ExampleMod-2.0.0.7z'
             pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
 
@@ -57,7 +57,7 @@ Describe 'Schema 15 source acquisition contract' {
         $requestPath = Join-Path $outside 'source-request.json'
         [ordered]@{
             schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
-            version = '2.0.0'; fileName = 'ExampleMod.rar'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+            version = '2.0.0'; fileName = 'ExampleMod.7z'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
         $linkedArtifacts = Join-Path $runRoot 'review-artifacts'
         New-TestReparsePoint -Path $linkedArtifacts -Target $outside | Out-Null
@@ -70,15 +70,15 @@ Describe 'Schema 15 source acquisition contract' {
             Should -Throw '*reparse*'
     }
 
-    # Scenario: The fixed runner receives a source request whose Main file is known to be RAR.
+    # Scenario: The fixed runner receives a source request whose Main file is known to be 7z.
     # Purpose: Validate identity and archive eligibility before acquiring the canonical MOD reservation.
     It 'InterT25_RejectsKnownUnsupportedArchivesBeforeReservation' {
-        $repository = Join-Path $TestDrive 'known-rar-runner-repository'
+        $repository = Join-Path $TestDrive 'known-7z-runner-repository'
         New-Item -ItemType Directory -Path $repository -Force | Out-Null
-        $requestPath = Join-Path $TestDrive 'known-rar-runner-request.json'
+        $requestPath = Join-Path $TestDrive 'known-7z-runner-request.json'
         [ordered]@{
             schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
-            version = '2.0.0'; fileName = 'ExampleMod-2.0.0.rar'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+            version = '2.0.0'; fileName = 'ExampleMod-2.0.0.7z'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
         } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
 
         $result = & (Join-Path $scriptRoot 'mod-update.ps1') acquire-source `
@@ -100,7 +100,7 @@ Describe 'Schema 15 source acquisition contract' {
         New-Item -ItemType Directory -Path $repository, $outside -Force | Out-Null
         [ordered]@{
             schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
-            version = '2.0.0'; fileName = 'ExampleMod.rar'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+            version = '2.0.0'; fileName = 'ExampleMod.7z'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outside 'source-request.json') -NoNewline
         New-TestReparsePoint -Path $linked -Target $outside | Out-Null
 
@@ -1255,7 +1255,7 @@ Describe 'Schema 15 source acquisition contract' {
         foreach ($requestPath in @($failedRequestPath, $waitingRequestPath)) {
             [ordered]@{
                 schemaVersion = 1; gameDomain = 'warhammer40kdarktide'; modId = 123; mainFileId = 456
-                version = '2.0.0'; fileName = 'ExampleMod.rar'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
+                version = '2.0.0'; fileName = 'ExampleMod.7z'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/123'
             } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -NoNewline
         }
         $queuePath = Join-Path $TestDrive 'failure-isolation-queue.json'

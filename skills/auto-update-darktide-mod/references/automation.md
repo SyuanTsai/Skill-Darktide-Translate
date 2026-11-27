@@ -21,7 +21,7 @@ Do not copy only `mod-update.ps1`; the runner, independent validator, packaged W
 
 ## Usage
 
-For a Schema 14 manual claim, the archive must be a stable, ordinary ZIP directly under the target repository's `AI Auto Update` directory. The canonical MOD directory must already be known and must match the ZIP's single root directory.
+For a Schema 14 manual claim, the archive must be a stable, ordinary ZIP or RAR directly under the target repository's `AI Auto Update` directory. The canonical MOD directory must already be known and must match the archive's single root directory.
 
 Manual and automatic claims both require a source-request `schemaVersion: 2` containing the complete Nexus page/Main-file tuple: game domain, MOD ID, canonical page URL, page Version/Last updated, Main file ID/version/uploaded-at UTC, and the full filename including extension. The claim copies it to `review-artifacts/source-request.json` and binds it with archive size/SHA-256 and acquisition method in `source-tuple.json`.
 
@@ -221,12 +221,23 @@ Rolling back the Skill itself means restoring a previous immutable `darktide-tra
 - Owner publication writes and flushes `.<owner-leaf>.publish-<guid>.tmp` beside the target before closing it and calling `File.Move`. A process crash in that interval can leave the recognizable temporary behind. While holding the owner-update lock, a missing shared owner checks all such temporaries in `AI Auto Update/In Progress/.locks`; a missing MOD owner checks only the temporary prefix for its own owner leaf in `AI Auto Update/In Progress/.locks/mod`. A match reports `BLOCKED: incomplete owner publication residue exists under '<relative-lock-root>' (...). Follow 'Manual recovery for incomplete owner publication' in references/automation.md.` without publishing state. Completed shared stale takeover evidence is stored separately as `.<resource-key>.lock.stale-<sha256>.json`, and another MOD's temporary does not block this MOD.
 - Owner-checked directory cleanup first renames `<owned-directory>` to the deterministic sibling `<owned-directory>.codex-removal`, then deletes only that quarantined tree. A retry resumes deletion when the original path is absent and that exact quarantine exists; it records the cleanup step only after both paths are absent. A file at either name, both directories existing together, a link or reparse point, or a deletion failure remains cleanup-pending and requires the procedure below.
 - The local primitives deliberately provide lexical containment and same-directory move publication, not handle-bound identity, single-link, or no-reparse guarantees. Keep the Skill installation and live coordination roots writable only by their owning user. A crash after the move has published the complete new owner; a crash before the move leaves either the previous owner intact or the recognizable temporary that the missing-owner guard blocks.
-- Only ZIP archives are accepted by the deterministic extractor.
+- The desktop runner accepts ZIP and single-volume RAR. ZIP uses .NET. RAR requires Python 3 and the native UnRAR SDK shared library (API 8 or later, matching Python's architecture). Set `DARKTIDE_UNRAR_LIBRARY` to the absolute path of the trusted installed library, or use the default WinRAR directory on Windows / system libunrar on Unix. From the Skill directory, run `python -I -B scripts/rar_reader.py --check` (use `python3` on Unix) to check the dependency. The reader uses the SDK's test operation and streams data into paths validated by the runner. Encrypted, split, redirected and special entries stop verification. The per-entry decompression dictionary limit is 256 MiB.
 - Nexus identity remains receipt-verified. Translation wording is Agent-supplied only for Schema 15 `AI_REQUIRED` units or Schema 14 approved spans; scripts do not log in, bypass CAPTCHA, scrape credentials, or invent translations.
 - The runner assumes one canonical MOD directory and one repository-local `main` base. Conflicting or multi-root archives stop.
 - Publication needs authenticated `git` and `gh`; unavailable external review is recorded and does not trigger login prompts.
 - Merge remains a user-authorized GitHub action. The fixed finalizer runs after an explicit user request or merge event, observes once without background polling, and releases resources only for a verified reviewed-head merge.
 - Reviewed-head automatic cleanup currently proves merge-commit topology (`F` is an ancestor of the reported merge commit). A squash or rebase topology retains the run for user-selected reconciliation instead of being treated as reviewed F.
+
+### Offline verification of Loadout Monitor 1.9.6
+
+From the Skill source repository root, check the installed decoder and replay Nexus mod 160, Main file 8444. The replay checks the original filename, 26130-byte length and SHA-256 from Mods #388. It exercises browser-file intake, independent receipt replay, verified listing and extraction in a disposable directory. The expected MOD root defaults to `LoadoutMonitor`.
+
+```powershell
+python -I -B ./skills/auto-update-darktide-mod/scripts/rar_reader.py --check
+pwsh -NoProfile -File ./tests/Confirm-LoadoutMonitorArchive.ps1 -ArchivePath (Read-Host 'Full path to the original RAR')
+```
+
+The automated RAR fixtures substitute the native SDK calls and exercise the production header checks, byte-count enforcement, decoder failure handling and tree comparison. Verification of the native ABI and compression method requires the installed library and the original archive.
 
 ### Manual recovery for incomplete owner publication
 
