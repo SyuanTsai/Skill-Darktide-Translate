@@ -254,6 +254,25 @@ generate_translation(second, nil, nil, locale_order)'
     }
 
 
+    # Scenario: The loader otherwise matches but the native open uses a different path, mode, or arity.
+    # Purpose: Keep the conditional sidecar proof limited to the exact read-only call.
+    It 'UnitT66_RequiresTheExactReadOnlySidecarOpen: <Case>' -ForEach @(
+        @{ Case = 'write mode'; From = '","r")'; To = '","w")' }
+        @{ Case = 'read-write mode'; From = '","r")'; To = '","r+")' }
+        @{ Case = 'other path operand'; From = '.. my_lid ..'; To = '.. other_lid ..' }
+        @{ Case = 'additional operand'; From = '","r")'; To = '","r", extra)' }
+    ) {
+        $source = New-TestPositionalSource -LocaleList '"en", "zh-cn"' -Rows 'sample = {"English", "简体"}'
+        $tail = (Get-TestPositionalSidecarTail).Replace($From, $To)
+        $source = Add-TestPositionalRuntime $source $tail
+
+        $document = Read-TestPositionalSource $source
+
+        $document.Contains('zhTwSidecarPath') | Should -BeFalse
+        @($document.units | Where-Object blockedReason -CEQ 'unsupported_generated_localization_call').Count | Should -Be 3
+        @($document.units | Where-Object { $_.Contains('conditionalZhTwSidecar') }).Count | Should -Be 0
+    }
+
     # Scenario: A known sidecar-tail shape borrows a custom or mutated native loader binding.
     # Purpose: Keep disk absence from authorizing removal of a call that could still execute.
     It 'UnitT67_RejectsUnprovenNativeSidecarBindings: <Case>' -ForEach @(

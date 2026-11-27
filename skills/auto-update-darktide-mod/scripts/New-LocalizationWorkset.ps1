@@ -372,8 +372,8 @@ if ($newDocument.Contains('zhTwSidecarPath')) {
     if ($newDocument.zhTwSidecarLocaleBindingProven -and $loaderPath -ceq $expectedLoaderPath) {
         $sidecarPath = Assert-ContainedPath -Candidate (Join-Path $stagingRoot $sidecarPathWithinMod) -Root $stagingRoot
         $sidecarEvidence = [ordered]@{ loaderPath = $loaderPath; path = $sidecarPath; blockedReason = 'generated_sidecar_missing' }
+        Assert-NoReparsePath -Path $sidecarPath -Root $stagingRoot -AllowMissing
         if (Test-Path -LiteralPath $sidecarPath -PathType Leaf) {
-            Assert-NoReparsePath -Path $sidecarPath -Root $stagingRoot
             $sidecarBytes = Read-FileBytesWithHeartbeat -Path $sidecarPath
             $sidecar = Get-LuaLocalizationDocument -Bytes $sidecarBytes -DisplayPath $sidecarPath -SourceId $sourceIdentity -ZhTwSidecar -HeartbeatAction $HeartbeatAction
             $sidecarEvidence = [ordered]@{

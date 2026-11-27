@@ -1508,18 +1508,25 @@ function Test-LuaNativeSidecarLoaderBinding {
         $ioCall -gt $Start -and ($ioCall + 3) -lt $End -and
         (Test-LuaExactTokens $tokens ($ioDeclaration - 1) ($ioDeclaration + 6) 'local _io = Mods.lua.io') -and
         (Test-LuaTableStatementBoundary $tokens ($ioDeclaration + 6)) -and
-        (Test-LuaExactTokens $tokens $ioCall ($ioCall + 3) '_io.open(')
+        $tokens[$ioCall + 1].text -ceq '.' -and $tokens[$ioCall + 2].text -ceq 'open' -and $tokens[$ioCall + 3].text -ceq '('
 }
 
 function Get-LuaGeneratedSidecarPath {
     param($Context, $Generator)
     $tokens = $Context.tokens
     if ($null -eq $Generator -or $Generator.reason -or $Generator.unresolved.Count -ne 3) { return }
-    $tail = @'
+    $beforeOpen = @'
 if lid and type(lid) == "string" then
     local _mod_directory = "./../mods/"
     local my_lid = SIDECAR_PATH .. lid
-    local file = _io.open(_mod_directory .. my_lid .. ".lua","r")
+'@
+    # Verify the path operand and literal read-only mode directly in the Lua tokens.
+    $readOnlyOpen = @(
+        'local', 'file', '=', '_io', '.', 'open', '('
+        '_mod_directory', '..', 'my_lid', '..', '".lua"'
+        ',', '"r"', ')'
+    )
+    $afterOpen = @'
     if file ~= nil then
         file:close()
         my_lid = mod:io_dofile(my_lid)
@@ -1544,7 +1551,20 @@ end
         $start = $index - 15
         if ($start -lt 0 -or $tokens[$start].text -cne 'if' -or $Context.layout.depths[$start] -ne 0) { continue }
         $end = $Context.layout.closes[$start]
-        if ($end -and (Test-LuaExactTokens $tokens $start $end ($tail.Replace('SIDECAR_PATH', $pathToken)))) {
+        $openStart = $index + 5
+        $afterOpenStart = $openStart + $readOnlyOpen.Count
+        if (-not $end -or $afterOpenStart -gt $end -or
+            -not (Test-LuaExactTokens $tokens $start ($openStart - 1) ($beforeOpen.Replace('SIDECAR_PATH', $pathToken))) -or
+            -not (Test-LuaExactTokens $tokens $afterOpenStart $end $afterOpen)) { continue }
+
+        $matchesReadOnlyOpen = $true
+        for ($offset = 0; $offset -lt $readOnlyOpen.Count; $offset++) {
+            if ($tokens[$openStart + $offset].text -cne $readOnlyOpen[$offset]) {
+                $matchesReadOnlyOpen = $false
+                break
+            }
+        }
+        if ($matchesReadOnlyOpen) {
             $localeBindingProven = Test-LuaActiveLocaleBinding $Context $start
             $outsideCalls = @($Generator.unresolved | Where-Object { $_ -le $start -or $_ -ge $end })
             return [pscustomobject]@{

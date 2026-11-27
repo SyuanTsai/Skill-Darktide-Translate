@@ -1763,3 +1763,18 @@ return localization
         Test-Path -LiteralPath (Join-Path $outside 'localization-workset.json') -PathType Leaf | Should -Be $true
     }
 }
+
+Describe 'Localization sidecar directory identity' {
+    It 'UnitT29_RejectsSidecarAbsenceInRedirectedDirectory' {
+        Import-Module (Join-Path $PSScriptRoot '../skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1') -Force
+        $stage = Join-Path $TestDrive 'stage'
+        $parent = Join-Path $stage 'scripts/mods'
+        $outside = Join-Path $TestDrive 'outside'
+        $null = New-Item -ItemType Directory -Path $parent, $outside -Force
+        $relativeSidecar = 'scripts/mods/Example/Example_localization_zh-tw.lua'
+        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        $null = New-Item -ItemType $linkType -Path (Join-Path $parent 'Example') -Target $outside
+        Test-LocalizationWorksetStagedSidecarAbsent -StagingRoot $stage -RelativeSidecar $relativeSidecar |
+            Should -BeFalse
+    }
+}

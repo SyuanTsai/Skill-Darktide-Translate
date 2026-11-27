@@ -5,6 +5,7 @@
 Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Scope Local -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Scope Local -ErrorAction Stop
 
 function Assert-LocalizationWorksetPassthroughCoverage {
     param([string[]] $Prefixes, [object[]] $Units)
@@ -36,6 +37,9 @@ function Test-LocalizationWorksetStagedSidecarAbsent {
     if (-not $RelativeSidecar) { return $false }
     $sidecar = Join-Path $StagingRoot $RelativeSidecar
     $directory = Split-Path -Parent $sidecar
+    if (Test-PortableReparseItem -Path $directory -TrustedRoot $StagingRoot -Label 'Localization sidecar directory') {
+        return $false
+    }
     $prefix = (Split-Path -Leaf $sidecar) -creplace 'zh-tw\.lua$', ''
     @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop | Where-Object {
         $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and

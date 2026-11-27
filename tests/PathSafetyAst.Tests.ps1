@@ -72,6 +72,7 @@ $scopedFiles = @($runtimePowerShellFiles)
 $reviewedPathnameCallAllowances = @'
 skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1|Read-LocalizationRuleFile|Get-Item|1
 skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1|Read-LocalizationRuleFile|IO.File::ReadAllBytes|1
+skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1|Test-LocalizationWorksetStagedSidecarAbsent|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-PrBody|Test-Path|1
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|<script>|Test-Path|2
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|Assert-NoReparsePath|Get-Item|1
@@ -184,7 +185,7 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-ByteFile|Test-Path|
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-BytesWithHeartbeat|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|New-Item|1
-skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|Test-Path|5
+skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|Test-Path|6
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Assert-NoReparsePath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Assert-NoReparsePath|type::IO.DirectoryInfo|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Get-FileSha256|IO.File::Open|1
