@@ -57,16 +57,11 @@ def library():
         dll = (c.WinDLL if os.name == "nt" else c.CDLL)(location)
     except OSError as exc:
         raise RuntimeError("Cannot load installed UnRAR. Set DARKTIDE_UNRAR_LIBRARY to its absolute path.") from exc
-    signatures = {
-        "RARGetDllVersion": (c.c_int, []),
-        "RAROpenArchiveEx": (P, [c.POINTER(OpenData)]),
-        "RARReadHeaderEx": (c.c_int, [P, c.POINTER(Header)]),
-        "RARProcessFileW": (c.c_int, [P, c.c_int, P, P]),
-        "RARCloseArchive": (c.c_int, [P]),
-    }
-    for name, (result, args) in signatures.items():
-        fn = getattr(dll, name)
-        fn.restype, fn.argtypes = result, args
+    dll.RARGetDllVersion.restype, dll.RARGetDllVersion.argtypes = c.c_int, []
+    dll.RAROpenArchiveEx.restype, dll.RAROpenArchiveEx.argtypes = P, [c.POINTER(OpenData)]
+    dll.RARReadHeaderEx.restype, dll.RARReadHeaderEx.argtypes = c.c_int, [P, c.POINTER(Header)]
+    dll.RARProcessFileW.restype, dll.RARProcessFileW.argtypes = c.c_int, [P, c.c_int, P, P]
+    dll.RARCloseArchive.restype, dll.RARCloseArchive.argtypes = c.c_int, [P]
     if dll.RARGetDllVersion() < 8:
         raise ValueError("UnRAR SDK API version 8 or newer required")
     return dll

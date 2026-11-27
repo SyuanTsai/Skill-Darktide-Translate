@@ -58,7 +58,10 @@ Describe 'Skill source pin generator' {
         @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1'
         @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/assets/api-rules-manifest.json'
         @($pin.skillFiles.repositoryPath) | Should -Not -Contain 'packages/darktide-translate/darktide_translate.py'
-        @($pin.skillFiles.repositoryPath | Where-Object { $_ -like '*.py' }) | Should -BeNullOrEmpty
+        $pythonFiles = @($pin.skillFiles | Where-Object { $_.repositoryPath -like '*.py' })
+        $pythonFiles.Count | Should -Be 1
+        $pythonFiles[0].repositoryPath | Should -Be 'skills/auto-update-darktide-mod/scripts/rar_reader.py'
+        $pythonFiles[0].sha256 | Should -Be ((Get-FileHash -LiteralPath (Join-Path $fixture.SkillRoot 'scripts/rar_reader.py') -Algorithm SHA256).Hash.ToLowerInvariant())
         $result.result | Should -Be 'passed'
         $result.skillSourcePin.fileCount | Should -Be @($pin.skillFiles).Count
     }
@@ -73,6 +76,18 @@ Describe 'Skill source pin generator' {
 
         { & $fixture.IntegrityCheck -SkillSourcePinPath $pinPath -PassThru } |
             Should -Throw '*Installed Skill file differs from its source pin*'
+    }
+
+    # Scenario: A caller changes the pinned RAR decoder after generating the source pin.
+    # Purpose: Fail closed before the Skill can use a decoder whose installed bytes changed.
+    It 'InterT25_RejectsTamperedInstalledRarReaderBytes' {
+        $fixture = New-SkillSourcePinFixture -Root (Join-Path $TestDrive 'tampered-rar-reader')
+        $pinPath = Join-Path $TestDrive 'tampered-rar-reader-pin.json'
+        & $fixture.Generator -RepositoryRoot $fixture.Root -Ref HEAD -OutputPath $pinPath
+        [IO.File]::AppendAllText((Join-Path $fixture.SkillRoot 'scripts/rar_reader.py'), "`n# drift`n", [Text.UTF8Encoding]::new($false))
+
+        { & $fixture.IntegrityCheck -SkillSourcePinPath $pinPath -PassThru } |
+            Should -Throw '*Installed Skill file differs from its source pin: skills/auto-update-darktide-mod/scripts/rar_reader.py*'
     }
 
     It 'UnitT30_RefusesToOverwriteAnExistingOutputFile' {
