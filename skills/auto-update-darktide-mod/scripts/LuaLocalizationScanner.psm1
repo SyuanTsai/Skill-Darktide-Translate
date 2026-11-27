@@ -959,9 +959,9 @@ function Add-LuaPositionalRows {
         [Collections.Generic.HashSet[string]] $AmbiguousTables
     )
     $tokens = $Context.tokens
-    $input = Get-LuaLiteralLocalTable $Context $Arguments[0] $AllowedReferences
+    $sourceTable = Get-LuaLiteralLocalTable $Context $Arguments[0] $AllowedReferences
     $localeOrder = Get-LuaLiteralLocalTable $Context $Arguments[3] $AllowedReferences
-    if ($null -eq $input -or $null -eq $localeOrder) {
+    if ($null -eq $sourceTable -or $null -eq $localeOrder) {
         Add-LuaGeneratedBlock $Context $tokens[$Arguments[0]].text 'generated_local_table_unproven'
         return
     }
@@ -997,8 +997,8 @@ function Add-LuaPositionalRows {
         Get-LuaLiteralListInsertByte $Context $localeFields.fields
     } else { $null }
 
-    $rowIndex = $input.open + 1
-    while ($rowIndex -lt $input.close) {
+    $rowIndex = $sourceTable.open + 1
+    while ($rowIndex -lt $sourceTable.close) {
         Invoke-LuaScannerProgressHeartbeat
         $keyEnd = if ($tokens[$rowIndex].text -ceq '[') { Get-MatchingTokenIndex $tokens $rowIndex '[' ']' } else { $rowIndex }
         $key = if ($keyEnd -eq $rowIndex -or ($keyEnd -eq ($rowIndex + 2) -and $tokens[$rowIndex + 1].type -ceq 'string')) {
@@ -1054,7 +1054,7 @@ function Add-LuaPositionalRows {
             })
         }
         $rowIndex = $rowClose + 1
-        if ($rowIndex -lt $input.close) {
+        if ($rowIndex -lt $sourceTable.close) {
             if ($tokens[$rowIndex].text -cnotin @(',', ';')) {
                 Add-LuaGeneratedBlock $Context $tokens[$Arguments[0]].text 'generated_input_rows_unproven'
                 return
