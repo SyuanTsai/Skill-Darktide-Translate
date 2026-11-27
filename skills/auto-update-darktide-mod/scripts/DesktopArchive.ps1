@@ -172,7 +172,9 @@ function Open-DesktopArchive {
         if ($evidence.archiveFormat -cne $Format -or $Format -cnotin @('zip','rar')) {
             throw 'Archive format differs from recorded evidence.'
         }
-        if ($evidence.sha256 -cne $ExpectedSha256) { throw 'Claimed archive SHA-256 changed before processing.' }
+        if ($evidence.sha256 -cne $ExpectedSha256) {
+            throw "Claimed archive SHA-256 changed before $($Format.ToUpperInvariant()) processing."
+        }
         if ($Format -ceq 'rar') {
             $python = Get-Command -CommandType Application -Name $(if ($IsWindows) { 'python.exe' } else { 'python3' }) -ErrorAction Stop | Select-Object -First 1
             $info = [Diagnostics.ProcessStartInfo]::new($python.Source)

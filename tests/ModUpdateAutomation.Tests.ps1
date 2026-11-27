@@ -1891,20 +1891,22 @@ function Enter-SharedCoordinationLease {
     It 'UnitT120_ImplementsContainedBytePreservingArchiveExtraction' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
 
-        $runner | Should -Match 'ZipArchive'
+        $archive = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts/DesktopArchive.ps1') -Raw
+        $runner | Should -Match 'Open-DesktopArchive'
         $runner | Should -Match 'GetFullPath'
         $runner | Should -Match 'StartsWith'
-        $runner | Should -Match 'ExternalAttributes'
-        $runner | Should -Match 'CreateNew'
-        $runner | Should -Match 'ExpectedSha256'
+        ($archive -match 'ZipArchive') | Should -BeTrue
+        ($archive -match 'ExternalAttributes') | Should -BeTrue
+        ($archive -match 'CreateNew') | Should -BeTrue
+        ($archive -match 'ExpectedSha256') | Should -BeTrue
         $runner | Should -Match 'function Get-FileSha256'
         $runner | Should -Match 'Copy-StreamWithHeartbeat'
         $runner | Should -Match 'Source archive must be a regular file, not a reparse point'
         $runner | Should -Match 'Claimed archive must be a regular file, not a reparse point'
-        $runner | Should -Match '\$entryStream\s*=\s*\$entry\.Open\(\)'
+        ($archive -match '\$Reader\.archive\.Entries\[\$i\]\.Open\(\)') | Should -BeTrue
         $runner | Should -Not -Match '\$input\s*='
         $runner | Should -Not -Match '(?i)Invoke-Expression|\biex\b'
-        $runner | Should -Not -Match '(?i)(Get-Content|ReadAllText|ReadAllBytes)[^\r\n]*Trim(?:End)?\(|-replace\s+[''\"]\\s'
+        ($runner + $archive) | Should -Not -Match '(?i)(Get-Content|ReadAllText|ReadAllBytes)[^\r\n]*Trim(?:End)?\(|-replace\s+[''\"]\\s'
     }
 
     # Scenario: Direct localization fields or dynamic lookups need approved Traditional Chinese maintenance.
@@ -4879,32 +4881,42 @@ function Get-SourceTupleContractSha256 {
             lockPrimitive = 'dotnet-fileshare-none'
         } | ConvertTo-Json | Set-Content -LiteralPath $lockPath -NoNewline
 
-        (& $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru).result | Should -Be 'passed'
-        { & $runnerPath extract -RepositoryRoot $repository -StatePath $statePath -PassThru } |
-            Should -Throw '*Security approval required for changed risky archive payload*'
-        (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable).status | Should -Be 'waiting-user'
+        try {
+            (& $runnerPath verify-source -RepositoryRoot $repository -StatePath $statePath -PassThru).result | Should -Be 'passed'
+            { & $runnerPath extract -RepositoryRoot $repository -StatePath $statePath -PassThru } |
+                Should -Throw '*Security approval required for changed risky archive payload*'
+            (Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable).status | Should -Be 'waiting-user'
 
-        $approvalPath = Join-Path $TestDrive 'payload-approval.json'
-        [IO.File]::WriteAllText($approvalPath, ([ordered]@{
-            schemaVersion = 1; runId = $runId; archiveSha256 = $archiveSha
-            approvals = @([ordered]@{ relativePath = 'ExampleMod/payload.dll'; fileSha256 = $payloadSha })
-        } | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
-        (& $runnerPath extract -RepositoryRoot $repository -StatePath $statePath -SecurityOverridePath $approvalPath -PassThru).result | Should -Be 'passed'
-        $finalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
-        (Get-FileHash -LiteralPath $finalState.securityOverrideReceipt.path -Algorithm SHA256).Hash.ToLowerInvariant() |
-            Should -Be $finalState.securityOverrideReceipt.sha256
-        $manifest = Get-Content -LiteralPath $finalState.extractionManifest.path -Raw | ConvertFrom-TestJson -AsHashtable
-        $payload = @($manifest.files | Where-Object path -eq 'ExampleMod/payload.dll')[0]
-        $payload.securityDisposition.result | Should -Be 'approved-exact-tuple'
-        $payload.securityDisposition.archiveSha256 | Should -Be $archiveSha
-        $payload.securityDisposition.fileSha256 | Should -Be $payloadSha
-        (& $validatorPath -StatePath $statePath -SecurityPayloadOnly -PassThru).result | Should -Be 'passed'
+            $approvalPath = Join-Path $TestDrive 'payload-approval.json'
+            [IO.File]::WriteAllText($approvalPath, ([ordered]@{
+                schemaVersion = 1; runId = $runId; archiveSha256 = $archiveSha
+                approvals = @([ordered]@{ relativePath = 'ExampleMod/payload.dll'; fileSha256 = $payloadSha })
+            } | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+            (& $runnerPath extract -RepositoryRoot $repository -StatePath $statePath -SecurityOverridePath $approvalPath -PassThru).result | Should -Be 'passed'
+            $finalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-TestJson -AsHashtable
+            (Get-FileHash -LiteralPath $finalState.securityOverrideReceipt.path -Algorithm SHA256).Hash.ToLowerInvariant() |
+                Should -Be $finalState.securityOverrideReceipt.sha256
+            $manifest = Get-Content -LiteralPath $finalState.extractionManifest.path -Raw | ConvertFrom-TestJson -AsHashtable
+            $payload = @($manifest.files | Where-Object path -eq 'ExampleMod/payload.dll')[0]
+            $payload.securityDisposition.result | Should -Be 'approved-exact-tuple'
+            $payload.securityDisposition.archiveSha256 | Should -Be $archiveSha
+            $payload.securityDisposition.fileSha256 | Should -Be $payloadSha
+            (& $validatorPath -StatePath $statePath -SecurityPayloadOnly -PassThru).result | Should -Be 'passed'
 
-        $approvalArtifact = Get-Content -LiteralPath $finalState.securityOverrideReceipt.path -Raw | ConvertFrom-TestJson -AsHashtable
-        $approvalArtifact.approvals[0].fileSha256 = ('0' * 64)
-        [IO.File]::WriteAllText($finalState.securityOverrideReceipt.path, ($approvalArtifact | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
-        { & $validatorPath -StatePath $statePath -SecurityPayloadOnly -PassThru } |
-            Should -Throw '*Security override receipt SHA-256 changed*'
+            $approvalArtifact = Get-Content -LiteralPath $finalState.securityOverrideReceipt.path -Raw | ConvertFrom-TestJson -AsHashtable
+            $approvalArtifact.approvals[0].fileSha256 = ('0' * 64)
+            [IO.File]::WriteAllText($finalState.securityOverrideReceipt.path, ($approvalArtifact | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+            { & $validatorPath -StatePath $statePath -SecurityPayloadOnly -PassThru } |
+                Should -Throw '*Security override receipt SHA-256 changed*'
+        } finally {
+            if ($format -eq 'rar') {
+                # The copied Skill imports its own modules into this Pester host.
+                $fixtureModuleRoot = [IO.Path]::GetFullPath($fixtureScripts)
+                Get-Module -All | Where-Object {
+                    $_.Path -and [IO.Path]::GetDirectoryName($_.Path) -eq $fixtureModuleRoot
+                } | Remove-Module -Force
+            }
+        }
     }
 
     # Scenario: A valid-looking state keeps the canonical reservation path string, but that directory is replaced by a junction.
