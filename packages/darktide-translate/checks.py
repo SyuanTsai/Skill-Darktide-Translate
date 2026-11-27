@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 from collections import Counter
+from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -15,6 +16,7 @@ PLACEHOLDER = re.compile(r"\{[A-Za-z_][\w.]*(?::[^{}\n]+)?\}|" + PRINTF)
 FORMAT = re.compile(PRINTF)
 MARKUP = re.compile(r"\{#([a-zA-Z_]\w*)\([^{}\n]*\)\}")
 NUMBER = re.compile(r"[+-]?\d+(?:\.\d+)?%?")
+PRIVATE_USE = re.compile(r"[\ue000-\uf8ff\U000f0000-\U000ffffd\U00100000-\U0010fffd]")
 DOUBLE_QUOTE_PAIRS = {'"': '"', '“': '”', '＂': '＂'}
 
 
@@ -115,6 +117,16 @@ def strip_unexpected_outer_quotes(template, segments):
     return normalized, ["unexpected_outer_double_quotes"]
 
 
+def is_icon_only(template):
+    text = "".join(template.segments.values()).strip()
+    return (
+        bool(text) and not PRIVATE_USE.sub("", text).strip()
+        and all(token.kind == "string" or token.text in ("..", "(", ")") for token in template.tokens)
+        # A parenthesized expression can also be the receiver of a Lua function call.
+        and not any(left.text == ")" and right.text == "(" for left, right in pairwise(template.tokens))
+    )
+
+
 def validate(template, segments, glossary, luac, *, check_terms=True):
     if not isinstance(segments, dict) or segments.keys() != template.segments.keys():
         return None, ["segment_mismatch"]
@@ -136,6 +148,10 @@ def validate(template, segments, glossary, luac, *, check_terms=True):
         issues.append("newline_mismatch")
     if Counter(NUMBER.findall(source)) != Counter(NUMBER.findall(target)):
         issues.append("number_mismatch")
+    if ((segments != template.segments and is_icon_only(template))
+            or any(PRIVATE_USE.findall(original) != PRIVATE_USE.findall(segments[key])
+                   for key, original in template.segments.items())):
+        issues.append("glyph_mismatch")
     if check_terms:
         for group in glossary.groups(" ".join(template.segments.values())):
             translations = {entry.translation for entry in group}

@@ -149,6 +149,38 @@ def test_ac3_exact_glossary_and_scoped_checks(terms):
     assert validate(Template.parse('"Finesse"'), {"s1": "靈巧傷害"}, terms, Luac(None))[1] == []
 
 
+# Scenario: Lua segments contain pure or mixed private-use text and receive candidate translations.
+# Purpose: Require exact icon-only values and preserve the glyph sequence in each Lua segment.
+@pytest.mark.parametrize(("source", "segments", "issues"), [
+    ('" \ue000\ue001\ue000 "', {"s1": " \ue000\ue001\ue000 "}, []),
+    ('" \ue000 "', {"s1": "\ue000"}, ["glyph_mismatch"]),
+    ('"\ue000 \ue001"', {"s1": "\ue000\ue001"}, ["glyph_mismatch"]),
+    ('"\ue000"', {"s1": "圖示\ue000"}, ["glyph_mismatch"]),
+    ('"\ue000"', {"s1": ""}, ["glyph_mismatch"]),
+    ('"Label \ue000"', {"s1": "標籤\ue000"}, []),
+    ('"Label \ue000"', {"s1": "標籤"}, ["glyph_mismatch"]),
+    ('"Label"', {"s1": "標籤\ue000"}, ["glyph_mismatch"]),
+    ('"Label \ue000"', {"s1": "標籤\ue001"}, ["glyph_mismatch"]),
+    ('"Label \ue000\ue000"', {"s1": "標籤\ue000"}, ["glyph_mismatch"]),
+    ('"Label \ue000\ue001\ue000"', {"s1": "標籤\ue000\ue000\ue001"}, ["glyph_mismatch"]),
+    ('"Label \U000f0000\U0010fffd"', {"s1": "標籤\U000f0000\U0010fffd"}, []),
+    ('"Label \U000f0000\U0010fffd"', {"s1": "標籤\U000f0000"}, ["glyph_mismatch"]),
+    ('"\ue000" .. amount .. " Label"', {"s1": "\ue000", "s2": " 標籤"}, []),
+    ('"\ue000" .. amount .. " Label"', {"s1": "", "s2": "\ue000 標籤"}, ["glyph_mismatch"]),
+    ('"\ue000" .. amount .. ""', {"s1": "\ue000前", "s2": "後"}, []),
+    ('("\ue000")()', {"s1": "\ue000前"}, []),
+    ('"Weakspot \ue000"', {"s1": "弱處\ue000"}, ["glossary_term_missing"]),
+])
+def test_UnitT30_private_use_glyphs_stay_unchanged_in_their_lua_segments(source, segments, issues, terms):
+    template = Template.parse(source)
+
+    rendered, actual = validate(template, segments, terms, Luac(None))
+
+    assert actual == issues
+    if not issues:
+        assert Template.parse(rendered).segments == segments
+
+
 def assert_reference_terms(glossary):
     for text, count in {"Finesse": 2, "Flamer": 2, "Damage vs Maniacs": 3,
                         "Damage vs Groaners and Poxwalkers": 3, "Run 'n' Gun": 1,
