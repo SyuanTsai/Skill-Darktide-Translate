@@ -77,7 +77,7 @@ Describe 'Desktop archive reader' {
         $archive = Get-Content -LiteralPath (Join-Path $source 'DesktopArchive.ps1') -Raw
         $reader = Get-Content -LiteralPath (Join-Path $source 'rar_reader.py') -Raw
         $archive | Should -Match '(?s)\[IO\.File\]::Open\(\$destination,\s*\[IO\.FileMode\]::CreateNew,\s*\[IO\.FileAccess\]::Write,\s*\[IO\.FileShare\]::None\)'
-        $archive | Should -Not -Match "Open\(\$destination,'CreateNew'"
+        $archive | Should -Not -Match 'Open\(\$destination,''CreateNew'''
         $reader | Should -Not -Match 'os\.environ'
         $reader | Should -Not -Match '\brequests\b'
         $reader | Should -Match 'SHGetKnownFolderPath'
@@ -125,7 +125,13 @@ Describe 'Desktop archive reader' {
     # Scenario: Archive bytes no longer match the request, or the installed decoder cannot load.
     # Purpose: Both conditions must stop verification before any receipt or output is produced.
     It 'InterT35_FailsClosedOnChecksumOrDependencyFailure' {
-        . (Join-Path $source 'DesktopArchive.ps1')
+        $failedDecoder = Join-Path $TestDrive 'failed-decoder'
+        $null = New-Item -ItemType Directory -Path $failedDecoder
+        Copy-Item -LiteralPath (Join-Path $source 'DesktopArchive.ps1') -Destination $failedDecoder
+        $rejectDecoder = Join-Path $failedDecoder 'rar_reader.py'
+        'raise SystemExit("RAR verification failed: Cannot load trusted UnRAR SDK.")' |
+            Set-Content -LiteralPath $rejectDecoder -Encoding utf8NoBOM
+        . (Join-Path $failedDecoder 'DesktopArchive.ps1')
         $file = Join-Path $TestDrive 'unavailable.rar'
         $sha = Write-RarFixture $file @(@{name='Mod/file'})
         { Open-DesktopArchive $file ('0' * 64) rar } | Should -Throw '*SHA-256*'
