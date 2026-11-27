@@ -13,9 +13,8 @@ function Assert-LocalizationWorksetPassthroughCoverage {
     foreach ($prefix in $Prefixes) {
         if (-not $prefix) { continue }
         foreach ($unit in $Units) {
-            if ($null -ne $unit -and $unit.containerPath -ceq '$' -and
-                ([string]$unit.key).StartsWith($prefix, [StringComparison]::Ordinal)) {
-                throw "A game-localized output could overwrite a known localization key: $($unit.key)"
+            if (Test-LuaLocalizationUnitInRootNamespace $unit $prefix) {
+                throw "A game-localized output could overwrite a known localization key: $($unit.containerPath) / $($unit.key)"
             }
         }
     }
@@ -193,7 +192,8 @@ function Get-LocalizationWorksetWriteBlockReason {
         [string] $Action,
         [Collections.IDictionary] $OldUnit,
         [Collections.IDictionary] $NewUnit,
-        [switch] $SharedNewTable
+        [switch] $SharedNewTable,
+        [Collections.IDictionary] $Review
     )
     $sharedReason = 'generated_shared_translation_span_requires_review'
     if ($Action -ceq 'BLOCKED') { return }
@@ -227,6 +227,21 @@ function Get-LocalizationWorksetWriteBlockReason {
         if (-not $SharedNewTable -and $Action -cin @('AI_REQUIRED', 'RESTORE_OLD_ZH_TW') -and (Test-LocalizationWorksetPositionalAppend $NewUnit)) { return }
         return 'generated_positional_locale_requires_review'
     }
+    $hasLiteralTranslation = $null -ne $NewUnit -and $null -ne $NewUnit['generatedBinding'] -and
+        $NewUnit.generatedBinding.kind -ceq 'literal-list-loop' -and $null -ne $NewUnit.zhTwExpression
+    $isLiteralOverlay = $false
+    if ($hasLiteralTranslation) {
+        $fieldStart = [long]$NewUnit.zhTwExpression.fieldStartByte
+        $fieldEnd = $fieldStart + [long]$NewUnit.zhTwExpression.fieldLengthByte
+        $isLiteralOverlay = $fieldStart -le [long]$NewUnit.tableOpenByte -or $fieldEnd -gt [long]$NewUnit.tableCloseByte
+    }
+    # A shared or external literal can be approved as it stands. It is unsafe to
+    # edit its shared bytes or remove only part of a separate Lua assignment.
+    if ($hasLiteralTranslation -and ($SharedNewTable -or $isLiteralOverlay) -and $Action -ceq 'AI_REQUIRED') {
+        if ($null -eq $Review -or ($Review['reviewStatus'] -ceq 'preserved' -and $null -eq $Review['suggestedZhTwExpression'])) { return }
+        return 'generated_shared_literal_translation_requires_preservation_review'
+    }
+    if ($isLiteralOverlay) { return 'generated_literal_overlay_write_unproven' }
     if ($SharedNewTable) {
         if ($Action -ceq 'RESTORE_OLD_ZH_TW' -and (Test-LocalizationWorksetNumericRestore $OldUnit $NewUnit)) { return }
         return $sharedReason

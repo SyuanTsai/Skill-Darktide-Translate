@@ -471,7 +471,7 @@ foreach ($unit in @($workset.units)) {
     $classification = Get-ExpectedClassification -OldUnit $parsedOld -NewUnit $parsedNew `
         -ReviewSimplifiedChanges:($workset['positionalLabelReview'] -ceq 'zh-cn-changes')
     $shared = $null -ne $parsedNew -and $null -ne $parsedNew.tableOpenByte -and $sharedOffsets.Contains([long]$parsedNew.tableOpenByte)
-    $writeBlockReason = Get-LocalizationWorksetWriteBlockReason -Action $classification.action -OldUnit $parsedOld -NewUnit $parsedNew -SharedNewTable:$shared
+    $writeBlockReason = Get-LocalizationWorksetWriteBlockReason -Action $classification.action -OldUnit $parsedOld -NewUnit $parsedNew -SharedNewTable:$shared -Review $unit
     if ($writeBlockReason) {
         throw "Localization receipt includes a generated unit requiring separate review: $unitId ($writeBlockReason)"
     }

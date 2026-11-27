@@ -1212,6 +1212,160 @@ function Add-LuaAccumulatorRootTable {
     $null = Read-LuaTable -Text $Context.text -Tokens $Context.tokens -OpenIndex $Open -ContainerPath '$' -AssignedKey $null -SourceId $Context.sourceId -Units $Context.units -BomLength $Context.bomLength
 }
 
+function Test-LuaLiteralLanguageTable {
+    param([object[]] $Tokens, [int] $Open, [int] $Close)
+    $languages = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $position = $Open + 1
+    while ($position -lt $Close) {
+        $keyEnd = if ($Tokens[$position].text -ceq '[') { $position + 2 } else { $position }
+        $value = $keyEnd + 2
+        if ($value -ge $Close -or $Tokens[$keyEnd + 1].text -cne '=' -or $Tokens[$value].type -cne 'string') { return $false }
+        $key = Get-LuaKey $Tokens $position $keyEnd
+        if ($key -cnotin @('en', 'zh-cn', 'zh-tw') -or -not $languages.Add($key)) { return $false }
+        try { $null = ConvertFrom-LuaKeyString $Tokens[$value].text -RequireUtf8 }
+        catch { return $false }
+        $position = $value + 1
+        if ($position -lt $Close) {
+            if ($Tokens[$position].text -cnotin @(',', ';')) { return $false }
+            $position++
+        }
+    }
+    $languages.Contains('en')
+}
+
+function Get-LuaLiteralListLoop {
+    param($Context, [string] $Accumulator, [int] $Iterator, [int] $After)
+    $tokens = $Context.tokens
+    $start = $Iterator - 5
+    if ($start -le $After -or ($Iterator + 7) -ge $tokens.Count -or $Context.layout.depths[$start] -ne 0 -or
+        $tokens[$start].text -cne 'for' -or $tokens[$start + 1].text -cne '_' -or $tokens[$start + 2].text -cne ',' -or
+        $tokens[$start + 3].type -cne 'identifier' -or $tokens[$start + 4].text -cne 'in' -or
+        $tokens[$Iterator + 1].text -cne '(') { return }
+    $parameter = $tokens[$start + 3].text
+    if ($parameter -cin @('_', $Accumulator) -or $Accumulator -ceq '_') { return }
+
+    $argument = $Iterator + 2
+    $close = Get-MatchingTokenIndex $tokens ($Iterator + 1) '(' ')'
+    $doIndex = $close + 1
+    if ($tokens[$doIndex].text -cne 'do' -or -not $Context.layout.closes.ContainsKey($doIndex)) { return }
+    $end = $Context.layout.closes[$doIndex]
+    if ($tokens[$end].text -cne 'end') { return }
+    $list = if ($tokens[$argument].text -ceq '{' -and $tokens[$close - 1].text -ceq '}') {
+        if ((Get-MatchingTokenIndex $tokens $argument '{' '}') -eq ($close - 1)) { [pscustomobject]@{ open = $argument; close = $close - 1 } }
+    }
+    elseif ($close -eq ($argument + 1)) {
+        Get-LuaLiteralLocalTable $Context $argument ([Collections.Generic.HashSet[int]]::new())
+    }
+    if ($null -eq $list) { return }
+    $fields = Get-LuaLiteralList $tokens $list.open $list.close
+    if ($null -eq $fields -or $fields.fields.Count -lt 1 -or $fields.fields.Count -gt 128) { return }
+    $prefixes = [Collections.Generic.List[string]]::new()
+    $seenPrefixes = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($field in $fields.fields) {
+        try { $prefix = ConvertFrom-LuaKeyString $tokens[$field.valueStartIndex].text -RequireUtf8 }
+        catch { return }
+        if ($prefix -cnotmatch '^[A-Za-z0-9_]+$' -or -not $seenPrefixes.Add($prefix)) { return }
+        $prefixes.Add($prefix)
+    }
+
+    $items = [Collections.Generic.List[object]]::new()
+    $seenSuffixes = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $position = $doIndex + 1
+    $overlay = $null
+    while ($position -lt $end) {
+        Invoke-LuaScannerProgressHeartbeat
+        if ($items.Count -ge 128 -or ($position + 6) -ge $end -or $tokens[$position].text -cne $Accumulator -or
+            $tokens[$position + 1].text -cne '[' -or $tokens[$position + 2].text -cne $parameter -or
+            $tokens[$position + 3].text -cne '..' -or $tokens[$position + 4].type -cne 'string' -or
+            $tokens[$position + 5].text -cne ']') { return }
+        try { $suffix = ConvertFrom-LuaKeyString $tokens[$position + 4].text -RequireUtf8 }
+        catch { return }
+        if ($suffix -cnotmatch '^_[A-Za-z0-9_]+$' -or -not $seenSuffixes.Add($suffix)) { return }
+
+        $fieldIndex = $position + 6
+        $isOverlay = $tokens[$fieldIndex].text -ceq '['
+        if ($null -eq $overlay) { $overlay = $isOverlay }
+        elseif ($overlay -ne $isOverlay) { return }
+        if ($isOverlay) {
+            $value = $fieldIndex + 4
+            if ($value -ge $end -or $tokens[$fieldIndex + 1].text -cne '"zh-tw"' -or
+                $tokens[$fieldIndex + 2].text -cne ']' -or $tokens[$fieldIndex + 3].text -cne '=' -or
+                $tokens[$value].type -cne 'string' -or -not (Test-LuaTableStatementBoundary $tokens $value)) { return }
+            try { $null = ConvertFrom-LuaKeyString $tokens[$value].text -RequireUtf8 }
+            catch { return }
+            $items.Add([pscustomobject]@{ suffix = $suffix; field = [ordered]@{
+                fieldStartIndex = $fieldIndex; valueStartIndex = $value; valueEndIndex = $value; separatorIndex = $null
+            } })
+            $position = $value + 1
+        }
+        else {
+            $assignment = Get-LuaAccumulatorAssignment $tokens $position
+            if ($null -eq $assignment -or $assignment.tableEnd -lt 0 -or $assignment.tableEnd -ge $end -or
+                -not (Test-LuaLiteralLanguageTable $tokens $assignment.valueIndex $assignment.tableEnd)) { return }
+            $items.Add([pscustomobject]@{ suffix = $suffix; tableIndex = $assignment.valueIndex })
+            $position = $assignment.tableEnd + 1
+        }
+        if ($tokens[$position].text -ceq ';') { $position++ }
+    }
+    if ($items.Count -eq 0 -or ($items.Count * $prefixes.Count) -gt 512) { return }
+
+    $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($item in $items) {
+        foreach ($prefix in $prefixes) {
+            if (-not $keys.Add($prefix + $item.suffix)) { return }
+        }
+    }
+    [pscustomobject]@{ start = $start; end = $end; parameter = $parameter; prefixes = $prefixes; items = $items; overlay = $overlay }
+}
+
+function Add-LuaLiteralListLoop {
+    param($Context, $Loop, [Collections.Generic.Dictionary[string, object]] $PriorOutputs)
+    foreach ($item in $Loop.items) {
+        $overlayTable = $null
+        foreach ($prefix in $Loop.prefixes) {
+            Invoke-LuaScannerProgressHeartbeat
+            $key = $prefix + $item.suffix
+            if ($Loop.overlay) {
+                $target = if ($PriorOutputs.ContainsKey($key)) { $PriorOutputs[$key] }
+                if ($null -eq $target -or $null -ne $target.zhTwExpression -or $null -eq $target.tableOpenByte -or
+                    $target.generatedBinding.prefix -cne $prefix -or $target.generatedBinding.suffix -cne $item.suffix -or
+                    ($null -ne $overlayTable -and $target.tableOpenByte -ne $overlayTable)) {
+                    Add-LuaGeneratedBlock $Context $key 'generated_literal_overlay_target_unproven'
+                    return
+                }
+                # All users of this physical overlay value must be in one shared-table group.
+                $overlayTable = $target.tableOpenByte
+            }
+            else {
+                $binding = [ordered]@{ kind = 'literal-list-loop'; parameter = $Loop.parameter; prefix = $prefix; suffix = $item.suffix }
+                Add-LuaGeneratedTable $Context $item.tableIndex $key $binding
+                $unit = $Context.units[$Context.units.Count - 1]
+                if (-not $PriorOutputs.TryAdd($key, $unit)) { $PriorOutputs[$key] = $null }
+            }
+        }
+    }
+    if ($Loop.overlay) {
+        foreach ($item in $Loop.items) {
+            $translation = New-ExpressionRecord -Text $Context.text -Tokens $Context.tokens -Field $item.field -BomLength $Context.bomLength -KnownStringLiteral
+            foreach ($prefix in $Loop.prefixes) {
+                $PriorOutputs[$prefix + $item.suffix].zhTwExpression = $translation
+            }
+        }
+    }
+}
+
+function Test-LuaLocalizationUnitInRootNamespace {
+    param($Unit, [string] $Prefix)
+    if ($null -eq $Unit -or [string]::IsNullOrEmpty($Prefix)) { return $false }
+    $container = [string]$Unit.containerPath
+    # A computed root key has no proven literal namespace.
+    if ($container -ceq '$') {
+        $key = [string]$Unit.key
+        return $key.StartsWith($Prefix, [StringComparison]::Ordinal) -or $key.StartsWith('[', [StringComparison]::Ordinal)
+    }
+    $container.StartsWith('$.' + $Prefix, [StringComparison]::Ordinal) -or $container.StartsWith('$[', [StringComparison]::Ordinal)
+}
+
 function Get-LuaGameLocalizedPassthrough {
     param($Context, [string] $Accumulator, [int] $After)
     $prefix = 'game_class_name_'
@@ -1243,6 +1397,37 @@ end
         -not (Test-LuaActiveLocaleBinding $Context $start)) { return }
 
     [pscustomobject]@{ start = $start; end = $end; prefix = $prefix }
+}
+
+function Get-LuaMoodLocalizedPassthrough {
+    param($Context, [string] $Accumulator, [int] $After)
+    if ($Accumulator -cin @('_', 'mood_type', 'label', 'MoodSettings', 'require', 'pairs', 'string')) { return }
+    $tokens = $Context.tokens
+    $references = @($Context.references['MoodSettings'] | Where-Object { $null -ne $_ -and -not (Test-LuaReferenceIsField $Context $_) })
+    if ($references.Count -ne 2) { return }
+    $declaration = $references[0]
+    $start = $references[1] - 7
+    $doIndex = $start + 11
+    if ($declaration -lt 1 -or $Context.layout.depths[$declaration] -ne 0 -or ($declaration + 5) -ge $start -or
+        $start -le $After -or $Context.layout.depths[$start] -ne 0 -or -not $Context.layout.closes.ContainsKey($doIndex) -or
+        -not (Test-LuaExactTokens $tokens ($declaration - 1) ($declaration + 5) 'local MoodSettings = require("scripts/settings/camera/mood/mood_settings")') -or
+        -not (Test-LuaTableStatementBoundary $tokens ($declaration + 5))) { return }
+
+    $loop = @'
+for mood_type, _ in pairs(MoodSettings.mood_types) do
+    local label = string.gsub(mood_type, "_", " ")
+    ACCUMULATOR["hide_mood_vfx_" .. mood_type] = {
+        en = "Disable " .. label,
+    }
+end
+'@
+    $end = $Context.layout.closes[$doIndex]
+    if (-not (Test-LuaExactTokens $tokens $start $end ($loop.Replace('ACCUMULATOR', $Accumulator))) -or
+        -not (Test-LuaUnshadowedPrimitive $Context 'require') -or
+        -not (Test-LuaUnshadowedPrimitive $Context 'pairs') -or
+        -not (Test-LuaUnshadowedPrimitive $Context 'string' -MemberCalls)) { return }
+
+    [pscustomobject]@{ start = $start; end = $end; prefix = 'hide_mood_vfx_' }
 }
 
 function Add-LuaAccumulatorUnits {
@@ -1300,10 +1485,24 @@ function Add-LuaAccumulatorUnits {
 
     $generator = Get-LuaPositionalGenerator $Context $accumulator
     $Context.sidecarPath = Get-LuaGeneratedSidecarPath $Context $generator
-    $gameLocalized = Get-LuaGameLocalizedPassthrough $Context $accumulator $initialClose
+    $gameLocalized = @(
+        Get-LuaGameLocalizedPassthrough $Context $accumulator $initialClose
+        Get-LuaMoodLocalizedPassthrough $Context $accumulator $initialClose
+    )
+    $literalLoops = @(
+        if ($Context.references.ContainsKey('ipairs') -and (Test-LuaUnshadowedPrimitive $Context 'ipairs')) {
+            foreach ($iterator in $Context.references['ipairs']) { Get-LuaLiteralListLoop $Context $accumulator $iterator $initialClose }
+        }
+    )
     $events = [Collections.Generic.SortedDictionary[int, object]]::new()
-    if ($null -ne $gameLocalized) {
-        $events.Add($gameLocalized.start, [pscustomobject]@{ type = 'gameLocalizedPassthrough' })
+    $coveredReferences = [Collections.Generic.HashSet[int]]::new()
+    foreach ($loop in $gameLocalized) {
+        $events.Add($loop.start, [pscustomobject]@{ type = 'gameLocalizedPassthrough' })
+        for ($index = $loop.start + 1; $index -lt $loop.end; $index++) { $null = $coveredReferences.Add($index) }
+    }
+    foreach ($loop in $literalLoops) {
+        $events.Add($loop.start, [pscustomobject]@{ type = 'literalListLoop'; loop = $loop })
+        for ($index = $loop.start + 1; $index -lt $loop.end; $index++) { $null = $coveredReferences.Add($index) }
     }
     if ($null -ne $generator) {
         foreach ($entry in $generator.calls.GetEnumerator()) {
@@ -1316,7 +1515,7 @@ function Add-LuaAccumulatorUnits {
 
     foreach ($index in $accumulatorReferences) {
         if ($index -in @($declaration, $initial, $last)) { continue }
-        if ($null -ne $gameLocalized -and $index -gt $gameLocalized.start -and $index -lt $gameLocalized.end) { continue }
+        if ($coveredReferences.Contains($index)) { continue }
         if ($null -ne $generator -and $index -gt $generator.start -and $index -lt $generator.end -and $initial -lt $generator.start) { continue }
         $assignment = Get-LuaAccumulatorAssignment $tokens $index
         if ($null -ne $assignment) {
@@ -1332,10 +1531,12 @@ function Add-LuaAccumulatorUnits {
 
     $hasWritten = $false
     $templateGenerators = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $literalLoopOutputs = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     foreach ($entry in $events.GetEnumerator()) {
         Invoke-LuaScannerProgressHeartbeat
         $index = $entry.Key
         switch ($entry.Value.type) {
+            'literalListLoop' { Add-LuaLiteralListLoop $Context $entry.Value.loop $literalLoopOutputs }
             'reassignment' {
                 if (-not $hasWritten -and $index -gt $initialClose -and $initialClose -eq ($initial + 3) -and
                     $Context.layout.depths[$index] -eq 0 -and $tokens[$index - 1].text -cnotin @('local', '.', ':', ',') -and
@@ -1415,15 +1616,17 @@ function Add-LuaAccumulatorUnits {
         $hasWritten = $true
     }
 
-    if ($null -ne $gameLocalized) {
+    foreach ($loop in $gameLocalized) {
+        $collides = $false
         foreach ($unit in $Context.units) {
             Invoke-LuaScannerProgressHeartbeat
-            if ($unit.containerPath -ceq '$' -and $unit.key.StartsWith($gameLocalized.prefix, [StringComparison]::Ordinal)) {
-                Add-LuaGeneratedBlock $Context $gameLocalized.prefix 'game_localize_passthrough_prefix_collision'
-                return
+            if (Test-LuaLocalizationUnitInRootNamespace $unit $loop.prefix) {
+                $collides = $true
+                break
             }
         }
-        $Context.gameLocalizedPassthroughPrefix = $gameLocalized.prefix
+        if ($collides) { Add-LuaGeneratedBlock $Context $loop.prefix 'game_localize_passthrough_prefix_collision' }
+        else { $Context.gameLocalizedPassthroughPrefixes.Add($loop.prefix) }
     }
 }
 
@@ -1684,7 +1887,7 @@ function Get-LuaLocalizationDocument {
             tokens = $tokens; text = $text; units = $units; sourceId = $SourceId; bomLength = $bomLength
             layout = $null; references = $null; sidecarPath = $null; namedAccumulator = $false
             tableCache = [Collections.Generic.Dictionary[int, object]]::new()
-            gameLocalizedPassthroughPrefix = $null
+            gameLocalizedPassthroughPrefixes = [Collections.Generic.List[string]]::new()
         }
         Add-LuaAccumulatorUnits $context
         if (-not $context.namedAccumulator) {
@@ -1769,8 +1972,8 @@ function Get-LuaLocalizationDocument {
             $document.zhTwSidecarPath = $context.sidecarPath.path
             $document.zhTwSidecarLocaleBindingProven = $context.sidecarPath.localeBindingProven
         }
-        if ($context.gameLocalizedPassthroughPrefix) {
-            $document.gameLocalizedPassthroughPrefixes = @($context.gameLocalizedPassthroughPrefix)
+        if ($context.gameLocalizedPassthroughPrefixes.Count -gt 0) {
+            $document.gameLocalizedPassthroughPrefixes = @($context.gameLocalizedPassthroughPrefixes)
         }
         $document
     }
@@ -1917,4 +2120,4 @@ function Test-LuaNonStringTokenSequence {
         (Get-LuaFormatSignature -Tokens $translationTokens -FormatSpans $formatSpans)
 }
 
-Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence
+Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence, Test-LuaLocalizationUnitInRootNamespace
