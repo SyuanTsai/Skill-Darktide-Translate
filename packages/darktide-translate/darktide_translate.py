@@ -21,6 +21,7 @@ from claude_runner.client import Client, FatalApiError
 from claude_runner.state import State, StateMismatch
 
 from checks import FORMAT, MARKUP, Luac, strip_unexpected_outer_quotes, validate
+from gameplay_context import INSUFFICIENT, fingerprint, load_context
 from glossary import Glossary
 from lua_template import ComplexExpression, Expression, Template, decode_string, token_shape, tokenize
 from rules import ASSETS_RELATIVE, MODES, load_config, load_rules
@@ -31,6 +32,7 @@ from workset import Workset, WorksetError, expression
 API_KEY_VARIABLE = "ANTHROPIC_API_KEY"
 LOOKUP = "needs_lookup_definition"
 COMPLEX = "complex_expression"
+CONTEXT_BLOCK = object()
 
 
 def positive_int(text):
@@ -54,6 +56,7 @@ def parser():
     for name in ("workset", "state", "cache-dir", "summary-out"):
         run.add_argument(f"--{name}", type=Path, required=True)
     run.add_argument("--max-items", type=positive_int)
+    run.add_argument("--gameplay-context", type=Path)
     run.add_argument("--dry-run", action="store_true")
     return commands
 
@@ -67,11 +70,12 @@ def cache_identity(unit, binding):
 
 
 class Requests:
-    def __init__(self, rules, workset, templates, glossary):
+    def __init__(self, rules, workset, templates, glossary, contexts):
         self.rules = rules
         self.units = workset.pending
         self.templates = templates
         self.glossary = glossary
+        self.contexts = contexts
         self.mode = rules.binding["mode"]
         self.system = {role: rules.system(role) for role in ("translator", "reviewer")}
         self.schemas = {
@@ -119,8 +123,15 @@ class Requests:
                            self.translator_schema(unit_ids), unit_ids)
 
     def reviewer_payload(self, values):
-        units = [{"unitId": unit_id, "source": self.templates[unit_id].segments,
-                  "translation": value["segments"]} for unit_id, value in values.items()]
+        units = []
+        for unit_id, value in values.items():
+            unit = {"unitId": unit_id, "source": self.templates[unit_id].segments,
+                    "translation": value["segments"]}
+            if unit_id in self.contexts:
+                context = self.contexts[unit_id]
+                unit["key"] = context["key"]
+                unit["gameplayContext"] = {name: data for name, data in context.items() if name != "key"}
+            units.append(unit)
         return self.user(values, units)
 
     def review(self, client, values):
@@ -210,13 +221,18 @@ def preserve_expression(unit, raw, luac):
 def valid_approval(record, template, glossary, luac):
     if not isinstance(record, dict) or not isinstance(record.get("review"), dict):
         return False
-    if record["review"].get("verdict") != "pass":
+    if record["review"].get("verdict") != "pass" or needs_gameplay_context(record["review"].get("issues")):
         return False
     rendered, issues = validate(template, record.get("segments"), glossary, luac)
     return not issues and rendered == record.get("expression")
 
 
-def prepare(workset, state, cache, binding, glossary, luac):
+def needs_gameplay_context(issues):
+    return isinstance(issues, list) and any(
+        isinstance(issue, dict) and issue.get("category") == "gameplay_context" for issue in issues)
+
+
+def prepare(workset, state, cache, binding, glossary, luac, contexts, context_blockers):
     templates, identities, progress = {}, {}, {}
     ready, queue = {}, []
     for unit_id, unit in workset.pending.items():
@@ -226,10 +242,18 @@ def prepare(workset, state, cache, binding, glossary, luac):
         progress[unit_id] = step
         if record.get("status") == "blocked" and record.get("blockedReason") not in ("api_failed", LOOKUP, COMPLEX):
             continue
+        if unit_id in context_blockers:
+            ready[unit_id] = (context_blockers[unit_id], None)
+            continue
         identity = cache_identity(unit, binding)
+        if unit_id in contexts:
+            identity.append(fingerprint([unit_id, contexts[unit_id]]))
         try:
             template = Template.parse(identity[0] or "")
         except ComplexExpression:
+            if unit_id in contexts:
+                ready[unit_id] = (INSUFFICIENT, None)
+                continue
             preserved = preserve_expression(unit, identity[0] or "", luac)
             ready[unit_id] = ("preserved", preserved) if preserved else ("invalid_lua_expression", None)
             continue
@@ -262,6 +286,8 @@ def distinct_paths(args):
              (args.workset, args.state, args.summary_out, args.summary_out.with_suffix(".md"))]
     if len(set(paths)) != len(paths):
         raise WorksetError("工作集、狀態檔與兩種摘要必須使用不同路徑。")
+    if args.gameplay_context is not None and args.gameplay_context.resolve() in paths:
+        raise WorksetError("遊戲脈絡檔必須使用獨立路徑。")
     return paths
 
 
@@ -271,16 +297,20 @@ def run(args, config, transport, sleeper, luac):
     base_oid = (workset.document["baseOid"] or "") if workset.document.get("generatorVersion") == 2 else None
     rules = load_rules(args.mods_root, args.mode, workset.document["modRelativePath"], config, base_oid=base_oid)
     binding = workset.bind(rules.binding)
+    contexts, context_blockers = load_context(args.gameplay_context, args.mods_root, workset)
     identity = {"worksetSha256": workset.document["immutableContractSha256"],
                 "rulesSha": binding["rulesSha256"], "glossarySha": binding["glossarySha256"],
-                "mode": binding["mode"], "model": binding["modelId"]}
+                "mode": binding["mode"], "model": binding["modelId"],
+                "gameplayContextSha256": fingerprint([contexts, context_blockers])
+                if contexts or context_blockers else None}
     state = State(args.state, identity)
     usage = Usage(state.data["usage"])
     state.data["usage"] = usage.data
     cache = Cache(args.cache_dir)
     glossary = Glossary.parse(rules.glossary.decode("utf-8-sig"))
-    templates, identities, progress, ready, queue = prepare(workset, state, cache, binding, glossary, luac)
-    requests = Requests(rules, workset, templates, glossary)
+    templates, identities, progress, ready, queue = prepare(
+        workset, state, cache, binding, glossary, luac, contexts, context_blockers)
+    requests = Requests(rules, workset, templates, glossary, contexts)
     limit = args.max_items if args.max_items is not None else config["maxItemsPerRun"]
     prices = config["pricingUsdPerMTok"]
     batch_size = config["batchSize"]
@@ -299,6 +329,9 @@ def run(args, config, transport, sleeper, luac):
     preview = {}
 
     def finish(unit_id, step, reason, *, value=None, review=None, details=None, origin="api"):
+        if value is CONTEXT_BLOCK or (review and needs_gameplay_context(review.get("issues"))):
+            reason, value, review = INSUFFICIENT, None, None
+            step.feedback = []
         status = "blocked" if reason else "preserved" if origin == "preserved" else "approved"
         record = {
             "status": status,
@@ -328,6 +361,11 @@ def run(args, config, transport, sleeper, luac):
             cache.put(identities[unit_id], {**value, "review": review})
 
     def fallback(unit_id, value, issues, exhausted):
+        if needs_gameplay_context(issues):
+            # A context gap needs new evidence. Route it to finish without another translation attempt.
+            return CONTEXT_BLOCK
+        if unit_id in contexts:
+            return None
         if not value or not value.get("termReview"):
             return None
         term_only = issues == ["glossary_term_missing"] or (
