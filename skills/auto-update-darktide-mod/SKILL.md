@@ -1,6 +1,6 @@
 ---
 name: auto-update-darktide-mod
-description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs, preserve active zh-tw, and produce Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
+description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs or single-volume RARs. Preserve active zh-tw and record Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization. Excludes standalone translation and MOD authoring.
 allowed-tools: "git, pwsh, webfetch"
 ---
 <!--
@@ -25,7 +25,7 @@ The coordination helpers themselves use only local .NET locking, same-directory 
 4. Before selecting, writing, or reviewing zh-tw, read [references/translation-quality.md](references/translation-quality.md) completely. Its English-first, curated-translation, and functional-meaning outcome standard refines the semantic translation clauses in both Schema 14 documents and Schema 15 while leaving their deterministic evidence boundaries intact.
 5. For a new Schema 15 run, read [references/schema-15.md](references/schema-15.md) completely after the expanded Schema 14 Workflow. Its acquisition, receipt, status, localization-workset, and lifecycle rules override only the corresponding Schema 14 manual-source and approved-span rules.
 6. Before local Review, external feedback classification, or Review completion, use the same script to materialize `assets/review-baseline.md` from the same pinned Skill source commit and read it completely, then apply the translation-quality outcome standard to its semantic fidelity checks.
-7. Before executing or recovering deterministic stages, read [references/automation.md](references/automation.md). Use [mod-update.ps1](scripts/mod-update.ps1) for fixed stage orchestration, [Finalize-ModUpdateMerge.ps1](scripts/Finalize-ModUpdateMerge.ps1) through its `finalize-merge` command for merge reconciliation or finalization, and the [Candidate Gate script](scripts/Test-ModUpdateCandidate.ps1) as the independent Final Candidate Gate. These reusable scripts derive MOD, run, PR, SHA, path, and reservation facts from the verified state instead of generated per-run helpers.
+7. The desktop runner extends the original Schema 14/15 ZIP boundary to structurally verified RAR. Preserve the original Main filename, format, size and SHA-256. Before executing or recovering deterministic stages, read [references/automation.md](references/automation.md). Use [mod-update.ps1](scripts/mod-update.ps1) for fixed stage orchestration, [Finalize-ModUpdateMerge.ps1](scripts/Finalize-ModUpdateMerge.ps1) through its `finalize-merge` command for merge reconciliation or finalization, and the [Candidate Gate script](scripts/Test-ModUpdateCandidate.ps1) as the independent Final Candidate Gate. These reusable scripts derive MOD, run, PR, SHA, path, and reservation facts from the verified state instead of generated per-run helpers.
 
 8. Read [references/api-translation.md](references/api-translation.md) for the packaged API assets and PowerShell workset binding. Run the Python adapter separately from the repository source tree or GitHub Actions.
 
@@ -49,7 +49,7 @@ Keep the temporary materialization outside the Skill source and target MOD repos
 
 ## Select the operation
 
-- **Automatic source:** execute Schema 15 `acquire-source`, independently verify the receipt, and claim only the same run-owned verified ZIP before continuing the complete evidence flow.
+- **Automatic source:** execute Schema 15 `acquire-source`, independently verify the receipt, and claim only the same run-owned verified ZIP or single-volume RAR before continuing the complete evidence flow. RAR requires Python 3 and the native UnRAR SDK.
 - **Manual claim or update:** supply the complete Nexus Main-file source request, then execute the complete Schema 14 source, security, localization, clean-install, C0, C1, C2, C3, and F evidence, Candidate Gate, publication, and local Review flow.
 - **Resume:** reattach only the matching run ID and reservation tuple. Before acquiring a writer lease or reusing any completed checkpoint, prove the installed package against the fixed run-local source pin; package drift stops without changing state, reservation evidence, source, or the pin. Then revalidate completed artifacts before reuse.
 - **Review or feedback:** bind every conclusion to the current F, Gate tuple, immutable evidence receipt, and packaged Review Baseline. Apply only `in-scope / adopt` findings.

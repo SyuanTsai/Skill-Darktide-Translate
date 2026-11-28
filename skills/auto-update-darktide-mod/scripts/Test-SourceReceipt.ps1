@@ -25,6 +25,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+. (Join-Path $PSScriptRoot 'DesktopArchive.ps1')
 
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
@@ -114,43 +115,6 @@ function Get-SanitizedUrl {
     $builder.UserName = ''
     $builder.Password = ''
     $builder.Uri.AbsoluteUri.TrimEnd('?')
-}
-
-function Get-ArchiveEvidence {
-    param([string] $Path)
-    Invoke-Heartbeat
-    $bytes = [byte[]]::new(8)
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
-    try {
-        $size = $stream.Length
-        $read = $stream.Read($bytes, 0, $bytes.Length)
-        $stream.Position = 0
-        $buffer = [byte[]]::new(1MB)
-        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $hasher.AppendData($buffer, 0, $readCount)
-            Invoke-Heartbeat
-        }
-        $sha256 = [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
-    }
-    finally {
-        $hasher.Dispose()
-        $stream.Dispose()
-    }
-    $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
-        (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
-        'zip'
-    }
-    elseif ($read -ge 7 -and $bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and
-        $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07 -and $bytes[6] -in @(0x00, 0x01)) {
-        'rar'
-    }
-    elseif ($read -ge 6 -and $bytes[0] -eq 0x37 -and $bytes[1] -eq 0x7A -and $bytes[2] -eq 0xBC -and
-        $bytes[3] -eq 0xAF -and $bytes[4] -eq 0x27 -and $bytes[5] -eq 0x1C) {
-        '7z'
-    }
-    else { 'unknown' }
-    [ordered]@{ size = [int64]$size; sha256 = $sha256; archiveFormat = $format }
 }
 
 function Assert-NoReparsePath {
@@ -337,8 +301,8 @@ foreach ($timing in @('downloadMilliseconds', 'waitingMilliseconds', 'verifyMill
 Assert-StableObservations -Receipt $receipt
 if ($isRetainedNonDelivered) {
     if ([string]::IsNullOrWhiteSpace($RetainedPath)) { throw 'Retained non-delivered receipt verification requires RetainedPath.' }
-    if ([IO.Path]::GetExtension($requestedFileName).ToLowerInvariant() -cne '.zip') {
-        throw 'Retained non-delivered receipt requires an originally eligible ZIP filename.'
+    if ([IO.Path]::GetExtension($requestedFileName).ToLowerInvariant() -cnotin @('.zip','.rar')) {
+        throw 'Retained non-delivered receipt requires an originally eligible archive filename.'
     }
     $retainedFull = [IO.Path]::GetFullPath($RetainedPath)
     $null = Assert-NoReparsePath -Path $retainedFull -Root $sourceRunRoot -Label 'Retained source'
@@ -349,7 +313,9 @@ if ($isRetainedNonDelivered) {
             $sourceRunRoot, (Get-PortablePathComparison -Root $sourceRunRoot))) {
         throw 'Retained source is outside a fixed run-local incoming directory.'
     }
-    $archiveEvidence = Get-ArchiveEvidence -Path $retainedFull
+    $legacyRar = $receiptStatus -ceq 'unsupported' -and $receipt.archiveFormat -ceq 'rar' -and
+        [IO.Path]::GetExtension($requestedFileName).ToLowerInvariant() -ceq '.zip'
+    $archiveEvidence = Get-DesktopArchiveEvidence -Path $retainedFull -Heartbeat { Invoke-Heartbeat } -LegacyUnsupportedRar:$legacyRar
     if ([int64]$archiveEvidence.size -ne [int64]$receipt.size -or
         [string]$archiveEvidence.sha256 -cne [string]$receipt.sha256 -or
         [string]$archiveEvidence.archiveFormat -cne [string]$receipt.archiveFormat -or
@@ -360,10 +326,11 @@ if ($isRetainedNonDelivered) {
     if ($receipt.officialHashPassed -ne $actualOfficialHashPassed) {
         throw 'Retained source official SHA-256 result differs from the receipt.'
     }
+    $expectedFormat = [IO.Path]::GetExtension($requestedFileName).TrimStart('.').ToLowerInvariant()
     $filenameMismatch = [string]$receipt.filename -cne $requestedFileName
     $hashMismatch = $null -ne $requestOfficialSha256 -and -not $actualOfficialHashPassed
     $recoveryResult = if ($receiptStatus -ceq 'unsupported') {
-        if ([string]$archiveEvidence.archiveFormat -ceq 'zip') { throw 'Unsupported source receipt contains ZIP bytes.' }
+        if ([string]$archiveEvidence.archiveFormat -ceq $expectedFormat) { throw 'Unsupported source receipt contains the requested format.' }
         [ordered]@{
             result = 'waiting'; status = 'waiting-user'
             waitingReason = [ordered]@{ code = 'unsupported_archive_format'; message = ('Detected unsupported {0} archive bytes after download.' -f ([string]$archiveEvidence.archiveFormat)) }
@@ -371,7 +338,7 @@ if ($isRetainedNonDelivered) {
         }
     }
     else {
-        if ([string]$archiveEvidence.archiveFormat -cne 'zip' -or (-not $hashMismatch -and -not $filenameMismatch)) {
+        if ([string]$archiveEvidence.archiveFormat -cne $expectedFormat -or (-not $hashMismatch -and -not $filenameMismatch)) {
             throw 'Rejected source receipt has no reproducible hash or filename mismatch.'
         }
         if ($hashMismatch) {
@@ -408,11 +375,15 @@ if (-not [string]::IsNullOrWhiteSpace($RunRoot)) {
     }
 }
 $null = Assert-NoReparsePath -Path $deliveredPath -Root $sourceRunRoot -Label 'Delivered source'
-$archiveEvidence = Get-ArchiveEvidence -Path $deliveredPath
+$archiveEvidence = Get-DesktopArchiveEvidence -Path $deliveredPath -Heartbeat { Invoke-Heartbeat }
 if ([int64]$archiveEvidence.size -ne [int64]$receipt.size) { throw 'Delivered source size does not match the receipt.' }
 $actualSha256 = [string]$archiveEvidence.sha256
 if ($actualSha256 -cne [string]$receipt.sha256) { throw 'Delivered source SHA-256 does not match the receipt.' }
-if ([string]$receipt.archiveFormat -cne 'zip' -or [string]$archiveEvidence.archiveFormat -cne 'zip') { throw 'Delivered source is not a ZIP archive.' }
+$expectedFormat = [IO.Path]::GetExtension($requestedFileName).TrimStart('.').ToLowerInvariant()
+if ($expectedFormat -cnotin @('zip','rar') -or $receipt.archiveFormat -cne $expectedFormat -or $archiveEvidence.archiveFormat -cne $expectedFormat) {
+    throw 'Delivered archive format differs from receipt or requested filename.'
+}
+if ($expectedFormat -ceq 'rar') { Test-DesktopRarData $deliveredPath $actualSha256 { Invoke-Heartbeat } }
 if ([IO.Path]::GetFileName($deliveredPath) -cne [string]$receipt.filename -or $receipt.filename -cne (ConvertTo-InvariantString $request.fileName)) {
     throw 'Delivered source filename does not match the receipt and request.'
 }
