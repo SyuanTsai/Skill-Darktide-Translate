@@ -4073,8 +4073,8 @@ function Invoke-ApprovedSpans {
 }
 
 function Invoke-LocalizationWorkset {
-    param([Collections.IDictionary] $State)
-    $terminologyPath = if ($script:PSBoundParameters.ContainsKey('TerminologyRequestPath')) {
+    param([Collections.IDictionary] $State, [string] $TerminologyRequestPath)
+    $terminologyPath = if ($TerminologyRequestPath) {
         Assert-NoReparsePath -Path $TerminologyRequestPath -Root ([string]$State.runRoot) -Label 'Reviewed terminology request'
     }
     $completed = Get-CompletedStageResult -State $State -Name 'localization'
@@ -4257,9 +4257,11 @@ function Invoke-LocalizationWorkset {
 }
 
 function Invoke-Localization {
-    param([Collections.IDictionary] $State)
-    if ([int]$State.schemaVersion -ge 15) { return Invoke-LocalizationWorkset -State $State }
-    if ($script:PSBoundParameters.ContainsKey('TerminologyRequestPath')) { throw 'Reviewed terminology requires Schema 15 localization.' }
+    param([Collections.IDictionary] $State, [string] $TerminologyRequestPath)
+    if ([int]$State.schemaVersion -ge 15) {
+        return Invoke-LocalizationWorkset -State $State -TerminologyRequestPath $TerminologyRequestPath
+    }
+    if ($TerminologyRequestPath) { throw 'Reviewed terminology requires Schema 15 localization.' }
     $completed = Get-CompletedStageResult -State $State -Name 'localization'
     if ($completed) { return $completed }
     $stage = Start-Stage -Name 'localization'
@@ -5751,7 +5753,7 @@ function Invoke-StageCommand {
         'verify-source' { Invoke-VerifySource -State $State }
         'extract' { Invoke-Extract -State $State }
         'install' { Invoke-Install -State $State }
-        'localization' { Invoke-Localization -State $State }
+        'localization' { Invoke-Localization -State $State -TerminologyRequestPath $TerminologyRequestPath }
         'build-commits' { Invoke-BuildCommits -State $State }
         'validate' { Invoke-Validate -State $State }
         'publish' { Invoke-Publish -State $State }
