@@ -31,6 +31,7 @@ param(
     [ValidateRange(0, 60000)]
     [int] $ObservationIntervalMilliseconds = 1000,
     [string] $LocalizationPlanPath,
+    [switch] $ReviewPositionalLabelChanges,
     # Match the API adapter's --mode when processing a ready Schema 15 workset.
     [ValidateSet('update', 'improve')]
     [string] $TranslationMode = 'update',
@@ -51,6 +52,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+. (Join-Path $PSScriptRoot 'DesktopArchive.ps1')
 
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
@@ -1271,7 +1273,7 @@ function New-Manifest {
     )
     $rootFull = [IO.Path]::GetFullPath($Root)
     $files = @(
-        Get-ChildItem -LiteralPath $rootFull -File -Recurse |
+        Get-ChildItem -LiteralPath $rootFull -File -Recurse -Force |
             ForEach-Object {
                 $relative = [IO.Path]::GetRelativePath($rootFull, $_.FullName).Replace('\', '/')
                 $record = [ordered]@{
@@ -1385,7 +1387,7 @@ function Assert-ArchivePayloadSecurity {
         [string]$State.evidenceChain.c0Oid
     }
     else { [string]$State.baseOid }
-    foreach ($file in Get-ChildItem -LiteralPath $ExtractedRoot -File -Recurse | Sort-Object FullName) {
+    foreach ($file in Get-ChildItem -LiteralPath $ExtractedRoot -File -Recurse -Force | Sort-Object FullName) {
         $relative = [IO.Path]::GetRelativePath($ExtractedRoot, $file.FullName).Replace('\', '/')
         $bytes = Read-FileBytesWithHeartbeat -Path $file.FullName
         $risk = Get-ArchivePayloadRisk -RelativePath $relative -Bytes $bytes -ExternalAttributes ([int64]$entryAttributes[$relative])
@@ -2802,10 +2804,10 @@ function Test-SourceRequestPreflight {
         throw 'officialSha256 must contain 64 hexadecimal characters.'
     }
     $extension = [IO.Path]::GetExtension([string]$request.fileName).ToLowerInvariant()
-    if ($extension -cne '.zip') {
+    if ($extension -cnotin @('.zip','.rar')) {
         return [ordered]@{
             result = 'waiting'; status = 'waiting-user'
-            waitingReason = [ordered]@{ code = 'unsupported_archive_format'; message = 'Only ZIP Main files are supported in Schema 15.' }
+            waitingReason = [ordered]@{ code = 'unsupported_archive_format'; message = 'Only ZIP and RAR Main files are supported in Schema 15.' }
             archiveFormat = $extension.TrimStart('.'); sourceRequestPath = $full
         }
     }
@@ -2839,9 +2841,10 @@ function Complete-InterruptedSourceDelivery {
             throw "Interrupted source delivery $field no longer matches its request."
         }
     }
-    if ([string]$receipt.archiveFormat -cne 'zip' -or [string]$receipt.filename -cne [string]$request.fileName -or
+    if ([string]$receipt.archiveFormat -cnotin @('zip','rar') -or
+        [string]$receipt.archiveFormat -cne [IO.Path]::GetExtension([string]$request.fileName).TrimStart('.').ToLowerInvariant() -or [string]$receipt.filename -cne [string]$request.fileName -or
         [string]$receipt.sha256 -notmatch '^[0-9a-f]{64}$' -or [int64]$receipt.size -le 0) {
-        throw 'Interrupted source delivery receipt is not a verified ZIP tuple.'
+        throw 'Interrupted source delivery receipt is not a verified archive tuple.'
     }
     $incomingCandidate = [IO.Path]::GetFullPath((Join-Path $IncomingDirectory ([string]$receipt.filename)))
     $deliveredCandidate = [IO.Path]::GetFullPath((Join-Path $DeliveryDirectory ([string]$receipt.filename)))
@@ -2863,6 +2866,10 @@ function Complete-InterruptedSourceDelivery {
         if ([int64]$source.Length -ne [int64]$receipt.size -or $candidateSha256 -cne [string]$receipt.sha256) {
             throw 'Interrupted source delivery file no longer matches its receipt.'
         }
+        $source.Position = 0
+        $headerSize = $source.Read($buffer,0,8)
+        if ((Get-DesktopArchiveSignature $buffer $headerSize) -cne $receipt.archiveFormat) { throw 'Interrupted archive format differs.' }
+        if ($receipt.archiveFormat -ceq 'rar') { Test-DesktopRarData $candidate $candidateSha256 { Update-ActiveReservationHeartbeat } }
         if (-not $deliveredExists) {
             if (-not (Test-Path -LiteralPath $DeliveryDirectory -PathType Container)) {
                 $null = Assert-NoReparsePath -Path (Split-Path -Parent $DeliveryDirectory) -Root $RepositoryRoot -Label 'Interrupted delivery parent'
@@ -3483,7 +3490,20 @@ function Invoke-Claim {
     }
 
     $null = Assert-NoReparsePath -Path $sourceFull -Root $repository -Label 'Source archive'
-    $archiveSha = Get-FileSha256 -Path $sourceFull
+    $archiveEvidence = Get-DesktopArchiveEvidence $sourceFull { Update-ActiveReservationHeartbeat }
+    $archiveSha = $archiveEvidence.sha256
+    if ($sourceIdentity.officialSha256 -and $sourceIdentity.officialSha256 -cne $archiveSha) {
+        throw 'Archive SHA-256 differs from the official source request.'
+    }
+    $sourceFormat = $archiveEvidence.archiveFormat
+    if ($sourceFormat -cnotin @('zip','rar') -or $sourceFormat -cne [IO.Path]::GetExtension($sourceFull).TrimStart('.').ToLowerInvariant()) {
+        throw 'Archive signature differs from the requested ZIP or RAR filename.'
+    }
+    if ($archiveEvidence.size -ne $sampleTwo.Length -or ($sourceReceipt -and
+        ($receipt.sha256 -cne $archiveSha -or $receipt.archiveFormat -cne $sourceFormat -or $receipt.size -ne $archiveEvidence.size))) {
+        throw 'Claimed archive differs from the verified source observations.'
+    }
+    if ($sourceFormat -ceq 'rar' -and !$sourceReceipt) { Test-DesktopRarData $sourceFull $archiveSha { Update-ActiveReservationHeartbeat } }
     $reviewArtifacts = Join-Path $runRoot 'review-artifacts'
     New-Item -ItemType Directory -Path $reviewArtifacts -Force | Out-Null
     if (-not (Test-Path -LiteralPath $boundPinPath -PathType Leaf)) {
@@ -3563,7 +3583,7 @@ function Invoke-Claim {
             path = [IO.Path]::GetFullPath($coordinatorArchive)
             size = $sampleTwo.Length
             sha256 = $archiveSha
-            format = if ($sourceReceipt) { 'zip' } else { 'zip' }
+            format = $sourceFormat
             preserveOriginal = [bool]$sourceReceipt
         }
     }
@@ -3662,7 +3682,7 @@ function Invoke-Claim {
             path = [IO.Path]::GetFullPath($claimedArchive)
             size = $sampleTwo.Length
             sha256 = $archiveSha
-            format = 'zip'
+            format = $sourceFormat
             preserveOriginal = [bool]$sourceReceipt
         }
         completedStages = if ($sourceReceipt) { @('acquire-source') } else { @() }
@@ -3744,133 +3764,32 @@ function Invoke-Claim {
     Complete-IncompleteClaim -State $state -Context $claimStage
 }
 
-function Assert-NoArchiveFileAncestorCollisions {
-    param(
-        [Parameter(Mandatory)]
-        [Collections.Generic.Dictionary[string, bool]] $Seen
-    )
-    $filePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($pair in $Seen.GetEnumerator()) {
-        if (-not $pair.Value) { $null = $filePaths.Add($pair.Key) }
-    }
-    foreach ($path in $Seen.Keys) {
-        # Written this way so SkillSpector static analysis can fully parse this command.
-        $separatorIndex = $path.IndexOf([char]47)
-        while ($separatorIndex -ge 0) {
-            if ($separatorIndex -gt 0) {
-                $ancestor = $path.Substring(0, $separatorIndex)
-                if ($filePaths.Contains($ancestor)) {
-                    throw "Archive file/ancestor archive path collision rejected: $ancestor"
-                }
-            }
-            # Written this way so SkillSpector static analysis can fully parse this command.
-            $separatorIndex = $path.IndexOf([char]47, $separatorIndex + 1)
-        }
-    }
-}
-
-function Get-ZipEntries {
-    param(
-        [Parameter(Mandatory)][string] $Path,
-        [Parameter(Mandatory)][string] $ExpectedSha256
-    )
-    Add-Type -AssemblyName System.IO.Compression
-    $actualSha256 = Get-FileSha256 -Path $Path
-    if ($actualSha256 -ne $ExpectedSha256) {
-        throw 'Claimed archive SHA-256 changed before ZIP processing.'
-    }
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    try {
-        $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Read, $false)
-        $seen = [Collections.Generic.Dictionary[string, bool]]::new([StringComparer]::OrdinalIgnoreCase)
-        $entries = [Collections.Generic.List[object]]::new()
-        $totalLength = [int64]0
-        if ($archive.Entries.Count -gt 100000) { throw 'Archive entry count exceeds the 100,000 entry limit.' }
-        foreach ($entry in $archive.Entries) {
-            $entryPath = $entry.FullName.Replace('\', '/')
-            $segments = @($entryPath.Split('/', [StringSplitOptions]::RemoveEmptyEntries))
-            if ([IO.Path]::IsPathRooted($entryPath) -or $entryPath.StartsWith('/') -or $entryPath.Contains(':') -or $segments -contains '..' -or $entryPath.IndexOfAny([char[]]@(0, 10, 13)) -ge 0) {
-                throw "Archive path traversal or rooted path rejected: $entryPath"
-            }
-            if ($segments.Count -eq 0) { continue }
-            foreach ($segment in $segments) {
-                if ($segment.EndsWith(' ') -or $segment.EndsWith('.')) { throw "Windows path collision rejected: $entryPath" }
-                if ($segment -match '(?i)^(con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$') {
-                    throw "Archive path uses a reserved Windows device name: $entryPath"
-                }
-            }
-            $isDirectory = $entryPath.EndsWith('/')
-            $collisionKey = $entryPath.TrimEnd('/').Normalize([Text.NormalizationForm]::FormC)
-            if ($seen.ContainsKey($collisionKey)) { throw "Duplicate or Unicode/case-colliding archive path rejected: $entryPath" }
-            $seen.Add($collisionKey, $isDirectory)
-            $unixType = ($entry.ExternalAttributes -shr 16) -band 0xF000
-            if ($unixType -eq 0xA000) { throw "Archive symlink rejected: $entryPath" }
-            if ((($entry.ExternalAttributes -band 0xFFFF) -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Archive reparse point rejected: $entryPath"
-            }
-            if ($unixType -notin @(0, 0x4000, 0x8000) -or
-                ($unixType -eq 0x4000 -and -not $isDirectory) -or
-                ($unixType -eq 0x8000 -and $isDirectory)) {
-                throw "Archive special entry type rejected: $entryPath"
-            }
-            $totalLength += $entry.Length
-            if ($entry.Length -gt 1GB -or $totalLength -gt 4GB -or ($entry.CompressedLength -gt 0 -and ($entry.Length / $entry.CompressedLength) -gt 1000)) {
-                throw "Archive expansion limit rejected: $entryPath"
-            }
-            if (-not $isDirectory) {
-                try {
-                    $probe = $entry.Open()
-                    try { $null = $probe.ReadByte() } finally { $probe.Dispose() }
-                }
-                catch { throw ('Encrypted or unreadable archive entry rejected: {0}. {1}' -f ([string]$entryPath), ([string]($_.Exception.Message))) }
-            }
-            $entries.Add([ordered]@{
-                path = $entryPath
-                size = $entry.Length
-                compressedSize = $entry.CompressedLength
-                externalAttributes = $entry.ExternalAttributes
-                directory = $isDirectory
-            })
-        }
-        Assert-NoArchiveFileAncestorCollisions -Seen $seen
-        [ordered]@{ archive = $archive; stream = $stream; entries = $entries }
-    }
-    catch {
-        $stream.Dispose()
-        throw
-    }
-}
-
 function Invoke-VerifySource {
     param([Collections.IDictionary] $State)
     $completed = Get-CompletedStageResult -State $State -Name 'verify-source'
     if ($completed) { return $completed }
     $stage = Start-Stage -Name 'verify-source'
     Assert-LockOwner -State $State
-    $archivePath = [string]$State.archive.path
-    $zip = Get-ZipEntries -Path $archivePath -ExpectedSha256 $State.archive.sha256
+    $archivePath = Assert-NoReparsePath -Path $State.archive.path -Root $State.runRoot -Label 'Claimed archive'
+    $reader = Open-DesktopArchive $archivePath $State.archive.sha256 (Get-StateArchiveFormat $State.archive) { Update-ActiveReservationHeartbeat }
     try {
-        $fileEntries = @($zip.entries | Where-Object { -not $_.directory })
-        if ($fileEntries.Count -eq 0) { throw 'Archive contains no files.' }
-        $roots = @($fileEntries | ForEach-Object { $_.path.Split('/')[0] } | Sort-Object -Unique)
-        if ($roots.Count -ne 1 -or $roots[0] -cne $State.repoModDirectory) {
-            throw 'Invalid archive root; exactly one root matching the canonical MOD directory is required.'
-        }
+        Assert-DesktopArchiveRoot $reader.entries $State.repoModDirectory
+        Read-DesktopArchiveData $reader -Heartbeat { Update-ActiveReservationHeartbeat }
         $listing = [ordered]@{
             schemaVersion = 1
             archiveSha256 = $State.archive.sha256
-            root = $roots[0]
-            entries = @($zip.entries | Sort-Object { $_.path })
+            root = $State.repoModDirectory
+            entries = @($reader.entries | Sort-Object { $_.path })
             verifiedAt = Get-UtcTimestamp
         }
+        if ($reader.format -ceq 'rar') { $listing.archiveFormat = 'rar' }
         $path = Join-Path $State.artifactsRoot 'archive-listing.json'
         Write-AtomicJson -Path $path -Value $listing
-        $State.archive.format = 'zip'
+        $State.archive.format = $reader.format
         Complete-Stage -State $State -Context $stage -ArtifactSha256 (Get-FileSha256 -Path $path) -Data ([ordered]@{ listingPath = $path; entryCount = $listing.entries.Count })
     }
     finally {
-        $zip.archive.Dispose()
-        $zip.stream.Dispose()
+        Close-DesktopArchive $reader
     }
 }
 
@@ -3882,43 +3801,37 @@ function Invoke-Extract {
     Assert-LockOwner -State $State
     Import-SecurityOverrides -State $State -Path $SecurityOverridePath
     $stagingRoot = Join-Path $State.runRoot 'staging'
-    $temporaryRoot = Join-Path $stagingRoot ('.extract-' + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
-    $zip = Get-ZipEntries -Path $State.archive.path -ExpectedSha256 $State.archive.sha256
-    $payloadSecurity = $null
+    $temporaryRoot = Join-Path $stagingRoot '.extract-pending'
+    $archivePath = Assert-NoReparsePath -Path $State.archive.path -Root $State.runRoot -Label 'Claimed archive'
+    $reader = Open-DesktopArchive $archivePath $State.archive.sha256 (Get-StateArchiveFormat $State.archive) { Update-ActiveReservationHeartbeat }
+    $ownedStage = $null
     try {
-        foreach ($entry in $zip.archive.Entries) {
-            $relative = $entry.FullName.Replace('\', '/')
-            if ([string]::IsNullOrWhiteSpace($relative)) { continue }
-            $destination = Assert-ContainedPath -Candidate (Join-Path $temporaryRoot $relative) -Root $temporaryRoot -Label 'Archive entry'
-            if ($relative.EndsWith('/')) {
-                New-Item -ItemType Directory -Path $destination -Force | Out-Null
-                continue
-            }
-            $parent = Split-Path -Parent $destination
-            New-Item -ItemType Directory -Path $parent -Force | Out-Null
-            $entryStream = $entry.Open()
-            $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-            try { Copy-StreamWithHeartbeat -Source $entryStream -Destination $output } finally { $output.Dispose(); $entryStream.Dispose() }
+        Assert-DesktopArchiveRoot $reader.entries $State.repoModDirectory
+        $null = Assert-NoReparsePath -Path $temporaryRoot -Root $State.runRoot -Label 'Archive staging' -AllowMissing
+        Remove-DirectoryTreeWithHeartbeat -Path $temporaryRoot -Root $stagingRoot
+        New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+        $ownedStage = $temporaryRoot
+        $hashes = @{}
+        Read-DesktopArchiveData $reader $temporaryRoot -Heartbeat { Update-ActiveReservationHeartbeat } -Hashes $hashes
+        $null = Assert-NoReparseTree -Path $temporaryRoot -Root $State.runRoot -Label 'Extracted staging tree'
+        Assert-DesktopExtractionTree $reader.entries $temporaryRoot $hashes
+        $payloadSecurity = Assert-ArchivePayloadSecurity -State $State -ExtractedRoot $temporaryRoot -Entries $reader.entries
+        $finalRoot = Join-Path $stagingRoot 'extracted'
+        if (Test-Path -LiteralPath $finalRoot) {
+            $recoveryPath = Join-Path $stagingRoot ('recovery-' + [guid]::NewGuid().ToString('N'))
+            Update-ActiveReservationHeartbeat -Force
+            Move-Item -LiteralPath $finalRoot -Destination $recoveryPath
+            $State.lastRecovery = [ordered]@{ at = Get-UtcTimestamp; reason = 'incomplete extract replaced'; retainedPath = $recoveryPath }
         }
-        $payloadSecurity = Assert-ArchivePayloadSecurity -State $State -ExtractedRoot $temporaryRoot -Entries $zip.entries
-    }
-    finally {
-        $zip.archive.Dispose()
-        $zip.stream.Dispose()
-    }
-    $null = Assert-NoReparseTree -Path $temporaryRoot -Root ([string]$State.runRoot) -Label 'Extracted staging tree'
-    $finalRoot = Join-Path $stagingRoot 'extracted'
-    if (Test-Path -LiteralPath $finalRoot) {
-        $recoveryPath = Join-Path $stagingRoot ('recovery-' + [guid]::NewGuid().ToString('N'))
         Update-ActiveReservationHeartbeat -Force
-        Move-Item -LiteralPath $finalRoot -Destination $recoveryPath
-        $State.lastRecovery = [ordered]@{ at = Get-UtcTimestamp; reason = 'incomplete extract replaced'; retainedPath = $recoveryPath }
-    }
-    Update-ActiveReservationHeartbeat -Force
-    [IO.Directory]::Move($temporaryRoot, $finalRoot)
-    $manifestPath = Join-Path $State.artifactsRoot 'extraction-manifest.json'
-    $manifest = New-Manifest -Root $finalRoot -OutputPath $manifestPath -Kind 'extraction' -SecurityDispositions $payloadSecurity
+        [IO.Directory]::Move($temporaryRoot, $finalRoot)
+        $ownedStage = $finalRoot
+        $manifestPath = Join-Path $State.artifactsRoot 'extraction-manifest.json'
+        $manifest = New-Manifest -Root $finalRoot -OutputPath $manifestPath -Kind 'extraction' -SecurityDispositions $payloadSecurity
+    } catch {
+        if ($ownedStage) { Remove-DirectoryTreeWithHeartbeat -Path $ownedStage -Root $stagingRoot }
+        throw
+    } finally { Close-DesktopArchive $reader }
     $State.extractionRoot = [IO.Path]::GetFullPath($finalRoot)
     $State.extractionManifest = $manifest
     Complete-Stage -State $State -Context $stage -ArtifactSha256 $manifest.sha256 -Data $manifest
@@ -3927,13 +3840,13 @@ function Invoke-Extract {
 function Copy-DirectoryBytes {
     param([string] $Source, [string] $Destination)
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-    Get-ChildItem -LiteralPath $Source -Directory -Recurse | ForEach-Object {
+    Get-ChildItem -LiteralPath $Source -Directory -Recurse -Force | ForEach-Object {
         $directory = $_
         $relative = [IO.Path]::GetRelativePath($Source, $directory.FullName)
         New-Item -ItemType Directory -Path (Join-Path $Destination $relative) -Force | Out-Null
         Update-ActiveReservationHeartbeat
     }
-    Get-ChildItem -LiteralPath $Source -File -Recurse | ForEach-Object {
+    Get-ChildItem -LiteralPath $Source -File -Recurse -Force | ForEach-Object {
         $file = $_
         $relative = [IO.Path]::GetRelativePath($Source, $file.FullName)
         $target = Join-Path $Destination $relative
@@ -3956,6 +3869,7 @@ function Invoke-Install {
     $source = Assert-NoReparsePath @sourcePathParameters
     if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw 'Verified archive root is missing from extraction staging.' }
     $null = Assert-NoReparseTree -Path $source -Root ([string]$State.runRoot) -Label 'Verified extracted MOD tree before install'
+    $null = Get-VerifiedExtractionEvidence $State { Update-ActiveReservationHeartbeat }
     $modsRootParameters = @{
         Path = Join-Path $State.worktreePath 'Warhammer 40,000 DARKTIDE/mods'
         Root = [string]$State.worktreePath
@@ -4103,6 +4017,9 @@ function Invoke-LocalizationWorkset {
     }
     if ($script:PSBoundParameters.ContainsKey('TranslationMode')) { $generationParameters.TranslationMode = $TranslationMode }
     if ($script:PSBoundParameters.ContainsKey('ModelId')) { $generationParameters.ModelId = $ModelId }
+    if ($script:PSBoundParameters.ContainsKey('ReviewPositionalLabelChanges')) {
+        $generationParameters.ReviewPositionalLabelChanges = $ReviewPositionalLabelChanges
+    }
     $generation = & $generator @generationParameters
     if ($generation.status -eq 'automation-excluded') {
         $State.status = 'automation-excluded'
@@ -4810,7 +4727,7 @@ function Assert-FileTreeMatchesManifest {
     }
     $expected = @($manifest.files | Sort-Object { [string]$_.path })
     $actual = @(
-        Get-ChildItem -LiteralPath $rootFull -File -Recurse | ForEach-Object {
+        Get-ChildItem -LiteralPath $rootFull -File -Recurse -Force | ForEach-Object {
             Update-ActiveReservationHeartbeat
             [ordered]@{
                 path = [IO.Path]::GetRelativePath($rootFull, $_.FullName).Replace('\', '/')

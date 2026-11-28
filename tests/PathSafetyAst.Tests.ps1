@@ -48,6 +48,7 @@ function ConvertTo-CountMap {
 }
 
 $runtimePowerShellFiles = @(
+    'skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1',
     'skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1',
     'skills/auto-update-darktide-mod/scripts/Expand-Schema14Reference.ps1',
     'skills/auto-update-darktide-mod/scripts/Finalize-LocalizationWorksetEvidence.ps1',
@@ -65,13 +66,14 @@ $runtimePowerShellFiles = @(
     'skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1',
     'skills/auto-update-darktide-mod/scripts/mod-update.ps1'
 )
-$protectedRuntimePowerShellInventorySha256 = '2d42925fba66c1c67ef8dec941d7f0769a2eed5088f703cc946b9396e0155497'
+$protectedRuntimePowerShellInventorySha256 = '5a0cce2f7eb034b02625a6bbd3b0d81c59d98da7faa7b8c21be5b9c221235d86'
 $scopedFiles = @($runtimePowerShellFiles)
 
 # Exact reviewed runtime function-level inventory. Format: file|function|call|count.
 $reviewedPathnameCallAllowances = @'
 skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1|Read-LocalizationRuleFile|Get-Item|1
 skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1|Read-LocalizationRuleFile|IO.File::ReadAllBytes|1
+skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1|Test-LocalizationWorksetStagedSidecarAbsent|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-PrBody|Test-Path|1
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|<script>|Test-Path|2
 skills/auto-update-darktide-mod/scripts/Apply-LocalizationWorkset.ps1|Assert-NoReparsePath|Get-Item|1
@@ -129,7 +131,11 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Exit-RunWriterLock|Test-P
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-CompletedStageResult|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Resolve-InitialState|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-FileSha256|IO.File::Open|1
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Get-ZipEntries|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Get-DesktopArchiveEvidence|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Open-DesktopArchiveSource|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Read-DesktopArchiveData|IO.File::Open|1
+skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Read-DesktopArchiveData|IO.Directory::CreateDirectory|2
+skills/auto-update-darktide-mod/scripts/DesktopArchive.ps1|Assert-DesktopExtractionTree|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Import-SecurityOverrides|Get-Item|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-AcquireSource|IO.File::Delete|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-AcquireSource|IO.File::Move|1
@@ -184,7 +190,7 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-ByteFile|Test-Path|
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Write-BytesWithHeartbeat|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|New-Item|1
-skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|Test-Path|5
+skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|<script>|Test-Path|6
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Assert-NoReparsePath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Assert-NoReparsePath|type::IO.DirectoryInfo|1
 skills/auto-update-darktide-mod/scripts/New-LocalizationWorkset.ps1|Get-FileSha256|IO.File::Open|1
@@ -215,7 +221,6 @@ skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|<script>|Test-
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|Assert-NoReparsePath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|Assert-RegularDirectoryRoot|New-Item|1
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|Assert-RegularDirectoryRoot|Test-Path|1
-skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|Get-ArchiveEvidence|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|Get-FileSha256|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|Invoke-ApiDownload|IO.File::Move|1
 skills/auto-update-darktide-mod/scripts/Receive-NexusMainFile.ps1|Invoke-ApiDownload|IO.File::Open|1
@@ -270,7 +275,6 @@ skills/auto-update-darktide-mod/scripts/Test-LocalizationWorksetReceipt.ps1|Asse
 skills/auto-update-darktide-mod/scripts/Test-LocalizationWorksetReceipt.ps1|Assert-RegularFile|Test-Path|1
 skills/auto-update-darktide-mod/scripts/Test-LocalizationWorksetReceipt.ps1|Read-FileBytesWithHeartbeat|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/Test-ModUpdateCandidate.ps1|<script>|Test-Path|6
-skills/auto-update-darktide-mod/scripts/Test-ModUpdateCandidate.ps1|Assert-ArchivePayloadSecurityIntegrity|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/Test-ModUpdateCandidate.ps1|Assert-ClaimedArchiveIntegrity|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/Test-ModUpdateCandidate.ps1|Assert-EvidenceGenerationReceiptIntegrity|Get-Item|1
 skills/auto-update-darktide-mod/scripts/Test-ModUpdateCandidate.ps1|Assert-NoReparsePath|Get-Item|1
@@ -292,7 +296,6 @@ skills/auto-update-darktide-mod/scripts/Test-ReferenceIntegrity.ps1|Test-SkillSo
 skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|<script>|Test-Path|2
 skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Assert-NoReparsePath|Get-Item|1
 skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Assert-NoReparsePath|type::IO.DirectoryInfo|1
-skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Get-ArchiveEvidence|IO.File::Open|1
 skills/auto-update-darktide-mod/scripts/Test-SourceReceipt.ps1|Get-FileSha256|IO.File::Open|1
 '@ -split "`r?`n" | Where-Object { $_ }
 
