@@ -43,9 +43,11 @@ python packages/darktide-translate/darktide_translate.py run
 
 有待確認術語的譯文照常進行結構檢查與獨立審查。JSON 摘要的頂層 `unknownTerms` 是已採用譯文的彙整陣列，無項目時為 `[]`。每筆包含字串欄位 `unitId`、`key`、`source`、`translation`，以及字串陣列 `terms`。`source` 是工作集的 NEW 英文 Lua 表達式，`translation` 是回填的臺灣繁中 Lua 表達式。Markdown 摘要在「待確認術語」列出 key 與詞清單。
 
-`needsLookupDefinition` 標記的譯文通過結構檢查及審查後照常採用。若無譯文或修正後只剩用詞問題，先採結構相容的 NEW 繁中，再查 OLD 繁中，最後以原始英文運算式回填。無法安全模板化且已驗證語法的運算式會記為 `reviewStatus: preserved`，並維持 `suggestedZhTwExpression: null`。Apply 和 Receipt 保留該筆 NEW 欄位的原始位元組。
+`needsLookupDefinition` 標記的譯文通過結構檢查及審查後照常採用。若查詞時無可用譯文，先採結構相容的 NEW 繁中，再查 OLD 繁中，最後以原始英文運算式回填。無法安全模板化且已驗證語法的運算式會記為 `reviewStatus: preserved`，並維持 `suggestedZhTwExpression: null`。Apply 和 Receipt 保留該筆 NEW 欄位的原始位元組。
 
-JSON 摘要的 `termReviews` 沿用術語欄位，另含 `reason` 及 `adoption`。原因可為 `needs_lookup_definition` 或 `complex_expression`，`translation` 記載實際採用或保留的 Lua 值。Markdown 摘要在「待確認術語」列出原因、待確認詞及採用值。
+JSON 摘要的 `termReviews` 沿用術語欄位，另含 `reason` 及 `adoption`。原因可為 `needs_lookup_definition`、`max_corrections_reached` 或 `complex_expression`，`translation` 記載實際採用或保留的 Lua 值。Markdown 摘要在「待確認術語」列出原因、待確認詞及採用值。
+
+修正次數用盡且最後只剩文字品質問題（如語意、數值或術語）時，沿用相同的回退順序。回退項不進入翻譯快取，並以 `max_corrections_reached` 和 `lastFailure` 記錄最後的檢查代碼或審查意見。已保存且綁定相同工作集的文字問題可直接回退。Lua、格式參數、遊戲字串引用、佔位符、色碼與換行等結構檢查仍然適用。
 
 若英文原文沒有外層雙引號，轉接器會在審查前移除整段譯文多餘的外層雙引號。採用這筆譯文時，JSON 摘要的 `warnings` 陣列會記錄 `unitId` 和 `code: "unexpected_outer_double_quotes"`。
 
