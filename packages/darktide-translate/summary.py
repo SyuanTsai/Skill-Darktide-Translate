@@ -133,6 +133,10 @@ def write_summary(path, report, records, usage, prices):
             terms = "、".join(markdown_text(term) for term in item["terms"]) or "—"
             lines.append(f"- {markdown_text(item['key'])} — {item['reason']}，待確認詞 {terms}，"
                          f"{ADOPTION_LABELS[item['adoption']]}：{markdown_text(item['translation'])}")
+            if last_failure := item.get("lastFailure"):
+                issues = (issue if isinstance(issue, str) else f"{issue['category']}：{issue['detail']}"
+                          for issue in last_failure)
+                lines.append("  - 最後一次失敗：" + "、".join(map(markdown_text, issues)))
     if warnings:
         lines += ["", "### 警告", ""]
         lines.extend(f"- {markdown_text(item['unitId'])} — {WARNING_LABELS[item['code']]}（{item['code']}）"
