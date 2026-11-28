@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "issue": "repository-local",
   "path": "references/schema-15.md",
-  "sizeBytes": 14904,
-  "sha256": "4cb3fa95c205b28e3c33bc1bf4eb763842ccc350335a7b65deda647bc932e6c4",
+  "sizeBytes": 15154,
+  "sha256": "4941c114011bcb648e85f2eba8137a367d3990264e31205ce22ad37119e21a02",
   "derivedFrom": {
     "workflowSchemaVersion": 14,
     "workflowSha256": "931a38d48d3f7d23b435108fc990e395f853604cd3aafac7068c0438f9c48549",

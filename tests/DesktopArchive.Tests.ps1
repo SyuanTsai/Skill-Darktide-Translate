@@ -17,6 +17,24 @@ Describe 'Desktop archive reader' {
             [IO.File]::WriteAllBytes($Path, [byte[]](@(82,97,114,33,26,7,1,0) + [Text.Encoding]::UTF8.GetBytes($json)))
             (Get-FileHash -LiteralPath $Path).Hash.ToLowerInvariant()
         }
+        function Write-ArchiveRootFixture($Path, [string[]]$Names, [string]$Format) {
+            if ($Format -eq 'rar') {
+                return Write-RarFixture $Path @(foreach ($name in $Names) {
+                    @{name=$name; directory=$name.EndsWith('/')}
+                })
+            }
+            $zip = [IO.Compression.ZipFile]::Open($Path, 'Create')
+            try {
+                foreach ($name in $Names) {
+                    $entry = $zip.CreateEntry($name)
+                    if (!$name.EndsWith('/')) {
+                        $stream = $entry.Open()
+                        try { $stream.WriteByte(65) } finally { $stream.Dispose() }
+                    }
+                }
+            } finally { $zip.Dispose() }
+            (Get-FileHash -LiteralPath $Path).Hash.ToLowerInvariant()
+        }
     }
     # Scenario: The reader receives a file with an unsafe or ambiguous path.
     # Purpose: Reject the entire manifest before creating any destinations.
@@ -203,5 +221,39 @@ Describe 'Desktop archive reader' {
         [IO.File]::WriteAllBytes($file,$bytes)
         $reader = Open-DesktopArchive $file (Get-FileHash $file).Hash.ToLowerInvariant() zip
         try { { Read-DesktopArchiveData $reader } | Should -Throw } finally { Close-DesktopArchive $reader }
+    }
+
+    $rootCases = foreach ($format in @('zip', 'rar')) {
+        # Given a canonical MOD payload and a separate safe empty directory
+        # When the manifest and MOD root are validated
+        # Then both formats accept the archive.
+        @{format=$format; scenario='accepts an extra empty directory'; extra=@('extras/'); errorMessage=$null}
+
+        # Given a file outside the canonical MOD directory
+        # When the manifest and MOD root are validated
+        # Then the root validator rejects the archive.
+        @{format=$format; scenario='rejects an extra file'; extra=@('extras/file.txt'); errorMessage='*Invalid archive root*'}
+
+        # Given empty directory entries with traversal, a reserved name, or a case collision
+        # When the manifest is opened for MOD root validation
+        # Then the shared manifest validator rejects the unsafe directory entries.
+        @{format=$format; scenario='rejects directory traversal'; extra=@('../extras/'); errorMessage='*path traversal rejected*'}
+        @{format=$format; scenario='rejects a reserved directory name'; extra=@('NUL/'); errorMessage='*reserved Windows device name*'}
+        @{format=$format; scenario='rejects colliding directories'; extra=@('extras/', 'Extras/'); errorMessage='*case-colliding archive path*'}
+    }
+    It 'InterT65_<format> <scenario>' -TestCases $rootCases {
+        param($format, $extra, $errorMessage)
+        $file = Join-Path $TestDrive "root-$([guid]::NewGuid()).$format"
+        $sha = Write-ArchiveRootFixture $file (@('ExampleMod/file.txt') + $extra) $format
+        $verifyRoot = {
+            $reader = Open-DesktopArchive $file $sha $format
+            try { Assert-DesktopArchiveRoot $reader.entries 'ExampleMod' }
+            finally { Close-DesktopArchive $reader }
+        }
+        if ($errorMessage) {
+            $verifyRoot | Should -Throw $errorMessage
+        } else {
+            $verifyRoot | Should -Not -Throw
+        }
     }
 }

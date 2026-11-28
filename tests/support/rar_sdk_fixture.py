@@ -27,11 +27,13 @@ class FixtureSDK:
         row = rows[self.index]
         h = header._obj
         h.wide_name = row["name"]
-        h.size = h.packed = row.get("size", 3)
+        directory = row.get("directory", False)
+        h.flags = 32 if directory else 0
+        h.size = h.packed = row.get("size", 0 if directory else 3)
         h.host = 2
         h.hash_type = 1
         h.crc = row.get("crc", zlib.crc32(row.get("data", "abc").encode()))
-        h.attributes = 32
+        h.attributes = 16 if directory else 32
         h.redir_type = row.get("redirect", 0)
         return 0
 

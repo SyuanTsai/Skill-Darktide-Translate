@@ -1,6 +1,6 @@
 ---
 name: auto-update-darktide-mod
-description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs, preserve active zh-tw, and produce Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
+description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIP or single-volume RAR archives, preserve active zh-tw, and produce Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
 allowed-tools: "git, pwsh, webfetch"
 ---
 <!--
@@ -47,7 +47,7 @@ Keep the temporary materialization outside the Skill source and target MOD repos
 
 ## Select the operation
 
-- **Automatic source:** execute Schema 15 `acquire-source`, independently verify the receipt, and claim only the same run-owned verified ZIP before continuing the complete evidence flow.
+- **Automatic source:** execute Schema 15 `acquire-source`, independently verify the receipt, and claim only the same run-owned verified ZIP or single-volume RAR before continuing the complete evidence flow. RAR requires Python 3 and the native UnRAR SDK.
 - **Manual claim or update:** supply the complete Nexus Main-file source request, then execute the complete Schema 14 source, security, localization, clean-install, C0, C1, C2, C3, and F evidence, Candidate Gate, publication, and local Review flow.
 - **Resume:** reattach only the matching run ID and reservation tuple. Before acquiring a writer lease or reusing any completed checkpoint, prove the installed package against the fixed run-local source pin; package drift stops without changing state, reservation evidence, source, or the pin. Then revalidate completed artifacts before reuse.
 - **Review or feedback:** bind every conclusion to the current F, Gate tuple, immutable evidence receipt, and packaged Review Baseline. Apply only `in-scope / adopt` findings.

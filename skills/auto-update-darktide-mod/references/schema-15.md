@@ -50,12 +50,13 @@ Use `waiting-user` only for login, OTP, CAPTCHA, terms, permissions, or a known 
 
 ## Archive boundary
 
-The first release accepts ZIP only.
+Desktop automatic acquisition accepts ZIP and single-volume RAR. RAR requires Python 3 and the native UnRAR SDK.
 
-- A known RAR or 7z filename stops before download with `unsupported_archive_format`.
+- A known 7z filename stops before download with `unsupported_archive_format`.
 - `.part` and `.crdownload` files never enter verification.
 - ZIP, RAR, and 7z are identified by signature bytes, not extension alone.
-- RAR, 7z, or unknown bytes detected after download remain in incoming with their receipt and never reach claim, extraction, or installation.
+- 7z or unknown bytes detected after download remain in incoming with their receipt and never reach claim, extraction, or installation.
+- All files must be under the canonical MOD directory. Safe empty directories elsewhere are allowed. Every entry, including directories, must pass the shared archive path safety checks.
 
 The receipt records request identity, provider, sanitized source URL, filename, size, SHA-256, archive format, official-hash result, two stability observations, timestamps, delivered path, and separate download, wait, verify, and delivery timings.
 

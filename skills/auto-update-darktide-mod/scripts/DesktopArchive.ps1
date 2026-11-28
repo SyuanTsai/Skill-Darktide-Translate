@@ -116,11 +116,12 @@ function Assert-DesktopArchiveRoot {
     param([object[]] $Entries, [string] $ModDirectory)
     $files = 0
     foreach ($entry in $Entries) {
+        if ($entry.directory) { continue }
         $parts = $entry.path.Split('/',2)
         if ($parts.Length -ne 2 -or !$parts[0].Equals($ModDirectory,[StringComparison]::Ordinal)) {
-            throw 'Invalid archive root; entries must belong to the canonical MOD directory.'
+            throw 'Invalid archive root; files must belong to the canonical MOD directory.'
         }
-        if (!$entry.directory) { $files++ }
+        $files++
     }
     if (!$files) { throw 'Archive contains no files.' }
 }
