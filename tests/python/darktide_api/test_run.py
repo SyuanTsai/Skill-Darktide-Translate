@@ -7,10 +7,11 @@ import subprocess
 import pytest
 
 from claude_runner.client import FakeTransport, FatalApiError, Response, RetryableApiError
+from claude_runner.state import State
 from checks import Luac
 from darktide_translate import main
 from gameplay_context import lua_path
-from rules import SKILL_ROOT, load_rules, relative_path
+from rules import SKILL_ROOT, load_config, load_rules, relative_path
 
 FIXTURES = Path(__file__).parent / "fixtures"
 WORDS = "sk-ant-TEST-DO-NOT-LOG-0000"
@@ -65,7 +66,7 @@ def job(tmp_path):
     return Run(tmp_path)
 
 
-def scripted(translation="增加15%", *, model=MODEL, issues=(), unknown=(), lookup=False):
+def scripted(translation="增加15%", *, model=MODEL, issues=(), unknown=(), lookup=False, reject=False):
     def respond(request):
         units = request.user["units"]
         if request.role == "translator":
@@ -73,7 +74,7 @@ def scripted(translation="增加15%", *, model=MODEL, issues=(), unknown=(), loo
                       "unknownTerms": list(unknown), "needsLookupDefinition": lookup}
                      for unit in units]
         else:
-            items = [{"unitId": unit["unitId"], "verdict": "fail" if issues else "pass",
+            items = [{"unitId": unit["unitId"], "verdict": "fail" if issues or reject else "pass",
                       "issues": list(issues)} for unit in units]
         return Response(json.dumps({"items": items}), model=model, usage={
             "input_tokens": 40, "output_tokens": 20,
@@ -269,6 +270,29 @@ def test_UnitT30_review_disposition_uses_evidence_requirement(job, request, cont
     else:
         assert set(transport.requests[1].user["units"][0]) == {"unitId", "source", "translation"}
         assert read(job.workset)["units"][0]["reviewStatus"] == "approved"
+
+
+# Scenario: Review keeps rejecting a translation that requires gameplay evidence.
+# Purpose: The exhausted unit stays pending on the first run and on resume.
+def test_gameplay_review_exhaustion_cannot_fall_back_on_resume(job, gameplay):
+    unit, evidence, sidecar, _ = gameplay
+    sidecar.write_text(json.dumps(evidence), encoding="utf-8")
+    job.save()
+    previous = job.workset.read_bytes()
+    flags = ["--gameplay-context", str(sidecar)]
+    translate = scripted("範例譯文")
+    review = scripted(issues=[{"category": "meaning", "detail": "The action is mistranslated."}])
+    attempts = load_config()["maxCorrectionsPerItem"] + 1
+
+    for replies in ([translate, review] * attempts, []):
+        transport = FakeTransport(replies)
+        assert job.run(transport, *flags) == 0
+        assert len(transport.requests) == len(replies)
+        assert job.workset.read_bytes() == previous
+        summary = read(job.summary)
+        assert summary["blocked"] == [{"unitId": unit["unitId"], "reason": "max_corrections_reached"}]
+        assert summary["termReviews"] == []
+    assert not list(job.cache.rglob("*.json"))
 
 
 # Scenario: A pending input is retried with a change to the review evidence.
@@ -471,6 +495,60 @@ def test_ac6_and_4_10_zero_api_cache_hit_and_model_guard(job, model):
     assert read(job.summary)["cacheHitCount"] == (1 if model == MODEL else 0)
 
 
+# Scenario: Another workset supplies different previous English or upstream zh-tw for the same new text.
+# Purpose: Re-review candidates when their source history or translation context changes.
+@pytest.mark.parametrize(("side", "field", "value"), [
+    ("old", "sourceExpression", '"Raise by 10%"'),
+    ("new", "zhTwExpression", '"提高15%"'),
+])
+def test_InterT08_cache_isolated_by_candidate_context(job, side, field, value):
+    job.save()
+    assert job.run(FakeTransport([scripted(), scripted()])) == 0
+
+    unit = job.doc["units"][0]
+    unit[side][field]["raw"] = value
+    job.doc["immutableContractSha256"] = "b" * 64
+    job.save()
+    assert job.run(FakeTransport([])) == 4
+    job.state.unlink()
+    transport = FakeTransport([scripted("提高15%"), scripted()])
+
+    assert job.run(transport) == 0
+    assert [request.role for request in transport.requests] == ["translator", "reviewer"]
+    assert read(job.summary)["cacheHitCount"] == 0
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == '"提高15%"'
+
+
+# Scenario: A fresh workset changes its new English, bound rules, or requested model.
+# Purpose: Keep the adapter from resuming or reusing an approval across these boundaries.
+@pytest.mark.parametrize("changed", ["source", "rules", "model"])
+def test_InterT09_workset_change_isolates_state_and_cache(job, monkeypatch, changed):
+    job.save()
+    assert job.run(FakeTransport([scripted(), scripted()])) == 0
+
+    config = load_config()
+    if changed == "source":
+        job.doc["units"][0]["new"]["sourceExpression"]["raw"] = '"Boost 15%"'
+    elif changed == "rules":
+        rule = next(row for row in job.doc["translationBinding"]["rulesManifest"] if row["repo"] == "mods")
+        (job.mods / rule["path"]).write_bytes(b"Changed sample rules\r\n")
+    else:
+        config["model"] = "mock-replacement-model"
+        monkeypatch.setattr("darktide_translate.load_config", lambda: config)
+    job.doc["translationBinding"] = load_rules(job.mods, "update", "mods/TestMod", config).binding
+    job.doc["immutableContractSha256"] = "b" * 64
+    job.save()
+
+    assert job.run(FakeTransport([])) == 4
+    job.state.unlink()
+    reply = scripted("提高15%", model=config["model"])
+    transport = FakeTransport([reply, reply])
+    assert job.run(transport) == 0
+    assert [request.role for request in transport.requests] == ["translator", "reviewer"]
+    assert read(job.summary)["cacheHitCount"] == 0
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == '"提高15%"'
+
+
 # Scenario: The translator flags terms in a translation that passes both checks.
 # Purpose: Keep the adopted text and terms available after API, resume, and cache paths.
 def test_InterT10_unknown_terms_follow_the_approved_translation(job):
@@ -583,11 +661,14 @@ def test_InterT35_lookup_uses_safe_adoption(job, candidate, previous, translatio
     assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == adopted
     report = read(job.summary)
     assert report["blocked"] == []
-    assert report["termReviews"] == [{"unitId": unit["unitId"], "key": unit["key"], "source": source,
-                                      "terms": ["Alt decal"], "translation": adopted,
-                                      "reason": "needs_lookup_definition", "adoption": adoption}]
+    reason = "max_corrections_reached" if review_issue else "needs_lookup_definition"
+    expected = {"unitId": unit["unitId"], "key": unit["key"], "source": source,
+                "terms": ["Alt decal"], "translation": adopted, "reason": reason, "adoption": adoption}
+    if review_issue:
+        expected["lastFailure"] = [{"category": review_issue, "detail": "Alt decal"}]
+    assert report["termReviews"] == [expected]
     markdown = job.summary.with_suffix(".md").read_text(encoding="utf-8")
-    assert "needs_lookup_definition" in markdown and "Alt decal" in markdown
+    assert reason in markdown and "Alt decal" in markdown
     job.save()
     assert job.run(FakeTransport([])) == 0
     assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == adopted
@@ -614,23 +695,97 @@ def test_InterT36_opaque_lua_expression_is_preserved(job, existing):
                                       "reason": "complex_expression", "adoption": "preserved_expression"}]
 
 
-# Scenario: Source Lua is invalid, or a candidate still violates a required structural/semantic check.
-# Purpose: Leave invalid items pending, including unsafe candidates that also carried a lookup flag.
-@pytest.mark.parametrize(("reason", "replies"), [
-    ("max_corrections_reached", [scripted("增加10%")] * 3),
-    ("max_corrections_reached", [scripted("增加10%", lookup=True)] * 3),
-    ("max_corrections_reached", [scripted(lookup=True),
-                                 scripted(issues=[{"category": "condition", "detail": "condition"}])] * 3),
-    ("invalid_lua_expression", []),
-])
-def test_InterT40_blocked_remains_pending(job, reason, replies):
-    if reason == "invalid_lua_expression":
-        job.doc["units"][0]["new"]["sourceExpression"]["raw"] = 'Localize("key") ..'
+# Scenario: The proposed text repeatedly changes a literal gameplay value.
+# Purpose: Keep the exact English value and expose the deterministic failure in term review.
+def test_InterT37_exhausted_numeric_text_mismatch_is_reported(job):
     job.save()
+    assert job.run(FakeTransport([scripted("增加10%")] * 3)) == 0
+    report = read(job.summary)
+    assert report["blocked"] == []
+    assert report["termReviews"][0]["lastFailure"] == ["number_mismatch"]
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == '"Gain 15%"'
+
+
+# Scenario: Corrections end with a semantic rejection, including a previously blocked state.
+# Purpose: Adopt compatible existing zh-tw or exact English and report the last failure without caching.
+@pytest.mark.parametrize(("existing", "adoption"), [
+    (r"'現有貼花{amount}%s\n{#color(1,2,3)}%d{#reset()}'", "existing_zh_tw"),
+    (r'"舊版貼花{amount}%d\n{#color(1,2,3)}%s{#reset()}"', "english_fallback"),
+])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_InterT38_exhausted_text_corrections_use_safe_fallback(job, existing, adoption, legacy):
+    unit = job.doc["units"][0]
+    unit_id = unit["unitId"]
+    source = r'"Alt decal{amount}%s\n{#color(1,2,3)}%d{#reset()}"'
+    adopted = existing if adoption == "existing_zh_tw" else source
+    unit["new"]["sourceExpression"]["raw"] = source
+    unit["new"]["zhTwExpression"] = None
+    unit["old"]["zhTwExpression"] = {"raw": existing}
+    feedback = [{"category": "meaning", "detail": "貼花功能的語意有誤"}]
+    translation = scripted("替代貼花{amount}%s\n{#color(1,2,3)}%d{#reset()}")
+    review = scripted(issues=feedback)
+    job.save()
+    if legacy:
+        # Seed a v0.7.0 terminal state with the same immutable workset binding.
+        binding = job.doc["translationBinding"]
+        identity = {"worksetSha256": job.doc["immutableContractSha256"],
+                    "rulesSha": binding["rulesSha256"], "glossarySha": binding["glossarySha256"],
+                    "mode": binding["mode"], "model": binding["modelId"]}
+        State(job.state, identity).set_unit(unit_id, {
+            "status": "blocked", "blockedReason": "max_corrections_reached",
+            "attempts": 3, "corrections": 2, "feedback": feedback,
+        })
+
+    transport = FakeTransport([] if legacy else [translation, review] * 3)
+    assert job.run(transport) == 0
+    output = read(job.workset)["units"][0]
+    assert (output["reviewStatus"], output["suggestedZhTwExpression"]) == ("approved", adopted)
+    report = read(job.summary)
+    assert report["blocked"] == []
+    assert report["termReviews"] == [{"unitId": unit_id, "key": unit["key"], "source": source,
+                                      "terms": [], "translation": adopted, "lastFailure": feedback,
+                                      "reason": "max_corrections_reached", "adoption": adoption}]
+    assert "貼花功能的語意有誤" in job.summary.with_suffix(".md").read_text(encoding="utf-8")
+    assert list(job.cache.rglob("*.json")) == []
+    assert len(transport.requests) == (0 if legacy else 6)
+    job.save()
+    assert job.run(FakeTransport([])) == 0
+    assert read(job.summary)["termReviews"] == report["termReviews"]
+
+
+# Scenario: The reviewer rejects structurally valid text without supplying issues.
+# Purpose: Use a safe fallback and identify the missing reviewer detail in the summary.
+def test_InterT39_review_rejection_without_detail_is_reported(job):
+    job.save()
+    assert job.run(FakeTransport([scripted(), scripted(reject=True)] * 3)) == 0
+    report = read(job.summary)
+    assert report["blocked"] == []
+    assert report["termReviews"][0]["lastFailure"] == ["review_rejected_without_detail"]
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == '"Gain 15%"'
+
+
+# Scenario: Source Lua is invalid, or a candidate still violates a structural check.
+# Purpose: Leave invalid items pending even when the model marks them as needing lookup.
+@pytest.mark.parametrize(("source", "translation", "issue"), [
+    ('"Gain %d"', "增加%s", "format_order_mismatch"),
+    ('Localize("key") ..', None, "invalid_lua_expression"),
+])
+def test_InterT40_blocked_remains_pending(job, source, translation, issue):
+    unit = job.doc["units"][0]
+    unit["new"]["sourceExpression"]["raw"] = source
+    job.save()
+    replies = [scripted(translation, lookup=True)] * 3 if translation else []
     assert job.run(FakeTransport(replies)) == 0
-    assert read(job.summary)["blocked"][0]["reason"] == reason
+    report = read(job.summary)
+    record = read(job.state)["units"][unit["unitId"]]
+    if translation:
+        assert issue in record["feedback"]
+    assert report["blocked"][0]["reason"] == ("max_corrections_reached" if translation else issue)
+    assert report["termReviews"] == []
     assert read(job.workset)["units"][0]["reviewStatus"] == "pending"
     assert list(job.cache.rglob("*.json")) == []
+    assert job.run(FakeTransport([])) == 0
+    assert read(job.summary)["blocked"] == report["blocked"]
 
 
 @pytest.mark.parametrize("dry", [True, False])
@@ -648,14 +803,31 @@ def test_4_12_budget_and_explicit_override(job, dry):
     assert ("上限經人工覆寫為 800" in job.summary.with_suffix(".md").read_text(encoding="utf-8"))
 
 
-def test_4_13_usage_and_4_15_request_shape(job):
+# Scenario: A changed English source with existing zh-tw is sent for translation and review.
+# Purpose: Verify the two roles receive their own prompt, schema and inputs, with usage recorded separately.
+def test_InterT50_translation_and_review_request_shape_and_usage(job):
     job.save()
     transport = FakeTransport([scripted(), scripted()])
     assert job.run(transport) == 0
+    translator, reviewer = transport.requests
+    assert (translator.role, reviewer.role) == ("translator", "reviewer")
+    unit = job.doc["units"][0]
+    shared = {"mode": "update", "glossarySha256": job.doc["translationBinding"]["glossarySha256"],
+              "glossary": []}
+    source = {"unitId": unit["unitId"], "source": {"s1": "Gain 15%"}}
+    assert translator.user == {**shared, "units": [{**source, "key": unit["key"],
+        "containerPath": unit["containerPath"], "previousEnglish": '"Gain 10%"',
+        "previousZhTw": '"增加10%"', "candidateZhTw": '"增加10%"', "feedback": []}]}
+    assert reviewer.user == {**shared, "units": [{**source, "translation": {"s1": "增加15%"}}]}
+    assert {"unitId", "segments", "unknownTerms", "needsLookupDefinition"} == set(
+        translator.schema["properties"]["items"]["items"]["required"])
+    assert {"unitId", "verdict", "issues"} == set(reviewer.schema["properties"]["items"]["items"]["required"])
     for request in transport.requests:
         assert request.model == MODEL and request.effort == "medium"
         assert request.max_tokens == 32000
         assert "Sample rules" in request.system
+        prompt = SKILL_ROOT / f"assets/api-{request.role}-prompt.md"
+        assert request.system.startswith(prompt.read_text(encoding="utf-8-sig").strip())
         assert request.schema["properties"]["items"]["type"] == "array"
     summary = read(job.summary)
     for role in ("translator", "reviewer"):

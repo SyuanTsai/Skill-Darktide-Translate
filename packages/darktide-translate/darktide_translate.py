@@ -31,6 +31,8 @@ from workset import Workset, WorksetError, expression
 
 API_KEY_VARIABLE = "ANTHROPIC_API_KEY"
 LOOKUP = "needs_lookup_definition"
+MAX_CORRECTIONS = "max_corrections_reached"
+TEXT_CHECKS = ("lookup_text_missing", "number_mismatch", "glossary_term_missing")
 COMPLEX = "complex_expression"
 CONTEXT_BLOCK = object()
 
@@ -64,7 +66,9 @@ def parser():
 def cache_identity(unit, binding):
     return [
         expression(unit, "new", "sourceExpression"),
+        expression(unit, "old", "sourceExpression"),
         expression(unit, "old", "zhTwExpression"),
+        expression(unit, "new", "zhTwExpression"),
         binding["rulesSha256"], binding["glossarySha256"], binding["mode"], binding["modelId"],
     ]
 
@@ -172,7 +176,7 @@ def text_fragments(texts):
                               and re.search(r"[^\W\d_]", FORMAT.sub("", MARKUP.sub("", text)))))
 
 
-def lookup_adoption(unit, template, glossary, luac):
+def fallback_adoption(unit, template, glossary, luac):
     for side in ("new", "old"):
         raw = expression(unit, side, "zhTwExpression")
         if not raw:
@@ -189,6 +193,30 @@ def lookup_adoption(unit, template, glossary, luac):
     if luac.accepts(template.raw):
         return template.raw, "english_fallback"
     return None, None
+
+
+def text_only_feedback(issues):
+    # Reviewer issues are semantic and only reach this point after deterministic checks pass.
+    return isinstance(issues, list) and not needs_gameplay_context(issues) and all(
+        issue in TEXT_CHECKS or (
+            isinstance(issue, dict) and isinstance(issue.get("category"), str)
+            and isinstance(issue.get("detail"), str))
+        for issue in issues
+    )
+
+
+def fallback_value(unit, template, glossary, luac, value=None, *, reason, last_failure=None):
+    raw, adoption = fallback_adoption(unit, template, glossary, luac)
+    if raw is None:
+        return None
+    value = value or {}
+    unknown_terms = value.get("unknownTerms", [])
+    terms = (value.get("termReview") or {}).get("terms", unknown_terms)
+    review = {"reason": reason, "adoption": adoption, "terms": terms}
+    if last_failure is not None:
+        review["lastFailure"] = last_failure or ["review_rejected_without_detail"]
+    return {"segments": None, "expression": raw, "unknownTerms": unknown_terms, "warnings": [],
+            "termReview": review}
 
 
 def preserve_expression(unit, raw, luac):
@@ -240,7 +268,9 @@ def prepare(workset, state, cache, binding, glossary, luac, contexts, context_bl
         step = Progress(record.get("attempts", 0), record.get("corrections", 0),
                         record.get("feedback", []), record.get("cacheable", True))
         progress[unit_id] = step
-        if record.get("status") == "blocked" and record.get("blockedReason") not in ("api_failed", LOOKUP, COMPLEX):
+        blocked = record.get("blockedReason") if record.get("status") == "blocked" else None
+        recover = blocked == MAX_CORRECTIONS and text_only_feedback(record.get("feedback"))
+        if blocked not in (None, "api_failed", LOOKUP, COMPLEX) and not recover:
             continue
         if unit_id in context_blockers:
             ready[unit_id] = (context_blockers[unit_id], None)
@@ -254,14 +284,24 @@ def prepare(workset, state, cache, binding, glossary, luac, contexts, context_bl
             if unit_id in contexts:
                 ready[unit_id] = (INSUFFICIENT, None)
                 continue
+            if recover:
+                continue
             preserved = preserve_expression(unit, identity[0] or "", luac)
             ready[unit_id] = ("preserved", preserved) if preserved else ("invalid_lua_expression", None)
             continue
         templates[unit_id], identities[unit_id] = template, identity
+        if recover:
+            if unit_id in contexts:
+                continue
+            value = fallback_value(unit, template, glossary, luac,
+                                   reason=MAX_CORRECTIONS, last_failure=step.feedback)
+            if value is not None:
+                ready[unit_id] = ("fallback", value)
+            continue
         if record.get("status") == "approved":
             adoption = (record.get("termReview") or {}).get("adoption")
             if adoption in ("english_fallback", "existing_zh_tw"):
-                valid = lookup_adoption(unit, template, glossary, luac) == (record["expression"], adoption)
+                valid = fallback_adoption(unit, template, glossary, luac) == (record["expression"], adoption)
             else:
                 valid = valid_approval(record, template, glossary, luac)
             if not valid:
@@ -366,18 +406,13 @@ def run(args, config, transport, sleeper, luac):
             return CONTEXT_BLOCK
         if unit_id in contexts:
             return None
-        if not value or not value.get("termReview"):
-            return None
-        term_only = issues == ["glossary_term_missing"] or (
-            issues and all(isinstance(issue, dict) and issue.get("category") == "term" for issue in issues))
-        if issues != ["lookup_text_missing"] and not (exhausted and term_only):
-            return None
         unit, template = workset.pending[unit_id], templates[unit_id]
-        raw, adoption = lookup_adoption(unit, template, glossary, luac)
-        if raw is None:
-            return None
-        return {**value, "segments": None, "expression": raw, "warnings": [],
-                "termReview": {**value["termReview"], "adoption": adoption}}
+        if exhausted and text_only_feedback(issues):
+            return fallback_value(unit, template, glossary, luac, value,
+                                  reason=MAX_CORRECTIONS, last_failure=issues)
+        if issues == ["lookup_text_missing"]:
+            return fallback_value(unit, template, glossary, luac, value, reason=LOOKUP)
+        return None
 
     def summarize(status, message=None):
         report["status"] = status
