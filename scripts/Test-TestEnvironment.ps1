@@ -80,7 +80,7 @@ catch {
 }
 $checks.Add((Test-TestEnvironmentSkillPackageIndex -RepositoryRoot $root -GitPath $gitPath))
 
-$pesterVersion = Get-TestEnvironmentManifestVersion -ManifestPath $PesterManifestPath
+$pesterVersion = if ([string]::IsNullOrWhiteSpace($PesterManifestPath)) { $null } else { Get-TestEnvironmentManifestVersion -ManifestPath $PesterManifestPath }
 $pesterHash = if (-not [string]::IsNullOrWhiteSpace($PesterManifestPath) -and (Test-Path -LiteralPath $PesterManifestPath -PathType Leaf)) {
     (Get-FileHash -LiteralPath $PesterManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
 } else { $null }

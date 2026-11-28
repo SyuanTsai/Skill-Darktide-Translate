@@ -168,7 +168,7 @@ foreach ($name in $Component) {
     $expected = $ExpectedSha256
     if ([string]::IsNullOrWhiteSpace($packagePath)) {
         $deletePackage = $true
-        if ($name -ceq 'Pester') {
+        if ($name -eq 'Pester') {
             $version = Get-LatestPesterVersion
             $sourceUrl = "$($config.pester.repository)/package/Pester/$version"
             $packagePath = Join-Path $scratchRoot "Pester.$version.nupkg"
@@ -195,7 +195,7 @@ foreach ($name in $Component) {
     try {
         $actual = Get-InstallSha256 $packagePath
         if ($actual -cne $expected.ToLowerInvariant()) { throw "Package sha256 mismatch: expected $($expected.ToLowerInvariant()), actual $actual." }
-        if ($name -ceq 'Pester') { $receipt.pester = Install-PesterPackage $packagePath $sourceUrl $actual $receipt }
+        if ($name -eq 'Pester') { $receipt.pester = Install-PesterPackage $packagePath $sourceUrl $actual $receipt }
         else {
             if ([string]::IsNullOrWhiteSpace($version)) {
                 $leaf = Split-Path -Leaf $packagePath

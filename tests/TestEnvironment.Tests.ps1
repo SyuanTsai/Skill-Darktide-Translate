@@ -9,6 +9,22 @@ Describe 'Repository test environment' {
         $script:InstallerPath = Join-Path $script:RepositoryRoot 'scripts/Install-TestEnvironment.ps1'
         Import-Module $script:ModulePath -Force
 
+        # Runs a cmd.exe command line that switches to code page 950, then restores the caller's console code pages,
+        # because chcp changes the shared console and would otherwise outlive the test run.
+        function Invoke-TestCmdWithCodePage950 {
+            param([Parameter(Mandatory)][string] $Command)
+            $originalOutput = [Console]::OutputEncoding
+            $originalInput = [Console]::InputEncoding
+            try {
+                $output = @(& cmd.exe /d /c ('chcp 950 >nul & ' + $Command))
+                [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($output -join "`n") }
+            }
+            finally {
+                try { [Console]::OutputEncoding = $originalOutput } catch { Write-Verbose "Console output encoding was not restorable: $($_.Exception.Message)" }
+                try { [Console]::InputEncoding = $originalInput } catch { Write-Verbose "Console input encoding was not restorable: $($_.Exception.Message)" }
+            }
+        }
+
         function New-TestPesterManifest {
             param([string] $Root, [string] $Version)
             $moduleRoot = Join-Path $Root "Pester/$Version"
@@ -117,9 +133,8 @@ Describe 'Repository test environment' {
         $stderrPath = Join-Path $TestDrive 'invoke-tests.stderr.txt'
         if ($IsWindows) {
             # A zh-TW console code page (950) previously turned the UTF-8 preflight JSON into invalid text.
-            $command = 'chcp 950 >nul & "{0}" -NoProfile -File "{1}" -PesterManifestPath "{2}" 2>"{3}"' -f $powerShell, $invokeTests, $missing, $stderrPath
-            & cmd.exe /d /c $command | Out-Null
-            $exitCode = $LASTEXITCODE
+            $command = '"{0}" -NoProfile -File "{1}" -PesterManifestPath "{2}" 2>"{3}"' -f $powerShell, $invokeTests, $missing, $stderrPath
+            $exitCode = (Invoke-TestCmdWithCodePage950 -Command $command).ExitCode
             $stderr = [IO.File]::ReadAllText($stderrPath, [Text.Encoding]::GetEncoding(950))
         }
         else {
@@ -138,8 +153,8 @@ Describe 'Repository test environment' {
         $powerShell = Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })
         $stdoutPath = Join-Path $TestDrive 'preflight.stdout.txt'
         if ($IsWindows) {
-            $command = 'chcp 950 >nul & "{0}" -NoProfile -File "{1}" -PesterManifestPath "{2}" >"{3}" 2>nul & chcp' -f $powerShell, $script:PreflightPath, (Join-Path $TestDrive 'missing/Pester.psd1'), $stdoutPath
-            $after = (& cmd.exe /d /c $command) -join "`n"
+            $command = '"{0}" -NoProfile -File "{1}" -PesterManifestPath "{2}" >"{3}" 2>nul & chcp' -f $powerShell, $script:PreflightPath, (Join-Path $TestDrive 'missing/Pester.psd1'), $stdoutPath
+            $after = (Invoke-TestCmdWithCodePage950 -Command $command).Output
             $after | Should -Match '\b950\b'
         }
         else {
@@ -168,6 +183,37 @@ Describe 'Repository test environment' {
         $runtime.status | Should -BeExactly 'blocked'
         $runtime.actual | Should -Match '^Desktop 5\.1'
         $report.environment.powerShell.edition | Should -BeExactly 'Desktop'
+    }
+
+    # Scenario: No explicit Pester manifest is given and the ToolRoot has no Pester installation (a fresh machine or CI runner).
+    # Purpose: Ensure the preflight still emits a BLOCKED report with installation guidance instead of terminating without JSON.
+    It 'InterT64_ReportsMissingPesterAsBlockedWhenToolRootIsEmpty' {
+        $powerShell = Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })
+        $emptyToolRoot = Join-Path $TestDrive 'empty-tool-root'
+        $output = @(& $powerShell -NoProfile -File $script:PreflightPath -ToolRoot $emptyToolRoot 2>$null)
+        $LASTEXITCODE | Should -Be 2
+        $report = $output[-1] | ConvertFrom-Json
+        $pester = @($report.checks | Where-Object id -eq 'pester-module')[0]
+        $pester.status | Should -BeExactly 'blocked'
+        $pester.remediation | Should -Match 'Install-TestEnvironment\.ps1'
+        $report.environment.pester.version | Should -BeNullOrEmpty
+    }
+
+    # Scenario: The installer is called with a component name in a different letter case, which ValidateSet accepts.
+    # Purpose: Ensure the accepted spelling installs the requested Pester package instead of falling into the PowerShell branch.
+    It 'InterT71_InstallsPesterWhenTheComponentNameUsesLowerCase' {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $source = Join-Path $TestDrive 'package-source-lower'
+        New-Item -ItemType Directory -Path $source | Out-Null
+        [IO.File]::WriteAllText((Join-Path $source 'Pester.psd1'), "@{ ModuleVersion = '6.3.0'; RootModule = 'Pester.psm1' }`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $source 'Pester.psm1'), "# fixture`n", [Text.UTF8Encoding]::new($false))
+        $package = Join-Path $TestDrive 'Pester.6.3.0.lower.nupkg'
+        [IO.Compression.ZipFile]::CreateFromDirectory($source, $package)
+        $sha = (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant()
+        $toolRoot = Join-Path $TestDrive 'tools-lower'
+        & $script:InstallerPath -ToolRoot $toolRoot -Component pester -OfflinePackagePath $package -ExpectedSha256 $sha
+        Test-Path (Join-Path $toolRoot 'modules/Pester/6.3.0/Pester.psd1') | Should -BeTrue
+        (Get-Content -Raw (Join-Path $toolRoot 'install-receipt.json') | ConvertFrom-Json).pester.version | Should -Be '6.3.0'
     }
 
     # Scenario: A locally supplied minimal Pester nupkg has a valid or invalid expected digest.
