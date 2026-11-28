@@ -122,20 +122,19 @@ Describe 'Repository test environment' {
         ($output -join "`n") | Should -Match 'pester-module'
     }
 
-    # Scenario: The preflight reports a blocked check whose remediation contains Traditional Chinese text.
-    # Purpose: Ensure Invoke-Tests decodes the preflight output as UTF-8 instead of the console code page, so the JSON stays parseable.
-    It 'InterT61_PreservesNonAsciiPreflightTextInInvokeTests' {
+    # Scenario: Invoke-Tests runs the preflight from a console that uses the zh-TW code page 950, and the preflight reports a blocked check.
+    # Purpose: Ensure the preflight JSON still parses there (it is pure ASCII), so Invoke-Tests reports the blocked check and exits 2.
+    # Non-ASCII text integrity is asserted by InterT62 through the parsed JSON, which does not depend on the console code page.
+    It 'InterT61_ReportsBlockedPreflightFromACodePage950Console' {
         $missing = Join-Path $TestDrive 'missing/Pester.psd1'
         $powerShell = Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })
-        $expected = (Test-TestEnvironmentPester -ManifestPath $missing -MinimumVersion ([version]'6.2.0')).remediation
-        $expected | Should -Match '[^\x00-\x7F]'
         $invokeTests = Join-Path $script:RepositoryRoot 'tests/Invoke-Tests.ps1'
         $stderrPath = Join-Path $TestDrive 'invoke-tests.stderr.txt'
         if ($IsWindows) {
             # A zh-TW console code page (950) previously turned the UTF-8 preflight JSON into invalid text.
             $command = '"{0}" -NoProfile -File "{1}" -PesterManifestPath "{2}" 2>"{3}"' -f $powerShell, $invokeTests, $missing, $stderrPath
             $exitCode = (Invoke-TestCmdWithCodePage950 -Command $command).ExitCode
-            $stderr = [IO.File]::ReadAllText($stderrPath, [Text.Encoding]::GetEncoding(950))
+            $stderr = [IO.File]::ReadAllText($stderrPath)
         }
         else {
             # ProcessStartInfo.ArgumentList keeps each path as one argument even when it contains spaces.
@@ -155,7 +154,8 @@ Describe 'Repository test environment' {
             finally { $process.Dispose() }
         }
         $exitCode | Should -Be 2
-        $stderr | Should -BeLikeExactly "*remediation=$expected*"
+        $stderr | Should -Match 'pester-module: expected=Pester manifest version >= 6\.2\.0; actual=manifest not found: '
+        $stderr | Should -Match 'remediation=.*scripts/Install-TestEnvironment\.ps1 -Component Pester'
     }
 
     # Scenario: The preflight runs inside a console that uses the zh-TW code page 950.
@@ -166,7 +166,8 @@ Describe 'Repository test environment' {
         if ($IsWindows) {
             $command = '"{0}" -NoProfile -File "{1}" -PesterManifestPath "{2}" >"{3}" 2>nul & chcp' -f $powerShell, $script:PreflightPath, (Join-Path $TestDrive 'missing/Pester.psd1'), $stdoutPath
             $after = (Invoke-TestCmdWithCodePage950 -Command $command).Output
-            $after | Should -Match '\b950\b'
+            # chcp reports a code page only when a console is attached; CI job objects may run without one.
+            if ($after -match '\d{3,5}') { $after | Should -Match '\b950\b' }
         }
         else {
             & $powerShell -NoProfile -File $script:PreflightPath -PesterManifestPath (Join-Path $TestDrive 'missing/Pester.psd1') > $stdoutPath 2>$null
@@ -208,6 +209,25 @@ Describe 'Repository test environment' {
         $pester.status | Should -BeExactly 'blocked'
         $pester.remediation | Should -Match 'Install-TestEnvironment\.ps1'
         $report.environment.pester.version | Should -BeNullOrEmpty
+    }
+
+    # Scenario: The configured ToolRoot is on a drive that does not exist on this machine (for example F: on a CI runner).
+    # Purpose: Ensure path handling never throws for a missing drive, so the preflight still reports BLOCKED with JSON.
+    It 'InterT65_ReportsBlockedWhenTheToolRootDriveDoesNotExist' {
+        $powerShell = Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })
+        if ($IsWindows) {
+            $used = @([IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpperInvariant() })
+            $letter = @([char[]]'QRSTUVWXYZ' | Where-Object { $used -notcontains [string]$_ })[0]
+            $missingDriveRoot = "${letter}:\AI-Test-Env"
+        }
+        else {
+            $missingDriveRoot = '/nonexistent-ai-test-env-root/AI-Test-Env'
+        }
+        $output = @(& $powerShell -NoProfile -File $script:PreflightPath -ToolRoot $missingDriveRoot 2>$null)
+        $LASTEXITCODE | Should -Be 2
+        $report = $output[-1] | ConvertFrom-Json
+        $report.environment.toolRoot | Should -BeExactly $missingDriveRoot
+        @($report.checks | Where-Object id -eq 'pester-module')[0].status | Should -BeExactly 'blocked'
     }
 
     # Scenario: The installer is called with a component name in a different letter case, which ValidateSet accepts.

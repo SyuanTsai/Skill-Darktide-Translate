@@ -27,7 +27,7 @@ if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
 $ToolRoot = [IO.Path]::GetFullPath($ToolRoot)
 
 if ([string]::IsNullOrWhiteSpace($PesterManifestPath)) {
-    $pesterRoot = Join-Path $ToolRoot 'modules/Pester'
+    $pesterRoot = [IO.Path]::Combine($ToolRoot, 'modules', 'Pester')
     $candidates = @()
     if (Test-Path -LiteralPath $pesterRoot -PathType Container) {
         $candidates = @(Get-ChildItem -LiteralPath $pesterRoot -Directory | ForEach-Object {
@@ -41,7 +41,7 @@ if ([string]::IsNullOrWhiteSpace($PesterManifestPath)) {
     if ($candidates.Count -gt 0) { $PesterManifestPath = $candidates[0].Path }
 }
 
-$receiptPath = Join-Path $ToolRoot 'install-receipt.json'
+$receiptPath = [IO.Path]::Combine($ToolRoot, 'install-receipt.json')
 $expectedManifestHash = $null
 if ((Test-Path -LiteralPath $receiptPath -PathType Leaf) -and -not [string]::IsNullOrWhiteSpace($PesterManifestPath)) {
     try {
