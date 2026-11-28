@@ -30,7 +30,8 @@
                     "negation",
                     "limit",
                     "term",
-                    "scope"
+                    "scope",
+                    "gameplay_context"
                   ]
                 },
                 "detail": {

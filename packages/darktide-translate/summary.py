@@ -27,6 +27,9 @@ BLOCK_LABELS = {
     "complex_expression": "無法安全建立 Lua 模板",
     "invalid_lua_expression": "Lua 運算式無效或無法驗證",
     "api_failed": "API 失敗，可接續",
+    "gameplay_context_missing": "缺少必要遊戲脈絡",
+    "gameplay_context_invalid": "遊戲脈絡與候選來源不符或超出允許範圍",
+    "gameplay_context_insufficient": "遊戲脈絡不足以確認譯文",
 }
 ADOPTION_LABELS = {
     "translation": "採用通過審查的譯文",
