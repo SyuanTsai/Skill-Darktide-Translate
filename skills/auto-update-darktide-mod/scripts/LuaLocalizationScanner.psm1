@@ -612,7 +612,8 @@ function Read-LuaTable {
         [AllowNull()][string] $AssignedKey,
         [string] $SourceId,
         [Collections.Generic.List[object]] $Units,
-        [int] $BomLength
+        [int] $BomLength,
+        [string] $RootKey
     )
     $closeIndex = Get-MatchingTokenIndex -Tokens $Tokens -StartIndex $OpenIndex -Open '{' -Close '}'
     $fields = [Collections.Generic.List[object]]::new()
@@ -687,7 +688,8 @@ function Read-LuaTable {
 
         if ($Tokens[$valueStart].text -ceq '{') {
             $tablePath = if ([string]::IsNullOrWhiteSpace($AssignedKey)) { $ContainerPath } else { Join-LuaContainerPath -ContainerPath $ContainerPath -Key $AssignedKey }
-            $null = Read-LuaTable -Text $Text -Tokens $Tokens -OpenIndex $valueStart -ContainerPath $tablePath -AssignedKey $key -SourceId $SourceId -Units $Units -BomLength $BomLength
+            $childRootKey = if ($AssignedKey) { $RootKey } else { $key }
+            $null = Read-LuaTable -Text $Text -Tokens $Tokens -OpenIndex $valueStart -ContainerPath $tablePath -AssignedKey $key -SourceId $SourceId -Units $Units -BomLength $BomLength -RootKey $childRootKey
         }
         $position = if ($null -ne $separatorIndex) { [int]$separatorIndex + 1 } else { $valueEnd + 1 }
     }
@@ -698,7 +700,7 @@ function Read-LuaTable {
         if ($sourceFields.Count -gt 1 -or $zhTwFields.Count -gt 1) {
             $Units.Add([pscustomobject]@{
                 sourceId = $SourceId; containerPath = $ContainerPath; key = $AssignedKey; blockedReason = 'duplicate_language_field'
-                sourceExpression = $null; zhTwExpression = $null; tableOpenByte = $null; tableCloseByte = $null
+                sourceExpression = $null; zhTwExpression = $null; tableOpenByte = $null; tableCloseByte = $null; rootKey = $RootKey
             })
         }
         elseif ($sourceFields.Count -eq 1 -or $zhTwFields.Count -eq 1) {
@@ -707,6 +709,7 @@ function Read-LuaTable {
                 sourceId = $SourceId
                 containerPath = $ContainerPath
                 key = $AssignedKey
+                rootKey = $RootKey
                 blockedReason = if ($sourceFields.Count -eq 0) { 'missing_en_source_expression' } else { $null }
                 sourceExpression = if ($sourceFields.Count -eq 1) { New-ExpressionRecord -Text $Text -Tokens $Tokens -Field $sourceFields[0] -BomLength $BomLength } else { $null }
                 zhTwExpression = if ($zhTwFields.Count -eq 1) { New-ExpressionRecord -Text $Text -Tokens $Tokens -Field $zhTwFields[0] -BomLength $BomLength } else { $null }
@@ -760,6 +763,17 @@ function Add-LuaGeneratedBlock {
     })
 }
 
+function Set-LuaOverwrittenDescendants {
+    param($Context, [string] $Key)
+    # Keep prior identities as blocked evidence for the workset comparison.
+    $descendants = $null
+    if (-not $Context.descendantsByRoot.Remove($Key, [ref]$descendants)) { return }
+    foreach ($unit in $descendants) {
+        Invoke-LuaScannerProgressHeartbeat
+        if (-not $unit.blockedReason) { $unit.blockedReason = 'generated_root_assignment_overwrites_descendant' }
+    }
+}
+
 function Add-LuaGeneratedTable {
     param($Context, [int] $TableIndex, [string] $Key, $Binding)
     $templateKey = '__template__'
@@ -769,12 +783,14 @@ function Add-LuaGeneratedTable {
         $null = Read-LuaTable -Text $Context.text -Tokens $Context.tokens -OpenIndex $TableIndex -ContainerPath '$' -AssignedKey $templateKey -SourceId $Context.sourceId -Units $tableUnits -BomLength $Context.bomLength
         $Context.tableCache.Add($TableIndex, $tableUnits)
     }
+    Set-LuaOverwrittenDescendants $Context $Key
+    $descendants = [Collections.Generic.List[object]]::new()
     $destination = Join-LuaContainerPath '$' $Key
     $hasRoot = $false
     foreach ($unit in $Context.tableCache[$TableIndex]) {
         $root = $unit.containerPath -ceq '$'
         $hasRoot = $hasRoot -or $root
-        $Context.units.Add([pscustomobject]@{
+        $projected = [pscustomobject]@{
             sourceId = $unit.sourceId
             containerPath = if ($root) { '$' } else { $destination + $unit.containerPath.Substring($templatePath.Length) }
             key = if ($root) { $Key } else { $unit.key }
@@ -785,8 +801,11 @@ function Add-LuaGeneratedTable {
             tableCloseByte = $unit.tableCloseByte
             generated = $true
             generatedBinding = $Binding
-        })
+        }
+        $Context.units.Add($projected)
+        if (-not $root) { $descendants.Add($projected) }
     }
+    if ($descendants.Count) { $Context.descendantsByRoot.Add($Key, $descendants) }
     if (-not $hasRoot) { Add-LuaGeneratedBlock $Context $Key 'generated_output_language_fields_unproven' '$' }
 }
 
@@ -1030,7 +1049,7 @@ function Add-LuaPositionalRows {
         if ($reason) { Add-LuaGeneratedBlock $Context $key $reason '$' }
         else {
             $zhCnValue = $null
-            if ($null -ne $localeInsertByte) {
+            if ($localeIndices.ContainsKey('zh-cn')) {
                 $literal = $tokens[$rowFields.fields[$localeIndices['zh-cn']].valueStartIndex].text
                 $zhCnValue = try { ConvertFrom-LuaKeyString -Literal $literal -RequireUtf8 } catch { $null }
             }
@@ -1043,7 +1062,8 @@ function Add-LuaPositionalRows {
                 tableOpenByte = ConvertTo-Utf8ByteOffset $Context.text $tokens[$rowOpen].start $Context.bomLength
                 tableCloseByte = ConvertTo-Utf8ByteOffset $Context.text $tokens[$rowClose].start $Context.bomLength
                 generated = $true; positionalLocale = $true; positionalZhTwValue = $zhTwValue
-                positionalWrite = if ($null -ne $zhCnValue) {
+                positionalZhCnValue = $zhCnValue
+                positionalWrite = if ($null -ne $localeInsertByte -and $null -ne $zhCnValue) {
                     [ordered]@{
                         localeInsertByte = $localeInsertByte
                         rowInsertByte = Get-LuaLiteralListInsertByte $Context $rowFields.fields
@@ -1209,7 +1229,17 @@ function Test-LuaReferenceIsField {
 
 function Add-LuaAccumulatorRootTable {
     param($Context, [int] $Open)
+    $firstUnit = $Context.units.Count
     $null = Read-LuaTable -Text $Context.text -Tokens $Context.tokens -OpenIndex $Open -ContainerPath '$' -AssignedKey $null -SourceId $Context.sourceId -Units $Context.units -BomLength $Context.bomLength
+    for ($index = $firstUnit; $index -lt $Context.units.Count; $index++) {
+        Invoke-LuaScannerProgressHeartbeat
+        $unit = $Context.units[$index]
+        if ($unit.containerPath -ceq '$') { continue }
+        if (-not $Context.descendantsByRoot.ContainsKey($unit.rootKey)) {
+            $Context.descendantsByRoot.Add($unit.rootKey, [Collections.Generic.List[object]]::new())
+        }
+        $Context.descendantsByRoot[$unit.rootKey].Add($unit)
+    }
 }
 
 function Test-LuaLiteralLanguageTable {
@@ -1578,7 +1608,10 @@ function Add-LuaAccumulatorUnits {
                 }
                 else {
                     $key = Get-LuaLiteralAccumulatorKey $tokens $index $assignment
-                    if ($key) { Add-LuaGeneratedBlock $Context $key 'unsupported_generated_localization_assignment' '$' }
+                    if ($key) {
+                        if ($index -gt $initialClose) { Set-LuaOverwrittenDescendants $Context $key }
+                        Add-LuaGeneratedBlock $Context $key 'unsupported_generated_localization_assignment' '$'
+                    }
                     else {
                         $shape = Get-CanonicalTokenText $tokens $assignment.keyStart $assignment.keyEnd
                         Add-LuaGeneratedBlock $Context $shape 'unsupported_generated_localization_key'
@@ -1887,6 +1920,7 @@ function Get-LuaLocalizationDocument {
             tokens = $tokens; text = $text; units = $units; sourceId = $SourceId; bomLength = $bomLength
             layout = $null; references = $null; sidecarPath = $null; namedAccumulator = $false
             tableCache = [Collections.Generic.Dictionary[int, object]]::new()
+            descendantsByRoot = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
             gameLocalizedPassthroughPrefixes = [Collections.Generic.List[string]]::new()
         }
         Add-LuaAccumulatorUnits $context
@@ -1924,6 +1958,7 @@ function Get-LuaLocalizationDocument {
             }
             if ($unit.PSObject.Properties['positionalLocale'] -and $unit.positionalLocale) {
                 $numberedUnit.positionalLocale = $true
+                if ($null -ne $unit.positionalZhCnValue) { $numberedUnit.positionalZhCnValue = $unit.positionalZhCnValue }
                 if (-not $unit.blockedReason -and $null -ne $unit.positionalWrite) {
                     $numberedUnit.positionalWrite = $unit.positionalWrite
                 }

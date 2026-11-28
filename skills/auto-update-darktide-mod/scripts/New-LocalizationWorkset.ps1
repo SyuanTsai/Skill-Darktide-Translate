@@ -190,8 +190,8 @@ function New-UnitRecord {
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { $changeType = 'blocked'; $action = 'BLOCKED' }
     elseif ($null -eq $NewUnit) { $changeType = 'deleted_key'; $action = 'ACCEPT_REMOVAL' }
     elseif (Test-LocalizationWorksetPositionalAppend $NewUnit) {
-        $changeType = 'missing_zh_tw'
-        $action = Get-LocalizationWorksetPositionalAction -OldUnit $OldUnit -NewUnit $NewUnit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
+        $decision = Get-LocalizationWorksetPositionalDecision -OldUnit $OldUnit -NewUnit $NewUnit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
+        $changeType = $decision.changeType; $action = $decision.action; $blockedReason = $decision.blockedReason
     }
     elseif ([bool]$NewUnit.sourceExpression.isFullyLocaleResolvedExpression -and $null -eq $oldZhTw -and $null -eq $newZhTw) { $changeType = 'localized_source'; $action = 'NONE' }
     elseif ($null -eq $OldUnit) { $changeType = 'new_key'; $action = 'AI_REQUIRED' }

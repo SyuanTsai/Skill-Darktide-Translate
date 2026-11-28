@@ -367,7 +367,10 @@ if ($workset.new.Contains('zhTwSidecar') -or $before.Contains('zhTwSidecarPath')
 Assert-LocalizationWorksetPassthroughCoverage -Prefixes $before['gameLocalizedPassthroughPrefixes'] `
     -Units (@($before.units) + @($workset.units | ForEach-Object { $_.old }))
 $beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
+foreach ($unit in @($before.units)) {
+    if ($unit.blockedReason) { throw "Localization apply found a blocked NEW unit: $($unit.unitId) ($($unit.blockedReason))" }
+    $beforeById[[string]$unit.unitId] = $unit
+}
 $sharedOffsets = Get-LocalizationWorksetSharedTableOffsets -Units @($before.units)
 $edits = [Collections.Generic.List[object]]::new()
 $expectedZhTw = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)

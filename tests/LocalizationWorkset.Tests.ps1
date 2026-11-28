@@ -66,6 +66,33 @@ return output
             $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(($reviewContract | ConvertTo-Json -Depth 10 -Compress))
             [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
         }
+        function New-TestWorksetFixture {
+            param([string] $OldLua, [string] $NewLua)
+
+            $repository = Join-Path $TestDrive ('workset-' + [guid]::NewGuid().ToString('N'))
+            $oldMod = Join-Path $repository 'mods/Example'
+            $run = Join-Path $repository 'runs/review'
+            $staging = Join-Path $run 'staging/localization-workset-input/Example'
+            New-Item -ItemType Directory -Path $oldMod, $staging -Force | Out-Null
+            & git -C $repository init --quiet
+            & git -C $repository config user.name 'Workset Fixture'
+            & git -C $repository config user.email 'workset-fixture@example.invalid'
+            & git -C $repository config core.autocrlf false
+            $null = New-Item -ItemType Directory -Path (Join-Path $run 'review-artifacts')
+            $newPath = Join-Path $staging 'Example_localization.lua'
+            [IO.File]::WriteAllText((Join-Path $oldMod 'Example_localization.lua'), $OldLua)
+            [IO.File]::WriteAllText($newPath, $NewLua)
+            Add-TestTranslationRules -RepositoryRoot $repository
+            & git -C $repository add -- mods/Example
+            & git -C $repository commit --quiet -m fixture
+            $LASTEXITCODE | Should -Be 0
+
+            @{
+                RepositoryRoot = $repository; BaseOid = (& git -C $repository rev-parse HEAD).Trim()
+                ModRelativePath = 'mods/Example'; StagingModPath = $staging
+                OutputPath = Join-Path $run 'review-artifacts/localization-workset.json'
+            }
+        }
     }
 
     # Scenario: Schema 15 replaces agent-authored byte spans with one deterministic localization workset.
@@ -641,6 +668,91 @@ return output
     }
 
 
+
+    It 'InterT28_ReviewsSimplifiedChineseIndependentlyOfPositionalWriteOrder: <Case>' -ForEach @(
+        @{ Case = 'changed'; OldLiteral = '"旧简体"'; Action = 'AI_REQUIRED'; Reason = $null }
+        @{ Case = 'unchanged'; OldLiteral = '"简体"'; Action = 'RESTORE_OLD_ZH_TW'; Reason = $null }
+        @{ Case = 'unproven'; OldLiteral = '"\xff"'; Action = 'BLOCKED'; Reason = 'generated_positional_zh_cn_value_unproven' }
+    ) {
+        # Given an old locale order of zh-cn, en, zh-tw and unchanged English in the new en, zh-cn order.
+        $old = (Get-TestPositionalGeneratorLua).Replace('"简体", "English", "繁體"', "$OldLiteral, `"English`", `"繁體`"").
+            Replace(', short = {"短", "Short"}', '')
+        $new = $old.Replace('{"zh-cn", "en", "zh-tw"}', '{"en", "zh-cn"}').
+            Replace("$OldLiteral, `"English`", `"繁體`"", '"English", "简体"')
+        $fixture = New-TestWorksetFixture -OldLua $old -NewLua $new
+
+        # When the workset is generated with Simplified Chinese review enabled.
+        $result = & (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') @fixture -ReviewPositionalLabelChanges -PassThru
+        $workset = Get-Content -LiteralPath $fixture.OutputPath -Raw | ConvertFrom-Json -AsHashtable
+        $unit = @($workset.units | Where-Object key -CEQ 'pre_direct-key')[0]
+
+        # Then the old zh-tw can be restored only with proven equivalent Simplified Chinese.
+        $unit.action | Should -BeExactly $Action
+        if ($Action -ceq 'BLOCKED') {
+            $unit.blockedReason | Should -BeExactly $Reason
+            $result.status | Should -BeExactly 'blocked'
+            { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $fixture.OutputPath -PassThru } |
+                Should -Throw '*Blocked localization workset*'
+        }
+        else {
+            $unit.blockedReason | Should -BeNullOrEmpty
+            $result.status | Should -BeExactly 'ready'
+            if ($Action -ceq 'AI_REQUIRED') {
+                $unit.reviewStatus = 'approved'
+                $unit.suggestedZhTwExpression = '"新繁體"'
+                $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $fixture.OutputPath
+            }
+            $newPath = Join-Path $fixture.StagingModPath 'Example_localization.lua'
+            $rawPath = Join-Path (Split-Path -Parent $fixture.OutputPath) 'new.lua'
+            Copy-Item -LiteralPath $newPath -Destination $rawPath
+            $applied = & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $fixture.OutputPath -PassThru
+            $applied.editCount | Should -Be 2
+            $receipt = & (Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1') -WorksetPath $fixture.OutputPath `
+                -NewPath $rawPath -MergedPath $newPath -RepositoryRoot $fixture.RepositoryRoot -ExpectedBaseOid $fixture.BaseOid `
+                -ExpectedModRelativePath $fixture.ModRelativePath -PassThru
+            $receipt.result | Should -BeExactly 'passed'
+        }
+    }
+
+    It 'InterT28_BlocksDescendantTranslationsOverwrittenByALaterRootAssignment' {
+        # Given a localized descendant and a sibling root whose key starts with the same text.
+        $old = @'
+local output = {
+    feature = { label = { en = "Label", ["zh-tw"] = "標籤" } },
+    features = { label = { en = "Other", ["zh-tw"] = "其他" } }
+}
+return output
+'@
+        $new = $old.Replace('return output', 'output.feature = { en = "Feature", ["zh-tw"] = "功能" }' + "`nreturn output")
+        $fixture = New-TestWorksetFixture -OldLua $old -NewLua $new
+
+        # When the workset compares the returned accumulator before and after the overwrite.
+        $result = & (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') @fixture -PassThru
+        $workset = Get-Content -LiteralPath $fixture.OutputPath -Raw | ConvertFrom-Json -AsHashtable
+        $descendant = @($workset.units | Where-Object { $_.containerPath -ceq '$.feature' -and $_.key -ceq 'label' })[0]
+
+        # Then the stale descendant blocks application and the unrelated sibling stays unchanged.
+        $descendant.action | Should -BeExactly 'BLOCKED'
+        $descendant.blockedReason | Should -BeExactly 'generated_root_assignment_overwrites_descendant'
+        ($workset.units | Where-Object containerPath -CEQ '$.features').action | Should -BeExactly 'NONE'
+        $result.status | Should -BeExactly 'blocked'
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $fixture.OutputPath -PassThru } |
+            Should -Throw '*Blocked localization workset*'
+
+        # A workset from the previous scanner still has a valid hash for its stale NONE decision.
+        $descendant.changeType = 'unchanged'
+        $descendant.action = 'NONE'
+        $descendant.blockedReason = $null
+        $descendant.new.blockedReason = $null
+        $workset.counts.blocked--
+        $workset.counts.unchanged++
+        $workset.status = 'ready'
+        $workset.immutableContractSha256 = Get-TestImmutableWorksetContractSha256 -Workset $workset
+        $workset | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $fixture.OutputPath
+        { & (Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1') -WorksetPath $fixture.OutputPath -PassThru } |
+            Should -Throw '*generated_root_assignment_overwrites_descendant*'
+        [IO.File]::ReadAllText((Join-Path $fixture.StagingModPath 'Example_localization.lua')) | Should -BeExactly $new
+    }
 
     # Scenario: A canonical MOD directory contains an internal double dot that is part of its legal single-directory name.
     # Purpose: Reject traversal path components without excluding safe identities already accepted by acquisition and claim.

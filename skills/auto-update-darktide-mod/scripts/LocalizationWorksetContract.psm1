@@ -79,19 +79,30 @@ function Test-LocalizationWorksetPositionalAppend {
         $null -ne $Unit['positionalWrite'] -and [int]$Unit.positionalWrite.languageCount -eq 2
 }
 
-function Get-LocalizationWorksetPositionalAction {
+function Get-LocalizationWorksetPositionalZhCnValue {
+    param([Collections.IDictionary] $Unit)
+    if ($Unit.Contains('positionalZhCnValue')) { return $Unit.positionalZhCnValue }
+    # Older worksets recorded this proof only alongside write metadata.
+    if ($null -ne $Unit['positionalWrite']) { return $Unit.positionalWrite['zhCnValue'] }
+}
+
+function Get-LocalizationWorksetPositionalDecision {
     param([Collections.IDictionary] $OldUnit, [Collections.IDictionary] $NewUnit, [switch] $ReviewSimplifiedChanges)
 
+    $action = 'AI_REQUIRED'
     if ($null -ne $OldUnit -and $null -ne $OldUnit.zhTwExpression -and
         $OldUnit.sourceExpression.raw -ceq $NewUnit.sourceExpression.raw) {
-        $oldProof = $OldUnit['positionalWrite']
-        $newProof = $NewUnit['positionalWrite']
-        if (-not $ReviewSimplifiedChanges -or $null -eq $oldProof -or -not $oldProof.Contains('zhCnValue') -or
-            -not $newProof.Contains('zhCnValue') -or [string]$oldProof.zhCnValue -ceq [string]$newProof.zhCnValue) {
-            return 'RESTORE_OLD_ZH_TW'
+        $action = 'RESTORE_OLD_ZH_TW'
+        if ($ReviewSimplifiedChanges) {
+            $oldZhCn = Get-LocalizationWorksetPositionalZhCnValue $OldUnit
+            $newZhCn = Get-LocalizationWorksetPositionalZhCnValue $NewUnit
+            if ($oldZhCn -isnot [string] -or $newZhCn -isnot [string]) {
+                return [ordered]@{ changeType = 'blocked'; action = 'BLOCKED'; blockedReason = 'generated_positional_zh_cn_value_unproven' }
+            }
+            if ($oldZhCn -cne $newZhCn) { $action = 'AI_REQUIRED' }
         }
     }
-    'AI_REQUIRED'
+    [ordered]@{ changeType = 'missing_zh_tw'; action = $action; blockedReason = $null }
 }
 
 function Get-LocalizationWorksetPositionalInsertions {
@@ -118,7 +129,9 @@ function Get-LocalizationWorksetPositionalInsertions {
         if ($null -eq $review -or $null -eq $review.new -or -not (Test-LocalizationWorksetPositionalAppend $review.new)) {
             throw 'Positional zh-tw writeback requires a proven translation decision for every row in the locale group.'
         }
-        $action = Get-LocalizationWorksetPositionalAction -OldUnit $review.old -NewUnit $unit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
+        $decision = Get-LocalizationWorksetPositionalDecision -OldUnit $review.old -NewUnit $unit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
+        $action = $decision.action
+        if ($decision.blockedReason) { throw "Positional zh-tw writeback is blocked: $($unit.unitId) ($($decision.blockedReason))" }
         if ($review.action -cne $action) { throw 'Positional zh-tw action differs from the expected source-bound decision.' }
         $literal = if ($action -ceq 'RESTORE_OLD_ZH_TW' -and $review.reviewStatus -ceq 'not-required' -and
             $null -eq $review.suggestedZhTwExpression) { [string]$review.old.zhTwExpression.raw }
@@ -408,4 +421,4 @@ function Get-LocalizationTranslationBinding {
     }
 }
 
-Export-ModuleMember -Function Get-ImmutableWorksetContractSha256, Get-LocalizationTranslationBinding, Get-LocalizationGitBlobBytes, Get-LocalizationWorksetWriteBlockReason, Get-LocalizationWorksetSharedTableOffsets, Test-LocalizationWorksetPositionalAppend, Get-LocalizationWorksetPositionalAction, Get-LocalizationWorksetPositionalInsertions, Assert-LocalizationWorksetSharedRestorationCoverage, Get-LocalizationWorksetSidecarRelativePath, Test-LocalizationWorksetStagedSidecarAbsent, Test-LocalizationWorksetTreeSidecarAbsent, Assert-LocalizationWorksetPassthroughCoverage
+Export-ModuleMember -Function Get-ImmutableWorksetContractSha256, Get-LocalizationTranslationBinding, Get-LocalizationGitBlobBytes, Get-LocalizationWorksetWriteBlockReason, Get-LocalizationWorksetSharedTableOffsets, Test-LocalizationWorksetPositionalAppend, Get-LocalizationWorksetPositionalDecision, Get-LocalizationWorksetPositionalInsertions, Assert-LocalizationWorksetSharedRestorationCoverage, Get-LocalizationWorksetSidecarRelativePath, Test-LocalizationWorksetStagedSidecarAbsent, Test-LocalizationWorksetTreeSidecarAbsent, Assert-LocalizationWorksetPassthroughCoverage

@@ -152,7 +152,7 @@ function Get-ExpressionSnapshot {
 }
 
 function Get-UnitSnapshotJson {
-    param($Unit)
+    param($Unit, [switch] $IncludePositionalZhCnValue)
     if ($null -eq $Unit) { return $null }
     $snapshot = [ordered]@{
         sourceId = $Unit.sourceId; containerPath = $Unit.containerPath; key = $Unit.key
@@ -162,6 +162,7 @@ function Get-UnitSnapshotJson {
         tableOpenByte = $Unit.tableOpenByte; tableCloseByte = $Unit.tableCloseByte
     }
     if ($Unit.Contains('positionalLocale')) { $snapshot.positionalLocale = $Unit.positionalLocale }
+    if ($IncludePositionalZhCnValue) { $snapshot.positionalZhCnValue = $Unit['positionalZhCnValue'] }
     if ($Unit.Contains('positionalWrite')) { $snapshot.positionalWrite = $Unit.positionalWrite }
     if ($Unit.Contains('generatedBinding')) { $snapshot.generatedBinding = $Unit.generatedBinding }
     $snapshot | ConvertTo-Json -Depth 20 -Compress
@@ -185,8 +186,7 @@ function Get-ExpectedClassification {
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { return [ordered]@{ changeType = 'blocked'; action = 'BLOCKED'; blockedReason = $blockedReason } }
     if ($null -eq $NewUnit) { return [ordered]@{ changeType = 'deleted_key'; action = 'ACCEPT_REMOVAL'; blockedReason = $null } }
     if (Test-LocalizationWorksetPositionalAppend $NewUnit) {
-        $action = Get-LocalizationWorksetPositionalAction -OldUnit $OldUnit -NewUnit $NewUnit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
-        return [ordered]@{ changeType = 'missing_zh_tw'; action = $action; blockedReason = $null }
+        return Get-LocalizationWorksetPositionalDecision -OldUnit $OldUnit -NewUnit $NewUnit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
     }
     if ([bool]$NewUnit.sourceExpression.isFullyLocaleResolvedExpression -and $null -eq $oldZhTw -and $null -eq $newZhTw) { return [ordered]@{ changeType = 'localized_source'; action = 'NONE'; blockedReason = $null } }
     if ($null -eq $OldUnit) { return [ordered]@{ changeType = 'new_key'; action = 'AI_REQUIRED'; blockedReason = $null } }
@@ -458,8 +458,12 @@ foreach ($unit in @($workset.units)) {
     $unitId = [string]$unit.unitId
     $parsedNew = if ($beforeById.ContainsKey($unitId)) { $beforeById[$unitId] } else { $null }
     $parsedOld = if ($bindingValueCount -eq 3 -and $oldById.ContainsKey($unitId)) { $oldById[$unitId] } elseif ($bindingValueCount -eq 0) { $unit.old } else { $null }
-    if ((Get-UnitSnapshotJson -Unit $unit.new) -cne (Get-UnitSnapshotJson -Unit $parsedNew) -or
-        ($bindingValueCount -eq 3 -and (Get-UnitSnapshotJson -Unit $unit.old) -cne (Get-UnitSnapshotJson -Unit $parsedOld))) {
+    $includeNewZhCn = $null -ne $unit.new -and $unit.new.Contains('positionalZhCnValue')
+    $includeOldZhCn = $null -ne $unit.old -and $unit.old.Contains('positionalZhCnValue')
+    if ((Get-UnitSnapshotJson -Unit $unit.new -IncludePositionalZhCnValue:$includeNewZhCn) -cne
+        (Get-UnitSnapshotJson -Unit $parsedNew -IncludePositionalZhCnValue:$includeNewZhCn) -or
+        ($bindingValueCount -eq 3 -and (Get-UnitSnapshotJson -Unit $unit.old -IncludePositionalZhCnValue:$includeOldZhCn) -cne
+        (Get-UnitSnapshotJson -Unit $parsedOld -IncludePositionalZhCnValue:$includeOldZhCn))) {
         throw "Localization workset unit snapshot differs from independently parsed OLD or NEW bytes: $unitId"
     }
     $identity = if ($null -ne $parsedNew) { $parsedNew } else { $parsedOld }
