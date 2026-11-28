@@ -14,6 +14,7 @@ param(
     [string] $TranslationMode = 'update',
     [ValidateNotNullOrEmpty()][string] $ModelId,
     [switch] $ReviewPositionalLabelChanges,
+    [string] $DynamicListMapPath,
     [scriptblock] $HeartbeatAction,
     [switch] $PassThru
 )
@@ -24,6 +25,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'LocalizationWorksetContract.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'LocalizationCoverage.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -440,6 +442,19 @@ $workset = [ordered]@{
     units = @($records)
 }
 if ($null -ne $sidecarEvidence) { $workset.new.zhTwSidecar = $sidecarEvidence }
+# Add evidence within the existing immutable OLD/NEW contract; retain legacy contracts.
+if ($null -eq $existingWorkset -or $existingWorkset.new.Contains('coverage')) {
+    if (-not $DynamicListMapPath -and $null -ne $existingWorkset -and $null -ne $existingWorkset.new.coverage.dynamicList) {
+        $DynamicListMapPath = $existingWorkset.new.coverage.dynamicList.path
+    }
+    $dynamicList = Get-LocalizationDynamicListEvidence $DynamicListMapPath
+    $workset.old.coverage = Get-LocalizationSourceCoverage $oldDocument $dynamicList
+    $workset.new.coverage = Get-LocalizationSourceCoverage $newDocument $dynamicList
+    $workset.old.repositoryRoot = $repository
+    $workset.new.coverageInputBase64 = [Convert]::ToBase64String($newBytes)
+    $workset.new.zhTwSurvival = @(Get-LocalizationZhTwSurvival $oldDocument.units $newDocument.units -ReviewSimplifiedChanges:$reviewSimplified)
+    if ($workset.old.coverage.blockedReasons.Count -or $workset.new.coverage.blockedReasons.Count) { $workset.status = 'blocked' }
+}
 if ($workset.generatorVersion -eq 2) {
     $workset.translationBinding = Get-LocalizationTranslationBinding `
         -SkillRoot (Split-Path -Parent $PSScriptRoot) -RepositoryRoot $repository -BaseOid $resolvedBaseOid `
@@ -447,6 +462,15 @@ if ($workset.generatorVersion -eq 2) {
 }
 if ($reviewSimplified) { $workset.positionalLabelReview = 'zh-cn-changes' }
 $workset.immutableContractSha256 = Get-ImmutableWorksetContractSha256 -Workset $workset
+$blockedExplanation = if ($workset.status -ceq 'blocked') {
+    $reasons = @($records | Where-Object blockedReason | ForEach-Object { $_.key + ': ' + $_.blockedReason })
+    foreach ($side in @('old', 'new')) {
+        if ($workset[$side].Contains('coverage')) {
+            $reasons += @($workset[$side].coverage.blockedReasons | ForEach-Object { $side + ': ' + $_ })
+        }
+    }
+    $reasons -join '; '
+}
 
 if ($existingWorkset) {
     $existing = $existingWorkset
@@ -459,10 +483,10 @@ if ($existingWorkset) {
         [string]$existing.immutableContractSha256 -cne [string]$workset.immutableContractSha256) {
         throw 'Existing localization workset immutable contract changed.'
     }
-    Write-Result -Value ([ordered]@{ result = 'passed'; status = $existing.status; idempotent = $true; path = $outputFull; sha256 = Get-FileSha256 -Path $outputFull; unitCount = @($existing.units).Count })
+    Write-Result -Value ([ordered]@{ result = 'passed'; status = $existing.status; reason = $blockedExplanation; idempotent = $true; path = $outputFull; sha256 = Get-FileSha256 -Path $outputFull; unitCount = @($existing.units).Count })
     return
 }
 Assert-NoReparsePath -Path $outputParent -Root $repository
 Assert-NoReparsePath -Path $outputFull -Root $repository -AllowMissing
 Write-AtomicJson -Path $outputFull -Value $workset
-Write-Result -Value ([ordered]@{ result = 'passed'; status = $workset.status; idempotent = $false; path = $outputFull; sha256 = Get-FileSha256 -Path $outputFull; unitCount = $records.Count; counts = $counts })
+Write-Result -Value ([ordered]@{ result = 'passed'; status = $workset.status; reason = $blockedExplanation; idempotent = $false; path = $outputFull; sha256 = Get-FileSha256 -Path $outputFull; unitCount = $records.Count; counts = $counts })

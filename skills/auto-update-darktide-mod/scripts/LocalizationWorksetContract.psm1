@@ -264,6 +264,17 @@ function Get-LocalizationWorksetWriteBlockReason {
 function Get-ImmutableWorksetContractSha256 {
     param([Collections.IDictionary] $Workset)
 
+    if ($Workset.old.Contains('coverage') -or $Workset.new.Contains('coverage') -or
+        $Workset.new.Contains('coverageInputBase64') -or $Workset.new.Contains('zhTwSurvival')) {
+        if ($Workset.old['coverage'] -isnot [Collections.IDictionary] -or
+            $Workset.new['coverage'] -isnot [Collections.IDictionary] -or
+            $Workset.old.coverage['version'] -ne 1 -or $Workset.new.coverage['version'] -ne 1 -or
+            $Workset.new['coverageInputBase64'] -isnot [string] -or
+            $Workset.new['zhTwSurvival'] -isnot [array] -or
+            [string]::IsNullOrWhiteSpace([string]$Workset.old['repositoryRoot'])) {
+            throw 'Localization source coverage contract is incomplete or unsupported.'
+        }
+    }
     $unitContracts = @($Workset.units | ForEach-Object {
         [ordered]@{
             unitId = $_.unitId; sourceId = $_.sourceId; containerPath = $_.containerPath

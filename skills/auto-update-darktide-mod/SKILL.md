@@ -29,6 +29,8 @@ The coordination helpers themselves use only local .NET locking, same-directory 
 
 8. Read [references/api-translation.md](references/api-translation.md) for the packaged API assets and PowerShell workset binding. Run the Python adapter separately from the repository source tree or GitHub Actions.
 
+9. For source coverage, OLD zh-tw survival evidence and game-list terminology candidates, read [references/localization-coverage.md](references/localization-coverage.md). Partial coverage and English-only mood generators block new worksets.
+
 Existing runs continue with the workflow tuple recorded in their own state. Runs pinned to version 0.3.12 or later expose `finalize-merge`; an older run follows the finalization or recovery procedure in its recorded package. A package upgrade starts a new run and leaves the old state unchanged.
 
 ### Example

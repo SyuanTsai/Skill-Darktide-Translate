@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 [CmdletBinding()]
-param()
+param([string[]] $TestPath)
 
 $ErrorActionPreference = 'Stop'
 $available = @(
@@ -17,6 +17,13 @@ $selected = $available[0]
 Import-Module $selected.Path -Force
 $testFiles = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.Tests.ps1' -File -Recurse |
         Sort-Object FullName | Select-Object -ExpandProperty FullName)
+if ($TestPath) {
+    $requested = @($TestPath | ForEach-Object { [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $_)) })
+    foreach ($path in $requested) {
+        if ($path -notin $testFiles) { throw "TestPath is not a repository test: $path" }
+    }
+    $testFiles = $requested
+}
 if ($testFiles.Count -eq 0) {
     throw 'No Pester test files were found.'
 }

@@ -15,6 +15,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'LocalizationWorksetContract.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'LocalizationCoverage.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -279,6 +280,32 @@ function Invoke-ByteEdits {
     $result
 }
 
+function Assert-ApplyCoverage {
+    param($Workset, [byte[]] $OutputBytes)
+    if (-not $Workset.new.Contains('coverage')) { return }
+    $oldBytes = Get-LocalizationGitBlobBytes -WorkingDirectory $Workset.old.repositoryRoot -Object ($Workset.baseOid + ':' + $Workset.old.path) -HeartbeatAction $HeartbeatAction
+    $inputBytes = [Convert]::FromBase64String($Workset.new.coverageInputBase64)
+    if ((Get-Sha256Bytes $oldBytes) -cne $Workset.old.sha256 -or (Get-Sha256Bytes $inputBytes) -cne $Workset.new.sha256) {
+        throw 'Localization coverage source snapshot hash mismatch.'
+    }
+    $old = Get-LuaLocalizationDocument -Bytes $oldBytes -SourceId $Workset.sourceId -HeartbeatAction $HeartbeatAction
+    $inputDocument = Get-LuaLocalizationDocument -Bytes $inputBytes -SourceId $Workset.sourceId -HeartbeatAction $HeartbeatAction
+    if ($Workset.new.Contains('zhTwSidecar')) {
+        $old.units = @($old.units | Where-Object { -not $_['conditionalZhTwSidecar'] })
+        $inputDocument.units = @($inputDocument.units | Where-Object { -not $_['conditionalZhTwSidecar'] })
+    }
+    Assert-LocalizationSourceCoverage $Workset.old.coverage $old 'OLD'
+    Assert-LocalizationSourceCoverage $Workset.new.coverage $inputDocument 'NEW'
+    $ids = @(@($old.units) + @($inputDocument.units) | ForEach-Object unitId | Sort-Object -CaseSensitive -Unique)
+    $reviewIds = @($Workset.units | ForEach-Object unitId | Sort-Object -CaseSensitive -Unique)
+    if ($reviewIds.Count -ne $Workset.units.Count -or
+        ($ids | ConvertTo-Json -Compress) -cne ($reviewIds | ConvertTo-Json -Compress)) { throw 'Localization source coverage unit inventory mismatch.' }
+    if ($null -ne $OutputBytes) {
+        $output = Get-LuaLocalizationDocument -Bytes $OutputBytes -SourceId $Workset.sourceId -HeartbeatAction $HeartbeatAction
+        Assert-LocalizationZhTwSurvival $old.units $inputDocument.units $output.units -Recorded $Workset.new.zhTwSurvival -ReviewSimplifiedChanges:($Workset['positionalLabelReview'] -ceq 'zh-cn-changes')
+    }
+}
+
 function Assert-ApplySidecarAbsent {
     param($Workset, $Document, [string] $StagingRoot, [string] $MainPath)
 
@@ -341,6 +368,7 @@ if ($workset.Contains('apply') -and $workset.apply) {
             $appliedDocument = Get-LuaLocalizationDocument -Bytes $currentBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
             Assert-ApplySidecarAbsent $workset $appliedDocument $recordedStagingRoot $newPath
         }
+        Assert-ApplyCoverage $workset $currentBytes
         if ($applyStatus -ceq 'pending') {
             Assert-NoReparsePath -Path $worksetFull -Root $worksetRunRoot
             $workset.apply.status = 'applied'
@@ -359,6 +387,7 @@ if ($workset.Contains('apply') -and $workset.apply) {
 }
 if ($currentSha -cne [string]$workset.new.sha256) { throw 'Workset NEW localization SHA-256 changed before apply.' }
 $originalBytes = $currentBytes
+Assert-ApplyCoverage $workset
 $before = Get-LuaLocalizationDocument -Bytes $originalBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
 if ($workset.new.Contains('zhTwSidecar') -or $before.Contains('zhTwSidecarPath')) {
     Assert-ApplySidecarAbsent $workset $before $recordedStagingRoot $newPath
@@ -442,6 +471,7 @@ foreach ($unit in @($workset.units)) {
 
 $updatedBytes = Invoke-ByteEdits -Bytes $originalBytes -Edits @($edits)
 $after = Get-LuaLocalizationDocument -Bytes $updatedBytes -DisplayPath $newPath -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
+Assert-ApplyCoverage $workset $updatedBytes
 if ([bool]$after.bom -ne [bool]$workset.new.bom -or [string]$after.newline -cne [string]$workset.new.newline) {
     throw 'Localization apply changed the immutable NEW BOM or newline style.'
 }
