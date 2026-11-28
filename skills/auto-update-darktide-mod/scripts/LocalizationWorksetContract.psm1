@@ -6,6 +6,263 @@ Set-StrictMode -Version Latest
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1')
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1')
 
+Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Scope Local -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Scope Local -ErrorAction Stop
+
+function Assert-LocalizationWorksetPassthroughCoverage {
+    param([string[]] $Prefixes, [object[]] $Units)
+
+    foreach ($prefix in $Prefixes) {
+        if (-not $prefix) { continue }
+        foreach ($unit in $Units) {
+            if (Test-LuaLocalizationUnitInRootNamespace $unit $prefix) {
+                throw "A game-localized output could overwrite a known localization key: $($unit.containerPath) / $($unit.key)"
+            }
+        }
+    }
+}
+
+function Get-LocalizationWorksetSidecarRelativePath {
+    param([Collections.IDictionary] $Document, [string] $ModRelativePath, [string] $MainRelativePath)
+
+    if (-not $Document['zhTwSidecarLocaleBindingProven'] -or
+        $MainRelativePath -cnotmatch '\Ascripts/mods/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+_localization\.lua\z') { return }
+    $sidecar = $MainRelativePath -creplace '_localization\.lua$', '_localization_zh-tw.lua'
+    $modName = ($ModRelativePath -split '/')[-1]
+    if ([string]$Document.zhTwSidecarPath -ceq ($modName + '/' + $sidecar)) { $sidecar }
+}
+
+function Test-LocalizationWorksetStagedSidecarAbsent {
+    param([string] $StagingRoot, [string] $RelativeSidecar)
+
+    if (-not $RelativeSidecar) { return $false }
+    $sidecar = Join-Path $StagingRoot $RelativeSidecar
+    $directory = Split-Path -Parent $sidecar
+    if (Test-PortableReparseItem -Path $directory -TrustedRoot $StagingRoot -Label 'Localization sidecar directory') {
+        return $false
+    }
+    $prefix = (Split-Path -Leaf $sidecar) -creplace 'zh-tw\.lua$', ''
+    @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop | Where-Object {
+        $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
+            $_.Name.EndsWith('.lua', [StringComparison]::OrdinalIgnoreCase)
+    }).Count -eq 0
+}
+
+function Test-LocalizationWorksetTreeSidecarAbsent {
+    param([string] $Repository, [string] $Commit, [string] $ModRelativePath, [string] $RelativeSidecar)
+
+    if (-not $RelativeSidecar -or $Commit -cnotmatch '^[a-f0-9]{40}$') { return $false }
+    $paths = @(& git -C $Repository -c core.quotePath=false ls-tree -r -t --name-only $Commit -- $ModRelativePath)
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot independently inspect the localization sidecar in the immutable Git tree.' }
+    $prefix = $ModRelativePath + '/' + ($RelativeSidecar -creplace 'zh-tw\.lua$', '')
+    @($paths | Where-Object {
+        $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
+            $_.EndsWith('.lua', [StringComparison]::OrdinalIgnoreCase)
+    }).Count -eq 0
+}
+
+function Get-LocalizationWorksetSharedTableOffsets {
+    param([object[]] $Units)
+    $tableOffsets = [Collections.Generic.HashSet[long]]::new()
+    $sharedOffsets = [Collections.Generic.HashSet[long]]::new()
+    foreach ($unit in $Units) {
+        if ($null -ne $unit.tableOpenByte -and -not $tableOffsets.Add([long]$unit.tableOpenByte)) {
+            $null = $sharedOffsets.Add([long]$unit.tableOpenByte)
+        }
+    }
+    ,$sharedOffsets
+}
+
+function Test-LocalizationWorksetPositionalAppend {
+    param([Collections.IDictionary] $Unit)
+
+    return $null -ne $Unit -and [bool]$Unit['positionalLocale'] -and
+        -not $Unit['blockedReason'] -and $null -eq $Unit['zhTwExpression'] -and
+        $null -ne $Unit['positionalWrite'] -and [int]$Unit.positionalWrite.languageCount -eq 2
+}
+
+function Get-LocalizationWorksetPositionalZhCnValue {
+    param([Collections.IDictionary] $Unit)
+    if ($Unit.Contains('positionalZhCnValue')) { return $Unit.positionalZhCnValue }
+    # Older worksets recorded this proof only alongside write metadata.
+    if ($null -ne $Unit['positionalWrite']) { return $Unit.positionalWrite['zhCnValue'] }
+}
+
+function Get-LocalizationWorksetPositionalDecision {
+    param([Collections.IDictionary] $OldUnit, [Collections.IDictionary] $NewUnit, [switch] $ReviewSimplifiedChanges)
+
+    $action = 'AI_REQUIRED'
+    if ($null -ne $OldUnit -and $null -ne $OldUnit.zhTwExpression -and
+        $OldUnit.sourceExpression.raw -ceq $NewUnit.sourceExpression.raw) {
+        $action = 'RESTORE_OLD_ZH_TW'
+        if ($ReviewSimplifiedChanges) {
+            $oldZhCn = Get-LocalizationWorksetPositionalZhCnValue $OldUnit
+            $newZhCn = Get-LocalizationWorksetPositionalZhCnValue $NewUnit
+            if ($oldZhCn -isnot [string] -or $newZhCn -isnot [string]) {
+                return [ordered]@{ changeType = 'blocked'; action = 'BLOCKED'; blockedReason = 'generated_positional_zh_cn_value_unproven' }
+            }
+            if ($oldZhCn -cne $newZhCn) { $action = 'AI_REQUIRED' }
+        }
+    }
+    [ordered]@{ changeType = 'missing_zh_tw'; action = $action; blockedReason = $null }
+}
+
+function Get-LocalizationWorksetPositionalInsertions {
+    param([object[]] $ParsedUnits, [object[]] $ReviewedUnits, [switch] $ReviewSimplifiedChanges)
+
+    $targets = @($ParsedUnits | Where-Object { Test-LocalizationWorksetPositionalAppend $_ })
+    if ($targets.Count -eq 0) { return }
+    if (@($ParsedUnits | Where-Object blockedReason).Count) {
+        throw 'Cannot append a positional locale while a generated translation output is unproven.'
+    }
+
+    $reviewedById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($unit in $ReviewedUnits) {
+        if (-not $reviewedById.TryAdd([string]$unit.unitId, $unit)) {
+            throw 'Positional writeback review contains a duplicate unit.'
+        }
+    }
+
+    $localeOffsets = [Collections.Generic.HashSet[long]]::new()
+    $rowOffsets = [Collections.Generic.HashSet[long]]::new()
+    $plans = [Collections.Generic.List[object]]::new()
+    foreach ($unit in $targets) {
+        $review = if ($reviewedById.ContainsKey($unit.unitId)) { $reviewedById[$unit.unitId] }
+        if ($null -eq $review -or $null -eq $review.new -or -not (Test-LocalizationWorksetPositionalAppend $review.new)) {
+            throw 'Positional zh-tw writeback requires a proven translation decision for every row in the locale group.'
+        }
+        $decision = Get-LocalizationWorksetPositionalDecision -OldUnit $review.old -NewUnit $unit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
+        $action = $decision.action
+        if ($decision.blockedReason) { throw "Positional zh-tw writeback is blocked: $($unit.unitId) ($($decision.blockedReason))" }
+        if ($review.action -cne $action) { throw 'Positional zh-tw action differs from the expected source-bound decision.' }
+        $literal = if ($action -ceq 'RESTORE_OLD_ZH_TW' -and $review.reviewStatus -ceq 'not-required' -and
+            $null -eq $review.suggestedZhTwExpression) { [string]$review.old.zhTwExpression.raw }
+        elseif ($action -ceq 'AI_REQUIRED' -and $review.reviewStatus -ceq 'approved') { [string]$review.suggestedZhTwExpression }
+        else { throw 'Positional zh-tw writeback requires a proven translation decision for every row in the locale group.' }
+        $provenOriginalLiteral = $action -ceq 'RESTORE_OLD_ZH_TW' -and $review.old['positionalLocale'] -and
+            $review.old['positionalZhTwValue'] -is [string]
+        if (-not $provenOriginalLiteral -and $literal -cnotmatch '\A"(?:[^"\\\p{Cc}]|\\["\\nrt])+"\z') {
+            throw "Positional zh-tw approval must be one nonempty double-quoted Lua string: $($unit.unitId)"
+        }
+        if (-not (Test-LuaNonStringTokenSequence -Source ([string]$unit.sourceExpression.raw) -Translation $literal)) {
+            throw "Positional zh-tw approval differs from NEW English token or format structure: $($unit.unitId)"
+        }
+        $localeOffset = [long]$unit.positionalWrite.localeInsertByte
+        $rowOffset = [long]$unit.positionalWrite.rowInsertByte
+        if ($localeOffset -le 0 -or $rowOffset -le 0 -or $localeOffset -eq $rowOffset -or -not $rowOffsets.Add($rowOffset)) {
+            throw 'Positional zh-tw insertions overlap or have invalid source offsets.'
+        }
+        if ($localeOffsets.Add($localeOffset)) {
+            $plans.Add([ordered]@{ startByte = $localeOffset; unitId = $unit.unitId; text = ', "zh-tw"'; literal = $null })
+        }
+        $plans.Add([ordered]@{ startByte = $rowOffset; unitId = $unit.unitId; text = ', ' + $literal; literal = $literal })
+    }
+    if ($localeOffsets.Overlaps($rowOffsets)) { throw 'Positional zh-tw locale and row insertions overlap.' }
+    $plans.ToArray()
+}
+
+function Test-LocalizationWorksetNumericRestore {
+    param([Collections.IDictionary] $OldUnit, [Collections.IDictionary] $NewUnit)
+
+    if ($null -eq $OldUnit -or $null -eq $NewUnit -or $OldUnit['blockedReason'] -or $NewUnit['blockedReason'] -or
+        $null -eq $OldUnit.zhTwExpression -or $null -ne $NewUnit.zhTwExpression -or
+        $null -eq $OldUnit['generatedBinding'] -or $null -eq $NewUnit['generatedBinding'] -or
+        $NewUnit.generatedBinding.kind -cne 'numeric-loop' -or $NewUnit.generatedBinding['tostringBindingProven'] -ne $true -or
+        (ConvertTo-Json -InputObject $OldUnit.generatedBinding -Compress) -cne (ConvertTo-Json -InputObject $NewUnit.generatedBinding -Compress) -or
+        $OldUnit.sourceExpression.raw -cne $NewUnit.sourceExpression.raw) { return $false }
+
+    $parameter = [regex]::Escape([string]$NewUnit.generatedBinding.parameter)
+    $prefix = '"(?:[^"\\\p{Cc}]|\\["\\nrt])+"'
+    [string]$OldUnit.zhTwExpression.raw -cmatch ("\A" + $prefix + '[ \t]*\.\.[ \t]*tostring\([ \t]*' + $parameter + '[ \t]*\)\z')
+}
+
+function Assert-LocalizationWorksetSharedRestorationCoverage {
+    param([object[]] $ParsedUnits, [object[]] $ReviewedUnits)
+
+    $restorations = @($ReviewedUnits | Where-Object {
+        $_.action -ceq 'RESTORE_OLD_ZH_TW' -and (Test-LocalizationWorksetNumericRestore $_.old $_.new)
+    })
+    if ($restorations.Count -eq 0) { return }
+    $byId = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $ReviewedUnits) {
+        if (-not $byId.TryAdd([string]$entry.unitId, $entry)) { throw 'Localization restoration contains a duplicate unit.' }
+    }
+    foreach ($group in @($restorations | Group-Object { [long]$_.new.tableOpenByte })) {
+        $expectedExpression = [string]$group.Group[0].old.zhTwExpression.raw
+        $parsed = @($ParsedUnits | Where-Object { $null -ne $_.tableOpenByte -and [long]$_.tableOpenByte -eq [long]$group.Name })
+        if ($parsed.Count -ne $group.Count) { throw 'Shared numeric localization requires all generated outputs.' }
+        foreach ($unit in $parsed) {
+            $review = if ($byId.ContainsKey($unit.unitId)) { $byId[$unit.unitId] }
+            if ($null -eq $review -or $review.action -cne 'RESTORE_OLD_ZH_TW' -or
+                -not (Test-LocalizationWorksetNumericRestore $review.old $unit) -or
+                [string]$review.old.zhTwExpression.raw -cne $expectedExpression) {
+                throw 'Shared numeric localization requires the same proven original zh-tw expression for every output.'
+            }
+        }
+    }
+}
+
+function Get-LocalizationWorksetWriteBlockReason {
+    param(
+        [string] $Action,
+        [Collections.IDictionary] $OldUnit,
+        [Collections.IDictionary] $NewUnit,
+        [switch] $SharedNewTable,
+        [Collections.IDictionary] $Review
+    )
+    $sharedReason = 'generated_shared_translation_span_requires_review'
+    if ($Action -ceq 'BLOCKED') { return }
+    if ($null -ne $OldUnit -and $null -ne $NewUnit) {
+        $oldBinding = $OldUnit['generatedBinding']
+        $newBinding = $NewUnit['generatedBinding']
+        if (($null -ne $oldBinding -or $null -ne $newBinding) -and
+            (ConvertTo-Json -InputObject $oldBinding -Compress) -cne (ConvertTo-Json -InputObject $newBinding -Compress)) {
+            return 'generated_binding_changed_requires_review'
+        }
+    }
+    if ($Action -ceq 'NONE') {
+        if ($SharedNewTable -and $null -ne $OldUnit -and $null -ne $NewUnit) {
+            foreach ($field in @('sourceExpression', 'zhTwExpression')) {
+                $oldExpression = $OldUnit[$field]
+                $newExpression = $NewUnit[$field]
+                $oldRaw = if ($null -ne $oldExpression) { $oldExpression['raw'] } else { $null }
+                $newRaw = if ($null -ne $newExpression) { $newExpression['raw'] } else { $null }
+                if ($oldRaw -cne $newRaw) { return $sharedReason }
+            }
+        }
+        return
+    }
+    if ($Action -ceq 'ACCEPT_REMOVAL') {
+        if ($null -ne $OldUnit -and $OldUnit['positionalLocale'] -and $null -ne $OldUnit['zhTwExpression']) {
+            return 'generated_positional_zh_tw_output_removed'
+        }
+        return
+    }
+    if ($null -ne $NewUnit -and $NewUnit['positionalLocale']) {
+        if (-not $SharedNewTable -and $Action -cin @('AI_REQUIRED', 'RESTORE_OLD_ZH_TW') -and (Test-LocalizationWorksetPositionalAppend $NewUnit)) { return }
+        return 'generated_positional_locale_requires_review'
+    }
+    $hasLiteralTranslation = $null -ne $NewUnit -and $null -ne $NewUnit['generatedBinding'] -and
+        $NewUnit.generatedBinding.kind -ceq 'literal-list-loop' -and $null -ne $NewUnit.zhTwExpression
+    $isLiteralOverlay = $false
+    if ($hasLiteralTranslation) {
+        $fieldStart = [long]$NewUnit.zhTwExpression.fieldStartByte
+        $fieldEnd = $fieldStart + [long]$NewUnit.zhTwExpression.fieldLengthByte
+        $isLiteralOverlay = $fieldStart -le [long]$NewUnit.tableOpenByte -or $fieldEnd -gt [long]$NewUnit.tableCloseByte
+    }
+    # A shared or external literal can be approved as it stands. It is unsafe to
+    # edit its shared bytes or remove only part of a separate Lua assignment.
+    if ($hasLiteralTranslation -and ($SharedNewTable -or $isLiteralOverlay) -and $Action -ceq 'AI_REQUIRED') {
+        if ($null -eq $Review -or ($Review['reviewStatus'] -ceq 'preserved' -and $null -eq $Review['suggestedZhTwExpression'])) { return }
+        return 'generated_shared_literal_translation_requires_preservation_review'
+    }
+    if ($isLiteralOverlay) { return 'generated_literal_overlay_write_unproven' }
+    if ($SharedNewTable) {
+        if ($Action -ceq 'RESTORE_OLD_ZH_TW' -and (Test-LocalizationWorksetNumericRestore $OldUnit $NewUnit)) { return }
+        return $sharedReason
+    }
+}
+
 function Get-ImmutableWorksetContractSha256 {
     param([Collections.IDictionary] $Workset)
 
@@ -46,6 +303,12 @@ function Get-ImmutableWorksetContractSha256 {
             $contract.translationBinding = $binding
         }
         default { throw 'Localization workset generator version is unsupported.' }
+    }
+    if ($Workset.Contains('positionalLabelReview')) {
+        if ($Workset.generatorVersion -ne 2 -or $Workset.positionalLabelReview -cne 'zh-cn-changes') {
+            throw 'Localization workset positional review scope is invalid.'
+        }
+        $contract.positionalLabelReview = $Workset.positionalLabelReview
     }
     $bytes = [Text.Encoding]::UTF8.GetBytes(($contract | ConvertTo-Json -Depth 40 -Compress))
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
@@ -175,7 +438,7 @@ function Get-ExpressionSnapshot {
 }
 
 function Get-UnitSnapshotJson {
-    param($Unit)
+    param($Unit, [switch] $IncludePositionalZhCnValue)
     if ($null -eq $Unit) { return $null }
     $snapshot = [ordered]@{
         sourceId = $Unit.sourceId; containerPath = $Unit.containerPath; key = $Unit.key
@@ -184,6 +447,10 @@ function Get-UnitSnapshotJson {
         zhTwExpression = Get-ExpressionSnapshot -Expression $Unit.zhTwExpression
         tableOpenByte = $Unit.tableOpenByte; tableCloseByte = $Unit.tableCloseByte
     }
+    if ($Unit.Contains('positionalLocale')) { $snapshot.positionalLocale = $Unit.positionalLocale }
+    if ($IncludePositionalZhCnValue) { $snapshot.positionalZhCnValue = $Unit['positionalZhCnValue'] }
+    if ($Unit.Contains('positionalWrite')) { $snapshot.positionalWrite = $Unit.positionalWrite }
+    if ($Unit.Contains('generatedBinding')) { $snapshot.generatedBinding = $Unit.generatedBinding }
     $snapshot | ConvertTo-Json -Depth 20 -Compress
 }
 
@@ -394,6 +661,13 @@ function Get-ReviewedTerminologyEdit {
         -not [string]::Equals($correction.new.zhTwRaw, $newUnit.zhTwExpression.raw)) {
         throw 'Reviewed terminology prior literals differ from independently parsed OLD or NEW bytes.'
     }
+    $sharedOffsets = Get-LocalizationWorksetSharedTableOffsets -Units @($NewDocument.units)
+    $shared = $null -ne $newUnit.tableOpenByte -and $sharedOffsets.Contains([long]$newUnit.tableOpenByte)
+    $writeBlockReason = Get-LocalizationWorksetWriteBlockReason -Action 'TERMINOLOGY_REPLACE' `
+        -OldUnit $oldUnit -NewUnit $newUnit -SharedNewTable:$shared
+    if ($writeBlockReason) {
+        throw "Reviewed terminology cannot replace this NEW translation span: $writeBlockReason."
+    }
     $null = ConvertFrom-LuaQuotedLiteral -Expression $newUnit.sourceExpression.raw
     $prior = ConvertFrom-LuaQuotedLiteral -Expression $newUnit.zhTwExpression.raw
     $translation = $correction.translation
@@ -462,4 +736,5 @@ function New-ReviewedTerminologyEvidence {
 Export-ModuleMember -Function Get-ImmutableWorksetContractSha256, Get-LocalizationTranslationBinding, Get-LocalizationGitBlobBytes,
     Get-UnitSnapshotJson, Assert-LocalizationTranslationBinding, Assert-LocalizationDocumentMetadata,
     Get-ReviewedTerminologyContext, Get-ReviewedTerminologyEdit,
-    New-ReviewedTerminologyEvidence
+    New-ReviewedTerminologyEvidence,
+    Get-LocalizationWorksetWriteBlockReason, Get-LocalizationWorksetSharedTableOffsets, Test-LocalizationWorksetPositionalAppend, Get-LocalizationWorksetPositionalDecision, Get-LocalizationWorksetPositionalInsertions, Assert-LocalizationWorksetSharedRestorationCoverage, Get-LocalizationWorksetSidecarRelativePath, Test-LocalizationWorksetStagedSidecarAbsent, Test-LocalizationWorksetTreeSidecarAbsent, Assert-LocalizationWorksetPassthroughCoverage

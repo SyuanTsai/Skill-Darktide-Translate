@@ -15,6 +15,7 @@ Describe 'Skill source pin generator' {
             $skillsRoot = Join-Path $Root 'skills'
             [void](New-Item -ItemType Directory -Path $scriptsRoot -Force)
             [void](New-Item -ItemType Directory -Path $skillsRoot -Force)
+            Copy-Item -LiteralPath (Join-Path $script:RepositoryRoot '.gitattributes') -Destination $Root
             Copy-Item -LiteralPath $script:GeneratorPath -Destination (Join-Path $scriptsRoot 'New-SkillSourcePin.ps1')
             Copy-Item -LiteralPath $script:SourceSkillRoot -Destination $skillsRoot -Recurse
             [IO.File]::WriteAllText((Join-Path $Root 'VERSION'), '0.5.0', [Text.UTF8Encoding]::new($false))
@@ -37,15 +38,19 @@ Describe 'Skill source pin generator' {
         }
     }
 
-    # Scenario: An operator pins an immutable source checkout before installing the Skill.
-    # Purpose: Prove the generated schema is accepted by the runtime integrity implementation itself.
+    # Scenario: An operator pins an immutable source before installing from a Windows-style Git checkout.
+    # Purpose: Prove byte-exact package checkout and verification even when core.autocrlf is enabled.
     It 'InterT10_GeneratesAPinAcceptedByTheInstalledIntegrityCheck' {
         $fixture = New-SkillSourcePinFixture -Root (Join-Path $TestDrive 'accepted')
         $pinPath = Join-Path $TestDrive 'accepted-pin.json'
 
         & $fixture.Generator -RepositoryRoot $fixture.Root -Ref HEAD -OutputPath $pinPath
         $pin = Get-Content -LiteralPath $pinPath -Raw | ConvertFrom-TestJson
-        $result = & $fixture.IntegrityCheck -SkillSourcePinPath $pinPath -PassThru
+        $checkoutPrefix = (Join-Path $TestDrive 'windows-checkout').Replace('\', '/') + '/'
+        & git -c core.autocrlf=true -C $fixture.Root checkout-index --all "--prefix=$checkoutPrefix"
+        if ($LASTEXITCODE -ne 0) { throw 'Could not materialize the Skill with Windows checkout settings.' }
+        $installedSkillRoot = Join-Path $checkoutPrefix 'skills/auto-update-darktide-mod'
+        $result = & (Join-Path $installedSkillRoot 'scripts/Test-ReferenceIntegrity.ps1') -SkillSourcePinPath $pinPath -PassThru
 
         $pin.schemaVersion | Should -Be 1
         $pin.repository | Should -Be 'https://github.com/SyuanTsai/Skill-Darktide-Translate.git'
@@ -56,9 +61,13 @@ Describe 'Skill source pin generator' {
         $pin.skillPath | Should -Be 'skills/auto-update-darktide-mod'
         @($pin.skillFiles).Count | Should -BeGreaterThan 10
         @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/scripts/LocalizationWorksetContract.psm1'
+        @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/scripts/DarktideArchiveCrc.cs'
         @($pin.skillFiles.repositoryPath) | Should -Contain 'skills/auto-update-darktide-mod/assets/api-rules-manifest.json'
         @($pin.skillFiles.repositoryPath) | Should -Not -Contain 'packages/darktide-translate/darktide_translate.py'
-        @($pin.skillFiles.repositoryPath | Where-Object { $_ -like '*.py' }) | Should -BeNullOrEmpty
+        $pythonFiles = @($pin.skillFiles | Where-Object { $_.repositoryPath -like '*.py' })
+        $pythonFiles.Count | Should -Be 1
+        $pythonFiles[0].repositoryPath | Should -Be 'skills/auto-update-darktide-mod/scripts/rar_reader.py'
+        $pythonFiles[0].sha256 | Should -Be ((Get-FileHash -LiteralPath (Join-Path $fixture.SkillRoot 'scripts/rar_reader.py') -Algorithm SHA256).Hash.ToLowerInvariant())
         $result.result | Should -Be 'passed'
         $result.skillSourcePin.fileCount | Should -Be @($pin.skillFiles).Count
     }
@@ -73,6 +82,18 @@ Describe 'Skill source pin generator' {
 
         { & $fixture.IntegrityCheck -SkillSourcePinPath $pinPath -PassThru } |
             Should -Throw '*Installed Skill file differs from its source pin*'
+    }
+
+    # Scenario: A caller changes the pinned RAR decoder after generating the source pin.
+    # Purpose: Fail closed before the Skill can use a decoder whose installed bytes changed.
+    It 'InterT25_RejectsTamperedInstalledRarReaderBytes' {
+        $fixture = New-SkillSourcePinFixture -Root (Join-Path $TestDrive 'tampered-rar-reader')
+        $pinPath = Join-Path $TestDrive 'tampered-rar-reader-pin.json'
+        & $fixture.Generator -RepositoryRoot $fixture.Root -Ref HEAD -OutputPath $pinPath
+        [IO.File]::AppendAllText((Join-Path $fixture.SkillRoot 'scripts/rar_reader.py'), "`n# drift`n", [Text.UTF8Encoding]::new($false))
+
+        { & $fixture.IntegrityCheck -SkillSourcePinPath $pinPath -PassThru } |
+            Should -Throw '*Installed Skill file differs from its source pin: skills/auto-update-darktide-mod/scripts/rar_reader.py*'
     }
 
     It 'UnitT30_RefusesToOverwriteAnExistingOutputFile' {

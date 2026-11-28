@@ -11,6 +11,7 @@ param(
     [string] $RepositoryRoot,
     [string] $ExpectedBaseOid,
     [string] $ExpectedModRelativePath,
+    [string] $ExpectedUpstreamOid,
     [scriptblock] $HeartbeatAction,
     [switch] $PassThru,
     [string] $TerminologyRequestPath,
@@ -147,7 +148,7 @@ function Get-CanonicalExpression {
 }
 
 function Get-ExpectedClassification {
-    param($OldUnit, $NewUnit)
+    param($OldUnit, $NewUnit, [switch] $ReviewSimplifiedChanges)
     $blockedReason = if ($null -ne $NewUnit -and -not [string]::IsNullOrWhiteSpace([string]$NewUnit.blockedReason)) { [string]$NewUnit.blockedReason }
         elseif ($null -ne $OldUnit -and -not [string]::IsNullOrWhiteSpace([string]$OldUnit.blockedReason)) { [string]$OldUnit.blockedReason }
         else { $null }
@@ -157,6 +158,9 @@ function Get-ExpectedClassification {
     $newZhTw = if ($null -ne $NewUnit) { Get-CanonicalExpression -Expression $NewUnit.zhTwExpression } else { $null }
     if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { return [ordered]@{ changeType = 'blocked'; action = 'BLOCKED'; blockedReason = $blockedReason } }
     if ($null -eq $NewUnit) { return [ordered]@{ changeType = 'deleted_key'; action = 'ACCEPT_REMOVAL'; blockedReason = $null } }
+    if (Test-LocalizationWorksetPositionalAppend $NewUnit) {
+        return Get-LocalizationWorksetPositionalDecision -OldUnit $OldUnit -NewUnit $NewUnit -ReviewSimplifiedChanges:$ReviewSimplifiedChanges
+    }
     if ([bool]$NewUnit.sourceExpression.isFullyLocaleResolvedExpression -and $null -eq $oldZhTw -and $null -eq $newZhTw) { return [ordered]@{ changeType = 'localized_source'; action = 'NONE'; blockedReason = $null } }
     if ($null -eq $OldUnit) { return [ordered]@{ changeType = 'new_key'; action = 'AI_REQUIRED'; blockedReason = $null } }
     if ($null -eq $oldZhTw -and $null -eq $newZhTw) { return [ordered]@{ changeType = 'missing_zh_tw'; action = 'AI_REQUIRED'; blockedReason = $null } }
@@ -372,8 +376,7 @@ if ((Get-Sha256Bytes -Bytes $newBytes) -cne [string]$workset.new.sha256 -or
 }
 $reviewedLocator = if ($terminologyRequested) { $terminology.terminologyCorrection }
 $before = Get-LuaLocalizationDocument -Bytes $newBytes -DisplayPath $newFull -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction -ReviewedLocator $reviewedLocator
-$beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
+$sidecarProof = $workset.new.Contains('zhTwSidecar') -or $before.Contains('zhTwSidecarPath')
 $oldDocument = $null
 $oldById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 if ($bindingValueCount -eq 3) {
@@ -382,8 +385,34 @@ if ($bindingValueCount -eq 3) {
     $oldBytes = Get-LocalizationGitBlobBytes -WorkingDirectory $repositoryFull -Object $oldObject -HeartbeatAction $HeartbeatAction
     $oldDocument = Get-LuaLocalizationDocument -Bytes $oldBytes -DisplayPath ([string]$workset.old.path) -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction -ReviewedLocator $reviewedLocator
     Assert-LocalizationDocumentMetadata -Document $oldDocument -Expected $workset.old -Label 'OLD metadata differs from the immutable base blob'
-    foreach ($unit in @($oldDocument.units)) { $oldById[[string]$unit.unitId] = $unit }
 }
+if ($sidecarProof) {
+    $modPath = [string]$workset.modRelativePath
+    $staging = [string]$workset.new.root
+    $relativeSidecar = Get-LocalizationWorksetSidecarRelativePath -Document $before -ModRelativePath $modPath `
+        -MainRelativePath ([IO.Path]::GetRelativePath($staging, [string]$workset.new.path).Replace('\', '/'))
+    $evidence = $workset.new['zhTwSidecar']
+    if ($null -eq $evidence -or $evidence['absenceVerified'] -ne $true -or $null -eq $oldDocument -or
+        -not (Test-LocalizationWorksetStagedSidecarAbsent $staging $relativeSidecar)) {
+        throw 'Localization sidecar evidence requires separate review before receipt verification.'
+    }
+    $oldSidecar = Get-LocalizationWorksetSidecarRelativePath -Document $oldDocument -ModRelativePath $modPath `
+        -MainRelativePath (([string]$workset.old.path).Substring($modPath.Length + 1))
+    if (-not (Test-LocalizationWorksetTreeSidecarAbsent $repositoryFull $ExpectedBaseOid $modPath $oldSidecar) -or
+        -not (Test-LocalizationWorksetTreeSidecarAbsent $repositoryFull $ExpectedUpstreamOid $modPath $relativeSidecar)) {
+        throw 'Localization sidecar is present in an immutable source tree or its path cannot be proven.'
+    }
+    $oldDocument.units = @($oldDocument.units | Where-Object { -not $_['conditionalZhTwSidecar'] })
+    $before.units = @($before.units | Where-Object { -not $_['conditionalZhTwSidecar'] })
+}
+$oldPrefixes = if ($null -ne $oldDocument) { $oldDocument['gameLocalizedPassthroughPrefixes'] }
+$oldUnits = if ($null -ne $oldDocument) { $oldDocument.units }
+Assert-LocalizationWorksetPassthroughCoverage -Prefixes (@($oldPrefixes) + @($before['gameLocalizedPassthroughPrefixes'])) `
+    -Units (@($oldUnits) + @($before.units))
+$beforeById = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+foreach ($unit in @($before.units)) { $beforeById[[string]$unit.unitId] = $unit }
+if ($null -ne $oldDocument) { foreach ($unit in @($oldDocument.units)) { $oldById[[string]$unit.unitId] = $unit } }
+$sharedOffsets = Get-LocalizationWorksetSharedTableOffsets -Units @($before.units)
 Assert-LocalizationDocumentMetadata -Document $before -Expected $workset.new -Label 'NEW metadata differs from raw NEW evidence'
 $expectedIdentityIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($unit in @($before.units)) { $null = $expectedIdentityIds.Add([string]$unit.unitId) }
@@ -407,8 +436,12 @@ foreach ($unit in @($workset.units)) {
     $unitId = [string]$unit.unitId
     $parsedNew = if ($beforeById.ContainsKey($unitId)) { $beforeById[$unitId] } else { $null }
     $parsedOld = if ($bindingValueCount -eq 3 -and $oldById.ContainsKey($unitId)) { $oldById[$unitId] } elseif ($bindingValueCount -eq 0) { $unit.old } else { $null }
-    if ((Get-UnitSnapshotJson -Unit $unit.new) -cne (Get-UnitSnapshotJson -Unit $parsedNew) -or
-        ($bindingValueCount -eq 3 -and (Get-UnitSnapshotJson -Unit $unit.old) -cne (Get-UnitSnapshotJson -Unit $parsedOld))) {
+    $includeNewZhCn = $null -ne $unit.new -and $unit.new.Contains('positionalZhCnValue')
+    $includeOldZhCn = $null -ne $unit.old -and $unit.old.Contains('positionalZhCnValue')
+    if ((Get-UnitSnapshotJson -Unit $unit.new -IncludePositionalZhCnValue:$includeNewZhCn) -cne
+        (Get-UnitSnapshotJson -Unit $parsedNew -IncludePositionalZhCnValue:$includeNewZhCn) -or
+        ($bindingValueCount -eq 3 -and (Get-UnitSnapshotJson -Unit $unit.old -IncludePositionalZhCnValue:$includeOldZhCn) -cne
+        (Get-UnitSnapshotJson -Unit $parsedOld -IncludePositionalZhCnValue:$includeOldZhCn))) {
         throw "Localization workset unit snapshot differs from independently parsed OLD or NEW bytes: $unitId"
     }
     $identity = if ($null -ne $parsedNew) { $parsedNew } else { $parsedOld }
@@ -417,7 +450,13 @@ foreach ($unit in @($workset.units)) {
         [int]$unit.occurrence -ne [int]$identity.occurrence) {
         throw "Localization workset unit identity differs from independently parsed bytes: $unitId"
     }
-    $classification = Get-ExpectedClassification -OldUnit $parsedOld -NewUnit $parsedNew
+    $classification = Get-ExpectedClassification -OldUnit $parsedOld -NewUnit $parsedNew `
+        -ReviewSimplifiedChanges:($workset['positionalLabelReview'] -ceq 'zh-cn-changes')
+    $shared = $null -ne $parsedNew -and $null -ne $parsedNew.tableOpenByte -and $sharedOffsets.Contains([long]$parsedNew.tableOpenByte)
+    $writeBlockReason = Get-LocalizationWorksetWriteBlockReason -Action $classification.action -OldUnit $parsedOld -NewUnit $parsedNew -SharedNewTable:$shared -Review $unit
+    if ($writeBlockReason) {
+        throw "Localization receipt includes a generated unit requiring separate review: $unitId ($writeBlockReason)"
+    }
     if ([string]$unit.changeType -cne [string]$classification.changeType -or [string]$unit.action -cne [string]$classification.action -or
         [string]$unit.blockedReason -cne [string]$classification.blockedReason) {
         throw "Localization workset classification or action differs from OLD and NEW bytes: $unitId"
@@ -434,7 +473,21 @@ foreach ($name in $classificationCounts.Keys) {
     }
 }
 $expectedEdits = [Collections.Generic.List[object]]::new()
+Assert-LocalizationWorksetSharedRestorationCoverage -ParsedUnits $before.units -ReviewedUnits $workset.units
+$restoredSharedOffsets = [Collections.Generic.HashSet[long]]::new()
+$positionalIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$generatedZhTw = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+foreach ($insert in @(Get-LocalizationWorksetPositionalInsertions -ParsedUnits $before.units -ReviewedUnits $workset.units `
+        -ReviewSimplifiedChanges:($workset['positionalLabelReview'] -ceq 'zh-cn-changes'))) {
+    Invoke-Heartbeat
+    $expectedEdits.Add((New-Edit -Start $insert.startByte -Length 0 -Replacement ([Text.Encoding]::UTF8.GetBytes($insert.text)) -UnitId $insert.unitId -Operation 'INSERT'))
+    if ($null -ne $insert.literal) {
+        $null = $positionalIds.Add($insert.unitId)
+        $generatedZhTw[$insert.unitId] = $insert.literal
+    }
+}
 foreach ($unit in @($workset.units)) {
+    if ($positionalIds.Contains([string]$unit.unitId)) { continue }
     $action = [string]$unit.action
     if ($action -cne 'AI_REQUIRED' -and
         ([string]$unit.reviewStatus -cne 'not-required' -or $null -ne $unit.suggestedZhTwExpression)) {
@@ -473,7 +526,12 @@ foreach ($unit in @($workset.units)) {
         $expectedEdits.Add((New-Edit -Start ([int64]$currentUnit.zhTwExpression.startByte) -Length ([int64]$currentUnit.zhTwExpression.lengthByte) -Replacement $replacement -UnitId ([string]$unit.unitId) -Operation 'REPLACE'))
     }
     elseif ($null -ne $target) {
-        $expectedEdits.Add((Get-InsertionEdit -Unit $currentUnit -Expression ([string]$target.raw) -Bytes $newBytes -Newline $(if ($workset.new.newline -ceq 'crlf') { ([string][char]13 + [string][char]10) } else { [string][char]10 })))
+        if ($sharedOffsets.Contains([long]$currentUnit.tableOpenByte)) {
+            $generatedZhTw[[string]$unit.unitId] = [string]$target.raw
+        }
+        if (-not $sharedOffsets.Contains([long]$currentUnit.tableOpenByte) -or $restoredSharedOffsets.Add([long]$currentUnit.tableOpenByte)) {
+            $expectedEdits.Add((Get-InsertionEdit -Unit $currentUnit -Expression ([string]$target.raw) -Bytes $newBytes -Newline $(if ($workset.new.newline -ceq 'crlf') { ([string][char]13 + [string][char]10) } else { [string][char]10 })))
+        }
     }
 }
 
@@ -536,6 +594,19 @@ if ($mergedBytes.LongLength -ne $expectedMergedBytes.LongLength -or
 if ($terminologyRequested -and
     (Get-Sha256Bytes -Bytes (Read-FileBytesWithHeartbeat -Path $stagedOutput)) -cne $expectedMergedSha) {
     throw 'Reviewed terminology staged output differs from the deterministic edit plan.'
+}
+
+if ($generatedZhTw.Count -gt 0) {
+    $merged = Get-LuaLocalizationDocument -Bytes $mergedBytes -DisplayPath $mergedFull -SourceId ([string]$workset.sourceId) -HeartbeatAction $HeartbeatAction
+    foreach ($unit in $merged.units) {
+        if (-not $generatedZhTw.ContainsKey([string]$unit.unitId)) { continue }
+        if ($unit.blockedReason -or $null -eq $unit.zhTwExpression -or
+            [string]$unit.zhTwExpression.raw -cne $generatedZhTw[$unit.unitId]) {
+            throw 'Merged localization does not prove the expected generated zh-tw output.'
+        }
+        $null = $generatedZhTw.Remove($unit.unitId)
+    }
+    if ($generatedZhTw.Count) { throw 'Merged localization omits an expected generated zh-tw output.' }
 }
 
 $result = [ordered]@{

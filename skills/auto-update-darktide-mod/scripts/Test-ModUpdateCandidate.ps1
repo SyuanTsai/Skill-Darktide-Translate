@@ -18,6 +18,7 @@ $ErrorActionPreference = 'Stop'
 $luaLocalizationScannerModulePath = Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1'
 Import-Module -Name $luaLocalizationScannerModulePath -Force -ErrorAction Stop
 Import-Module -Name (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+. (Join-Path $PSScriptRoot 'DesktopArchive.ps1')
 Import-Module (Join-Path $PSScriptRoot 'LocalizationWorksetContract.psm1') -Force -ErrorAction Stop
 
 function ConvertFrom-JsonToken {
@@ -359,16 +360,16 @@ function Assert-ArchivePayloadSecurityIntegrity {
         throw 'Extraction manifest root changed before payload security validation.'
     }
     $archiveAttributes = [ordered]@{}
-    Add-Type -AssemblyName System.IO.Compression
-    $archiveStream = [IO.File]::Open([string]$State.archive.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    try {
-        $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Read, $false)
-        try {
-            foreach ($entry in $archive.Entries) { $archiveAttributes[$entry.FullName.Replace('\', '/')] = [int64]$entry.ExternalAttributes }
+    $verified = Get-VerifiedExtractionEvidence $State { Invoke-Heartbeat }
+    $hashes = $verified.hashes
+    foreach ($entry in $verified.entries) { $archiveAttributes[$entry.path] = [int64]$entry.externalAttributes }
+    $unverified = [Collections.Generic.HashSet[string]]::new([string[]]@($hashes.Keys), [StringComparer]::Ordinal)
+    foreach ($file in $manifest.files) {
+        if (!$unverified.Remove([string]$file.path) -or $hashes[$file.path] -ne $file.sha256) {
+            throw 'Extraction manifest differs from verified archive files.'
         }
-        finally { $archive.Dispose() }
     }
-    finally { $archiveStream.Dispose() }
+    if ($unverified.Count) { throw 'Extraction manifest omitted archive files.' }
     $approvalArtifact = $null
     if ($State.Contains('securityOverrideReceipt') -and $State.securityOverrideReceipt) {
         $approvalPath = Assert-NoReparsePath -Path ([string]$State.securityOverrideReceipt.path) -Root ([string]$State.repositoryRoot) -Label 'Security override receipt'
@@ -533,8 +534,8 @@ function Assert-SourceTupleIntegrity {
         [string]$contract.archive.sha256 -cne [string]$State.archive.sha256) {
         throw 'Source tuple does not bind the run and claimed archive.'
     }
-    if ([IO.Path]::GetExtension([string]$contract.archive.fileName).ToLowerInvariant() -cne '.zip') {
-        throw 'Source tuple archive filename must retain its complete ZIP extension.'
+    if ([IO.Path]::GetExtension([string]$contract.archive.fileName).TrimStart('.').ToLowerInvariant() -cne (Get-StateArchiveFormat $State.archive)) {
+        throw 'Source tuple archive filename must retain its verified archive extension.'
     }
     $requestPath = Assert-NoReparsePath -Path ([string]$tuple.sourceRequestPath) -Root ([string]$State.repositoryRoot) -Label 'Source tuple request'
     if (-not $requestPath.Equals(
@@ -1944,7 +1945,7 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
                 ExpectedMainFileId = [long]$nexus.mainFileId
             }
         }
-        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) @terminologyParameters -HeartbeatAction $HeartbeatAction -PassThru
+        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedUpstreamOid ([string]$chain.c2Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) @terminologyParameters -HeartbeatAction $HeartbeatAction -PassThru
         if ($receiptVerification.result -cne 'passed') { throw 'Independent localization apply receipt verification failed.' }
         if ($terminologyParameters.Count -gt 0 -and
             [string]$receiptVerification.terminologyCorrection.requestSha256 -cne [string]$state.localizationWorkset.terminologyRequest.sha256) {

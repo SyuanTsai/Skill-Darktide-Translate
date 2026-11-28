@@ -37,6 +37,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
+. (Join-Path $PSScriptRoot 'DesktopArchive.ps1')
 
 function ConvertFrom-JsonToken {
     param([AllowNull()][Newtonsoft.Json.Linq.JToken] $Token, [switch] $AsHashtable)
@@ -302,45 +303,6 @@ function Assert-NexusDownloadUri {
     $Uri
 }
 
-function Get-ArchiveEvidence {
-    param([string] $Path)
-    $bytes = [byte[]]::new(8)
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
-    try {
-        $size = $stream.Length
-        $read = $stream.Read($bytes, 0, $bytes.Length)
-        $stream.Position = 0
-        $buffer = [byte[]]::new(1MB)
-        while (($readCount = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $hasher.AppendData($buffer, 0, $readCount)
-            Invoke-Heartbeat
-        }
-        $sha256 = [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
-        $format = if ($read -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and
-            (($bytes[2] -eq 0x03 -and $bytes[3] -eq 0x04) -or ($bytes[2] -eq 0x05 -and $bytes[3] -eq 0x06) -or ($bytes[2] -eq 0x07 -and $bytes[3] -eq 0x08))) {
-            'zip'
-        }
-        elseif ($read -ge 7 -and $bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and
-            $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07 -and $bytes[6] -in @(0x00, 0x01)) {
-            'rar'
-        }
-        elseif ($read -ge 6 -and $bytes[0] -eq 0x37 -and $bytes[1] -eq 0x7A -and $bytes[2] -eq 0xBC -and
-            $bytes[3] -eq 0xAF -and $bytes[4] -eq 0x27 -and $bytes[5] -eq 0x1C) {
-            '7z'
-        }
-        else { 'unknown' }
-        [ordered]@{ size = [int64]$size; sha256 = $sha256; archiveFormat = $format; stream = $stream }
-    }
-    catch {
-        $stream.Dispose()
-        throw
-    }
-    finally {
-        $hasher.Dispose()
-    }
-}
-
 function New-WaitingResult {
     param([string] $Status, [string] $Code, [string] $Message, [string] $ArchiveFormat, [string] $Path)
     [ordered]@{
@@ -440,8 +402,8 @@ $requestFull = [IO.Path]::GetFullPath($SourceRequestPath)
 Assert-NoReparsePath -Path $requestFull -Root $sourceRunRoot -Label 'Source request'
 $request = Read-SourceRequest -Path $requestFull
 $requestedExtension = [IO.Path]::GetExtension([string]$request.fileName).ToLowerInvariant()
-if ($requestedExtension -ne '.zip') {
-    Write-Result -Value (New-WaitingResult -Status 'waiting-user' -Code 'unsupported_archive_format' -Message 'Only ZIP Main files are supported in Schema 15.' -ArchiveFormat $requestedExtension.TrimStart('.') -Path $null)
+if ($requestedExtension -cnotin @('.zip','.rar')) {
+    Write-Result -Value (New-WaitingResult -Status 'waiting-user' -Code 'unsupported_archive_format' -Message 'Only ZIP and RAR Main files are supported in Schema 15.' -ArchiveFormat $requestedExtension.TrimStart('.') -Path $null)
     return
 }
 
@@ -502,7 +464,9 @@ if ($sampleTwo.size -le 0) { throw 'Downloaded file is empty.' }
 
 $verifyStart = [Diagnostics.Stopwatch]::StartNew()
 Assert-NoReparsePath -Path $candidateFull -Root $sourceRunRoot -Label 'Downloaded file'
-$archiveEvidence = Get-ArchiveEvidence -Path $candidateFull
+$archiveSource = $null
+$archiveSource = Open-DesktopArchiveSource -Path $candidateFull -Heartbeat { Invoke-Heartbeat }
+$archiveEvidence = $archiveSource.evidence
 $temporaryDelivery = $null
 $deleteCandidateAfterDelivery = $false
 try {
@@ -553,7 +517,7 @@ try {
         }
     }
 
-    if ($archiveFormat -ne 'zip') {
+    if ($archiveFormat -cne $requestedExtension.TrimStart('.')) {
         $receipt.status = 'unsupported'
         Assert-NoReparsePath -Path $receiptFull -Root $sourceRunRoot -Label 'Source receipt' -AllowMissingLeaf
         Write-AtomicJson -Path $ReceiptPath -Value $receipt
@@ -575,6 +539,7 @@ try {
         return
     }
 
+    if ($archiveFormat -ceq 'rar') { Test-DesktopRarData $candidateFull $archiveEvidence.sha256 { Invoke-Heartbeat } }
     $deliveryStart = [Diagnostics.Stopwatch]::StartNew()
     $deliveryFull = [IO.Path]::GetFullPath($DeliveryDirectory)
     $deliveryFull = Assert-RegularDirectoryRoot -Path $deliveryFull -Label 'Delivery directory' -RunRoot $sourceRunRoot
@@ -588,8 +553,8 @@ try {
     $temporaryDelivery = Assert-ContainedFilePath -Candidate (Join-Path $deliveryFull ('.delivery-' + [guid]::NewGuid().ToString('N') + '.tmp')) -Root $deliveryFull
     $destination = [IO.File]::Open($temporaryDelivery, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try {
-        $archiveEvidence.stream.Position = 0
-        Copy-StreamWithHeartbeat -Source $archiveEvidence.stream -Destination $destination
+        $archiveSource.stream.Position = 0
+        Copy-StreamWithHeartbeat -Source $archiveSource.stream -Destination $destination
         $destination.Flush($true)
     }
     finally { $destination.Dispose() }
@@ -614,7 +579,7 @@ try {
     })
 }
 finally {
-    if ($archiveEvidence.stream) { $archiveEvidence.stream.Dispose() }
+    if ($archiveSource) { Close-DesktopArchiveSource $archiveSource }
     if ($temporaryDelivery -and (Test-Path -LiteralPath $temporaryDelivery -PathType Leaf)) {
         [IO.File]::Delete($temporaryDelivery)
     }
