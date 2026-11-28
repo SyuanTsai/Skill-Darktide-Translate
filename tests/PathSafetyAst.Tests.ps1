@@ -151,7 +151,7 @@ skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Install|Test-Path|
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Localization|Get-ChildItem|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Localization|New-Item|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Localization|Test-Path|2
-skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-LocalizationWorkset|Test-Path|4
+skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-LocalizationWorkset|Test-Path|5
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-Publish|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|Invoke-ReviewSnapshot|Test-Path|1
 skills/auto-update-darktide-mod/scripts/mod-update.ps1|New-BuildMetadataPreview|Test-Path|1

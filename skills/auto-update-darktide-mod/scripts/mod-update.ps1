@@ -31,6 +31,7 @@ param(
     [ValidateRange(0, 60000)]
     [int] $ObservationIntervalMilliseconds = 1000,
     [string] $LocalizationPlanPath,
+    [ValidateNotNullOrEmpty()][string] $TerminologyRequestPath,
     # Match the API adapter's --mode when processing a ready Schema 15 workset.
     [ValidateSet('update', 'improve')]
     [string] $TranslationMode = 'update',
@@ -4073,8 +4074,17 @@ function Invoke-ApprovedSpans {
 
 function Invoke-LocalizationWorkset {
     param([Collections.IDictionary] $State)
+    $terminologyPath = if ($script:PSBoundParameters.ContainsKey('TerminologyRequestPath')) {
+        Assert-NoReparsePath -Path $TerminologyRequestPath -Root ([string]$State.runRoot) -Label 'Reviewed terminology request'
+    }
     $completed = Get-CompletedStageResult -State $State -Name 'localization'
-    if ($completed) { return $completed }
+    if ($completed) {
+        if ($terminologyPath -and (-not $State.localizationWorkset.Contains('terminologyRequest') -or
+                (Get-FileSha256 -Path $terminologyPath) -cne [string]$State.localizationWorkset.terminologyRequest.sha256)) {
+            throw 'Completed localization does not bind the supplied reviewed terminology request.'
+        }
+        return $completed
+    }
     $stage = Start-Stage -Name 'localization'
     Assert-LockOwner -State $State
     $reviewArtifacts = Join-Path ([string]$State.runRoot) 'review-artifacts'
@@ -4100,6 +4110,24 @@ function Invoke-LocalizationWorkset {
         SourceId = [string]$State.modSlug
         HeartbeatAction = { Update-ActiveReservationHeartbeat }
         PassThru = $true
+    }
+    $terminologyParameters = @{}
+    if ($terminologyPath) {
+        $tuplePath = Assert-NoReparsePath -Path (Join-Path $reviewArtifacts 'source-tuple.json') -Root ([string]$State.runRoot) -Label 'Source tuple'
+        $tupleBytes = Read-FileBytesWithHeartbeat -Path $tuplePath
+        if ((Get-Sha256Bytes -Bytes $tupleBytes) -cne [string]$State.sourceTuple.sha256) {
+            throw 'Source tuple SHA-256 changed before reviewed terminology localization.'
+        }
+        $tuple = [Text.Encoding]::UTF8.GetString($tupleBytes) | ConvertFrom-Json -AsHashtable
+        $terminologyParameters = @{
+            TerminologyRequestPath = $terminologyPath
+            ExpectedNexusId = [long]$tuple.contract.nexus.modId
+            ExpectedMainFileId = [long]$tuple.contract.nexus.mainFileId
+            RepositoryRoot = [string]$State.repositoryRoot
+            ExpectedBaseOid = [string]$State.baseOid
+            ExpectedModRelativePath = [string]$State.modRelativePath
+        }
+        $generationParameters.SourceId = 'nexus-' + (ConvertTo-InvariantString $terminologyParameters.ExpectedNexusId)
     }
     if ($script:PSBoundParameters.ContainsKey('TranslationMode')) { $generationParameters.TranslationMode = $TranslationMode }
     if ($script:PSBoundParameters.ContainsKey('ModelId')) { $generationParameters.ModelId = $ModelId }
@@ -4130,31 +4158,41 @@ function Invoke-LocalizationWorkset {
         $waitingData = [ordered]@{ worksetPath = $worksetPath; pendingUnitIds = @($pending.unitId); required = 'Review only AI_REQUIRED units, set reviewStatus=approved and suggestedZhTwExpression, then resume localization.' }
         return Suspend-Stage -State $State -Context $stage -Result 'waiting-input' -ArtifactSha256 ([string]$State.localizationWorkset.sha256) -OutputStage 'localization-workset' -Data $waitingData
     }
-    $applier = Join-Path $PSScriptRoot 'Apply-LocalizationWorkset.ps1'
-    $applied = & $applier -WorksetPath $worksetPath -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
-    if ($applied.result -cne 'passed') { throw 'Localization workset apply did not pass.' }
-    $null = Assert-NoReparsePath -Path $worksetPath -Root ([string]$State.repositoryRoot) -Label 'Applied localization workset'
-    $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
     $stagedLocalization = [IO.Path]::GetFullPath([string]$workset.new.path)
-    $null = Assert-NoReparsePath -Path $stagedLocalization -Root ([string]$State.repositoryRoot) -Label 'Applied localization output'
     $relativeToMod = [IO.Path]::GetRelativePath($stagingModRoot, $stagedLocalization).Replace('\', '/')
     if ($relativeToMod.StartsWith('../', [StringComparison]::Ordinal) -or [IO.Path]::IsPathRooted($relativeToMod)) { throw 'Applied localization path escapes workset staging.' }
     $relative = ([string]$State.modRelativePath).TrimEnd('/') + '/' + $relativeToMod
     $worktreeFile = Assert-ContainedPath -Candidate (Join-Path ([string]$State.worktreePath) $relative) -Root ([string]$State.worktreePath) -Label 'Localization worktree target'
     $worktreeFile = Assert-NoReparsePath -Path $worktreeFile -Root ([string]$State.worktreePath) -Label 'Raw worktree localization input'
-    if ((Get-FileSha256 -Path $worktreeFile) -cne [string]$workset.new.sha256) { throw 'Raw worktree localization differs from the workset NEW input.' }
     $rawBytes = Read-FileBytesWithHeartbeat -Path $worktreeFile
+    if ((Get-Sha256Bytes -Bytes $rawBytes) -cne [string]$workset.new.sha256) { throw 'Raw worktree localization differs from the workset NEW input.' }
+    $localizationRoot = Join-Path ([string]$State.artifactsRoot) 'localization'
+    $safeId = (Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($relative))).Substring(0, 16)
+    $artifactDirectory = Join-Path $localizationRoot $safeId
+    $rawPath = Join-Path $artifactDirectory 'new.lua'
+    if ($terminologyPath) {
+        # Apply must use immutable raw NEW even if a prior attempt already changed staging.
+        $rawPath = Assert-NoReparsePath -Path $rawPath -Root ([string]$State.runRoot) -Label 'Reviewed terminology raw NEW evidence' -AllowMissing
+        if (Test-Path -LiteralPath $rawPath) {
+            if ((Get-FileSha256 -Path $rawPath) -cne [string]$workset.new.sha256) { throw 'Reviewed terminology raw NEW evidence changed.' }
+        }
+        else { Write-ByteFile -Path $rawPath -Bytes $rawBytes }
+        $terminologyParameters.NewPath = $rawPath
+    }
+    $applier = Join-Path $PSScriptRoot 'Apply-LocalizationWorkset.ps1'
+    $applied = & $applier -WorksetPath $worksetPath @terminologyParameters -HeartbeatAction { Update-ActiveReservationHeartbeat } -PassThru
+    if ($applied.result -cne 'passed') { throw 'Localization workset apply did not pass.' }
+    $null = Assert-NoReparsePath -Path $worksetPath -Root ([string]$State.repositoryRoot) -Label 'Applied localization workset'
+    $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-Json -AsHashtable
+    $null = Assert-NoReparsePath -Path $stagedLocalization -Root ([string]$State.repositoryRoot) -Label 'Applied localization output'
     $rawBlobOid = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.autocrlf=true', 'hash-object', '-w', "--path=$relative", '--', $worktreeFile)).output.Trim()
     $indexedBytes = Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $rawBlobOid
     $mergedRawBytes = Read-FileBytesWithHeartbeat -Path $stagedLocalization
     $mergedBlobOid = (Invoke-Git -WorkingDirectory $State.worktreePath -Arguments @('-c', 'core.autocrlf=true', 'hash-object', '-w', "--path=$relative", '--', $stagedLocalization)).output.Trim()
     $mergedIndexedBytes = Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $mergedBlobOid
-    $localizationRoot = Join-Path ([string]$State.artifactsRoot) 'localization'
-    $safeId = (Get-Sha256Bytes -Bytes ([Text.Encoding]::UTF8.GetBytes($relative))).Substring(0, 16)
-    $artifactDirectory = Join-Path $localizationRoot $safeId
     $oldObject = ('{0}:{1}' -f ([string]($State.baseOid)), ([string]$workset.old.path))
     Write-ByteFile -Path (Join-Path $artifactDirectory 'old.lua') -Bytes (Get-GitBlobBytes -WorkingDirectory $State.worktreePath -Object $oldObject)
-    Write-ByteFile -Path (Join-Path $artifactDirectory 'new.lua') -Bytes $rawBytes
+    if (-not $terminologyPath) { Write-ByteFile -Path $rawPath -Bytes $rawBytes }
     Write-ByteFile -Path (Join-Path $artifactDirectory 'indexed.lua') -Bytes $indexedBytes
     Write-ByteFile -Path (Join-Path $artifactDirectory 'merged.lua') -Bytes $mergedRawBytes
     Write-ByteFile -Path (Join-Path $artifactDirectory 'merged-indexed.lua') -Bytes $mergedIndexedBytes
@@ -4207,6 +4245,12 @@ function Invoke-LocalizationWorkset {
         unitCount = @($workset.units).Count
         editCount = @($workset.apply.edits).Count
     }
+    if ($terminologyPath) {
+        $State.localizationWorkset.terminologyRequest = [ordered]@{
+            path = $terminologyPath
+            sha256 = $applied.terminologyCorrection.requestSha256
+        }
+    }
     $State.waitingReason = $null
     $State.status = 'localized'
     Complete-Stage -State $State -Context $stage -ArtifactSha256 (Get-FileSha256 -Path $manifestPath) -Data ([ordered]@{ mode = 'zh-tw-workset'; fileCount = 1; workset = $State.localizationWorkset })
@@ -4215,6 +4259,7 @@ function Invoke-LocalizationWorkset {
 function Invoke-Localization {
     param([Collections.IDictionary] $State)
     if ([int]$State.schemaVersion -ge 15) { return Invoke-LocalizationWorkset -State $State }
+    if ($script:PSBoundParameters.ContainsKey('TerminologyRequestPath')) { throw 'Reviewed terminology requires Schema 15 localization.' }
     $completed = Get-CompletedStageResult -State $State -Name 'localization'
     if ($completed) { return $completed }
     $stage = Start-Stage -Name 'localization'

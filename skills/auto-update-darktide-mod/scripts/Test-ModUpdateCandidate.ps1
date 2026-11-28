@@ -1821,6 +1821,7 @@ Add-ValidationCheck -Name 'install-normalization' -Action {
     'install, Git normalization, and candidate tree agree'
 }
 
+$verifiedTerminologyCorrection = $null
 Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
     if ([int]$state.schemaVersion -lt 15) { return 'not-applicable: Schema 14 approved spans' }
     if (-not $state.localizationWorkset -or [string]$state.localizationWorkset.status -cne 'applied') { throw 'Schema 15 applied localization workset evidence is missing.' }
@@ -1929,14 +1930,33 @@ Add-ValidationCheck -Name 'localization-workset-boundary' -Action {
         if ((Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$workset.apply.outputSha256 -or (Get-Sha256Bytes -Bytes $mergedBytes) -cne [string]$record.mergedRawSha256) { throw 'Workset merged bytes differ from apply evidence.' }
         if ((Get-Sha256Bytes -Bytes $mergedIndexedBytes) -cne [string]$record.mergedSha256) { throw 'Workset merged indexed bytes changed.' }
         $receiptVerifier = Join-Path $PSScriptRoot 'Test-LocalizationWorksetReceipt.ps1'
-        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) -HeartbeatAction $HeartbeatAction -PassThru
+        $terminologyParameters = @{}
+        if ($state.localizationWorkset.Contains('terminologyRequest')) {
+            # The source-tuple check independently verifies the contract hash against the run-local evidence.
+            if ($checks['source-tuple'].result -cne 'passed' -or
+                (Get-ContractSha256 -Contract $state.sourceTuple.contract) -cne [string]$state.sourceTuple.contractSha256) {
+                throw 'Reviewed terminology requires the verified Nexus Main file source tuple.'
+            }
+            $nexus = $state.sourceTuple.contract.nexus
+            $terminologyParameters = @{
+                TerminologyRequestPath = [string]$state.localizationWorkset.terminologyRequest.path
+                ExpectedNexusId = [long]$nexus.modId
+                ExpectedMainFileId = [long]$nexus.mainFileId
+            }
+        }
+        $receiptVerification = & $receiptVerifier -WorksetPath $worksetPath -NewPath $newPath -MergedPath $mergedPath -RunRoot ([string]$state.runRoot) -RepositoryRoot ([string]$state.repositoryRoot) -ExpectedBaseOid ([string]$chain.c0Oid) -ExpectedModRelativePath ([string]$state.modRelativePath) @terminologyParameters -HeartbeatAction $HeartbeatAction -PassThru
         if ($receiptVerification.result -cne 'passed') { throw 'Independent localization apply receipt verification failed.' }
+        if ($terminologyParameters.Count -gt 0 -and
+            [string]$receiptVerification.terminologyCorrection.requestSha256 -cne [string]$state.localizationWorkset.terminologyRequest.sha256) {
+            throw 'Reviewed terminology request SHA-256 differs from the localized run evidence.'
+        }
         $null = Test-LocalizationWorksetCandidate -NewBytes $newBytes -MergedBytes $mergedBytes -Edits @($workset.apply.edits)
         $targetPath = Join-Path $worktree ([string]$record.relativePath)
         $targetPath = Assert-NoReparsePath -Path $targetPath -Root $worktree -Label 'Worktree localization target'
         if ((Get-FileSha256 -Path $targetPath) -cne [string]$record.mergedRawSha256) { throw 'Worktree localization target differs from workset merged raw bytes.' }
         $candidateBlob = Get-GitBlobBytes -WorkingDirectory $worktree -Object ('{0}:{1}' -f ([string]$chain.fOid), ([string]$record.relativePath))
         if ((Get-Sha256Bytes -Bytes $candidateBlob) -cne [string]$record.mergedSha256) { throw 'F localization blob differs from workset merged indexed bytes.' }
+        if ($terminologyParameters.Count -gt 0) { $script:verifiedTerminologyCorrection = $receiptVerification.terminologyCorrection }
     }
     ('Workset units={0}, edits={1}, SHA-256={2}' -f ([string](@($workset.units).Count)), ([string](@($workset.apply.edits).Count)), ([string]$state.localizationWorkset.sha256))
 }
@@ -2022,6 +2042,9 @@ $report = [ordered]@{
     checks = $checks
     errors = @($errors)
     validatedAt = Get-UtcTimestamp
+}
+if ($resultName -ceq 'passed' -and $verifiedTerminologyCorrection) {
+    $report.terminologyCorrection = $verifiedTerminologyCorrection
 }
 Write-AtomicJson -Path $validationPath -Value $report
 $validationSha = Get-FileSha256 -Path $validationPath

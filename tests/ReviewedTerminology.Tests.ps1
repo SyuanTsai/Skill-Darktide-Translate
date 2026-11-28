@@ -7,6 +7,109 @@ Describe 'Schema 15 reviewed terminology' {
         $scriptRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'skills/auto-update-darktide-mod/scripts'
         $applyScript = Join-Path $scriptRoot 'Apply-LocalizationWorkset.ps1'
         $receiptScript = Join-Path $scriptRoot 'Test-LocalizationWorksetReceipt.ps1'
+        $runner = Join-Path $scriptRoot 'mod-update.ps1'
+        $candidate = Join-Path $scriptRoot 'Test-ModUpdateCandidate.ps1'
+        $pin = New-TestSkillSourcePin -SkillRoot (Split-Path -Parent $scriptRoot) -OutputPath (Join-Path $TestDrive 'reviewed-skill-pin.json')
+
+        function New-ReviewedRunnerFixture {
+            param([switch] $Ordinary)
+
+            $runId = [guid]::NewGuid().ToString()
+            $short = $runId.Substring(0, 8)
+            $repository = Join-Path $TestDrive "runner-$short"
+            $modPath = 'Warhammer 40,000 DARKTIDE/mods/ExampleMod'
+            $file = 'example_localization.lua'
+            $runRoot = Join-Path $repository "AI Auto Update/In Progress/examplemod-$short"
+            $incoming = Join-Path $runRoot ".incoming-$runId"
+            $null = New-Item -ItemType Directory -Path (Join-Path $repository $modPath), $incoming -Force
+            $raw = 'return { staff = { en = "Staff", ["zh-tw"] = "杖" }, other = { en = "Staff", ["zh-tw"] = "杖" } }'
+            [IO.File]::WriteAllText((Join-Path $repository "$modPath/$file"), $raw)
+            & git -C $repository init --quiet
+            & git -C $repository config core.longpaths true
+            & git -C $repository config user.name Fixture
+            & git -C $repository config user.email fixture@example.invalid
+            & git -C $repository add -- $modPath
+            Add-TestTranslationRules -RepositoryRoot $repository
+            & git -C $repository commit --quiet -m 'Base localization'
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot commit the runner test base.' }
+
+            $archivePath = Join-Path $incoming 'ExampleMod.zip'
+            $zip = [IO.Compression.ZipFile]::Open($archivePath, [IO.Compression.ZipArchiveMode]::Create)
+            try {
+                $entry = $zip.CreateEntry("ExampleMod/$file")
+                $writer = [IO.StreamWriter]::new($entry.Open())
+                try { $writer.Write($raw) } finally { $writer.Dispose() }
+            }
+            finally { $zip.Dispose() }
+            $sourceRequest = Join-Path $TestDrive "source-$short.json"
+            [ordered]@{
+                schemaVersion = 2; gameDomain = 'warhammer40kdarktide'; modId = 592; mainFileId = 1201
+                version = '2.0.0'; fileName = 'ExampleMod.zip'; pageUrl = 'https://www.nexusmods.com/warhammer40kdarktide/mods/592'
+                pageVersion = '2.0.0'; pageUpdatedAt = '2026-01-02T00:00:00.0000000+00:00'
+                mainFileUploadedAtUtc = '2026-01-01T00:00:00.0000000+00:00'
+            } | ConvertTo-Json | Set-Content -LiteralPath $sourceRequest -NoNewline
+            $verified = & $runner run -RepositoryRoot $repository -ModDirectory ExampleMod -RunId $runId -WorktreeParent $TestDrive `
+                -SourceRequestPath $sourceRequest -Provider browser -DownloadedFilePath $archivePath -SkillSourcePinPath $pin `
+                -ObservationIntervalMilliseconds 0 -BaseRef HEAD -Until source-verified -PassThru
+            if ($verified.stage -ne 'verify-source' -or $verified.result -ne 'passed') {
+                throw ('The local ZIP fixture did not pass source verification. ' + ($verified | ConvertTo-Json -Depth 10 -Compress))
+            }
+            $arguments = @{ RepositoryRoot = $repository; StatePath = $verified.statePath; PassThru = $true }
+            $null = & $runner extract @arguments
+            $null = & $runner install @arguments
+            $state = Get-Content -LiteralPath $verified.statePath -Raw | ConvertFrom-TestJson -AsHashtable
+            $staging = Join-Path $runRoot 'staging/localization-workset-input/ExampleMod'
+            $stagedFile = Join-Path $staging $file
+            $installedFile = Join-Path $state.installRoot $file
+            $worksetPath = Join-Path $runRoot 'review-artifacts/localization-workset.json'
+            $requestPath = Join-Path $runRoot 'review-artifacts/reviewed-request.json'
+            $request = $null
+            if (-not $Ordinary) {
+                $null = New-Item -ItemType Directory -Path $staging -Force
+                [IO.File]::Copy($installedFile, $stagedFile)
+                $null = & (Join-Path $scriptRoot 'New-LocalizationWorkset.ps1') -RepositoryRoot $repository -BaseOid $state.baseOid `
+                    -ModRelativePath $modPath -StagingModPath $staging -OutputPath $worksetPath -SourceId nexus-592 -PassThru
+                $workset = Get-Content -LiteralPath $worksetPath -Raw | ConvertFrom-TestJson -AsHashtable
+                $unit = $workset.units | Where-Object key -CEQ staff
+                $request = [ordered]@{
+                    schemaVersion = 1; nexusId = 592; fileId = 1201
+                    oldSha256 = $workset.old.sha256; newSha256 = $workset.new.sha256
+                    immutableContractSha256 = $workset.immutableContractSha256
+                    rulesSha256 = $workset.translationBinding.rulesSha256; glossarySha256 = $workset.translationBinding.glossarySha256
+                    reviewer = 'example-reviewer'; reviewReference = 'https://github.com/example/mods/pull/42#pullrequestreview-123'
+                    units = @()
+                    terminologyCorrection = [ordered]@{
+                        sourceId = 'nexus-592'; containerPath = '$'; key = 'staff'; occurrence = 1; unitId = $unit.unitId; action = 'NONE'
+                        old = [ordered]@{ sourceRaw = '"Staff"'; zhTwRaw = '"杖"' }
+                        new = [ordered]@{ sourceRaw = '"Staff"'; zhTwRaw = '"杖"' }
+                        translation = '法杖'
+                    }
+                }
+                $request | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $requestPath -NoNewline
+            }
+            @{
+                Arguments = $arguments; State = $state; Raw = $raw; InstalledFile = $installedFile
+                Staging = $staging; StagedFile = $stagedFile; WorksetPath = $worksetPath
+                RequestPath = $requestPath; Request = $request
+            }
+        }
+
+        function Write-ReviewedRunnerMetadata {
+            param($State)
+
+            $source = $State.sourceTuple.contract
+            $values = @('592', $source.nexus.pageUrl, '2.0.0', $source.nexus.pageUpdatedAt, '1201', '2.0.0',
+                $source.nexus.mainFileUploadedAtUtc, 'ExampleMod.zip', $source.archive.size, $source.archive.sha256, 'nexus-browser')
+            $labels = @('Nexus MOD ID', 'Nexus URL', 'Nexus page version', 'Nexus last updated', 'Main file ID',
+                'Main file version', 'Main file uploaded at UTC', 'Archive filename', 'Archive size bytes', 'Archive SHA-256', 'Acquisition method')
+            $keys = @('nexus_id', 'nexus_url', 'nexus_page_version', 'nexus_last_updated', 'main_file_id',
+                'version', 'main_file_uploaded_at_utc', 'filename', 'size_bytes', 'sha256', 'acquisition_method')
+            $readme = for ($i = 0; $i -lt $values.Count; $i++) { "- $($labels[$i]): $($values[$i])" }
+            $hash = for ($i = 0; $i -lt $values.Count; $i++) { "$($keys[$i])=$($values[$i])" }
+            $null = New-Item -ItemType Directory -Path (Join-Path $State.worktreePath '.hash') -Force
+            [IO.File]::WriteAllText((Join-Path $State.worktreePath 'README.md'), ($readme -join "`n"))
+            [IO.File]::WriteAllText((Join-Path $State.worktreePath '.hash/examplemod.hash'), ($hash -join "`n"))
+        }
 
         function New-ReviewedTerminologyFixture {
             param([string] $OldSource = 'Trauma Staff Effect?', [string] $NewSource = $OldSource,
@@ -93,6 +196,102 @@ $Extra}
                 }
                 NewText = $newText
             }
+        }
+    }
+
+    It 'InterT10_RoutesReviewedRequestThroughLocalizationAndCandidateGate: <entry>' -ForEach @(
+        @{ entry = 'first localization'; resume = $false }
+        @{ entry = 'run resume'; resume = $true }
+    ) {
+        # Given
+        $fixture = New-ReviewedRunnerFixture
+        $arguments = $fixture.Arguments
+        if (-not $resume) {
+            [IO.File]::Delete($fixture.WorksetPath)
+            [IO.File]::Delete($fixture.StagedFile)
+            [IO.Directory]::Delete($fixture.Staging)
+        }
+
+        # When
+        $localized = if ($resume) { & $runner run @arguments -Until localized -TerminologyRequestPath $fixture.RequestPath }
+            else { & $runner localization @arguments -TerminologyRequestPath $fixture.RequestPath }
+
+        # Then
+        $localized.result | Should -BeExactly 'passed'
+        [IO.File]::ReadAllText($fixture.StagedFile) |
+            Should -BeExactly $fixture.Raw.Replace('staff = { en = "Staff", ["zh-tw"] = "杖"', 'staff = { en = "Staff", ["zh-tw"] = "法杖"')
+        if (-not $resume) { return }
+        Write-ReviewedRunnerMetadata -State $fixture.State
+        (& $runner build-commits @arguments).result | Should -BeExactly 'passed'
+        [IO.File]::ReadAllText($fixture.InstalledFile) | Should -BeExactly ([IO.File]::ReadAllText($fixture.StagedFile))
+
+        # Given
+        $savedState = [IO.File]::ReadAllText($arguments.StatePath)
+        $ordinaryState = $savedState | ConvertFrom-TestJson -AsHashtable
+        $ordinaryState.localizationWorkset.Remove('terminologyRequest')
+        $ordinaryState | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $arguments.StatePath -NoNewline
+
+        # When / Then
+        try {
+            { & $candidate -StatePath $arguments.StatePath -PassThru | Out-Null } |
+                Should -Throw '*Localization workset apply receipt fields are malformed*'
+        }
+        finally { [IO.File]::WriteAllText($arguments.StatePath, $savedState) }
+
+        # When
+        (& $runner validate @arguments).result | Should -BeExactly 'passed'
+
+        # Then
+        $state = Get-Content -LiteralPath $arguments.StatePath -Raw | ConvertFrom-TestJson -AsHashtable
+        $report = Get-Content -LiteralPath $state.candidateGate.validationReportPath -Raw | ConvertFrom-TestJson -AsHashtable
+        $proof = $report.terminologyCorrection
+        $proof.requestSha256 | Should -BeExactly (Get-FileHash -LiteralPath $fixture.RequestPath).Hash.ToLowerInvariant()
+        $proof.reviewer | Should -BeExactly $fixture.Request.reviewer
+        $proof.reviewReference | Should -BeExactly $fixture.Request.reviewReference
+        $report.worksetDeletion.status | Should -BeExactly 'deleted'
+    }
+
+    It 'InterT11_PreservesOrdinaryRunnerWorksetAndBytes' {
+        # Given
+        $fixture = New-ReviewedRunnerFixture -Ordinary
+        $arguments = $fixture.Arguments
+        $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.InstalledFile))
+
+        # When
+        $localized = & $runner localization @arguments
+
+        # Then
+        $localized.result | Should -BeExactly 'passed'
+        $workset = Get-Content -LiteralPath $fixture.WorksetPath -Raw | ConvertFrom-TestJson -AsHashtable
+        $workset.sourceId | Should -BeExactly 'examplemod'
+        $workset.apply.Contains('terminologyCorrection') | Should -BeFalse
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.StagedFile)) | Should -BeExactly $before
+    }
+
+    It 'InterT12_RejectsMismatchedOrStaleRunnerRequestBeforeLocalizationWrite' {
+        # Given
+        $fixture = New-ReviewedRunnerFixture
+        $arguments = $fixture.Arguments
+        $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.InstalledFile))
+        $worksetBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.WorksetPath))
+        $approved = Get-Content -LiteralPath $fixture.RequestPath -Raw
+
+        foreach ($case in @(
+            @{ field = 'key'; value = 'other'; error = '*Reviewed terminology*' },
+            @{ field = 'fileId'; value = 1202; error = '*differs from trusted context*' },
+            @{ field = 'newSha256'; value = ('0' * 64); error = '*request is stale*' }
+        )) {
+            # When
+            $request = $approved | ConvertFrom-TestJson -AsHashtable
+            if ($case.field -eq 'key') { $request.terminologyCorrection.key = $case.value }
+            else { $request[$case.field] = $case.value }
+            $request | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $fixture.RequestPath -NoNewline
+
+            # Then
+            { & $runner localization @arguments -TerminologyRequestPath $fixture.RequestPath } | Should -Throw $case.error
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.StagedFile)) | Should -BeExactly $before
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.InstalledFile)) | Should -BeExactly $before
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.WorksetPath)) | Should -BeExactly $worksetBefore
         }
     }
 
