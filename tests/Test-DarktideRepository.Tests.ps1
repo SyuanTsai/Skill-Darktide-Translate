@@ -79,6 +79,8 @@ Describe 'Darktide consumer repository check' {
         $source | Should -Not -Match '(?i)pwsh\.exe|icacls|kernel32|advapi32|DllImport|Add-Type'
     }
 
+    # Scenario: The tracked Skill package and its working-tree bytes are identical to the Git index before read-only validation.
+    # Purpose: Preserve the InterT20 prerequisite also checked by scripts/Test-TestEnvironment.ps1 as skill-package-index.
     It 'InterT20_ValidatesTheTrackedRepositoryAsAReadOnlySnapshot' {
         $before = @(Get-DarktideTestSnapshot -Root $script:RepositoryRoot)
         $powerShell = Get-TestPowerShellExecutablePath

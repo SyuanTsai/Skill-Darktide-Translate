@@ -114,7 +114,16 @@ VERSION
 
 Run from the repository root:
 
-Repository contract tests require Pester 5 or later. Run the repository-owned checks directly when reproducing a consumer-gate result locally:
+### 測試環境
+
+首次執行或工具版本更新時，請安裝最新穩定版的 PowerShell 與 Pester，再執行預檢：
+
+```powershell
+pwsh -NoLogo -NoProfile -File ./scripts/Install-TestEnvironment.ps1
+pwsh -NoLogo -NoProfile -File ./scripts/Test-TestEnvironment.ps1
+```
+
+Repository contract tests require Pester 6.2.0 or later. Run the repository-owned checks directly when reproducing a consumer-gate result locally:
 
 ```powershell
 pwsh -NoLogo -NoProfile -File ./scripts/Test-DarktideRepository.ps1 -RepositoryRoot .

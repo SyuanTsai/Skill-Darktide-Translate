@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "toolRoot": { "windows": "F:\\GitFile\\AI-Test-Env", "environmentOverride": "AI_TEST_ENV_ROOT" },
+  "powerShell": { "policy": "latest-stable", "minimumVersion": "7.6.6", "edition": "Core" },
+  "pester": { "policy": "latest-stable", "minimumVersion": "6.2.0", "repository": "https://www.powershellgallery.com/api/v2" }
+}
