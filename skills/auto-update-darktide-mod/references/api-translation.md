@@ -17,6 +17,8 @@ Skill 提供 Schema 15 API 翻譯資產，以及產生、套用工作集和驗�
 
 Python 轉接器的 repo 路徑是 `packages/darktide-translate/darktide_translate.py`。它不隨 Skill 安裝，只能從 repo 原始碼工作樹或 GitHub Actions 執行。在 repo 根目錄以已備妥的 Python 3.11+ 環境執行，轉接器會載入同 repo 的 `packages/claude-runner`。
 
+Codex 或 Claude 都可從同一個原始碼工作樹呼叫下列 CLI。請使用與轉接器同版本的 PowerShell 套件產生工作集，並在執行後接續 `localization`，由現有流程套用工作集與驗證收據。
+
 轉接器處理 ready 的 Schema 15 工作集中同時為 `AI_REQUIRED` 與 `pending` 的項目。它會先驗證工作集綁定，再讀取狀態及快取。通過結構檢查與獨立語意審查的項目才會回填。
 
 ```text
@@ -47,7 +49,7 @@ JSON 摘要的 `termReviews` 沿用術語欄位，另含 `reason` 及 `adoption`
 
 若英文原文沒有外層雙引號，轉接器會在審查前移除整段譯文多餘的外層雙引號。採用這筆譯文時，JSON 摘要的 `warnings` 陣列會記錄 `unitId` 和 `code: "unexpected_outer_double_quotes"`。
 
-快取鍵依序包含 NEW 英文 raw、OLD 繁中 raw 或 JSON null、規則 SHA、詞彙表 SHA、模式及請求模型 ID。已審查通過且翻譯及審查回應模型均相符的結果才會寫入。轉接器使用 PATH 中的 `luac -p` 或 LuaJIT 編譯檢查運算式。兩者皆缺少時，摘要記錄 `luacAvailable: false`，運算式由內建解析器驗證。
+快取鍵包含 NEW 英文、OLD 英文、OLD 繁中、NEW 繁中候選的 raw 值（缺少時為 JSON null），以及規則 SHA、詞彙表 SHA、模式與請求模型 ID。舊格式的快取會自然失效。已審查通過且翻譯及審查回應模型均相符的結果才會寫入。轉接器使用 PATH 中的 `luac -p` 或 LuaJIT 編譯檢查運算式。兩者皆缺少時，摘要記錄 `luacAvailable: false`，運算式由內建解析器驗證。
 
 ## 安全檢查
 

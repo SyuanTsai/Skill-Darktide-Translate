@@ -9,7 +9,7 @@ import pytest
 from claude_runner.client import FakeTransport, FatalApiError, Response, RetryableApiError
 from checks import Luac
 from darktide_translate import main
-from rules import SKILL_ROOT, load_rules
+from rules import SKILL_ROOT, load_config, load_rules
 
 FIXTURES = Path(__file__).parent / "fixtures"
 WORDS = "sk-ant-TEST-DO-NOT-LOG-0000"
@@ -257,6 +257,60 @@ def test_ac6_and_4_10_zero_api_cache_hit_and_model_guard(job, model):
     assert read(job.summary)["cacheHitCount"] == (1 if model == MODEL else 0)
 
 
+# Scenario: Another workset supplies different previous English or upstream zh-tw for the same new text.
+# Purpose: Re-review candidates when their source history or translation context changes.
+@pytest.mark.parametrize(("side", "field", "value"), [
+    ("old", "sourceExpression", '"Raise by 10%"'),
+    ("new", "zhTwExpression", '"提高15%"'),
+])
+def test_InterT08_cache_isolated_by_candidate_context(job, side, field, value):
+    job.save()
+    assert job.run(FakeTransport([scripted(), scripted()])) == 0
+
+    unit = job.doc["units"][0]
+    unit[side][field]["raw"] = value
+    job.doc["immutableContractSha256"] = "b" * 64
+    job.save()
+    assert job.run(FakeTransport([])) == 4
+    job.state.unlink()
+    transport = FakeTransport([scripted("提高15%"), scripted()])
+
+    assert job.run(transport) == 0
+    assert [request.role for request in transport.requests] == ["translator", "reviewer"]
+    assert read(job.summary)["cacheHitCount"] == 0
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == '"提高15%"'
+
+
+# Scenario: A fresh workset changes its new English, bound rules, or requested model.
+# Purpose: Keep the adapter from resuming or reusing an approval across these boundaries.
+@pytest.mark.parametrize("changed", ["source", "rules", "model"])
+def test_InterT09_workset_change_isolates_state_and_cache(job, monkeypatch, changed):
+    job.save()
+    assert job.run(FakeTransport([scripted(), scripted()])) == 0
+
+    config = load_config()
+    if changed == "source":
+        job.doc["units"][0]["new"]["sourceExpression"]["raw"] = '"Boost 15%"'
+    elif changed == "rules":
+        rule = next(row for row in job.doc["translationBinding"]["rulesManifest"] if row["repo"] == "mods")
+        (job.mods / rule["path"]).write_bytes(b"Changed sample rules\r\n")
+    else:
+        config["model"] = "mock-replacement-model"
+        monkeypatch.setattr("darktide_translate.load_config", lambda: config)
+    job.doc["translationBinding"] = load_rules(job.mods, "update", "mods/TestMod", config).binding
+    job.doc["immutableContractSha256"] = "b" * 64
+    job.save()
+
+    assert job.run(FakeTransport([])) == 4
+    job.state.unlink()
+    reply = scripted("提高15%", model=config["model"])
+    transport = FakeTransport([reply, reply])
+    assert job.run(transport) == 0
+    assert [request.role for request in transport.requests] == ["translator", "reviewer"]
+    assert read(job.summary)["cacheHitCount"] == 0
+    assert read(job.workset)["units"][0]["suggestedZhTwExpression"] == '"提高15%"'
+
+
 # Scenario: The translator flags terms in a translation that passes both checks.
 # Purpose: Keep the adopted text and terms available after API, resume, and cache paths.
 def test_InterT10_unknown_terms_follow_the_approved_translation(job):
@@ -434,14 +488,31 @@ def test_4_12_budget_and_explicit_override(job, dry):
     assert ("上限經人工覆寫為 800" in job.summary.with_suffix(".md").read_text(encoding="utf-8"))
 
 
-def test_4_13_usage_and_4_15_request_shape(job):
+# Scenario: A changed English source with existing zh-tw is sent for translation and review.
+# Purpose: Verify the two roles receive their own prompt, schema and inputs, with usage recorded separately.
+def test_InterT50_translation_and_review_request_shape_and_usage(job):
     job.save()
     transport = FakeTransport([scripted(), scripted()])
     assert job.run(transport) == 0
+    translator, reviewer = transport.requests
+    assert (translator.role, reviewer.role) == ("translator", "reviewer")
+    unit = job.doc["units"][0]
+    shared = {"mode": "update", "glossarySha256": job.doc["translationBinding"]["glossarySha256"],
+              "glossary": []}
+    source = {"unitId": unit["unitId"], "source": {"s1": "Gain 15%"}}
+    assert translator.user == {**shared, "units": [{**source, "key": unit["key"],
+        "containerPath": unit["containerPath"], "previousEnglish": '"Gain 10%"',
+        "previousZhTw": '"增加10%"', "candidateZhTw": '"增加10%"', "feedback": []}]}
+    assert reviewer.user == {**shared, "units": [{**source, "translation": {"s1": "增加15%"}}]}
+    assert {"unitId", "segments", "unknownTerms", "needsLookupDefinition"} == set(
+        translator.schema["properties"]["items"]["items"]["required"])
+    assert {"unitId", "verdict", "issues"} == set(reviewer.schema["properties"]["items"]["items"]["required"])
     for request in transport.requests:
         assert request.model == MODEL and request.effort == "medium"
         assert request.max_tokens == 32000
         assert "Sample rules" in request.system
+        prompt = SKILL_ROOT / f"assets/api-{request.role}-prompt.md"
+        assert request.system.startswith(prompt.read_text(encoding="utf-8-sig").strip())
         assert request.schema["properties"]["items"]["type"] == "array"
     summary = read(job.summary)
     for role in ("translator", "reviewer"):
