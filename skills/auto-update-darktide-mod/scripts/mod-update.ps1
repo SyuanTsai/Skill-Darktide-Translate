@@ -31,6 +31,7 @@ param(
     [ValidateRange(0, 60000)]
     [int] $ObservationIntervalMilliseconds = 1000,
     [string] $LocalizationPlanPath,
+    [switch] $ReviewPositionalLabelChanges,
     # Match the API adapter's --mode when processing a ready Schema 15 workset.
     [ValidateSet('update', 'improve')]
     [string] $TranslationMode = 'update',
@@ -4016,6 +4017,9 @@ function Invoke-LocalizationWorkset {
     }
     if ($script:PSBoundParameters.ContainsKey('TranslationMode')) { $generationParameters.TranslationMode = $TranslationMode }
     if ($script:PSBoundParameters.ContainsKey('ModelId')) { $generationParameters.ModelId = $ModelId }
+    if ($script:PSBoundParameters.ContainsKey('ReviewPositionalLabelChanges')) {
+        $generationParameters.ReviewPositionalLabelChanges = $ReviewPositionalLabelChanges
+    }
     $generation = & $generator @generationParameters
     if ($generation.status -eq 'automation-excluded') {
         $State.status = 'automation-excluded'
