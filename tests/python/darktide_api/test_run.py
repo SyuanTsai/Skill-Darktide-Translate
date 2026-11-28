@@ -10,11 +10,13 @@ from claude_runner.client import FakeTransport, FatalApiError, Response, Retryab
 from claude_runner.state import State
 from checks import Luac
 from darktide_translate import main
-from rules import SKILL_ROOT, load_config, load_rules
+from gameplay_context import lua_path
+from rules import SKILL_ROOT, load_config, load_rules, relative_path
 
 FIXTURES = Path(__file__).parent / "fixtures"
 WORDS = "sk-ant-TEST-DO-NOT-LOG-0000"
 MODEL = "claude-sonnet-5-5"
+PRODUCTION_MOD = "Warhammer 40,000 DARKTIDE/mods/ChatBlock"
 
 
 def read(path):
@@ -78,6 +80,241 @@ def scripted(translation="增加15%", *, model=MODEL, issues=(), unknown=(), loo
             "input_tokens": 40, "output_tokens": 20,
             "cache_creation_input_tokens": 50, "cache_read_input_tokens": 100})
     return respond
+
+
+def mods_git(job, *args, input=None):
+    return subprocess.run(["git", "-C", str(job.mods), *args], check=True, input=input,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture
+def gameplay(job, request):
+    key = "auto_melee_swap_wait_for_reload_tooltip"
+    mod = getattr(request, "param", PRODUCTION_MOD)
+    localization = f"{mod}/scripts/mods/ChatBlock/ChatBlock_localization.lua"
+    runtime = localization.replace("_localization.lua", ".lua")
+    source = ('"If Auto Swap to Melee triggers during reload, finish the reload then swap. '
+              'If you return to the game before the reload ends, keep your ranged weapon."')
+    prefix = f"return {{ {key} = {{ en = ".encode()
+    blob = prefix + source.encode() + b" } }\n"
+    unit = job.doc["units"][0]
+    for item in (unit, unit["new"], unit["old"]):
+        item.update(key=key, unitId=f"chatblock :: $ :: {key} :: 1")
+    unit["new"]["sourceExpression"].update(raw=source, startByte=len(prefix), lengthByte=len(source))
+    job.doc.update(modRelativePath=mod, new={"sha256": hashlib.sha256(blob).hexdigest()})
+    job.doc["translationBinding"] = load_rules(job.mods, "update", mod).binding
+    # Synthetic control flow for the supplied #379 behavior. These lines are data only.
+    lines = [
+        "local function unrelated() return 'excluded' end",
+        "local function focus_lost() return not windows_focus() or steam_overlay() end",
+        "local function ranged_reload_active() return ranged() and reloading() end",
+        "local function auto_melee_swap_on_blocked(blocked)",
+        "  if not blocked then pending, deferred = false, false; return end",
+        "  if ranged_reload_active() then pending, deferred = true, true; return end",
+        "  if pending then swap_to_melee() end",
+        "end",
+        'mod:hook(HumanGameplay, "_input_active", function(input_active, self)',
+        "  local blocked = chat_open() or menu_open() or focus_lost()",
+        "  auto_melee_swap_on_blocked(blocked)",
+        "  return input_active(self) and not blocked",
+        "end)",
+        "local function also_unrelated() return 'excluded' end",
+    ]
+    (job.mods / localization).parent.mkdir(parents=True)
+    (job.mods / localization).write_bytes(blob)
+    (job.mods / runtime).write_bytes(("\n".join(lines) + "\n").encode())
+    other_runtime = (job.mods / mod).parent / "ChatBlockOther" / "ChatBlock.lua"
+    other_runtime.parent.mkdir()
+    other_runtime.write_bytes((job.mods / runtime).read_bytes())
+    mods_git(job, "init", "--quiet")
+    mods_git(job, "-c", "core.autocrlf=false", "add", "--", ".")
+    evidence = {
+        "version": 1, "candidateOid": mods_git(job, "write-tree"), "localizationPath": localization,
+        "units": {unit["unitId"]: {"key": key, "references": [
+            {"path": runtime, "startLine": 2, "endLine": 13},
+        ]}},
+    }
+    sidecar = job.path / "gameplay-context.json"
+    return unit, evidence, sidecar, lines
+
+
+# Scenario: Any input block is lifted during reload in the production ChatBlock layout.
+# Purpose: The reviewer receives the applicable predicate, cancellation branch, and exact paths.
+@pytest.mark.parametrize("condition", ["chat_open()", "menu_open()", "not windows_focus()", "steam_overlay()"])
+def test_UnitT10_gameplay_review_receives_bounded_input_and_reload_evidence(job, gameplay, condition):
+    unit, evidence, sidecar, lines = gameplay
+    job.save()
+    sidecar.write_text(json.dumps(evidence), encoding="utf-8")
+    transport = FakeTransport([scripted("範例譯文"), scripted()])
+    assert job.run(transport, "--gameplay-context", str(sidecar)) == 0
+    translator, reviewer = transport.requests
+    assert "gameplayContext" not in translator.user["units"][0]
+    payload = reviewer.user["units"][0]
+    assert (payload["unitId"], payload["key"]) == (unit["unitId"], unit["key"])
+    context = payload["gameplayContext"]
+    assert context["candidateOid"] == evidence["candidateOid"]
+    assert context["localizationSha256"] == job.doc["new"]["sha256"]
+    assert context["localizationPath"] == f"{PRODUCTION_MOD}/scripts/mods/ChatBlock/ChatBlock_localization.lua"
+    assert context["references"][0]["path"] == f"{PRODUCTION_MOD}/scripts/mods/ChatBlock/ChatBlock.lua"
+    excerpt = context["references"][0]["excerpt"]
+    assert excerpt == "\n".join(lines[1:13])
+    assert condition in "\n".join((lines[1], lines[9]))
+    assert "auto_melee_swap_on_blocked(blocked)" in excerpt
+    assert "if not blocked then pending, deferred = false, false; return end" in excerpt
+    assert read(job.workset)["units"][0]["reviewStatus"] == "approved"
+    for path in (job.state, job.summary, *job.cache.rglob("*.json")):
+        assert "auto_melee_swap_on_blocked(blocked)" not in path.read_text(encoding="utf-8")
+
+
+# Scenario: Reload completes while input is blocked, using the production or short MOD layout.
+# Purpose: Both layouts supply the deferred swap and eventual swap branches to the reviewer.
+@pytest.mark.parametrize("gameplay", [PRODUCTION_MOD, "mods/ChatBlock"], indirect=True, ids=["production", "short"])
+def test_UnitT15_gameplay_review_receives_still_blocked_swap_after_reload(job, gameplay):
+    _, evidence, sidecar, _ = gameplay
+    sidecar.write_text(json.dumps(evidence), encoding="utf-8")
+    job.save()
+    transport = FakeTransport([scripted("範例譯文"), scripted()])
+    assert job.run(transport, "--gameplay-context", str(sidecar)) == 0
+    excerpt = transport.requests[1].user["units"][0]["gameplayContext"]["references"][0]["excerpt"]
+    assert excerpt.index("if not blocked then") < excerpt.index("if ranged_reload_active()")
+    assert excerpt.index("if ranged_reload_active() then pending, deferred = true, true; return end") < (
+        excerpt.index("if pending then swap_to_melee() end"))
+
+
+# Scenario: Required context is absent or fails its candidate, unit, path or excerpt checks.
+# Purpose: A bound context error remains pending and leaves the workset untouched.
+@pytest.mark.parametrize(("fault", "reason"), [
+    ("absent", "gameplay_context_missing"), ("empty", "gameplay_context_missing"),
+    ("candidate", "gameplay_context_invalid"), ("source_hash", "gameplay_context_invalid"),
+    ("source", "gameplay_context_invalid"),
+    ("key", "gameplay_context_invalid"), ("foreign", "gameplay_context_invalid"),
+    ("traversal", "gameplay_context_invalid"), ("symlink", "gameplay_context_invalid"),
+    ("full_file", "gameplay_context_invalid"),
+    ("full_file_split", "gameplay_context_invalid"),
+])
+def test_UnitT20_required_gameplay_evidence_blocks_before_transport(job, gameplay, fault, reason):
+    unit, evidence, sidecar, lines = gameplay
+    row = evidence["units"][unit["unitId"]]
+    reference = row["references"][0]
+    if fault == "empty":
+        row["references"] = []
+    elif fault == "candidate":
+        evidence["candidateOid"] = "0" * 40
+    elif fault == "source_hash":
+        job.doc["new"]["sha256"] = "0" * 64
+    elif fault == "source":
+        unit["new"]["sourceExpression"]["startByte"] += 1
+    elif fault == "key":
+        row["key"] = "neighboring_key"
+    elif fault == "foreign":
+        reference["path"] = f"{PRODUCTION_MOD}Other/ChatBlock.lua"
+    elif fault == "traversal":
+        reference["path"] = f"{PRODUCTION_MOD}/../ChatBlockOther/ChatBlock.lua"
+    elif fault == "symlink":
+        link_blob = mods_git(job, "hash-object", "-w", "--stdin", input="../../../../ChatBlockOther/ChatBlock.lua")
+        mods_git(job, "update-index", "--cacheinfo", "120000", link_blob, reference["path"])
+        evidence["candidateOid"] = mods_git(job, "write-tree")
+    elif fault == "full_file":
+        reference.update(startLine=1, endLine=len(lines))
+    elif fault == "full_file_split":
+        row["references"] = [{**reference, "startLine": 1, "endLine": 2},
+                             {**reference, "startLine": 3, "endLine": len(lines)}]
+    job.save()
+    flags = []
+    if fault != "absent":
+        sidecar.write_text(json.dumps(evidence), encoding="utf-8")
+        flags = ["--gameplay-context", str(sidecar)]
+    previous = job.workset.read_bytes()
+    transport = FakeTransport([])
+    assert job.run(transport, *flags) == 0
+    assert not transport.requests
+    assert job.workset.read_bytes() == previous
+    assert read(job.summary)["blocked"] == [{"unitId": unit["unitId"], "reason": reason}]
+
+
+# Scenario: A reference is beneath a directory presented as the selected MOD.
+# Purpose: Only the two supported MOD root shapes can authorize Lua paths.
+@pytest.mark.parametrize("mod", [
+    "unrelated/ChatBlock",
+    "unrelated/mods/ChatBlock",
+    "mods/ChatBlock/nested",
+    f"{PRODUCTION_MOD}/nested",
+    "Warhammer 40,000 DARKTIDE/other/ChatBlock",
+])
+def test_UnitT25_rejects_unsupported_mod_roots(mod):
+    with pytest.raises(ValueError, match="Lua path outside the MOD"):
+        lua_path(f"{mod}/ChatBlock.lua", relative_path(mod))
+
+
+# Scenario: A valid excerpt fails to establish gameplay or a legacy neutral string needs no excerpt.
+# Purpose: Insufficiency stops correction and fallback, while neutral review retains its payload.
+@pytest.mark.parametrize("contextual", [True, False])
+def test_UnitT30_review_disposition_uses_evidence_requirement(job, request, contextual):
+    flags, issues = [], []
+    if contextual:
+        unit, evidence, sidecar, _ = request.getfixturevalue("gameplay")
+        evidence["units"][unit["unitId"]]["references"][0].update(startLine=2, endLine=2)
+        sidecar.write_text(json.dumps(evidence), encoding="utf-8")
+        flags = ["--gameplay-context", str(sidecar)]
+        issues = [{"category": "gameplay_context", "detail": "The excerpt omits reload behavior."}]
+    job.save()
+    transport = FakeTransport([scripted("範例譯文" if contextual else "增加15%", lookup=contextual),
+                               scripted(issues=issues)])
+    assert job.run(transport, *flags) == 0
+    if contextual:
+        assert read(job.summary)["blocked"] == [
+            {"unitId": unit["unitId"], "reason": "gameplay_context_insufficient"},
+        ]
+        assert read(job.workset)["units"][0]["reviewStatus"] == "pending"
+        assert not list(job.cache.rglob("*.json"))
+    else:
+        assert set(transport.requests[1].user["units"][0]) == {"unitId", "source", "translation"}
+        assert read(job.workset)["units"][0]["reviewStatus"] == "approved"
+
+
+# Scenario: Review keeps rejecting a translation that requires gameplay evidence.
+# Purpose: The exhausted unit stays pending on the first run and on resume.
+def test_gameplay_review_exhaustion_cannot_fall_back_on_resume(job, gameplay):
+    unit, evidence, sidecar, _ = gameplay
+    sidecar.write_text(json.dumps(evidence), encoding="utf-8")
+    job.save()
+    previous = job.workset.read_bytes()
+    flags = ["--gameplay-context", str(sidecar)]
+    translate = scripted("範例譯文")
+    review = scripted(issues=[{"category": "meaning", "detail": "The action is mistranslated."}])
+    attempts = load_config()["maxCorrectionsPerItem"] + 1
+
+    for replies in ([translate, review] * attempts, []):
+        transport = FakeTransport(replies)
+        assert job.run(transport, *flags) == 0
+        assert len(transport.requests) == len(replies)
+        assert job.workset.read_bytes() == previous
+        summary = read(job.summary)
+        assert summary["blocked"] == [{"unitId": unit["unitId"], "reason": "max_corrections_reached"}]
+        assert summary["termReviews"] == []
+    assert not list(job.cache.rglob("*.json"))
+
+
+# Scenario: A pending input is retried with a change to the review evidence.
+# Purpose: Both old persisted approvals and cache entries are isolated from the new evidence.
+def test_UnitT40_changed_gameplay_evidence_cannot_reuse_state_or_cache(job, gameplay):
+    unit, evidence, sidecar, _ = gameplay
+    job.save()
+    pending = job.workset.read_bytes()
+    sidecar.write_text(json.dumps(evidence), encoding="utf-8")
+    flags = ["--gameplay-context", str(sidecar)]
+    assert job.run(FakeTransport([scripted("範例譯文"), scripted()]), *flags) == 0
+    job.workset.write_bytes(pending)
+    evidence["units"][unit["unitId"]]["references"][0]["endLine"] = 12
+    sidecar.write_text(json.dumps(evidence), encoding="utf-8")
+    transport = FakeTransport([])
+    assert job.run(transport, *flags) == 4
+    assert not transport.requests
+    job.state = job.path / "new-state.json"
+    transport = FakeTransport([scripted("範例譯文"), scripted()])
+    assert job.run(transport, *flags) == 0
+    assert [request.role for request in transport.requests] == ["translator", "reviewer"]
+    assert read(job.summary)["cacheHitCount"] == 0
 
 
 @pytest.mark.parametrize("action", ["RESTORE_OLD_ZH_TW", "NONE"])
