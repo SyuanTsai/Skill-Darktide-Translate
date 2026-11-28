@@ -1,20 +1,48 @@
 # SPDX-FileCopyrightText: 2026 SyuanTsai
 # SPDX-License-Identifier: Apache-2.0
 [CmdletBinding()]
-param()
+param(
+    [string] $PesterManifestPath,
+    [string] $ToolRoot
+)
 
 $ErrorActionPreference = 'Stop'
-$available = @(
-    Get-Module -Name Pester -ListAvailable |
-        Where-Object { $_.Version -ge [version]'6.2.0' } |
-        Sort-Object Version -Descending
-)
-if ($available.Count -eq 0) {
-    throw 'Pester 6.2.0 or later is required to run repository tests.'
+$repositoryRoot = Split-Path -Parent $PSScriptRoot
+$preflightPath = Join-Path $repositoryRoot 'scripts/Test-TestEnvironment.ps1'
+$powerShellPath = (Get-Process -Id $PID).Path
+$argumentList = @('-NoProfile', '-File', $preflightPath, '-RepositoryRoot', $repositoryRoot)
+if (-not [string]::IsNullOrWhiteSpace($PesterManifestPath)) { $argumentList += @('-PesterManifestPath', $PesterManifestPath) }
+if (-not [string]::IsNullOrWhiteSpace($ToolRoot)) { $argumentList += @('-ToolRoot', $ToolRoot) }
+$start = [Diagnostics.ProcessStartInfo]::new()
+$start.FileName = $powerShellPath
+$start.UseShellExecute = $false
+$start.RedirectStandardOutput = $true
+$start.RedirectStandardError = $true
+foreach ($argument in $argumentList) { [void]$start.ArgumentList.Add($argument) }
+$process = [Diagnostics.Process]::new()
+try {
+    $process.StartInfo = $start
+    [void]$process.Start()
+    $standardOutput = $process.StandardOutput.ReadToEndAsync()
+    $standardError = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $preflightExitCode = $process.ExitCode
+    $preflightJson = $standardOutput.GetAwaiter().GetResult().Trim()
+    $preflightError = $standardError.GetAwaiter().GetResult().Trim()
+}
+finally { $process.Dispose() }
+try { $preflight = $preflightJson | ConvertFrom-Json }
+catch { throw "Test environment preflight did not return valid JSON: $preflightJson" }
+if ($preflightExitCode -ne 0 -or $preflight.result -cne 'READY') {
+    if (-not [string]::IsNullOrWhiteSpace($preflightError)) { [Console]::Error.WriteLine($preflightError) }
+    foreach ($check in @($preflight.checks | Where-Object status -eq blocked)) {
+        [Console]::Error.WriteLine("$($check.id): expected=$($check.expected); actual=$($check.actual); remediation=$($check.remediation)")
+    }
+    exit 2
 }
 
-$selected = $available[0]
-Import-Module $selected.Path -Force
+$selectedManifestPath = [string]$preflight.environment.pester.manifestPath
+Import-Module $selectedManifestPath -Force
 $testFiles = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.Tests.ps1' -File -Recurse |
         Sort-Object FullName | Select-Object -ExpandProperty FullName)
 if ($testFiles.Count -eq 0) {
@@ -34,8 +62,10 @@ if ($result.FailedCount -gt 0 -or $result.SkippedCount -gt 0 -or
 
 [PSCustomObject]@{
     result = 'passed'
-    pesterVersion = $selected.Version.ToString()
+    pesterVersion = [string]$preflight.environment.pester.version
     testCount = $result.TotalCount
     passedCount = $result.PassedCount
     failedCount = $result.FailedCount
+    environment = $preflight.environment
+    testEnvironmentReport = [string]$preflight.result
 }
