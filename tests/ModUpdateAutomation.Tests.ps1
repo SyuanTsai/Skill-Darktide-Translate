@@ -2224,11 +2224,11 @@ function Suspend-Stage {
     }
 
     # Scenario: The installed MOD root is swapped for a junction while localization waits for AI review and the same stage later resumes.
-    # Purpose: Reject physical path indirection before reading the raw worktree localization input on resume.
+    # Purpose: Reject physical indirection before reading and verify the exact bytes read against the workset NEW digest.
     It 'UnitT147_RechecksTheRawLocalizationPathBeforeResumeReads' {
         $runner = Get-Content -LiteralPath $runnerPath -Raw
 
-        $runner | Should -Match '(?s)\$worktreeFile = Assert-ContainedPath.*?\$worktreeFile = Assert-NoReparsePath -Path \$worktreeFile -Root \(\[string\]\$State\.worktreePath\) -Label ''Raw worktree localization input''.*?Get-FileSha256 -Path \$worktreeFile.*?Read-FileBytesWithHeartbeat -Path \$worktreeFile'
+        $runner | Should -Match '(?m)\$worktreeFile = Assert-ContainedPath[^\r\n]+\r?\n\s*\$worktreeFile = Assert-NoReparsePath -Path \$worktreeFile -Root \(\[string\]\$State\.worktreePath\) -Label ''Raw worktree localization input''\r?\n\s*\$rawBytes = Read-FileBytesWithHeartbeat -Path \$worktreeFile\r?\n\s*if \(\(Get-Sha256Bytes -Bytes \$rawBytes\) -cne \[string\]\$workset\.new\.sha256\) \{ throw '
     }
 
     # Scenario: The completed extraction tree is swapped for a junction before install resumes.

@@ -26,7 +26,7 @@ python packages/darktide-translate/darktide_translate.py run
   --workset <localization-workset.json> --mods-root <Mods repo>
   --state <api-state.json> --cache-dir <run cache>
   --summary-out <run>/api-summary.json [--mode update|improve]
-  [--max-items N] [--dry-run]
+  [--gameplay-context <context.json>] [--max-items N] [--dry-run]
 ```
 
 上例各行是同一指令。預設 `update`，修訂時明確使用 `--mode improve`。正式呼叫的憑證由環境變數 `ANTHROPIC_API_KEY` 提供。預演會讀工作集、狀態和快取，建立分批及詞彙切片並輸出估算，寫入 JSON 與相鄰的同名 Markdown 摘要。費用估算依版本化價格表換算，以 Console 帳單為準。
@@ -52,6 +52,36 @@ JSON 摘要的 `termReviews` 沿用術語欄位，另含 `reason` 及 `adoption`
 若英文原文沒有外層雙引號，轉接器會在審查前移除整段譯文多餘的外層雙引號。採用這筆譯文時，JSON 摘要的 `warnings` 陣列會記錄 `unitId` 和 `code: "unexpected_outer_double_quotes"`。
 
 快取鍵包含 NEW 英文、OLD 英文、OLD 繁中、NEW 繁中候選的 raw 值（缺少時為 JSON null），以及規則 SHA、詞彙表 SHA、模式與請求模型 ID。舊格式的快取會自然失效。已審查通過且翻譯及審查回應模型均相符的結果才會寫入。轉接器使用 PATH 中的 `luac -p` 或 LuaJIT 編譯檢查運算式。兩者皆缺少時，摘要記錄 `luacAvailable: false`，運算式由內建解析器驗證。
+
+## 提供遊戲脈絡
+
+Mods 端在有待審單元需要程式碼才能確認語意時，產生獨立的 JSON 並傳給 `run --gameplay-context`。從工作集複製該筆的完整 `unitId` 和 `key`。選用已核實代表該次候選內容的 Mods commit 或 tree，並確保 Git 物件已在 `--mods-root` 本機可讀。標準壓縮檔更新流程可能沒有對應的上游 Git 物件，Mods 端可用候選檔案的原始位元組建立本機 Git tree，並在 tree 內使用完整的 Mods 儲存庫相對路徑。若直接使用既有 commit，先核對其 localization 和相關 runtime 與候選內容相同。工作集仍使用原有的產生、回填和套用格式。
+
+```json
+{
+  "version": 1,
+  "candidateOid": "<40-character Mods commit or tree OID>",
+  "localizationPath": "Warhammer 40,000 DARKTIDE/mods/ChatBlock/scripts/mods/ChatBlock/ChatBlock_localization.lua",
+  "units": {
+    "<exact workset unitId>": {
+      "key": "auto_melee_swap_wait_for_reload_tooltip",
+      "references": [
+        {"path": "Warhammer 40,000 DARKTIDE/mods/ChatBlock/scripts/mods/ChatBlock/ChatBlock.lua", "startLine": 20, "endLine": 127}
+      ]
+    }
+  }
+}
+```
+
+行號從 1 開始，包含起迄行。以核實的 Git 物件為準填寫上述路徑。轉接器比對 localization blob 的 SHA-256 與工作集 `new.sha256`，再依單元的 byte span 核對 NEW 英文原始運算式。每筆最多 4 段，合計最多 120 行、8 KiB。只接受工作集所選 MOD 子樹內的普通 Lua 檔。MOD 根目錄格式為 `Warhammer 40,000 DARKTIDE/mods/<name>` 或舊版的 `mods/<name>`。摘錄須取自 runtime 檔、互不重疊，且保留檔案中未擷取的行。轉接器從本機 Git 讀取每個最多 1 MiB 的 blob。JSON 檔上限為 256 KiB，內容只需版本、候選 OID、localization 路徑、單元識別及行號範圍。
+
+ChatBlock #379 的來源是 Mods main `d4377f7af97c3aacd7eac66c5d2feddda765943f`，配合該版本的 tooltip 和 `ChatBlock.lua` 第 20–127 行。審查時應核對 `focus_lost()`、`ranged_reload_active()`、`auto_melee_swap_on_blocked(blocked)` 和 `HumanGameplay._input_active` hook。若裝填完成前關閉聊天、選單或 Steam 內嵌介面，或切回遊戲視窗，恢復角色操控會清除擱置的切換並保留遠程武器。若裝填完成時操控仍受阻，才會切換至近戰武器。接入 Mods 流程時，請從當次候選版本重新核對路徑與行號。
+
+ChatBlock 的該筆 tooltip，以及脈絡檔列出的單元，都需要有效證據。缺少證據、候選來源或範圍驗證失敗、或 reviewer 判定證據不足時，該筆維持 pending。摘要分別顯示 `gameplay_context_missing`、`gameplay_context_invalid` 或 `gameplay_context_insufficient`。Reviewer 也能對其他確實依賴遊戲行為的單元回報證據不足。脈絡檔的整體格式錯誤或含未知單元時，命令結束碼為 4。
+
+需要遊戲脈絡的單元必須通過審查才會回填。查詞無可用譯文或修正次數用盡時，即使沿用同一狀態檔重跑，也不採用文字回退。
+
+摘錄只送入對應單元的 reviewer 請求。狀態及快取以驗證後的脈絡雜湊綁定審查結果。更正證據後，以新的 `--state` 路徑重跑。若要重新審查已回填的項目，使用含該筆 pending 單元的原始工作集。既有的規則綁定仍適用。若未完成的工作集綁定了舊版 reviewer 資產，以現行規則另行產生工作集並保留歷史檔案。
 
 ## 安全檢查
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 * text=auto
 .gitattributes text eol=lf
+*.cs text eol=lf
 *.json text eol=lf
 *.lua text eol=lf
 *.md text eol=lf

@@ -252,6 +252,41 @@ end
         Get-LocalizationWorksetWriteBlockReason -Action 'NONE' -OldUnit $new -NewUnit $new | Should -BeNullOrEmpty
     }
 
+    It 'UnitT58_RejectsReviewedTerminologyOnAByteSpanSharedByGeneratedKeys' {
+        $source = (Get-TestColorLoop).Replace('en = "Red"', 'en = "Red", ["zh-tw"] = "Old"') + [char]10 + 'return output'
+        $document = Read-TestLiteralLoop $source
+        $unit = $document.units | Where-Object key -CEQ 'fire_red'
+        $prior = @{ sourceRaw = $unit.sourceExpression.raw; zhTwRaw = $unit.zhTwExpression.raw }
+        $workset = @{ units = @(@{
+            sourceId = $unit.sourceId; containerPath = $unit.containerPath; key = $unit.key
+            occurrence = $unit.occurrence; unitId = $unit.unitId; changeType = 'unchanged'; action = 'NONE'
+            old = $unit; new = $unit
+        }) }
+        $request = @{ terminologyCorrection = @{
+            sourceId = $unit.sourceId; containerPath = $unit.containerPath; key = $unit.key
+            occurrence = $unit.occurrence; unitId = $unit.unitId; action = 'NONE'
+            old = $prior; new = $prior; translation = 'Updated'
+        } }
+        Import-Module (Join-Path $scriptRoot 'LocalizationWorksetContract.psm1') -Force
+
+        { Get-ReviewedTerminologyEdit -Request $request -Workset $workset -OldDocument $document -NewDocument $document `
+                -NewBytes ([Text.Encoding]::UTF8.GetBytes($source)) } | Should -Throw '*generated_shared_translation_span_requires_review*'
+    }
+
+    It 'UnitT59_RejectsComputedKeysWhenLocatingReviewedTerminologyInAnAccumulator' {
+        $source = @'
+local output = {
+    [computed] = { en = "Red", ["zh-tw"] = "Old" },
+    red = { en = "Red", ["zh-tw"] = "Old" },
+}
+return output
+'@
+        $locator = @{ containerPath = '$'; key = 'red' }
+
+        { Get-LuaLocalizationDocument -Bytes ([Text.Encoding]::UTF8.GetBytes($source)) -SourceId 'literal-loops' `
+                -ReviewedLocator $locator } | Should -Throw '*ambiguous computed Lua key*'
+    }
+
     # Scenario: Two new generated keys share a source field that already contains reviewed zh-tw.
     # Purpose: Permit explicit zero-write approval while rejecting approval that supplies replacement bytes.
     It 'InterT60_RequiresExplicitZeroWriteReviewForSharedLiteralFields' {
