@@ -1,6 +1,6 @@
 ---
 name: auto-update-darktide-mod
-description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIP or single-volume RAR archives, preserve active zh-tw, and produce Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization; route standalone translation and MOD authoring elsewhere.
+description: Update Warhammer 40,000 DARKTIDE MODs from verified Nexus Main files or supplied ZIPs or single-volume RARs. Preserve active zh-tw and record Schema 14/15 Git evidence. Use for acquisition, claims, resumes, review feedback, or merge finalization. Excludes standalone translation and MOD authoring.
 allowed-tools: "git, pwsh, webfetch"
 ---
 <!--
