@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "sourcePath": "mood_settings.lua",
+  "entries": {
+    "knocked_down": "倒地",
+    "zealot_combat_ability_dash": "有信者之怒"
+  }
+}

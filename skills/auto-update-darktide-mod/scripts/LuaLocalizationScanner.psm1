@@ -613,7 +613,8 @@ function Read-LuaTable {
         [string] $SourceId,
         [Collections.Generic.List[object]] $Units,
         [int] $BomLength,
-        [string] $RootKey
+        [string] $RootKey,
+        [Collections.Generic.List[object]] $SourceGaps
     )
     $closeIndex = Get-MatchingTokenIndex -Tokens $Tokens -StartIndex $OpenIndex -Open '{' -Close '}'
     $fields = [Collections.Generic.List[object]]::new()
@@ -689,11 +690,28 @@ function Read-LuaTable {
         if ($Tokens[$valueStart].text -ceq '{') {
             $tablePath = if ([string]::IsNullOrWhiteSpace($AssignedKey)) { $ContainerPath } else { Join-LuaContainerPath -ContainerPath $ContainerPath -Key $AssignedKey }
             $childRootKey = if ($AssignedKey) { $RootKey } else { $key }
-            $null = Read-LuaTable -Text $Text -Tokens $Tokens -OpenIndex $valueStart -ContainerPath $tablePath -AssignedKey $key -SourceId $SourceId -Units $Units -BomLength $BomLength -RootKey $childRootKey
+            $null = Read-LuaTable -Text $Text -Tokens $Tokens -OpenIndex $valueStart -ContainerPath $tablePath -AssignedKey $key -SourceId $SourceId -Units $Units -BomLength $BomLength -RootKey $childRootKey -SourceGaps $SourceGaps
         }
         $position = if ($null -ne $separatorIndex) { [int]$separatorIndex + 1 } else { $valueEnd + 1 }
     }
 
+    if ($null -ne $SourceGaps -and @($fields | Where-Object { $_.key -cin @('en', 'zh-tw') }).Count -eq 0) {
+        if ($AssignedKey -and (@($fields | Where-Object { $_.key -ceq 'zh-cn' }).Count -gt 0 -or
+            ($fields.Count -eq 0 -and ($OpenIndex + 1) -lt $closeIndex -and $Tokens[$OpenIndex + 1].type -ceq 'string'))) {
+            $SourceGaps.Add([ordered]@{
+                key = $AssignedKey; containerPath = $ContainerPath; reason = 'unmapped_language_table'
+                startByte = ConvertTo-Utf8ByteOffset $Text $Tokens[$OpenIndex].start $BomLength
+            })
+        }
+        foreach ($field in $fields) {
+            $value = $Tokens[$field.valueStartIndex]
+            if ($value.text -ceq '{' -or $value.type -cin @('string', 'number') -or $value.text -cin @('true', 'false', 'nil')) { continue }
+            $SourceGaps.Add([ordered]@{
+                key = $field.key; containerPath = $ContainerPath; reason = 'unproven_source_field'
+                startByte = ConvertTo-Utf8ByteOffset $Text $Tokens[$field.fieldStartIndex].start $BomLength
+            })
+        }
+    }
     if (-not [string]::IsNullOrWhiteSpace($AssignedKey)) {
         $sourceFields = @($fields | Where-Object { $_.key -ceq 'en' })
         $zhTwFields = @($fields | Where-Object { $_.key -ceq 'zh-tw' })
@@ -1230,7 +1248,7 @@ function Test-LuaReferenceIsField {
 function Add-LuaAccumulatorRootTable {
     param($Context, [int] $Open)
     $firstUnit = $Context.units.Count
-    $null = Read-LuaTable -Text $Context.text -Tokens $Context.tokens -OpenIndex $Open -ContainerPath '$' -AssignedKey $null -SourceId $Context.sourceId -Units $Context.units -BomLength $Context.bomLength
+    $null = Read-LuaTable -Text $Context.text -Tokens $Context.tokens -OpenIndex $Open -ContainerPath '$' -AssignedKey $null -SourceId $Context.sourceId -Units $Context.units -BomLength $Context.bomLength -SourceGaps $Context.sourceGaps
     for ($index = $firstUnit; $index -lt $Context.units.Count; $index++) {
         Invoke-LuaScannerProgressHeartbeat
         $unit = $Context.units[$index]
@@ -1922,6 +1940,7 @@ function Get-LuaLocalizationDocument {
             tableCache = [Collections.Generic.Dictionary[int, object]]::new()
             descendantsByRoot = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
             gameLocalizedPassthroughPrefixes = [Collections.Generic.List[string]]::new()
+            sourceGaps = [Collections.Generic.List[object]]::new()
         }
         Add-LuaAccumulatorUnits $context
         if (-not $context.namedAccumulator) {
@@ -1929,7 +1948,7 @@ function Get-LuaLocalizationDocument {
             while ($position -lt $tokens.Count) {
                 Invoke-LuaScannerProgressHeartbeat
                 if ($tokens[$position].text -ceq '{') {
-                    $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength
+                    $position = Read-LuaTable -Text $text -Tokens $tokens -OpenIndex $position -ContainerPath '$' -AssignedKey $null -SourceId $SourceId -Units $units -BomLength $bomLength -SourceGaps $context.sourceGaps
                 }
                 $position++
             }
@@ -2009,6 +2028,53 @@ function Get-LuaLocalizationDocument {
         }
         if ($context.gameLocalizedPassthroughPrefixes.Count -gt 0) {
             $document.gameLocalizedPassthroughPrefixes = @($context.gameLocalizedPassthroughPrefixes)
+        }
+        # Inventory language fields independently of emitted units. A partial parse
+        # must not conceal an unconsumed language table (including helper inputs).
+        $uncovered = [Collections.Generic.List[object]]::new()
+        for ($index = 0; $index -lt ($tokens.Count - 1); $index++) {
+            Invoke-LuaScannerProgressHeartbeat
+            $language = $null
+            if ($tokens[$index].text -ceq 'en' -and $tokens[$index + 1].text -ceq '=') { $language = 'en' }
+            elseif ($tokens[$index].type -ceq 'string' -and $index -gt 0 -and ($index + 2) -lt $tokens.Count -and
+                $tokens[$index - 1].text -ceq '[' -and $tokens[$index + 1].text -ceq ']' -and $tokens[$index + 2].text -ceq '=') {
+                $name = ConvertFrom-LuaKeyString $tokens[$index].text
+                if ($name -cin @('en', 'zh-tw')) { $language = $name }
+            }
+            if (-not $language) { continue }
+            $offset = ConvertTo-Utf8ByteOffset $text $tokens[$index].start $bomLength
+            $covered = $false
+            foreach ($unit in $document.units) {
+                if ($null -ne $unit.tableOpenByte -and $offset -gt $unit.tableOpenByte -and $offset -lt $unit.tableCloseByte) {
+                    $covered = $true; break
+                }
+                foreach ($expression in @($unit.sourceExpression, $unit.zhTwExpression)) {
+                    if ($null -ne $expression -and $offset -ge $expression.fieldStartByte -and
+                        $offset -lt ($expression.fieldStartByte + $expression.fieldLengthByte)) { $covered = $true; break }
+                }
+                if ($covered) { break }
+            }
+            if (-not $covered) {
+                $uncovered.Add([ordered]@{ language = $language; startByte = $offset; reason = 'uncovered_language_field' })
+            }
+        }
+        $methods = @(for ($index = 0; $index -lt $units.Count; $index++) {
+            $unit = $units[$index]
+            $method = if ($unit.PSObject.Properties['positionalLocale'] -and $unit.positionalLocale) { 'positional-array' }
+                elseif ($unit.PSObject.Properties['generatedBinding'] -and $null -ne $unit.generatedBinding) { $unit.generatedBinding.kind }
+                elseif ($unit.PSObject.Properties['generated'] -and $unit.generated) { 'dynamic-assignment' }
+                else { 'named-language-table' }
+            [ordered]@{ unitId = $document.units[$index].unitId; method = $method }
+        })
+        $hasMoodList = $false; $hasMoodPrefix = $false
+        for ($index = 0; $index -lt $tokens.Count; $index++) {
+            if (($index + 2) -lt $tokens.Count -and $tokens[$index].text -ceq 'MoodSettings' -and
+                $tokens[$index + 1].text -ceq '.' -and $tokens[$index + 2].text -ceq 'mood_types') { $hasMoodList = $true }
+            if ($tokens[$index].type -ceq 'string' -and (ConvertFrom-LuaKeyString $tokens[$index].text) -ceq 'hide_mood_vfx_') { $hasMoodPrefix = $true }
+        }
+        $document.sourceInventory = [ordered]@{
+            languageFieldsOutsideUnits = @($uncovered); methods = $methods; unprovenFields = @($context.sourceGaps)
+            dynamicSources = @(if ($hasMoodList -and $hasMoodPrefix) { 'MoodSettings.mood_types' })
         }
         $document
     }
@@ -2155,4 +2221,49 @@ function Test-LuaNonStringTokenSequence {
         (Get-LuaFormatSignature -Tokens $translationTokens -FormatSpans $formatSpans)
 }
 
-Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence, Test-LuaLocalizationUnitInRootNamespace
+function Get-LuaMoodListKeys {
+    param([byte[]] $Bytes)
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes).TrimStart([char]0xfeff)
+    $tokens = @(Get-LuaTokens $text)
+    $declarations = @(for ($i = 0; $i -lt ($tokens.Count - 2); $i++) {
+        if ($tokens[$i].text -ceq 'mood_types' -and $tokens[$i + 1].text -ceq '=') { $i + 2 }
+    })
+    if ($declarations.Count -ne 1) { throw 'dynamic_list_source_unproven: expected one mood_types declaration' }
+    $start = $declarations[0]
+    $keys = [Collections.Generic.List[string]]::new()
+    if ($tokens[$start].text -ceq '{') {
+        $end = Get-MatchingTokenIndex $tokens $start '{' '}'
+        for ($i = $start + 1; $i -lt $end; $i++) {
+            if ($tokens[$i].text -cin @(',', ';')) { continue }
+            if ($tokens[$i].type -ceq 'identifier' -and $tokens[$i + 1].text -ceq '=') {
+                $keys.Add($tokens[$i].text); $i += 2
+            }
+            elseif ($tokens[$i].text -ceq '[' -and $tokens[$i + 1].type -ceq 'string' -and
+                $tokens[$i + 2].text -ceq ']' -and $tokens[$i + 3].text -ceq '=') {
+                $keys.Add((ConvertFrom-LuaKeyString $tokens[$i + 1].text)); $i += 4
+            }
+            else { throw 'dynamic_list_source_unproven: expected literal mood key' }
+            if ($tokens[$i].type -cnotin @('number', 'string') -and $tokens[$i].text -cnotin @('true', 'false')) {
+                throw 'dynamic_list_source_unproven: expected scalar mood value'
+            }
+        }
+    }
+    elseif (($start + 3) -lt $tokens.Count -and
+        (Test-LuaExactTokens $tokens $start ($start + 3) 'table.enum(')) {
+        $end = Get-MatchingTokenIndex $tokens ($start + 3) '(' ')'
+        for ($i = $start + 4; $i -lt $end; $i++) {
+            if ($tokens[$i].text -ceq ',') { continue }
+            if ($tokens[$i].type -cne 'string') { throw 'dynamic_list_source_unproven: expected literal enum member' }
+            $keys.Add((ConvertFrom-LuaKeyString $tokens[$i].text))
+        }
+    }
+    else { throw 'dynamic_list_source_unproven: unsupported mood_types structure' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($key in $keys) {
+        if ($key -cnotmatch '^[a-z][a-z0-9_]*$' -or -not $seen.Add($key)) { throw "dynamic_list_source_unproven: invalid or duplicate mood $key" }
+    }
+    if ($keys.Count -eq 0) { throw 'dynamic_list_source_unproven: empty mood_types' }
+    @($keys | Sort-Object -CaseSensitive)
+}
+
+Export-ModuleMember -Function Get-LuaLocalizationDocument, Test-LuaTableFieldAssignment, Test-LuaNonStringTokenSequence, Test-LuaLocalizationUnitInRootNamespace, Get-LuaMoodListKeys

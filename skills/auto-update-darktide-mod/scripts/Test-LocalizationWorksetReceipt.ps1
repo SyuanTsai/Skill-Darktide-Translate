@@ -22,6 +22,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'LuaLocalizationScanner.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'PathSafety.psm1') -Force -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'LocalizationWorksetContract.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'LocalizationCoverage.psm1') -Force -ErrorAction Stop
 
 function Invoke-Heartbeat { if ($HeartbeatAction) { $null = & $HeartbeatAction } }
 
@@ -425,6 +426,19 @@ if ($sidecarProof) {
     $before.units = @($before.units | Where-Object { -not $_['conditionalZhTwSidecar'] })
 }
 $oldPrefixes = if ($null -ne $oldDocument) { $oldDocument['gameLocalizedPassthroughPrefixes'] }
+if ($workset.new.Contains('coverage')) {
+    # Coverage receipts always reconstruct OLD, even for the legacy unbound
+    # invocation. Raw NEW and merged bytes still come from the caller's artifacts.
+    if ($null -eq $oldDocument) {
+        $coverageOld = Get-LocalizationGitBlobBytes -WorkingDirectory $workset.old.repositoryRoot -Object ($workset.baseOid + ':' + $workset.old.path) -HeartbeatAction $HeartbeatAction
+        if ((Get-Sha256Bytes $coverageOld) -cne $workset.old.sha256) { throw 'Localization coverage OLD snapshot hash mismatch.' }
+        $oldDocument = Get-LuaLocalizationDocument -Bytes $coverageOld -SourceId $workset.sourceId -HeartbeatAction $HeartbeatAction
+    }
+    Assert-LocalizationSourceCoverage $workset.old.coverage $oldDocument 'OLD'
+    Assert-LocalizationSourceCoverage $workset.new.coverage $before 'NEW'
+    $survivalOutput = Get-LuaLocalizationDocument -Bytes $mergedBytes -SourceId $workset.sourceId -HeartbeatAction $HeartbeatAction
+    Assert-LocalizationZhTwSurvival $oldDocument.units $before.units $survivalOutput.units -Recorded $workset.new.zhTwSurvival -ReviewSimplifiedChanges:($workset['positionalLabelReview'] -ceq 'zh-cn-changes')
+}
 $oldUnits = if ($null -ne $oldDocument) { $oldDocument.units }
 Assert-LocalizationWorksetPassthroughCoverage -Prefixes (@($oldPrefixes) + @($before['gameLocalizedPassthroughPrefixes'])) `
     -Units (@($oldUnits) + @($before.units))
