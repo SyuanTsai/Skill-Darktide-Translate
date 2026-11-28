@@ -138,10 +138,21 @@ Describe 'Repository test environment' {
             $stderr = [IO.File]::ReadAllText($stderrPath, [Text.Encoding]::GetEncoding(950))
         }
         else {
-            $process = Start-Process -FilePath $powerShell -ArgumentList @('-NoProfile', '-File', $invokeTests, '-PesterManifestPath', $missing) `
-                -RedirectStandardError $stderrPath -RedirectStandardOutput (Join-Path $TestDrive 'invoke-tests.stdout.txt') -NoNewWindow -Wait -PassThru
-            $exitCode = $process.ExitCode
-            $stderr = [IO.File]::ReadAllText($stderrPath)
+            # ProcessStartInfo.ArgumentList keeps each path as one argument even when it contains spaces.
+            $start = [Diagnostics.ProcessStartInfo]::new($powerShell)
+            foreach ($argument in @('-NoProfile', '-File', $invokeTests, '-PesterManifestPath', $missing)) { [void]$start.ArgumentList.Add($argument) }
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $process = [Diagnostics.Process]::Start($start)
+            try {
+                $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                $stderr = $process.StandardError.ReadToEnd()
+                [void]$stdoutTask.GetAwaiter().GetResult()
+                $process.WaitForExit()
+                $exitCode = $process.ExitCode
+            }
+            finally { $process.Dispose() }
         }
         $exitCode | Should -Be 2
         $stderr | Should -BeLikeExactly "*remediation=$expected*"
