@@ -17,6 +17,8 @@ Skill 提供 Schema 15 API 翻譯資產，以及產生、套用工作集和驗�
 
 Python 轉接器的 repo 路徑是 `packages/darktide-translate/darktide_translate.py`。它不隨 Skill 安裝，只能從 repo 原始碼工作樹或 GitHub Actions 執行。在 repo 根目錄以已備妥的 Python 3.11+ 環境執行，轉接器會載入同 repo 的 `packages/claude-runner`。
 
+Codex 或 Claude 都可從同一個原始碼工作樹呼叫下列 CLI。請使用與轉接器同版本的 PowerShell 套件產生工作集，並在執行後接續 `localization`，由現有流程套用工作集與驗證收據。
+
 轉接器處理 ready 的 Schema 15 工作集中同時為 `AI_REQUIRED` 與 `pending` 的項目。它會先驗證工作集綁定，再讀取狀態及快取。通過結構檢查與獨立語意審查的項目才會回填。
 
 ```text
@@ -41,13 +43,15 @@ python packages/darktide-translate/darktide_translate.py run
 
 有待確認術語的譯文照常進行結構檢查與獨立審查。JSON 摘要的頂層 `unknownTerms` 是已採用譯文的彙整陣列，無項目時為 `[]`。每筆包含字串欄位 `unitId`、`key`、`source`、`translation`，以及字串陣列 `terms`。`source` 是工作集的 NEW 英文 Lua 表達式，`translation` 是回填的臺灣繁中 Lua 表達式。Markdown 摘要在「待確認術語」列出 key 與詞清單。
 
-`needsLookupDefinition` 標記的譯文通過結構檢查及審查後照常採用。若無譯文或修正後只剩用詞問題，先採結構相容的 NEW 繁中，再查 OLD 繁中，最後以原始英文運算式回填。無法安全模板化且已驗證語法的運算式會記為 `reviewStatus: preserved`，並維持 `suggestedZhTwExpression: null`。Apply 和 Receipt 保留該筆 NEW 欄位的原始位元組。
+`needsLookupDefinition` 標記的譯文通過結構檢查及審查後照常採用。若查詞時無可用譯文，先採結構相容的 NEW 繁中，再查 OLD 繁中，最後以原始英文運算式回填。無法安全模板化且已驗證語法的運算式會記為 `reviewStatus: preserved`，並維持 `suggestedZhTwExpression: null`。Apply 和 Receipt 保留該筆 NEW 欄位的原始位元組。
 
-JSON 摘要的 `termReviews` 沿用術語欄位，另含 `reason` 及 `adoption`。原因可為 `needs_lookup_definition` 或 `complex_expression`，`translation` 記載實際採用或保留的 Lua 值。Markdown 摘要在「待確認術語」列出原因、待確認詞及採用值。
+JSON 摘要的 `termReviews` 沿用術語欄位，另含 `reason` 及 `adoption`。原因可為 `needs_lookup_definition`、`max_corrections_reached` 或 `complex_expression`，`translation` 記載實際採用或保留的 Lua 值。Markdown 摘要在「待確認術語」列出原因、待確認詞及採用值。
+
+修正次數用盡且最後只剩文字品質問題（如語意、數值或術語）時，沿用相同的回退順序。回退項不進入翻譯快取，並以 `max_corrections_reached` 和 `lastFailure` 記錄最後的檢查代碼或審查意見。已保存且綁定相同工作集的文字問題可直接回退。Lua、格式參數、遊戲字串引用、佔位符、色碼與換行等結構檢查仍然適用。
 
 若英文原文沒有外層雙引號，轉接器會在審查前移除整段譯文多餘的外層雙引號。採用這筆譯文時，JSON 摘要的 `warnings` 陣列會記錄 `unitId` 和 `code: "unexpected_outer_double_quotes"`。
 
-快取鍵依序包含 NEW 英文 raw、OLD 繁中 raw 或 JSON null、規則 SHA、詞彙表 SHA、模式及請求模型 ID。已審查通過且翻譯及審查回應模型均相符的結果才會寫入。轉接器使用 PATH 中的 `luac -p` 或 LuaJIT 編譯檢查運算式。兩者皆缺少時，摘要記錄 `luacAvailable: false`，運算式由內建解析器驗證。
+快取鍵包含 NEW 英文、OLD 英文、OLD 繁中、NEW 繁中候選的 raw 值（缺少時為 JSON null），以及規則 SHA、詞彙表 SHA、模式與請求模型 ID。舊格式的快取會自然失效。已審查通過且翻譯及審查回應模型均相符的結果才會寫入。轉接器使用 PATH 中的 `luac -p` 或 LuaJIT 編譯檢查運算式。兩者皆缺少時，摘要記錄 `luacAvailable: false`，運算式由內建解析器驗證。
 
 ## 安全檢查
 
